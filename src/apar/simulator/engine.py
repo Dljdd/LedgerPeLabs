@@ -5,12 +5,16 @@ from __future__ import annotations
 import heapq
 import json
 from collections.abc import Collection, Mapping
-from copy import deepcopy
+from contextvars import ContextVar
 from datetime import datetime, timedelta
 from decimal import Decimal
+from enum import Enum
+from math import isfinite
+from threading import Lock
 from types import MappingProxyType
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
+from weakref import ReferenceType, ref
 
 import numpy as np
 from numpy.random import Generator
@@ -21,6 +25,8 @@ from apar.contracts.scenarios import ScenarioBundle
 from apar.simulator.clock import Command, SimulationClock
 from apar.simulator.ledger import AccountReference, Ledger, LedgerEntry
 from apar.simulator.rails.base import (
+    AdapterFactory,
+    FrozenState,
     LedgerReader,
     RailAdapter,
     RailContext,
@@ -28,10 +34,141 @@ from apar.simulator.rails.base import (
 )
 
 _FAILED_MESSAGE = "simulation engine is terminally failed"
+_MAPPING_PROXY_TYPE: type[object] = type(MappingProxyType({}))
+_ACTIVE_ENGINE: ContextVar[SimulationEngine | None] = ContextVar(
+    "apar_active_simulation_engine",
+    default=None,
+)
+_LIVE_ADAPTERS: dict[int, ReferenceType[object]] = {}
+_LIVE_ADAPTERS_LOCK = Lock()
 
 
 class SimulationFailedError(RuntimeError):
     """Raised when an operation targets an irrecoverably failed simulation."""
+
+
+def _active_engine() -> SimulationEngine:
+    """Resolve callback-local dispatch without retaining an owner on the facade."""
+    engine = _ACTIVE_ENGINE.get()
+    if engine is None:
+        raise RuntimeError("adapter context is inactive")
+    return engine
+
+
+def _release_adapter(adapter_id: int, reference: ReferenceType[object]) -> None:
+    """Remove a dead adapter identity without racing a newer object reusing its ID."""
+    with _LIVE_ADAPTERS_LOCK:
+        if _LIVE_ADAPTERS.get(adapter_id) is reference:
+            _LIVE_ADAPTERS.pop(adapter_id, None)
+
+
+def _claim_fresh_adapter(adapter: object) -> RailAdapter:
+    """Operationally reject factories lending one live adapter to multiple engines."""
+    if isinstance(adapter, type) or not callable(getattr(adapter, "initialize", None)):
+        raise TypeError("adapter factory must return a RailAdapter instance")
+    if not callable(getattr(adapter, "handle", None)):
+        raise TypeError("adapter factory must return a RailAdapter instance")
+    adapter_id = id(adapter)
+
+    def release(dead: ReferenceType[object]) -> None:
+        _release_adapter(adapter_id, dead)
+
+    try:
+        reference = ref(adapter, release)
+    except TypeError as error:
+        raise TypeError("adapter factory must return a weak-referenceable adapter") from error
+    with _LIVE_ADAPTERS_LOCK:
+        existing = _LIVE_ADAPTERS.get(adapter_id)
+        if existing is not None and existing() is adapter:
+            raise ValueError("adapter factory must return a fresh adapter instance")
+        _LIVE_ADAPTERS[adapter_id] = reference
+    return cast(RailAdapter, adapter)
+
+
+def _construct_selected_adapter(
+    rail: Rail,
+    factories: Mapping[Rail, AdapterFactory],
+) -> RailAdapter | None:
+    """Validate factory inputs but construct only the scenario-selected rail."""
+    for candidate_factory in factories.values():
+        if not callable(candidate_factory):
+            raise TypeError("adapter factory must be callable")
+    selected_factory = factories.get(rail)
+    if selected_factory is None:
+        return None
+    return _claim_fresh_adapter(selected_factory())
+
+
+def _validate_finite_tree(value: object, *, label: str) -> None:
+    """Reject non-finite Python numeric semantics before JSON-mode coercion."""
+    if isinstance(value, Enum):
+        _validate_finite_tree(value.value, label=label)
+        return
+    if isinstance(value, float):
+        if not isfinite(value):
+            raise ValueError(f"{label} contains non-finite number")
+        return
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ValueError(f"{label} contains non-finite number")
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            _validate_finite_tree(key, label=label)
+            _validate_finite_tree(item, label=label)
+        return
+    if isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            _validate_finite_tree(item, label=label)
+
+
+def _freeze_state(value: object) -> FrozenState:
+    """Canonicalize the closed entity-state algebra without invoking user hooks."""
+    if isinstance(value, Enum):
+        return _freeze_state(value.value)
+    if value is None:
+        return None
+    if type(value) is bool:
+        return value
+    if type(value) is int:
+        return value
+    if type(value) is float:
+        number = value
+        if not isfinite(number):
+            raise ValueError("entity state numbers must be finite")
+        return number
+    if type(value) is str:
+        return value
+    if type(value) is bytes:
+        return value
+    if type(value) is Decimal:
+        amount = value
+        if not amount.is_finite():
+            raise ValueError("entity state numbers must be finite")
+        return amount
+    if type(value) is datetime:
+        timestamp = value
+        if not _is_utc(timestamp):
+            raise ValueError("entity state datetime must be a UTC timestamp")
+        return timestamp
+    if type(value) in (dict, _MAPPING_PROXY_TYPE):
+        mapping = cast(Mapping[object, object], value)
+        frozen: dict[str, FrozenState] = {}
+        for key, item in mapping.items():
+            if type(key) is not str:
+                raise TypeError("entity state mapping keys must be exact strings")
+            frozen[key] = _freeze_state(item)
+        return MappingProxyType(frozen)
+    if type(value) in (list, tuple):
+        sequence = cast(list[object] | tuple[object, ...], value)
+        return tuple(_freeze_state(item) for item in sequence)
+    if type(value) in (set, frozenset):
+        members = cast(set[object] | frozenset[object], value)
+        try:
+            return frozenset(_freeze_state(item) for item in members)
+        except TypeError as error:
+            raise TypeError("entity state set members must be hashable") from error
+    raise TypeError(f"unsupported entity state: {type(value).__name__}")
 
 
 def _is_utc(value: datetime) -> bool:
@@ -57,6 +194,8 @@ def _event_json_bytes(event: PaymentEvent) -> bytes:
     """Return strict canonical JSON for one event or reject opaque/non-finite data."""
     if not isinstance(event, PaymentEvent):
         raise TypeError("rail adapters must emit PaymentEvent instances")
+    python_value = event.model_dump(mode="python", round_trip=True, warnings=False)
+    _validate_finite_tree(python_value, label="event")
     try:
         raw = event.model_dump(mode="json", round_trip=True, warnings=False)
         return json.dumps(
@@ -79,6 +218,8 @@ def _bundle_json_bytes(bundle: ScenarioBundle) -> bytes:
     """Return strict canonical JSON for one scenario bundle."""
     if not isinstance(bundle, ScenarioBundle):
         raise TypeError("bundle must be a ScenarioBundle")
+    python_value = bundle.model_dump(mode="python", round_trip=True, warnings=False)
+    _validate_finite_tree(python_value, label="scenario bundle")
     try:
         raw = bundle.model_dump(mode="json", round_trip=True, warnings=False)
         return json.dumps(
@@ -127,10 +268,7 @@ class LedgerView:
 class _RandomCapability:
     """Guard every random draw with the adapter callback lifetime."""
 
-    __slots__ = ("__engine",)
-
-    def __init__(self, engine: SimulationEngine) -> None:
-        self.__engine = engine
+    __slots__ = ()
 
     def integers(
         self,
@@ -140,8 +278,7 @@ class _RandomCapability:
         *,
         endpoint: bool = False,
     ) -> np.integer[Any]:
-        self.__engine._require_adapter_callback()
-        return self.__engine._rng.integers(low, high, size, endpoint=endpoint)
+        return _active_engine()._rng.integers(low, high, size, endpoint=endpoint)
 
     def uniform(
         self,
@@ -149,61 +286,54 @@ class _RandomCapability:
         high: float = 1.0,
         size: int | tuple[int, ...] | None = None,
     ) -> object:
-        self.__engine._require_adapter_callback()
-        return self.__engine._rng.uniform(low, high, size)
+        return _active_engine()._rng.uniform(low, high, size)
 
     def random(self, size: int | tuple[int, ...] | None = None) -> object:
-        self.__engine._require_adapter_callback()
-        return self.__engine._rng.random(size)
+        return _active_engine()._rng.random(size)
 
     def bytes(self, length: int) -> bytes:
-        self.__engine._require_adapter_callback()
-        return self.__engine._rng.bytes(length)
+        return _active_engine()._rng.bytes(length)
 
 
 class _RailContext:
     """Restricted facade passed to adapter callbacks instead of the owning engine."""
 
-    __slots__ = ("__engine", "__rng")
-
-    def __init__(self, engine: SimulationEngine) -> None:
-        self.__engine = engine
-        self.__rng = _RandomCapability(engine)
+    __slots__ = ()
 
     @property
     def bundle(self) -> ScenarioBundle:
-        return self.__engine.bundle
+        return _active_engine().bundle
 
     @property
     def now(self) -> datetime:
-        return self.__engine.now
+        return _active_engine().now
 
     @property
     def rng(self) -> RandomCapability:
-        return self.__rng
+        return _RANDOM_CAPABILITY
 
     @property
     def ledger(self) -> LedgerReader:
-        return self.__engine.ledger
+        return _active_engine().ledger
 
     def schedule(self, at: datetime, priority: int, command: Command) -> None:
-        self.__engine._require_adapter_callback()
-        self.__engine.schedule(at, priority, command)
+        _active_engine().schedule(at, priority, command)
 
     def post(self, entry: LedgerEntry) -> None:
-        self.__engine._require_adapter_callback()
-        self.__engine.post(entry)
+        _active_engine().post(entry)
 
-    def entity_state(self, entity_id: str) -> object:
-        return self.__engine.entity_state(entity_id)
+    def entity_state(self, entity_id: str) -> FrozenState:
+        return _active_engine().entity_state(entity_id)
 
     def set_entity_state(self, entity_id: str, state: object) -> None:
-        self.__engine._require_adapter_callback()
-        self.__engine.set_entity_state(entity_id, state)
+        _active_engine().set_entity_state(entity_id, state)
 
     def new_uuid(self) -> str:
-        self.__engine._require_adapter_callback()
-        return self.__engine.new_uuid()
+        return _active_engine().new_uuid()
+
+
+_RANDOM_CAPABILITY: RandomCapability = _RandomCapability()
+_RAIL_CONTEXT: RailContext = _RailContext()
 
 
 class SimulationEngine:
@@ -212,7 +342,7 @@ class SimulationEngine:
     def __init__(
         self,
         bundle: ScenarioBundle,
-        adapters: Mapping[Rail, RailAdapter],
+        adapter_factories: Mapping[Rail, AdapterFactory],
         *,
         opening_balances: Mapping[AccountReference, Decimal] | None = None,
         allow_credit: Collection[AccountReference] | None = None,
@@ -227,17 +357,13 @@ class SimulationEngine:
         self._clock = SimulationClock(self._bundle.replay_manifest.simulation_start)
         self._ledger = Ledger(opening_balances, allow_credit=allow_credit)
         self._ledger_view = LedgerView(self._ledger)
-        self._adapters = MappingProxyType(
-            {rail: deepcopy(adapter) for rail, adapter in adapters.items()}
-        )
-        self._entity_state: dict[str, object] = {}
+        self._adapter = _construct_selected_adapter(self._bundle.rail, adapter_factories)
+        self._entity_state: dict[str, FrozenState] = {}
         self._events: list[PaymentEvent] = []
         self._seen_event_ids: set[str] = set()
         self._scheduled_times: list[datetime] = []
         self._initialized = False
-        self._callback_active = False
         self._failure: Exception | None = None
-        self._context: RailContext = _RailContext(self)
 
     @property
     def bundle(self) -> ScenarioBundle:
@@ -279,18 +405,18 @@ class SimulationEngine:
             self._mark_failed(error)
             raise
 
-    def entity_state(self, entity_id: str) -> object:
-        """Return a defensive copy of engine-owned entity state."""
+    def entity_state(self, entity_id: str) -> FrozenState:
+        """Return recursively immutable, engine-owned entity state."""
         self._ensure_healthy()
-        return deepcopy(self._entity_state[entity_id])
+        return self._entity_state[entity_id]
 
     def set_entity_state(self, entity_id: str, state: object) -> None:
-        """Deeply detach and store engine-owned state."""
+        """Canonicalize and store only the closed immutable state algebra."""
         self._ensure_healthy()
         try:
             if not entity_id:
                 raise ValueError("entity_id must not be empty")
-            self._entity_state[entity_id] = deepcopy(state)
+            self._entity_state[entity_id] = _freeze_state(state)
         except Exception as error:
             self._mark_failed(error)
             raise
@@ -325,7 +451,7 @@ class SimulationEngine:
                 raise ValueError("simulation cutoff cannot precede current simulation time")
 
         try:
-            adapter = self._adapters.get(self._bundle.rail)
+            adapter = self._adapter
             if adapter is None:
                 raise ValueError(f"unsupported rail: {self._bundle.rail.value}")
             if not self._initialized:
@@ -386,26 +512,18 @@ class SimulationEngine:
         return tuple(_validated_event(event) for event in events)
 
     def _invoke_initialize(self, adapter: RailAdapter) -> None:
-        self._callback_active = True
+        token = _ACTIVE_ENGINE.set(self)
         try:
-            adapter.initialize(self._context)
+            adapter.initialize(_RAIL_CONTEXT)
         finally:
-            self._callback_active = False
+            _ACTIVE_ENGINE.reset(token)
 
     def _invoke_handle(self, adapter: RailAdapter, command: Command) -> list[PaymentEvent]:
-        self._callback_active = True
+        token = _ACTIVE_ENGINE.set(self)
         try:
-            return adapter.handle(command, self._context)
+            return adapter.handle(command, _RAIL_CONTEXT)
         finally:
-            self._callback_active = False
-
-    def _require_adapter_callback(self) -> None:
-        """Reject retained mutation/random capabilities outside their callback."""
-        self._ensure_healthy()
-        if not self._callback_active:
-            error = RuntimeError("adapter context is inactive")
-            self._mark_failed(error)
-            raise error
+            _ACTIVE_ENGINE.reset(token)
 
     def _append_batch(self, candidates: list[PaymentEvent]) -> None:
         """Validate and canonically order a whole batch before append."""
@@ -437,7 +555,6 @@ class SimulationEngine:
     def _mark_failed(self, error: Exception) -> None:
         if self._failure is None:
             self._failure = error
-        self._callback_active = False
 
 
 __all__ = ["LedgerView", "SimulationEngine", "SimulationFailedError"]

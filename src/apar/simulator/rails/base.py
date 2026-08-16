@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Protocol
@@ -12,6 +13,20 @@ from apar.contracts.events import PaymentEvent
 from apar.contracts.scenarios import ScenarioBundle
 from apar.simulator.clock import Command
 from apar.simulator.ledger import LedgerEntry
+
+type FrozenState = (
+    None
+    | bool
+    | int
+    | float
+    | str
+    | bytes
+    | Decimal
+    | datetime
+    | Mapping[str, FrozenState]
+    | tuple[FrozenState, ...]
+    | frozenset[FrozenState]
+)
 
 
 class RandomCapability(Protocol):
@@ -94,8 +109,8 @@ class RailContext(Protocol):
         """Request one validated ledger posting."""
         ...
 
-    def entity_state(self, entity_id: str) -> object:
-        """Read a defensive entity-state snapshot."""
+    def entity_state(self, entity_id: str) -> FrozenState:
+        """Read recursively immutable, engine-owned entity state."""
         ...
 
     def set_entity_state(self, entity_id: str, state: object) -> None:
@@ -119,4 +134,19 @@ class RailAdapter(Protocol):
         ...
 
 
-__all__ = ["LedgerReader", "RailAdapter", "RailContext", "RandomCapability"]
+class AdapterFactory(Protocol):
+    """Trusted constructor for one fresh, selected-rail adapter instance."""
+
+    def __call__(self) -> RailAdapter:
+        """Construct a fresh adapter; closures and partials are supported."""
+        ...
+
+
+__all__ = [
+    "AdapterFactory",
+    "FrozenState",
+    "LedgerReader",
+    "RailAdapter",
+    "RailContext",
+    "RandomCapability",
+]
