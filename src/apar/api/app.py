@@ -7,6 +7,7 @@ from typing import Final
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from apar import __version__
@@ -15,6 +16,19 @@ from apar.registry.repository import ThreatRepository
 
 RESOURCE_NOT_FOUND: Final = "RESOURCE_NOT_FOUND"
 VALIDATION_FAILED: Final = "VALIDATION_FAILED"
+
+
+class ErrorDetail(BaseModel):
+    """Machine-readable information for every client-facing API error."""
+
+    code: str
+    message: str
+
+
+class ErrorEnvelope(BaseModel):
+    """The stable shape used for every client-facing API error response."""
+
+    detail: ErrorDetail
 
 
 class ApiError(Exception):
@@ -30,7 +44,7 @@ class ApiError(Exception):
 def _error_response(status_code: int, code: str, message: str) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
-        content={"detail": {"code": code, "message": message}},
+        content=ErrorEnvelope(detail=ErrorDetail(code=code, message=message)).model_dump(),
     )
 
 

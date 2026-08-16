@@ -5,6 +5,17 @@ from apar.config import Settings
 from tests.factories import make_threat_card
 
 
+def _resolve_schema(openapi: dict[str, object], schema: dict[str, object]) -> dict[str, object]:
+    reference = schema.get("$ref")
+    if reference is None:
+        return schema
+
+    component_name = str(reference).removeprefix("#/components/schemas/")
+    components = openapi["components"]
+    schemas = components["schemas"]
+    return schemas[component_name]
+
+
 def test_registry_lists_cards_and_reads_a_card_written_through_the_api(tmp_path) -> None:
     """Catch routes that do not use the lifespan-owned registry repository."""
     threat_payload = make_threat_card().model_dump(mode="json")
@@ -71,3 +82,28 @@ def test_openapi_has_only_the_declared_registry_operations(tmp_path) -> None:
 
     assert set(paths["/api/v1/threats"]) == {"get"}
     assert set(paths["/api/v1/threats/{threat_id}"]) == {"get", "put"}
+
+
+def test_openapi_declares_structured_errors_for_registry_failures(tmp_path) -> None:
+    """Catch runtime error envelopes that are undocumented or use FastAPI's default schema."""
+    with TestClient(create_app(Settings.from_root(tmp_path))) as client:
+        openapi = client.get("/openapi.json").json()
+
+    item_path = openapi["paths"]["/api/v1/threats/{threat_id}"]
+    response_schemas = [
+        item_path["get"]["responses"]["404"]["content"]["application/json"]["schema"],
+        item_path["put"]["responses"]["409"]["content"]["application/json"]["schema"],
+        item_path["put"]["responses"]["422"]["content"]["application/json"]["schema"],
+    ]
+
+    for response_schema in response_schemas:
+        envelope = _resolve_schema(openapi, response_schema)
+        assert set(envelope["required"]) == {"detail"}
+        detail = _resolve_schema(openapi, envelope["properties"]["detail"])
+        assert set(detail["required"]) == {"code", "message"}
+        assert detail["properties"] == {
+            "code": {"type": "string", "title": "Code"},
+            "message": {"type": "string", "title": "Message"},
+        }
+
+    assert "HTTPValidationError" not in openapi["components"]["schemas"]

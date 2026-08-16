@@ -4,7 +4,7 @@ from typing import Annotated, Final
 
 from fastapi import APIRouter, Depends
 
-from apar.api.app import ApiError
+from apar.api.app import ApiError, ErrorEnvelope
 from apar.api.dependencies import get_repository
 from apar.registry.models import ThreatCard
 from apar.registry.repository import ThreatRepository
@@ -22,7 +22,14 @@ def list_threats(repository: Repository) -> list[ThreatCard]:
     return repository.list()
 
 
-@router.get("/threats/{threat_id}", response_model=ThreatCard)
+@router.get(
+    "/threats/{threat_id}",
+    response_model=ThreatCard,
+    responses={
+        404: {"model": ErrorEnvelope, "description": "Threat card not found"},
+        422: {"model": ErrorEnvelope, "description": "Request validation failed"},
+    },
+)
 def get_threat(threat_id: str, repository: Repository) -> ThreatCard:
     """Return one registered threat card or a structured missing-resource error."""
     card = repository.get(threat_id)
@@ -31,7 +38,14 @@ def get_threat(threat_id: str, repository: Repository) -> ThreatCard:
     return card
 
 
-@router.put("/threats/{threat_id}", response_model=ThreatCard)
+@router.put(
+    "/threats/{threat_id}",
+    response_model=ThreatCard,
+    responses={
+        409: {"model": ErrorEnvelope, "description": "Threat ID mismatch"},
+        422: {"model": ErrorEnvelope, "description": "Request validation failed"},
+    },
+)
 def put_threat(threat_id: str, card: ThreatCard, repository: Repository) -> ThreatCard:
     """Replace the registered card when its stable ID matches the target path."""
     if threat_id != card.threat_id:
