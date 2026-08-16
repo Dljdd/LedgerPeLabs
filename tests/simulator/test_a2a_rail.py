@@ -1,0 +1,324 @@
+"""Executable A2A lifecycle, accounting, and event-contract tests."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from datetime import timedelta
+from decimal import Decimal
+
+import pytest
+
+from apar.compiler.compiler import compile_scenario
+from apar.contracts.events import EventKind, Rail
+from apar.simulator.clock import Command
+from apar.simulator.engine import SimulationEngine, SimulationFailedError
+from apar.simulator.rails.a2a import (
+    A2ARailAdapter,
+    AcceptA2A,
+    FreezeA2AFunds,
+    InitiateA2A,
+    LifecycleError,
+    PostA2A,
+    RecoverA2A,
+    RejectA2A,
+    ReportA2AFraud,
+    ReturnA2A,
+)
+from tests.factories import NOW, make_scenario_config, make_threat_card
+
+PAYMENT_ID = "a2a-payment-1"
+CAMPAIGN_ID = "00000000-0000-4000-8000-000000000201"
+TRACE_ID = "00000000-0000-4000-8000-000000000202"
+PAYER_ID = "00000000-0000-4000-8000-000000000203"
+PAYEE_ID = "00000000-0000-4000-8000-000000000204"
+
+
+def _a2a_bundle(*, seed: int = 260_816):  # type: ignore[no-untyped-def]
+    config = make_scenario_config(
+        seed=seed,
+        replay=make_scenario_config().replay.model_copy(update={"random_seed": seed}),
+    )
+    return compile_scenario(make_threat_card(default_config=config), config)
+
+
+def _engine(
+    *,
+    seed: int = 260_816,
+    payer_balance: Decimal = Decimal("100.00"),
+    currency: str = "USD",
+) -> SimulationEngine:
+    return SimulationEngine(
+        _a2a_bundle(seed=seed),
+        {Rail.A2A: A2ARailAdapter},
+        opening_balances={("payer", currency): payer_balance},
+    )
+
+
+def _initiate(
+    *,
+    amount: Decimal = Decimal("10.00"),
+    fee: Decimal = Decimal("0.00"),
+    currency: str = "USD",
+    idempotency_key: str = "a2a-initiate-1",
+) -> InitiateA2A:
+    return InitiateA2A(
+        PAYMENT_ID,
+        amount=amount,
+        currency=currency,
+        payer_account="payer",
+        payee_account="payee",
+        actor_id=PAYER_ID,
+        counterparty_id=PAYEE_ID,
+        campaign_id=CAMPAIGN_ID,
+        trace_id=TRACE_ID,
+        fee=fee,
+        idempotency_key=idempotency_key,
+    )
+
+
+def _schedule(engine: SimulationEngine, *commands: Command) -> None:
+    for priority, command in enumerate(commands):
+        engine.schedule(NOW, priority, command)
+
+
+def test_a2a_commands_are_public_immutable_command_subclasses() -> None:
+    """Catch rail builders bypassing the engine's immutable Command boundary."""
+    command = _initiate()
+
+    assert isinstance(command, Command)
+    assert command.campaign_id == CAMPAIGN_ID
+    assert command.payload["amount"] == Decimal("10.00")
+
+
+def test_a2a_default_posting_moves_value_once() -> None:
+    """Catch acceptance posting early or posting debiting the sender twice."""
+    engine = _engine()
+    _schedule(engine, _initiate(), AcceptA2A(PAYMENT_ID), PostA2A(PAYMENT_ID))
+
+    events = engine.run()
+
+    assert [event.event_type.value for event in events] == [
+        "transfer_initiated",
+        "transfer_accepted",
+        "transfer_posted",
+    ]
+    assert engine.ledger.balance("payer") == Decimal("90.00")
+    assert engine.ledger.balance("payee") == Decimal("10.00")
+    assert len(engine.ledger.entries) == 1
+    engine.ledger.assert_conserved()
+
+
+def test_a2a_full_recovery_path_emits_linked_events_and_conserves_value() -> None:
+    """Catch a missing A2A step, mutation, wrong freeze, or broken lineage."""
+    engine = _engine()
+    _schedule(
+        engine,
+        _initiate(fee=Decimal("1.00")),
+        AcceptA2A(PAYMENT_ID),
+        PostA2A(PAYMENT_ID),
+        ReportA2AFraud(PAYMENT_ID),
+        FreezeA2AFunds(PAYMENT_ID),
+        RecoverA2A(PAYMENT_ID),
+    )
+
+    events = engine.run()
+
+    assert [event.event_type for event in events] == [
+        EventKind.TRANSFER_INITIATED,
+        EventKind.TRANSFER_ACCEPTED,
+        EventKind.TRANSFER_POSTED,
+        EventKind.FRAUD_REPORTED,
+        EventKind.FUNDS_FROZEN,
+        EventKind.RECOVERY,
+    ]
+    assert [event.lineage.get("previous_event_id") for event in events] == [
+        None,
+        *[event.event_id for event in events[:-1]],
+    ]
+    assert all(event.rail is Rail.A2A for event in events)
+    assert all(event.viewpoint == "network_with_bank_enrichment" for event in events)
+    assert all(event.campaign_id == CAMPAIGN_ID for event in events)
+    assert all(event.trace_id == TRACE_ID for event in events)
+    assert all(event.actor_id == PAYER_ID for event in events)
+    assert all(event.counterparty_id == PAYEE_ID for event in events)
+    assert engine.ledger.balance("payer") == Decimal("99.00")
+    assert engine.ledger.balance("payee") == Decimal("0.00")
+    assert engine.ledger.balance("a2a:fees") == Decimal("1.00")
+    assert engine.ledger.balance("a2a:frozen") == Decimal("0.00")
+    engine.ledger.assert_conserved()
+
+
+def test_a2a_rejection_is_preposting_terminal_branch_without_ledger() -> None:
+    """Catch rejected transfers moving value or coexisting with posting."""
+    engine = _engine()
+    _schedule(engine, _initiate(), RejectA2A(PAYMENT_ID))
+
+    events = engine.run()
+
+    assert [event.event_type for event in events] == [
+        EventKind.TRANSFER_INITIATED,
+        EventKind.TRANSFER_REJECTED,
+    ]
+    assert engine.ledger.balance("payer") == Decimal("100.00")
+    assert engine.ledger.balance("payee") == Decimal("0.00")
+    assert engine.ledger.entries == ()
+
+
+def test_a2a_return_is_separate_posting_branch_and_retains_fee() -> None:
+    """Catch returns mutating the posted event or silently refunding a fee."""
+    engine = _engine()
+    _schedule(
+        engine,
+        _initiate(fee=Decimal("1.00")),
+        AcceptA2A(PAYMENT_ID),
+        PostA2A(PAYMENT_ID),
+        ReturnA2A(PAYMENT_ID),
+    )
+
+    events = engine.run()
+
+    assert [event.event_type for event in events] == [
+        EventKind.TRANSFER_INITIATED,
+        EventKind.TRANSFER_ACCEPTED,
+        EventKind.TRANSFER_POSTED,
+        EventKind.TRANSFER_RETURNED,
+    ]
+    assert engine.ledger.balance("payer") == Decimal("99.00")
+    assert engine.ledger.balance("payee") == Decimal("0.00")
+    assert engine.ledger.balance("a2a:fees") == Decimal("1.00")
+    engine.ledger.assert_conserved()
+
+
+def test_a2a_fee_is_explicit_and_duplicate_post_is_noop() -> None:
+    """Catch hidden fee loss or duplicate idempotency posting value twice."""
+    engine = _engine()
+    post = PostA2A(PAYMENT_ID, idempotency_key="post-once")
+    _schedule(engine, _initiate(fee=Decimal("1.00")), AcceptA2A(PAYMENT_ID), post, post)
+
+    events = engine.run()
+
+    assert [event.event_type for event in events].count(EventKind.TRANSFER_POSTED) == 1
+    assert engine.ledger.balance("payer") == Decimal("89.00")
+    assert engine.ledger.balance("payee") == Decimal("10.00")
+    assert engine.ledger.balance("a2a:fees") == Decimal("1.00")
+    assert len(engine.ledger.entries) == 1
+    engine.ledger.assert_conserved()
+
+
+def test_a2a_acceptance_does_not_move_value_before_posting() -> None:
+    """Catch acceptance being conflated with irrevocable posting."""
+    engine = _engine()
+    engine.schedule(NOW, 0, _initiate())
+    engine.schedule(NOW + timedelta(seconds=1), 0, AcceptA2A(PAYMENT_ID))
+    engine.schedule(NOW + timedelta(seconds=2), 0, PostA2A(PAYMENT_ID))
+
+    engine.run(until=NOW + timedelta(seconds=1))
+
+    assert engine.ledger.balance("payer") == Decimal("100.00")
+    assert engine.ledger.balance("payee") == Decimal("0.00")
+    assert engine.ledger.entries == ()
+
+
+def test_a2a_rejects_overdraft_atomically() -> None:
+    """Catch posting bypassing the ledger's no-overdraft invariant."""
+    engine = _engine(payer_balance=Decimal("5.00"))
+    _schedule(engine, _initiate(), AcceptA2A(PAYMENT_ID), PostA2A(PAYMENT_ID))
+
+    with pytest.raises(ValueError, match="overdraw account: payer"):
+        engine.run()
+
+    assert engine.ledger.balance("payer") == Decimal("5.00")
+    assert engine.ledger.entries == ()
+    with pytest.raises(SimulationFailedError):
+        engine.run()
+
+
+def test_a2a_quantizes_supported_currency_before_events_and_postings() -> None:
+    """Catch payment events disagreeing with exponent-aware ledger amounts."""
+    engine = _engine(currency="JPY", payer_balance=Decimal("100"))
+    _schedule(
+        engine,
+        _initiate(amount=Decimal("10.5"), currency="JPY"),
+        AcceptA2A(PAYMENT_ID),
+        PostA2A(PAYMENT_ID),
+    )
+
+    events = engine.run()
+
+    assert all(event.amount == Decimal("10") for event in events)
+    assert engine.ledger.balance("payer", "JPY") == Decimal("90")
+    assert engine.ledger.balance("payee", "JPY") == Decimal("10")
+    engine.ledger.assert_conserved()
+
+
+@pytest.mark.parametrize(
+    ("command", "code"),
+    [
+        (AcceptA2A(PAYMENT_ID), "A2A_ACCEPT_BEFORE_INITIATE"),
+        (RejectA2A(PAYMENT_ID), "A2A_REJECT_BEFORE_INITIATE"),
+        (PostA2A(PAYMENT_ID), "A2A_POST_BEFORE_ACCEPT"),
+        (ReportA2AFraud(PAYMENT_ID), "A2A_REPORT_BEFORE_POST"),
+        (FreezeA2AFunds(PAYMENT_ID), "A2A_FREEZE_BEFORE_REPORT"),
+        (RecoverA2A(PAYMENT_ID), "A2A_RECOVERY_BEFORE_FREEZE"),
+        (ReturnA2A(PAYMENT_ID), "A2A_RETURN_BEFORE_POST"),
+    ],
+)
+def test_a2a_illegal_shortcuts_fail_with_stable_code(command: Command, code: str) -> None:
+    """Catch transition-table shortcuts or unstable lifecycle diagnostics."""
+    engine = _engine()
+    _schedule(engine, command)
+
+    with pytest.raises(LifecycleError) as error:
+        engine.run()
+
+    assert error.value.code == code
+    with pytest.raises(SimulationFailedError):
+        engine.run()
+
+
+def test_a2a_rejection_cannot_coexist_with_acceptance() -> None:
+    """Catch incompatible acceptance and rejection terminal paths coexisting."""
+    engine = _engine()
+    _schedule(engine, _initiate(), AcceptA2A(PAYMENT_ID), RejectA2A(PAYMENT_ID))
+
+    with pytest.raises(LifecycleError) as error:
+        engine.run()
+
+    assert error.value.code == "A2A_REJECT_AFTER_ACCEPT"
+
+
+def test_a2a_state_is_closed_ordered_primitives() -> None:
+    """Catch adapters storing mutable models, sets, or unordered lifecycle history."""
+    engine = _engine()
+    _schedule(engine, _initiate(), AcceptA2A(PAYMENT_ID))
+    engine.run()
+
+    state = engine.entity_state(PAYMENT_ID)
+    assert isinstance(state, Mapping)
+    assert state["state"] == "accepted"
+    assert state["idempotency_keys"] == ("a2a-initiate-1", "a2a.accept:a2a-payment-1")
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [Decimal("NaN"), Decimal("Infinity"), Decimal("-1.00")],
+)
+def test_a2a_command_rejects_nonfinite_or_negative_amount(bad_value: Decimal) -> None:
+    """Catch invalid money entering state before the ledger boundary."""
+    with pytest.raises(ValueError, match="finite and positive"):
+        _initiate(amount=bad_value)
+
+
+def test_a2a_same_seed_replays_byte_identically() -> None:
+    """Catch rail-local nondeterminism in IDs, event ordering, or lineage."""
+    first = _engine(seed=123)
+    second = _engine(seed=123)
+    commands = (_initiate(), AcceptA2A(PAYMENT_ID), PostA2A(PAYMENT_ID))
+    _schedule(first, *commands)
+    _schedule(second, *commands)
+
+    first.run()
+    second.run()
+
+    assert first.serialize_events() == second.serialize_events()
+

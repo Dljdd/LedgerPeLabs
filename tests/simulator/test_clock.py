@@ -219,6 +219,13 @@ class MutableStr(str):
     """A str subclass that carries mutable state."""
 
 
+class ReversingPriority(int):
+    """An int subclass whose comparison semantics can corrupt heap ordering."""
+
+    def __lt__(self, other: object) -> bool:
+        return False
+
+
 class MutableAttributeKind(Enum):
     """An enum whose members can carry mutable state."""
 
@@ -439,3 +446,31 @@ def test_command_preserves_ordinary_string_keys() -> None:
     nested = command.payload["payment"]
     assert isinstance(nested, Mapping)
     assert nested["id"] == "p1"
+
+
+@pytest.mark.parametrize("name", [["authorize"], 7])
+def test_command_rejects_non_string_names(name: object) -> None:
+    """Catch non-string lifecycle dispatch keys entering scheduled commands."""
+    with pytest.raises(TypeError, match="command name must be an exact string"):
+        Command(name)  # type: ignore[arg-type]
+
+
+def test_command_rejects_mutable_string_subclass_name() -> None:
+    """Catch command dispatch retaining caller-owned string-subclass identity."""
+    name = MutableStr("authorize")
+    name.state = []  # type: ignore[attr-defined]
+
+    with pytest.raises(TypeError, match="command name must be an exact string"):
+        Command(name)
+
+
+def test_schedule_rejects_integer_subclass_priority(
+    clock: SimulationClock,
+    now: datetime,
+) -> None:
+    """Catch comparison-overriding integer subclasses entering the event heap."""
+    priority = ReversingPriority(1)
+    priority.state = []  # type: ignore[attr-defined]
+
+    with pytest.raises(TypeError, match="priority must be an exact integer"):
+        clock.schedule(now, priority, Command("authorize"))

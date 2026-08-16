@@ -91,6 +91,8 @@ class Command:
     payload: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if type(self.name) is not str:
+            raise TypeError("command name must be an exact string")
         if not self.name:
             raise ValueError("command name must not be empty")
         object.__setattr__(self, "payload", _immutable_mapping(self.payload))
@@ -130,8 +132,8 @@ class SimulationClock:
         )
         if normalized_at < self._now:
             raise ValueError("cannot schedule earlier than the current simulation time")
-        if isinstance(priority, bool) or not isinstance(priority, int):
-            raise TypeError("priority must be an integer")
+        if type(priority) is not int:
+            raise TypeError("priority must be an exact integer")
         if not isinstance(command, Command):
             raise TypeError("command must be a Command")
 

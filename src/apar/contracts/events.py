@@ -22,11 +22,16 @@ class Rail(StrEnum):
 
 class EventKind(StrEnum):
     AUTHORIZATION = "authorization"
+    AUTHORIZATION_DECLINED = "authorization_declined"
     CLEARING = "clearing"
     SETTLEMENT = "settlement"
     REVERSAL = "reversal"
     TRANSFER_INITIATED = "transfer_initiated"
+    TRANSFER_ACCEPTED = "transfer_accepted"
+    TRANSFER_REJECTED = "transfer_rejected"
     TRANSFER_POSTED = "transfer_posted"
+    TRANSFER_RETURNED = "transfer_returned"
+    FUNDS_FROZEN = "funds_frozen"
     REFUND = "refund"
     FRAUD_REPORTED = "fraud_reported"
     DISPUTE_OPENED = "dispute_opened"

@@ -133,6 +133,14 @@ class RailAdapter(Protocol):
         ...
 
 
+class LifecycleError(RuntimeError):
+    """Stable illegal-transition failure exposed by every payment rail."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
 class AdapterFactory(Protocol):
     """Trusted constructor for one fresh, selected-rail adapter instance."""
 
@@ -145,6 +153,7 @@ __all__ = [
     "AdapterFactory",
     "FrozenState",
     "LedgerReader",
+    "LifecycleError",
     "RailAdapter",
     "RailContext",
     "RandomCapability",
