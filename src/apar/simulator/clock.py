@@ -28,7 +28,9 @@ def _freeze_mapping(values: Mapping[str, object]) -> Mapping[str, object]:
 
 def _freeze(value: object) -> object:
     """Recursively freeze the explicit payload types supported by commands."""
-    if value is None or isinstance(value, (bool, bytes, Decimal, Enum, float, int, str, datetime)):
+    if isinstance(value, Enum):
+        return _freeze(value.value)
+    if value is None or type(value) in (bool, bytes, Decimal, float, int, str, datetime):
         return value
     if isinstance(value, Mapping):
         return _freeze_mapping(value)

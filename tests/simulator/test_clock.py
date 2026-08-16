@@ -4,7 +4,7 @@ from collections.abc import Mapping
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
-from enum import Enum
+from enum import Enum, StrEnum
 
 import pytest
 
@@ -107,6 +107,26 @@ class PayloadKind(Enum):
     AUTHORIZE = "authorize"
 
 
+class PayloadTextKind(StrEnum):
+    """A valid text enum for command tests."""
+
+    CAPTURE = "capture"
+
+
+class MutableInt(int):
+    """An int subclass that carries mutable state."""
+
+
+class MutableStr(str):
+    """A str subclass that carries mutable state."""
+
+
+class MutableAttributeKind(Enum):
+    """An enum whose members can carry mutable state."""
+
+    REVIEW = "review"
+
+
 class MutablePayload:
     """A deliberately unsupported mutable object for command tests."""
 
@@ -129,6 +149,7 @@ def test_command_freezes_supported_nested_payload_values(now: datetime) -> None:
             "created_at": now,
             "receipt": b"receipt",
             "kind": PayloadKind.AUTHORIZE,
+            "text_kind": PayloadTextKind.CAPTURE,
             "nested": [{"payment_ids": {"p1", "p2"}}],
         },
     )
@@ -136,8 +157,35 @@ def test_command_freezes_supported_nested_payload_values(now: datetime) -> None:
     assert command.payload["amount"] == Decimal("10.00")
     assert command.payload["created_at"] == now
     assert command.payload["receipt"] == b"receipt"
-    assert command.payload["kind"] is PayloadKind.AUTHORIZE
+    assert command.payload["kind"] == "authorize"
+    assert type(command.payload["kind"]) is str
+    assert command.payload["text_kind"] == "capture"
+    assert type(command.payload["text_kind"]) is str
     nested = command.payload["nested"]
     assert isinstance(nested, tuple)
     assert isinstance(nested[0], Mapping)
     assert nested[0]["payment_ids"] == frozenset({"p1", "p2"})
+
+
+def test_command_rejects_mutable_scalar_subclasses() -> None:
+    """Catch queued commands retaining mutable scalar-subclass identities."""
+    number = MutableInt(7)
+    number.state = []
+    text = MutableStr("p1")
+    text.state = []
+
+    with pytest.raises(TypeError, match="unsupported command payload value: MutableInt"):
+        Command("authorize", {"number": number})
+    with pytest.raises(TypeError, match="unsupported command payload value: MutableStr"):
+        Command("authorize", {"text": text})
+
+
+def test_command_canonicalizes_enum_member_with_mutable_attribute() -> None:
+    """Catch queued commands retaining enum identity or mutable member attributes."""
+    kind = MutableAttributeKind.REVIEW
+    kind.state = []
+    command = Command("authorize", {"kind": kind})
+    kind.state.append("changed")
+
+    assert command.payload["kind"] == "review"
+    assert type(command.payload["kind"]) is str
