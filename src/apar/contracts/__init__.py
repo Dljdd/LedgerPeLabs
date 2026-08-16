@@ -3,7 +3,7 @@
 from apar.contracts.decisions import Action, Decision, ReasonCode
 from apar.contracts.events import EventKind, LifecycleState, PaymentEvent, Rail
 from apar.contracts.reports import EvaluationReport, PromotionDecision
-from apar.contracts.scenarios import AttackerMode, FeedbackField, ScenarioBundle
+from apar.contracts.scenarios import AttackerMode, FeedbackField, ScenarioBundle, ScenarioConfig
 
 __all__ = [
     "Action",
@@ -18,4 +18,5 @@ __all__ = [
     "Rail",
     "ReasonCode",
     "ScenarioBundle",
+    "ScenarioConfig",
 ]

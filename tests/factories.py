@@ -1,15 +1,73 @@
 """Factories for valid public-contract fixtures."""
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
 from apar.contracts.decisions import Action, Decision, ReasonCode
 from apar.contracts.events import EventKind, PaymentEvent, Rail
 from apar.contracts.reports import EvaluationReport, PromotionDecision
-from apar.contracts.scenarios import AttackerMode, FeedbackField, ScenarioBundle
+from apar.contracts.scenarios import AttackerMode, FeedbackField, ScenarioConfig
+from apar.registry.models import EvidenceRecord, ThreatCard
 
 NOW = datetime(2026, 8, 16, 12, tzinfo=UTC)
+
+
+def make_threat_card(**overrides: Any) -> ThreatCard:
+    """Return a valid evidence-backed threat card with optional direct overrides."""
+    card = ThreatCard(
+        threat_id="app-personalized-mule",
+        title="AI-personalized APP scam and mule campaign",
+        version=2,
+        status="approved",
+        family="app_scam_mule",
+        confidence=0.9,
+        implementation_status="deep_scenario",
+        rails=[Rail.A2A, Rail.AGENTIC],
+        viewpoint="network_with_bank_enrichment",
+        genai_capability={"personalization": True, "iteration_speed": True},
+        attacker_objective="expected_net_settled_value",
+        observables=["beneficiary_age", "device_fan_out", "transfer_velocity"],
+        safety_class="synthetic_only",
+        evidence=[
+            EvidenceRecord(
+                evidence_id="uk-finance-fraud-report-2025",
+                direct_source_url="https://www.ukfinance.org.uk/policy-and-guidance/reports",
+                source_type="official_report",
+                publisher="UK Finance",
+                published_on=date(2025, 5, 28),
+                accessed_on=date(2026, 8, 16),
+                claim="APP fraud uses social engineering to induce authorized transfers.",
+                is_project_inference=False,
+                quality_grade="A",
+                reviewer_notes="Primary industry evidence; scenario remains synthetic.",
+            )
+        ],
+        default_config=ScenarioConfig(
+            scenario_id="app-mule-personalized-v1",
+            version="1.0.0",
+            rail=Rail.A2A,
+            viewpoint="network_with_bank_enrichment",
+            attacker_mode=AttackerMode.DECISION_ONLY,
+            attacker_objective="expected_net_settled_value",
+            query_budget=40,
+            feedback=[
+                FeedbackField.APPROVE,
+                FeedbackField.CHALLENGE,
+                FeedbackField.DECLINE,
+                FeedbackField.REALIZED_VALUE,
+            ],
+            benign_entity_count=5_000,
+            illicit_entity_count=60,
+            duration_hours=24,
+            seed=260_816,
+            export_level="sanitized",
+            economics={"acquisition_cost": "configured", "mule_commission": "configured"},
+            lifecycle={"label_delay_days": "configured"},
+            hidden_validity={"profile": "hidden-oracle-a"},
+        ),
+    )
+    return card.model_copy(update=overrides)
 
 
 def make_payment_event(**overrides: Any) -> PaymentEvent:
@@ -34,15 +92,13 @@ def make_payment_event(**overrides: Any) -> PaymentEvent:
     return event.model_copy(update=overrides)
 
 
-def make_scenario_config(**overrides: Any) -> ScenarioBundle:
-    """Return a valid scenario bundle with optional direct model-field overrides."""
-    scenario = ScenarioBundle(
+def make_scenario_config(**overrides: Any) -> ScenarioConfig:
+    """Return a valid scenario configuration with optional direct model-field overrides."""
+    scenario = ScenarioConfig(
         scenario_id="app-mule-personalized-v1",
         version="1.0.0",
-        threat_card_ref="threat-app-genai-004@2",
         rail=Rail.A2A,
         viewpoint="network_with_bank_enrichment",
-        genai_capability={"personalization": True, "translation": True, "adaptive_planning": True},
         attacker_mode=AttackerMode.DECISION_ONLY,
         attacker_objective="expected_net_settled_value",
         query_budget=40,
@@ -52,10 +108,14 @@ def make_scenario_config(**overrides: Any) -> ScenarioBundle:
             FeedbackField.DECLINE,
             FeedbackField.REALIZED_VALUE,
         ],
+        benign_entity_count=5_000,
+        illicit_entity_count=60,
+        duration_hours=24,
+        seed=260_816,
+        export_level="sanitized",
         economics={"acquisition_cost": "configured", "mule_commission": "configured"},
         lifecycle={"label_delay_days": "configured"},
         hidden_validity={"profile": "hidden-oracle-a"},
-        safety={"synthetic_only": True, "export_level": "sanitized"},
     )
     return scenario.model_copy(update=overrides)
 

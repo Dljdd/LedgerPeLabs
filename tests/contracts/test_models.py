@@ -9,7 +9,7 @@ from pydantic import ValidationError
 from apar.contracts.decisions import Action, Decision
 from apar.contracts.events import PaymentEvent
 from apar.contracts.reports import EvaluationReport, PromotionDecision
-from apar.contracts.scenarios import AttackerMode, FeedbackField, ScenarioBundle
+from apar.contracts.scenarios import AttackerMode, FeedbackField, ScenarioBundle, ScenarioConfig
 from tests.factories import (
     make_decision,
     make_evaluation_report,
@@ -92,14 +92,53 @@ def test_scenario_validates_feedback_and_query_budget() -> None:
     assert scenario.feedback == [FeedbackField.APPROVE, FeedbackField.REALIZED_VALUE]
 
     with pytest.raises(ValidationError, match="query_budget"):
-        ScenarioBundle.model_validate(make_scenario_config(query_budget=0).model_dump())
+        ScenarioConfig.model_validate(make_scenario_config(query_budget=0))
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("benign_entity_count", 0),
+        ("illicit_entity_count", -1),
+        ("duration_hours", 0),
+    ],
+)
+def test_scenario_config_rejects_non_positive_execution_bounds(
+    field_name: str, value: int
+) -> None:
+    """Catches empty populations or durations that cannot produce a scenario run."""
+    with pytest.raises(ValidationError, match=field_name):
+        ScenarioConfig.model_validate(make_scenario_config(**{field_name: value}))
+
+
+@pytest.mark.parametrize("seed", [None, True, 1.5, "260816"])
+def test_scenario_config_requires_a_fixed_integer_seed(seed: object) -> None:
+    """Catches missing or coercible replay seeds that weaken deterministic execution."""
+    with pytest.raises(ValidationError, match="seed"):
+        ScenarioConfig.model_validate(make_scenario_config(seed=seed))
 
 
 def test_scenario_accepts_independent_semantic_scenario_version() -> None:
     """Catches applying envelope schema-major compatibility to scenario revisions."""
-    scenario = ScenarioBundle.model_validate(make_scenario_config(version="2.0.0").model_dump())
+    scenario = ScenarioConfig.model_validate(make_scenario_config(version="2.0.0"))
     assert scenario.schema_version == "1.0.0"
     assert scenario.version == "2.0.0"
+
+
+def test_scenario_bundle_exposes_execution_bounds_as_first_class_fields() -> None:
+    """Catches replay and population parameters being dropped into untyped extensions."""
+    config = make_scenario_config()
+    bundle = ScenarioBundle(
+        **config.model_dump(exclude={"export_level"}),
+        threat_card_ref="app-personalized-mule@2",
+        genai_capability={"personalization": True},
+        safety={"synthetic_only": True, "export_level": config.export_level},
+    )
+
+    assert bundle.benign_entity_count == 5000
+    assert bundle.illicit_entity_count == 60
+    assert bundle.duration_hours == 24
+    assert bundle.seed == 260816
 
 
 def test_decision_rejects_future_or_equal_source() -> None:
