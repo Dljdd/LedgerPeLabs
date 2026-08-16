@@ -1,6 +1,8 @@
 """Tests for immutable, content-addressed local artifacts."""
 
 import hashlib
+import json
+import os
 from dataclasses import replace
 from datetime import date
 from decimal import Decimal
@@ -21,6 +23,29 @@ class CanonicalPayload(BaseModel):
     amount: Decimal
     published_on: date
     stage: Stage
+
+
+def _write_complete_artifact(root: Path, payload: bytes, media_type: str) -> ArtifactRef:
+    digest = hashlib.sha256(payload).hexdigest()
+    ref = ArtifactRef(digest, media_type, len(payload), f"{digest}/payload")
+    artifact_dir = root / digest
+    artifact_dir.mkdir()
+    (artifact_dir / "payload").write_bytes(payload)
+    (artifact_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "media_type": ref.media_type,
+                "relative_path": ref.relative_path,
+                "sha256": ref.sha256,
+                "size_bytes": ref.size_bytes,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return ref
 
 
 def test_json_hash_is_key_order_independent(tmp_path: Path) -> None:
@@ -96,12 +121,103 @@ def test_interrupted_write_removes_temporary_directory(
     """Catches failed atomic publication leaving a reusable partial artifact behind."""
     store = ArtifactStore(tmp_path)
 
-    def fail_publish(source: Path, destination: Path) -> None:
+    def fail_publish(source_name: str, destination_name: str) -> None:
         raise OSError("simulated interrupted rename")
 
-    monkeypatch.setattr("apar.storage.artifacts.os.rename", fail_publish)
+    monkeypatch.setattr(store, "_publish_no_replace", fail_publish)
 
     with pytest.raises(OSError, match="simulated interrupted rename"):
         store.put_bytes(b"interrupted", "application/octet-stream")
 
     assert list(tmp_path.iterdir()) == []
+
+
+def test_empty_destination_appearing_at_publication_is_never_replaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches a final rename overwriting an empty competing digest directory."""
+    store = ArtifactStore(tmp_path)
+    payload = b"racing artifact"
+    digest = hashlib.sha256(payload).hexdigest()
+    publish = store._publish_no_replace
+
+    def publish_after_empty_destination(source_name: str, destination_name: str) -> None:
+        (tmp_path / digest).mkdir()
+        publish(source_name, destination_name)
+
+    monkeypatch.setattr(store, "_publish_no_replace", publish_after_empty_destination)
+
+    with pytest.raises(ValueError, match="invalid contents"):
+        store.put_bytes(payload, "application/octet-stream")
+
+    assert (tmp_path / digest).is_dir()
+    assert list((tmp_path / digest).iterdir()) == []
+
+
+def test_concurrent_winner_is_verified_and_reused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches a losing publisher failing instead of converging on a valid winner."""
+    store = ArtifactStore(tmp_path)
+    payload = b"racing artifact"
+    media_type = "application/octet-stream"
+    publish = store._publish_no_replace
+    winner: ArtifactRef | None = None
+
+    def publish_after_winner(source_name: str, destination_name: str) -> None:
+        nonlocal winner
+        winner = _write_complete_artifact(tmp_path, payload, media_type)
+        publish(source_name, destination_name)
+
+    monkeypatch.setattr(store, "_publish_no_replace", publish_after_winner)
+
+    ref = store.put_bytes(payload, media_type)
+
+    assert winner is not None
+    assert ref == winner
+    assert store.read(ref) == payload
+
+
+def test_read_rejects_digest_directory_symlink_even_when_target_is_inside_root(
+    tmp_path: Path,
+) -> None:
+    """Catches accepting a digest-directory symlink merely because its target is in-root."""
+    store = ArtifactStore(tmp_path)
+    ref = store.put_bytes(b"evidence", "application/octet-stream")
+    artifact_dir = tmp_path / ref.sha256
+    safe_target = tmp_path / "safe-target"
+    artifact_dir.rename(safe_target)
+    artifact_dir.symlink_to(safe_target, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="directory"):
+        store.read(ref)
+
+
+def test_read_rejects_payload_swap_before_descriptor_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches a payload pathname being swapped for a symlink before it is opened."""
+    store = ArtifactStore(tmp_path)
+    ref = store.put_bytes(b"evidence", "application/octet-stream")
+    payload_path = tmp_path / ref.sha256 / "payload"
+    external_payload = tmp_path / "external-payload"
+    external_payload.write_bytes(b"external")
+    original_open = os.open
+    swapped = False
+
+    def swap_before_open(
+        path: str | os.PathLike[str], *args: object, **kwargs: object
+    ) -> int:
+        nonlocal swapped
+        if path == "payload" and not swapped:
+            payload_path.unlink()
+            payload_path.symlink_to(external_payload)
+            swapped = True
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("apar.storage.artifacts.os.open", swap_before_open)
+
+    with pytest.raises(ValueError, match="file"):
+        store.read(ref)
+
+    assert swapped

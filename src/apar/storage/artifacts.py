@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import json
 import os
 import shutil
 import stat
+import sys
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -17,6 +20,7 @@ from pydantic import BaseModel
 _DIGEST_LENGTH = 64
 _MANIFEST_FILENAME = "manifest.json"
 _PAYLOAD_FILENAME = "payload"
+_RENAME_EXCL = 0x00000004
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,12 +49,9 @@ class ArtifactStore:
         self._validate_media_type(media_type)
 
         digest = hashlib.sha256(payload).hexdigest()
-        artifact_dir = self._root / digest
-        if artifact_dir.exists():
-            existing_ref, existing_payload = self._load_verified(digest)
-            if existing_payload != payload:
-                raise ValueError(f"artifact payload does not match digest directory: {digest}")
-            return existing_ref
+        existing = self._load_if_present(digest)
+        if existing is not None:
+            return self._reuse_verified_artifact(digest, payload, existing)
 
         ref = ArtifactRef(
             sha256=digest,
@@ -64,14 +65,13 @@ class ArtifactStore:
             self._write_durable_file(temporary_dir / _MANIFEST_FILENAME, self._manifest_bytes(ref))
             self._fsync_directory(temporary_dir)
 
-            # A pre-existing target is always inspected rather than replaced.
-            if artifact_dir.exists():
-                existing_ref, existing_payload = self._load_verified(digest)
-                if existing_payload != payload:
-                    raise ValueError(f"artifact payload does not match digest directory: {digest}")
-                return existing_ref
-
-            os.rename(temporary_dir, artifact_dir)
+            try:
+                self._publish_no_replace(temporary_dir.name, digest)
+            except FileExistsError:
+                existing = self._load_if_present(digest)
+                if existing is None:
+                    raise ValueError(f"concurrent artifact disappeared: {digest}") from None
+                return self._reuse_verified_artifact(digest, payload, existing)
             self._fsync_directory(self._root)
             return ref
         finally:
@@ -92,37 +92,59 @@ class ArtifactStore:
     def read(self, ref: ArtifactRef) -> bytes:
         """Return a verified payload, rejecting forged or malformed references."""
         self._validate_ref_shape(ref)
-        stored_ref, payload = self._load_verified(ref.sha256)
+        try:
+            stored_ref, payload = self._load_verified(ref.sha256)
+        except FileNotFoundError as error:
+            raise ValueError(f"artifact does not exist: {ref.sha256}") from error
         if stored_ref != ref:
             raise ValueError("artifact reference does not match stored manifest")
         return payload
 
+    def _load_if_present(self, digest: str) -> tuple[ArtifactRef, bytes] | None:
+        try:
+            return self._load_verified(digest)
+        except FileNotFoundError:
+            return None
+
+    @staticmethod
+    def _reuse_verified_artifact(
+        digest: str, payload: bytes, existing: tuple[ArtifactRef, bytes]
+    ) -> ArtifactRef:
+        existing_ref, existing_payload = existing
+        if existing_payload != payload:
+            raise ValueError(f"artifact payload does not match digest directory: {digest}")
+        return existing_ref
+
     def _load_verified(self, digest: str) -> tuple[ArtifactRef, bytes]:
         self._validate_digest(digest)
-        artifact_dir = self._root / digest
-        self._require_directory_below_root(artifact_dir)
-        expected_entries = {_PAYLOAD_FILENAME, _MANIFEST_FILENAME}
-        entries = {entry.name for entry in artifact_dir.iterdir()}
-        if entries != expected_entries:
-            raise ValueError(f"artifact directory has invalid contents: {digest}")
+        root_fd = self._open_root_directory()
+        try:
+            artifact_fd = self._open_directory_at(root_fd, digest, digest)
+            try:
+                expected_entries = {_PAYLOAD_FILENAME, _MANIFEST_FILENAME}
+                entries = set(os.listdir(artifact_fd))
+                if entries != expected_entries:
+                    raise ValueError(f"artifact directory has invalid contents: {digest}")
+                payload = self._read_regular_file_at(artifact_fd, _PAYLOAD_FILENAME, digest)
+                manifest_bytes = self._read_regular_file_at(
+                    artifact_fd, _MANIFEST_FILENAME, digest
+                )
+            finally:
+                os.close(artifact_fd)
+        finally:
+            os.close(root_fd)
 
-        payload_path = artifact_dir / _PAYLOAD_FILENAME
-        manifest_path = artifact_dir / _MANIFEST_FILENAME
-        self._require_regular_file_below_root(payload_path)
-        self._require_regular_file_below_root(manifest_path)
-        payload = payload_path.read_bytes()
         if hashlib.sha256(payload).hexdigest() != digest:
             raise ValueError(f"artifact payload digest mismatch: {digest}")
-
         try:
-            loaded_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            loaded_manifest = json.loads(manifest_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ValueError(f"artifact manifest is unreadable: {digest}") from error
         if not isinstance(loaded_manifest, dict):
             raise ValueError(f"artifact manifest must be an object: {digest}")
         manifest = cast(dict[str, object], loaded_manifest)
         ref = self._ref_from_manifest(manifest, digest, len(payload))
-        if manifest_path.read_bytes() != self._manifest_bytes(ref):
+        if manifest_bytes != self._manifest_bytes(ref):
             raise ValueError(f"artifact manifest is not canonical: {digest}")
         return ref, payload
 
@@ -195,22 +217,85 @@ class ArtifactStore:
         ):
             raise ValueError("artifact reference has invalid digest")
 
-    def _require_directory_below_root(self, path: Path) -> None:
+    def _publish_no_replace(self, source_name: str, destination_name: str) -> None:
+        """Atomically rename a completed temporary directory only when destination is absent."""
+        root_fd = self._open_root_directory()
         try:
-            resolved = path.resolve(strict=True)
-        except OSError as error:
-            raise ValueError(f"artifact directory is unavailable: {path.name}") from error
-        if not resolved.is_relative_to(self._root) or not resolved.is_dir():
-            raise ValueError(f"artifact directory is invalid: {path.name}")
+            self._rename_directory_no_replace(root_fd, source_name, destination_name)
+        finally:
+            os.close(root_fd)
 
-    def _require_regular_file_below_root(self, path: Path) -> None:
+    @staticmethod
+    def _rename_directory_no_replace(root_fd: int, source_name: str, destination_name: str) -> None:
+        """Use Darwin's exclusive directory rename; unsupported systems fail closed."""
+        if sys.platform != "darwin":
+            raise RuntimeError("artifact publication requires Darwin renameatx_np support")
         try:
-            resolved = path.resolve(strict=True)
-            mode = path.lstat().st_mode
+            renameatx_np = ctypes.CDLL(None, use_errno=True).renameatx_np
+        except AttributeError as error:
+            raise RuntimeError(
+                "artifact publication requires Darwin renameatx_np support"
+            ) from error
+        renameatx_np.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameatx_np.restype = ctypes.c_int
+        result = renameatx_np(
+            root_fd,
+            os.fsencode(source_name),
+            root_fd,
+            os.fsencode(destination_name),
+            _RENAME_EXCL,
+        )
+        if result == 0:
+            return
+        error_number = ctypes.get_errno()
+        if error_number == errno.EEXIST:
+            raise FileExistsError(error_number, os.strerror(error_number), destination_name)
+        raise OSError(error_number, os.strerror(error_number), destination_name)
+
+    def _open_root_directory(self) -> int:
+        return self._open_directory_at(None, self._root, "root")
+
+    @staticmethod
+    def _open_directory_at(parent_fd: int | None, name: str | Path, label: str) -> int:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        try:
+            if parent_fd is None:
+                descriptor = os.open(name, flags)
+            else:
+                descriptor = os.open(name, flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            raise
         except OSError as error:
-            raise ValueError(f"artifact file is unavailable: {path.name}") from error
-        if not resolved.is_relative_to(self._root) or not stat.S_ISREG(mode):
-            raise ValueError(f"artifact file is invalid: {path.name}")
+            raise ValueError(f"artifact directory is invalid: {label}") from error
+        try:
+            if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                raise ValueError(f"artifact directory is invalid: {label}")
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    @staticmethod
+    def _read_regular_file_at(directory_fd: int, name: str, digest: str) -> bytes:
+        try:
+            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+        except OSError as error:
+            raise ValueError(f"artifact file is invalid: {digest}/{name}") from error
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise ValueError(f"artifact file is invalid: {digest}/{name}")
+            chunks: list[bytes] = []
+            while chunk := os.read(descriptor, 1024 * 1024):
+                chunks.append(chunk)
+            return b"".join(chunks)
+        finally:
+            os.close(descriptor)
 
     @staticmethod
     def _write_durable_file(path: Path, content: bytes) -> None:
