@@ -108,6 +108,38 @@ def _payload_fingerprint(payload: Mapping[str, object]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _digest_text(label: str, value: object) -> str:
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{label} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _record_commitment(
+    previous_commitment: str,
+    payment_id: str,
+    operation: str,
+    idempotency_key: str,
+    request_fingerprint: str,
+    event_id: str,
+) -> str:
+    """Detect isolated corruption, not authenticate trusted-owner state rewrites."""
+    fields = [
+        ["domain", "apar.card-history.v1"],
+        ["previous_commitment", previous_commitment],
+        ["payment_id", payment_id],
+        ["operation", operation],
+        ["idempotency_key", idempotency_key],
+        ["request_fingerprint", request_fingerprint],
+        ["event_id", event_id],
+    ]
+    encoded = json.dumps(fields, separators=(",", ":"), ensure_ascii=True).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
 class CardCommand(Command):
     """Immutable public command base exposing campaign metadata to generators."""
 
@@ -459,6 +491,7 @@ _STATE_KEYS = frozenset(
         "fee_account",
         "chargeback_account",
         "last_event_id",
+        "history_commitment",
         "idempotency_records",
     }
 )
@@ -542,6 +575,11 @@ def _validated_state(
             raise TypeError("last_event_id must be an exact string")
         if last_event_id:
             _uuid_text("last_event_id", last_event_id)
+        history_commitment = state["history_commitment"]
+        if type(history_commitment) is not str:
+            raise TypeError("history_commitment must be an exact string")
+        if history_commitment:
+            _digest_text("history_commitment", history_commitment)
 
         records = state["idempotency_records"]
         if type(records) is not tuple:
@@ -552,20 +590,23 @@ def _validated_state(
         previous_event_sequence = -1
         operations = frozenset(_COMMAND_OPERATIONS.values())
         replayed_state = CardState.CREATED
+        previous_commitment = ""
         for index, record in enumerate(records):
-            if type(record) is not tuple or len(record) != 4:
-                raise ValueError("idempotency record must contain four fields")
-            key, operation, fingerprint, record_event_id = record
+            if type(record) is not tuple or len(record) != 5:
+                raise ValueError("idempotency record must contain five fields")
+            key, operation, fingerprint, record_event_id, commitment = record
             if type(key) is not str or not key:
                 raise ValueError("idempotency record key must be a non-empty string")
             if type(operation) is not str or operation not in operations:
                 raise ValueError("idempotency record operation is invalid")
-            if (
-                type(fingerprint) is not str
-                or len(fingerprint) != 64
-                or any(character not in "0123456789abcdef" for character in fingerprint)
-            ):
-                raise ValueError("idempotency record fingerprint is invalid")
+            checked_fingerprint = _digest_text(
+                "idempotency record fingerprint",
+                fingerprint,
+            )
+            checked_commitment = _digest_text(
+                "idempotency record commitment",
+                commitment,
+            )
             if key in seen_keys:
                 raise ValueError("idempotency record keys must be unique")
             seen_keys.add(key)
@@ -583,8 +624,19 @@ def _validated_state(
                 raise ValueError("idempotency record event IDs must increase")
             previous_event_sequence = current_sequence
             command = _command_from_record(operation, key, state)
-            if _payload_fingerprint(command.payload) != fingerprint:
+            if _payload_fingerprint(command.payload) != checked_fingerprint:
                 raise ValueError("idempotency record fingerprint does not match request")
+            expected_commitment = _record_commitment(
+                previous_commitment,
+                payment_id,
+                operation,
+                key,
+                checked_fingerprint,
+                checked_event_id,
+            )
+            if checked_commitment != expected_commitment:
+                raise ValueError("idempotency record commitment does not match history")
+            previous_commitment = checked_commitment
             command_type = type(command)
             if index == 0 and command_type not in {
                 AuthorizeCard,
@@ -601,11 +653,13 @@ def _validated_state(
             except KeyError as error:
                 raise ValueError("card history contains an illegal transition") from error
         if records:
-            final_record = cast(tuple[str, str, str, str], records[-1])
+            final_record = cast(tuple[str, str, str, str, str], records[-1])
             if last_event_id != final_record[3]:
                 raise ValueError("last_event_id does not match final card history record")
-        elif last_event_id:
-            raise ValueError("last_event_id presence does not match card history")
+            if history_commitment != previous_commitment:
+                raise ValueError("history_commitment does not match final card record")
+        elif last_event_id or history_commitment:
+            raise ValueError("terminal history fields do not match empty card history")
         if replayed_state is not stored_state:
             raise ValueError("stored card state does not match replayed history")
         return state
@@ -631,6 +685,7 @@ def _opening_state(command: _OpenCardCommand) -> dict[str, object]:
         "fee_account": payload["fee_account"],
         "chargeback_account": payload["chargeback_account"],
         "last_event_id": "",
+        "history_commitment": "",
         "idempotency_records": (),
     }
 
@@ -658,8 +713,8 @@ def _is_idempotent_retry(
     operation = _COMMAND_OPERATIONS[type(command)]
     fingerprint = _payload_fingerprint(command.payload)
     for record in records:
-        key, recorded_operation, recorded_fingerprint, _ = cast(
-            tuple[str, str, str, str],
+        key, recorded_operation, recorded_fingerprint, _, _ = cast(
+            tuple[str, str, str, str, str],
             record,
         )
         if key == command.idempotency_key:
@@ -788,16 +843,32 @@ class CardRailAdapter:
 
         event_id = context.new_uuid()
         previous_event_id = cast(str, _state_value(state, "last_event_id", str))
+        previous_commitment = cast(
+            str,
+            _state_value(state, "history_commitment", str),
+        )
+        operation = _COMMAND_OPERATIONS[type(canonical)]
+        request_fingerprint = _payload_fingerprint(canonical.payload)
+        commitment = _record_commitment(
+            previous_commitment,
+            payment_id,
+            operation,
+            canonical.idempotency_key,
+            request_fingerprint,
+            event_id,
+        )
         updated = dict(state)
         updated["state"] = next_state.value
         updated["last_event_id"] = event_id
+        updated["history_commitment"] = commitment
         updated["idempotency_records"] = (
             *records,
             (
                 canonical.idempotency_key,
-                _COMMAND_OPERATIONS[type(canonical)],
-                _payload_fingerprint(canonical.payload),
+                operation,
+                request_fingerprint,
                 event_id,
+                commitment,
             ),
         )
         validated_updated = _validated_state(updated, payment_id)

@@ -33,6 +33,7 @@ from apar.simulator.rails.card import (
 from tests.factories import NOW, make_scenario_config, make_threat_card
 
 PAYMENT_ID = "card-payment-1"
+OTHER_PAYMENT_ID = "card-payment-2"
 CAMPAIGN_ID = "00000000-0000-4000-8000-000000000101"
 TRACE_ID = "00000000-0000-4000-8000-000000000102"
 PAYER_ID = "00000000-0000-4000-8000-000000000103"
@@ -70,6 +71,7 @@ def _engine(
 
 def _authorize(
     *,
+    payment_id: str = PAYMENT_ID,
     amount: Decimal = Decimal("10.00"),
     fee: Decimal = Decimal("0.00"),
     currency: str = "USD",
@@ -81,7 +83,7 @@ def _authorize(
     chargeback_account: str = "card:chargebacks",
 ) -> AuthorizeCard:
     return AuthorizeCard(
-        PAYMENT_ID,
+        payment_id,
         amount=amount,
         currency=currency,
         payer_account=payer_account,
@@ -283,14 +285,21 @@ def test_card_idempotency_state_records_key_and_command_identity() -> None:
 
     state = engine.entity_state(PAYMENT_ID)
     assert isinstance(state, Mapping)
-    records = cast(tuple[tuple[str, str, str, str], ...], state["idempotency_records"])
+    records = cast(
+        tuple[tuple[str, str, str, str, str], ...],
+        state["idempotency_records"],
+    )
     assert [(record[0], record[1]) for record in records] == [
         ("card-authorize-1", "card.authorize"),
         ("card.clear:card-payment-1", "card.clear"),
     ]
-    assert all(len(record) == 4 and len(record[2]) == 64 for record in records)
+    assert all(
+        len(record) == 5 and len(record[2]) == 64 and len(record[4]) == 64
+        for record in records
+    )
     assert [record[3] for record in records] == [event.event_id for event in events]
     assert state["last_event_id"] == records[-1][3]
+    assert state["history_commitment"] == records[-1][4]
 
 
 def test_card_duplicate_constructor_with_identical_request_is_noop() -> None:
@@ -659,6 +668,115 @@ def test_card_same_seed_replays_byte_identically() -> None:
     assert first.serialize_events() == second.serialize_events()
 
 
+def test_card_interleaved_payments_keep_independent_committed_histories() -> None:
+    """Catch a history chain incorrectly requiring contiguous engine UUIDs."""
+    engine = _engine()
+    _schedule(
+        engine,
+        _authorize(payment_id=PAYMENT_ID, idempotency_key="authorize-a"),
+        _authorize(payment_id=OTHER_PAYMENT_ID, idempotency_key="authorize-b"),
+        ClearCard(PAYMENT_ID),
+        ClearCard(OTHER_PAYMENT_ID),
+        SettleCard(PAYMENT_ID),
+        SettleCard(OTHER_PAYMENT_ID),
+    )
+
+    events = engine.run()
+
+    first_state = engine.entity_state(PAYMENT_ID)
+    second_state = engine.entity_state(OTHER_PAYMENT_ID)
+    assert isinstance(first_state, Mapping)
+    assert isinstance(second_state, Mapping)
+    first_records = cast(tuple[tuple[str, ...], ...], first_state["idempotency_records"])
+    second_records = cast(tuple[tuple[str, ...], ...], second_state["idempotency_records"])
+    assert all(len(record) == 5 for record in (*first_records, *second_records))
+    assert [record[3] for record in first_records] == [
+        events[index].event_id for index in (0, 2, 4)
+    ]
+    assert [record[3] for record in second_records] == [
+        events[index].event_id for index in (1, 3, 5)
+    ]
+    assert first_state["history_commitment"] == first_records[-1][4]
+    assert second_state["history_commitment"] == second_records[-1][4]
+    assert engine.ledger.balance("payer") == Decimal("80.00")
+    assert engine.ledger.balance("merchant") == Decimal("20.00")
+    engine.ledger.assert_conserved()
+
+
+def test_card_cross_entity_event_id_substitution_breaks_history_commitment() -> None:
+    """Catch an interleaved payment's event ID becoming this payment's lineage."""
+    engine = _engine()
+    _schedule(
+        engine,
+        _authorize(payment_id=PAYMENT_ID, idempotency_key="authorize-a"),
+        _authorize(payment_id=OTHER_PAYMENT_ID, idempotency_key="authorize-b"),
+        ClearCard(PAYMENT_ID),
+    )
+    engine.run()
+    first_state = engine.entity_state(PAYMENT_ID)
+    second_state = engine.entity_state(OTHER_PAYMENT_ID)
+    assert isinstance(first_state, Mapping)
+    assert isinstance(second_state, Mapping)
+    corrupted = cast(dict[str, object], dict(first_state))
+    records = cast(tuple[tuple[str, ...], ...], first_state["idempotency_records"])
+    foreign_event_id = cast(str, second_state["last_event_id"])
+    final_record = records[-1]
+    corrupted["idempotency_records"] = (
+        *records[:-1],
+        (*final_record[:3], foreign_event_id, *final_record[4:]),
+    )
+    corrupted["last_event_id"] = foreign_event_id
+    engine._entity_state[PAYMENT_ID] = cast(FrozenState, MappingProxyType(corrupted))
+    engine.schedule(NOW, 0, SettleCard(PAYMENT_ID))
+
+    with pytest.raises(LifecycleError) as error:
+        engine.run()
+
+    assert error.value.code == "CARD_STATE_CORRUPT"
+    assert len(engine.ledger.entries) == 2
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["malformed", "broken_link", "reordered_commitments", "terminal_tamper"],
+)
+def test_card_history_commitment_corruption_fails_before_new_effect(
+    corruption: str,
+) -> None:
+    """Catch malformed, broken, reordered, or detached record commitments."""
+    engine = _engine()
+    _schedule(engine, _authorize(), ClearCard(PAYMENT_ID))
+    engine.run()
+    state = engine.entity_state(PAYMENT_ID)
+    assert isinstance(state, Mapping)
+    corrupted = cast(dict[str, object], dict(state))
+    raw_records = cast(tuple[tuple[str, ...], ...], state["idempotency_records"])
+    assert all(len(record) == 5 for record in raw_records)
+    first, second = raw_records
+    records: tuple[tuple[str, ...], ...]
+    if corruption == "malformed":
+        records = (first, (*second[:4], "not-a-commitment"))
+        corrupted["history_commitment"] = "not-a-commitment"
+    elif corruption == "broken_link":
+        records = (first, (*second[:4], "0" * 64))
+        corrupted["history_commitment"] = "0" * 64
+    elif corruption == "reordered_commitments":
+        records = ((*first[:4], second[4]), (*second[:4], first[4]))
+        corrupted["history_commitment"] = first[4]
+    else:
+        records = raw_records
+        corrupted["history_commitment"] = "0" * 64
+    corrupted["idempotency_records"] = records
+    engine._entity_state[PAYMENT_ID] = cast(FrozenState, MappingProxyType(corrupted))
+    engine.schedule(NOW, 0, SettleCard(PAYMENT_ID))
+
+    with pytest.raises(LifecycleError) as error:
+        engine.run()
+
+    assert error.value.code == "CARD_STATE_CORRUPT"
+    assert len(engine.ledger.entries) == 1
+
+
 def _corrupt_card_state(change: Callable[[dict[str, object]], None]) -> SimulationEngine:
     engine = _engine()
     _schedule(engine, _authorize())
@@ -756,20 +874,23 @@ def test_card_corrupt_history_event_ids_fail_before_new_effect(corruption: str) 
     assert isinstance(state, Mapping)
     corrupted = cast(dict[str, object], dict(state))
     raw_records = cast(tuple[tuple[str, ...], ...], state["idempotency_records"])
-    assert all(len(record) == 4 for record in raw_records)
-    records = cast(tuple[tuple[str, str, str, str], ...], raw_records)
+    assert all(len(record) == 5 for record in raw_records)
+    records = cast(tuple[tuple[str, str, str, str, str], ...], raw_records)
     first, second = records
     if corruption == "malformed":
         replacement = "not-an-event-id"
-        records = (first, (*second[:3], replacement))
+        records = (first, (*second[:3], replacement, *second[4:]))
     elif corruption == "duplicate":
         replacement = first[3]
-        records = (first, (*second[:3], replacement))
+        records = (first, (*second[:3], replacement, *second[4:]))
     elif corruption == "unrelated":
         replacement = "00000000-0000-4000-8000-000000000999"
-        records = (first, (*second[:3], replacement))
+        records = (first, (*second[:3], replacement, *second[4:]))
     else:
-        records = ((*first[:3], second[3]), (*second[:3], first[3]))
+        records = (
+            (*first[:3], second[3], *first[4:]),
+            (*second[:3], first[3], *second[4:]),
+        )
         replacement = first[3]
     corrupted["idempotency_records"] = records
     corrupted["last_event_id"] = replacement
