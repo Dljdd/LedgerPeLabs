@@ -34,7 +34,8 @@ def _validation_code(error: ValidationError, default: str) -> str:
 
 def _validated_card(card: ThreatCard) -> ThreatCard:
     try:
-        return ThreatCard.model_validate(card)
+        fields = card.model_dump(mode="python", round_trip=True, warnings=False)
+        return ThreatCard.model_validate(fields)
     except ValidationError as error:
         code = _validation_code(error, "MISSING_EVIDENCE")
         raise CompilerError(code, "threat card failed validation") from None
@@ -42,7 +43,8 @@ def _validated_card(card: ThreatCard) -> ThreatCard:
 
 def _validated_config(config: ScenarioConfig) -> ScenarioConfig:
     try:
-        return ScenarioConfig.model_validate(config)
+        fields = config.model_dump(mode="python", round_trip=True, warnings=False)
+        return ScenarioConfig.model_validate(fields)
     except ValidationError as error:
         code = _validation_code(error, "INVALID_FEEDBACK")
         raise CompilerError(code, "scenario configuration failed validation") from None

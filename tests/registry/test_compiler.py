@@ -157,8 +157,8 @@ def test_compiler_revalidates_copied_threat_identity() -> None:
     assert error.value.code == "MISSING_EVIDENCE"
 
 
-def test_compiler_revalidates_copied_evidence_identity() -> None:
-    """Catches an invalid copied evidence slug bypassing the compiler boundary."""
+def test_compiler_round_trip_revalidates_copied_nested_evidence_identity() -> None:
+    """Catches a copied nested evidence slug bypassing field-mapping revalidation."""
     card = make_threat_card()
     invalid_evidence = card.evidence[0].model_copy(update={"evidence_id": "NOT A SLUG"})
     invalid = card.model_copy(update={"evidence": [invalid_evidence]})
