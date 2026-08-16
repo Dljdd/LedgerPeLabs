@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import fields
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import MappingProxyType
@@ -186,6 +187,32 @@ def test_agentic_command_is_public_immutable_engine_command() -> None:
     assert command.payment_id == "agentic-payment-1"
     assert command.campaign_id == CAMPAIGN_ID
     assert isinstance(command.payload, Mapping)
+
+
+@pytest.mark.parametrize("candidate", [None, object()])
+def test_agentic_command_validates_request_before_dereferencing_it(
+    candidate: object,
+) -> None:
+    with pytest.raises(TypeError, match="request must be an exact AgentPaymentRequest"):
+        AgenticPaymentCommand(
+            cast(AgentPaymentRequest, candidate),
+            payer_account=USER_REF,
+            payee_account=PAYEE_ID,
+        )
+
+
+def test_agentic_command_rejects_request_subclass_before_account_binding() -> None:
+    request_type = type("AgentPaymentRequestSubclass", (AgentPaymentRequest,), {})
+    request = request_type(
+        **{field.name: getattr(_request(), field.name) for field in fields(_request())}
+    )
+
+    with pytest.raises(TypeError, match="request must be an exact AgentPaymentRequest"):
+        AgenticPaymentCommand(
+            request,
+            payer_account=USER_REF,
+            payee_account=PAYEE_ID,
+        )
 
 
 def test_no_step_up_request_round_trips_through_public_command_and_engine() -> None:

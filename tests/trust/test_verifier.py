@@ -1224,6 +1224,90 @@ def test_valid_plan_applies_once_and_round_trips_state(
         verifier.apply_commit(prepared)
 
 
+@pytest.mark.parametrize(
+    "candidate_kind",
+    ["wrong_object", "wrong_exact", "subclass", "copy"],
+)
+def test_malformed_preview_discard_revokes_pending_preview_before_validation(
+    candidate_kind: str,
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+    valid_request: AgentPaymentRequest,
+) -> None:
+    verifier = _verifier(mandate, private_key)
+    preview = verifier.preview(valid_request, NOW)
+    candidate: object
+    if candidate_kind == "wrong_object":
+        candidate = None
+    elif candidate_kind == "wrong_exact":
+        candidate = preview.model_copy(update={"receipt_hash": "f" * 64})
+    elif candidate_kind == "subclass":
+        candidate = _receipt_subclass(preview)
+    else:
+        candidate = preview.model_copy()
+
+    with pytest.raises((TypeError, ValueError)):
+        verifier.discard_preview(cast(IntegrityReceipt, candidate))
+
+    stale = verifier.commit(valid_request, preview, ReceiptOutcome.APPROVE, NOW)
+
+    assert stale.reason_code is ReasonCode.EXECUTION_RECEIPT_MISMATCH
+    assert verifier.dump_state()["records"] == ()
+
+
+@pytest.mark.parametrize(
+    "candidate_kind",
+    ["issued_but_consumed", "wrong_object", "wrong_exact", "subclass", "copy"],
+)
+def test_malformed_preview_discard_revokes_pending_plan_before_validation(
+    candidate_kind: str,
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+    valid_request: AgentPaymentRequest,
+) -> None:
+    verifier = _verifier(mandate, private_key)
+    preview = verifier.preview(valid_request, NOW)
+    prepared = verifier.prepare_commit(
+        valid_request, preview, ReceiptOutcome.APPROVE, NOW
+    )
+    assert isinstance(prepared, TrustCommitPlan)
+    candidate: object
+    if candidate_kind == "issued_but_consumed":
+        candidate = preview
+    elif candidate_kind == "wrong_object":
+        candidate = None
+    elif candidate_kind == "wrong_exact":
+        candidate = preview.model_copy(update={"receipt_hash": "f" * 64})
+    elif candidate_kind == "subclass":
+        candidate = _receipt_subclass(preview)
+    else:
+        candidate = preview.model_copy()
+
+    with pytest.raises((TypeError, ValueError)):
+        verifier.discard_preview(cast(IntegrityReceipt, candidate))
+    with pytest.raises(ValueError, match="not issued or was already consumed"):
+        verifier.apply_commit(prepared)
+
+    assert verifier.dump_state()["records"] == ()
+
+
+def test_valid_preview_discard_is_identity_bound_and_single_use(
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+    valid_request: AgentPaymentRequest,
+) -> None:
+    verifier = _verifier(mandate, private_key)
+    preview = verifier.preview(valid_request, NOW)
+
+    verifier.discard_preview(preview)
+
+    with pytest.raises(ValueError, match="not issued or was already consumed"):
+        verifier.discard_preview(preview)
+    stale = verifier.commit(valid_request, preview, ReceiptOutcome.APPROVE, NOW)
+    assert stale.reason_code is ReasonCode.EXECUTION_RECEIPT_MISMATCH
+    assert verifier.dump_state()["records"] == ()
+
+
 def test_new_preview_attempt_revokes_abandoned_preview_even_when_it_rejects(
     mandate: AgentMandate,
     private_key: Ed25519PrivateKey,

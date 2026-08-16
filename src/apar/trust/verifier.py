@@ -858,10 +858,13 @@ class TrustVerifier:
 
     def discard_preview(self, preview: IntegrityReceipt) -> None:
         """Revoke one issued preview after downstream scoring cannot finalize it."""
+        pending = self._pending_preview
+        self._revoke_ephemeral()
         if type(preview) is not IntegrityReceipt:
             raise TypeError("preview must be an exact IntegrityReceipt")
-        if self._pending_preview is not None and self._pending_preview[0] == preview:
-            self._pending_preview = None
+        if pending is not None and pending[0] is preview:
+            return
+        raise ValueError("preview was not issued or was already consumed")
 
     def dump_state(self) -> Mapping[str, object]:
         return MappingProxyType({"version": 1, "records": self._records})

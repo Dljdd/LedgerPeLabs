@@ -392,3 +392,73 @@ G0 PASS: 20 threat cards, contracts, registry, compiler, API, and artifact store
 - Round-3 files: `src/apar/trust/verifier.py`,
   `src/apar/simulator/rails/agentic.py`, `tests/trust/test_verifier.py`, and
   `tests/simulator/test_agentic_rail.py`.
+
+## Fix round 4/5
+
+### Review findings addressed
+
+1. `discard_preview` now snapshots the pending preview and revokes both ephemeral slots at
+   method entry, before inspecting the caller argument. It then requires the exact issued
+   preview object. `None`, arbitrary objects, wrong exact receipts, receipt subclasses,
+   equality-equivalent copies, consumed previews, and repeated discard attempts all fail
+   without leaving either a preview or prepared plan reusable. A valid issued preview still
+   discards successfully once.
+2. `AgenticPaymentCommand` now requires an exact `AgentPaymentRequest` before validating
+   account text or dereferencing signed request fields. `None`, arbitrary objects, and
+   request subclasses therefore fail with the stable boundary `TypeError` and cannot leak an
+   `AttributeError`. The other Task 4 public constructors were checked for the same ordering
+   error; none dereference a constructor argument before their applicable exact-type gate.
+
+### RED evidence
+
+The targeted test run before production edits reproduced both review findings:
+
+```text
+11 failed, 1 passed, 112 deselected
+```
+
+Every malformed discard path either left the pending preview committable, left the prepared
+plan applicable, or silently accepted a wrong/copy receipt. `None` and arbitrary command
+requests leaked `AttributeError`; the already-defensive request-subclass case was the single
+passing control.
+
+### GREEN evidence
+
+```text
+.venv/bin/python -m pytest tests/trust/test_verifier.py \
+  tests/simulator/test_agentic_rail.py -q \
+  -k 'preview_discard or validates_request_before or request_subclass_before'
+13 passed, 112 deselected
+
+.venv/bin/python -m pytest tests/trust tests/simulator/test_agentic_rail.py -q
+125 passed
+
+.venv/bin/python -m pytest -q
+513 passed
+
+.venv/bin/ruff check src tests
+All checks passed!
+
+.venv/bin/mypy --strict src
+Success: no issues found in 33 source files
+
+.venv/bin/mypy src
+Success: no issues found in 33 source files
+
+.venv/bin/python scripts/verify_g0.py
+G0 PASS: 20 threat cards, contracts, registry, compiler, API, and artifact store
+```
+
+`git diff --check` passed and `validation_spike/` is unchanged from `492c736`.
+
+### Self-review and tradeoff
+
+- Preview discard now mirrors commit-plan capability semantics: object identity, not value
+  equality, proves possession of the live verifier-issued capability. This is deliberately
+  process-local and single-threaded, consistent with the simulator trust boundary.
+- Revocation happens even when the discard argument is malformed or stale. This makes a
+  caller mistake fail closed at the cost of requiring a fresh preview for retry, which is the
+  intended ephemeral-capability policy.
+- The patch changes only the two reviewed public boundaries, their regressions, and this
+  report. Trust ordering, persistent state, receipt derivation, ledger behavior, event
+  emission, and outcome semantics are unchanged.

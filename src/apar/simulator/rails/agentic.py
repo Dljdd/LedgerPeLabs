@@ -241,6 +241,8 @@ class AgenticPaymentCommand(Command):
         payer_account: str,
         payee_account: str,
     ) -> None:
+        if type(request) is not AgentPaymentRequest:
+            raise TypeError("request must be an exact AgentPaymentRequest")
         payer = _text("payer_account", payer_account)
         payee = _text("payee_account", payee_account)
         if payer != request.mandate.user_ref or payee != request.payee_id:
