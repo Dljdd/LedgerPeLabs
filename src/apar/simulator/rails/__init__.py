@@ -12,6 +12,13 @@ from apar.simulator.rails.a2a import (
     ReportA2AFraud,
     ReturnA2A,
 )
+from apar.simulator.rails.agentic import (
+    AGENTIC_TRUST_STATE_ID,
+    AgenticDecision,
+    AgenticPaymentCommand,
+    AgenticRailAdapter,
+    RiskScorer,
+)
 from apar.simulator.rails.base import (
     AdapterFactory,
     FrozenState,
@@ -37,10 +44,14 @@ from apar.simulator.rails.card import (
 )
 
 __all__ = [
+    "AGENTIC_TRUST_STATE_ID",
     "A2ACommand",
     "A2ARailAdapter",
     "AcceptA2A",
     "AdapterFactory",
+    "AgenticDecision",
+    "AgenticPaymentCommand",
+    "AgenticRailAdapter",
     "AuthorizeCard",
     "CardCommand",
     "CardRailAdapter",
@@ -64,6 +75,7 @@ __all__ = [
     "ReportA2AFraud",
     "ReportCardFraud",
     "ReturnA2A",
+    "RiskScorer",
     "ReverseCardAuthorization",
     "SettleCard",
 ]
