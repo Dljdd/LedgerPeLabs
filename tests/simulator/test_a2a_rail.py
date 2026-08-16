@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import timedelta
 from decimal import Decimal
 
@@ -13,6 +13,7 @@ from apar.contracts.events import EventKind, Rail
 from apar.simulator.clock import Command
 from apar.simulator.engine import SimulationEngine, SimulationFailedError
 from apar.simulator.rails.a2a import (
+    A2ACommand,
     A2ARailAdapter,
     AcceptA2A,
     FreezeA2AFunds,
@@ -60,18 +61,24 @@ def _initiate(
     fee: Decimal = Decimal("0.00"),
     currency: str = "USD",
     idempotency_key: str = "a2a-initiate-1",
+    payer_account: str = "payer",
+    payee_account: str = "payee",
+    fee_account: str = "a2a:fees",
+    frozen_account: str = "a2a:frozen",
 ) -> InitiateA2A:
     return InitiateA2A(
         PAYMENT_ID,
         amount=amount,
         currency=currency,
-        payer_account="payer",
-        payee_account="payee",
+        payer_account=payer_account,
+        payee_account=payee_account,
         actor_id=PAYER_ID,
         counterparty_id=PAYEE_ID,
         campaign_id=CAMPAIGN_ID,
         trace_id=TRACE_ID,
         fee=fee,
+        fee_account=fee_account,
+        frozen_account=frozen_account,
         idempotency_key=idempotency_key,
     )
 
@@ -205,6 +212,35 @@ def test_a2a_fee_is_explicit_and_duplicate_post_is_noop() -> None:
     engine.ledger.assert_conserved()
 
 
+def test_a2a_idempotency_key_collision_with_different_command_fails_closed() -> None:
+    """Catch one key silently suppressing a different A2A lifecycle command."""
+    engine = _engine()
+    _schedule(
+        engine,
+        _initiate(idempotency_key="shared-key"),
+        AcceptA2A(PAYMENT_ID, idempotency_key="shared-key"),
+    )
+
+    with pytest.raises(LifecycleError) as error:
+        engine.run()
+
+    assert error.value.code == "A2A_IDEMPOTENCY_KEY_COLLISION"
+    assert engine.ledger.entries == ()
+    assert engine.ledger.balance("payer") == Decimal("100.00")
+
+
+def test_a2a_same_command_same_key_remains_complete_noop() -> None:
+    """Catch collision detection breaking legitimate A2A retry idempotency."""
+    engine = _engine()
+    command = _initiate(idempotency_key="same-request")
+    _schedule(engine, command, command)
+
+    events = engine.run()
+
+    assert [event.event_type for event in events] == [EventKind.TRANSFER_INITIATED]
+    assert engine.ledger.entries == ()
+
+
 def test_a2a_acceptance_does_not_move_value_before_posting() -> None:
     """Catch acceptance being conflated with irrevocable posting."""
     engine = _engine()
@@ -252,6 +288,72 @@ def test_a2a_quantizes_supported_currency_before_events_and_postings() -> None:
 
 
 @pytest.mark.parametrize(
+    ("currency", "amount"),
+    [
+        ("USD", Decimal("0.004")),
+        ("JPY", Decimal("0.4")),
+        ("KWD", Decimal("0.0004")),
+    ],
+)
+def test_a2a_rejects_principal_that_quantizes_to_zero(
+    currency: str,
+    amount: Decimal,
+) -> None:
+    """Catch a nominally positive transfer becoming a zero-value posting."""
+    with pytest.raises(ValueError, match="amount must be finite and positive"):
+        _initiate(currency=currency, amount=amount)
+
+
+def test_a2a_zero_fee_remains_valid_after_quantization() -> None:
+    """Catch the principal fix accidentally rejecting an explicit zero fee."""
+    command = _initiate(fee=Decimal("0"))
+
+    assert command.payload["fee"] == Decimal("0.00")
+
+
+_A2A_ACCOUNT_ROLES = (
+    "payer_account",
+    "payee_account",
+    "fee_account",
+    "frozen_account",
+)
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        (first, second)
+        for index, first in enumerate(_A2A_ACCOUNT_ROLES)
+        for second in _A2A_ACCOUNT_ROLES[index + 1 :]
+    ],
+)
+def test_a2a_rejects_every_account_role_alias(first: str, second: str) -> None:
+    """Catch dictionary-leg collapse for any pair of A2A accounting roles."""
+    accounts = {
+        "payer_account": "payer",
+        "payee_account": "payee",
+        "fee_account": "a2a:fees",
+        "frozen_account": "a2a:frozen",
+    }
+    accounts[second] = accounts[first]
+
+    with pytest.raises(ValueError, match="A2A account roles must be pairwise distinct"):
+        _initiate(**accounts)  # type: ignore[arg-type]
+
+
+def test_a2a_frozen_account_cannot_alias_payee_and_engine_remains_unchanged() -> None:
+    """Catch a fictitious freeze that debits and credits the same account."""
+    engine = _engine()
+
+    with pytest.raises(ValueError, match="A2A account roles must be pairwise distinct"):
+        _initiate(frozen_account="payee")
+
+    assert engine.ledger.entries == ()
+    assert engine.ledger.balance("payer") == Decimal("100.00")
+    assert engine.run() == ()
+
+
+@pytest.mark.parametrize(
     ("command", "code"),
     [
         (AcceptA2A(PAYMENT_ID), "A2A_ACCEPT_BEFORE_INITIATE"),
@@ -296,7 +398,10 @@ def test_a2a_state_is_closed_ordered_primitives() -> None:
     state = engine.entity_state(PAYMENT_ID)
     assert isinstance(state, Mapping)
     assert state["state"] == "accepted"
-    assert state["idempotency_keys"] == ("a2a-initiate-1", "a2a.accept:a2a-payment-1")
+    assert state["idempotency_records"] == (
+        ("a2a-initiate-1", "a2a.initiate"),
+        ("a2a.accept:a2a-payment-1", "a2a.accept"),
+    )
 
 
 @pytest.mark.parametrize(
@@ -307,6 +412,45 @@ def test_a2a_command_rejects_nonfinite_or_negative_amount(bad_value: Decimal) ->
     """Catch invalid money entering state before the ledger boundary."""
     with pytest.raises(ValueError, match="finite and positive"):
         _initiate(amount=bad_value)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        A2ACommand("a2a.accept"),
+        type("UnknownA2ACommand", (A2ACommand,), {})(
+            "a2a.accept",
+            {"payment_id": PAYMENT_ID, "idempotency_key": "unknown"},
+        ),
+        type("UnknownAcceptA2A", (AcceptA2A,), {})(PAYMENT_ID),
+    ],
+)
+def test_a2a_rejects_unknown_concrete_command_before_payload_access(
+    command: Command,
+) -> None:
+    """Catch public rail base commands leaking KeyError or spoofing known names."""
+    engine = _engine()
+    _schedule(engine, command)
+
+    with pytest.raises(LifecycleError) as error:
+        engine.run()
+
+    assert error.value.code == "A2A_UNKNOWN_COMMAND"
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: _initiate(idempotency_key=""),
+        lambda: AcceptA2A(PAYMENT_ID, idempotency_key=""),
+    ],
+)
+def test_a2a_rejects_explicit_empty_idempotency_key(
+    build: Callable[[], Command],
+) -> None:
+    """Catch an explicitly invalid key being replaced with a generated default."""
+    with pytest.raises(ValueError, match="idempotency_key must not be empty"):
+        build()
 
 
 def test_a2a_same_seed_replays_byte_identically() -> None:

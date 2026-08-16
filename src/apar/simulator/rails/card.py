@@ -60,7 +60,18 @@ def _money(label: str, value: object, currency: str, *, positive: bool) -> Decim
         exponent = _EXPONENTS[currency]
     except KeyError as error:
         raise ValueError(f"unsupported currency: {currency}") from error
-    return amount.quantize(Decimal(1).scaleb(-exponent), rounding=ROUND_HALF_EVEN)
+    quantized = amount.quantize(
+        Decimal(1).scaleb(-exponent),
+        rounding=ROUND_HALF_EVEN,
+    )
+    if positive and quantized <= 0:
+        raise ValueError(f"{label} must be finite and positive")
+    return quantized
+
+
+def _require_distinct_accounts(*accounts: str) -> None:
+    if len(set(accounts)) != len(accounts):
+        raise ValueError("card account roles must be pairwise distinct")
 
 
 class CardCommand(Command):
@@ -109,25 +120,39 @@ class _OpenCardCommand(CardCommand):
         if checked_fee > checked_amount:
             raise ValueError("fee must not exceed amount")
         checked_payment_id = _text("payment_id", payment_id)
+        checked_payer = _text("payer_account", payer_account)
+        checked_payee = _text("payee_account", payee_account)
+        checked_hold = _text("hold_account", hold_account)
+        checked_fee_account = _text("fee_account", fee_account)
+        checked_chargeback = _text("chargeback_account", chargeback_account)
+        _require_distinct_accounts(
+            checked_payer,
+            checked_payee,
+            checked_hold,
+            checked_fee_account,
+            checked_chargeback,
+        )
         super().__init__(
             self._NAME,
             {
                 "payment_id": checked_payment_id,
                 "amount": checked_amount,
                 "currency": checked_currency,
-                "payer_account": _text("payer_account", payer_account),
-                "payee_account": _text("payee_account", payee_account),
+                "payer_account": checked_payer,
+                "payee_account": checked_payee,
                 "actor_id": _uuid_text("actor_id", actor_id),
                 "counterparty_id": _uuid_text("counterparty_id", counterparty_id),
                 "campaign_id": _uuid_text("campaign_id", campaign_id),
                 "trace_id": _uuid_text("trace_id", trace_id),
                 "fee": checked_fee,
-                "hold_account": _text("hold_account", hold_account),
-                "fee_account": _text("fee_account", fee_account),
-                "chargeback_account": _text("chargeback_account", chargeback_account),
+                "hold_account": checked_hold,
+                "fee_account": checked_fee_account,
+                "chargeback_account": checked_chargeback,
                 "idempotency_key": _text(
                     "idempotency_key",
-                    idempotency_key or f"{self._NAME}:{checked_payment_id}",
+                    idempotency_key
+                    if idempotency_key is not None
+                    else f"{self._NAME}:{checked_payment_id}",
                 ),
             },
         )
@@ -177,7 +202,9 @@ class _FollowupCardCommand(CardCommand):
                 "payment_id": checked_payment_id,
                 "idempotency_key": _text(
                     "idempotency_key",
-                    idempotency_key or f"{self._NAME}:{checked_payment_id}",
+                    idempotency_key
+                    if idempotency_key is not None
+                    else f"{self._NAME}:{checked_payment_id}",
                 ),
             },
         )
@@ -274,6 +301,21 @@ _MISSING_CODES: Mapping[type[Command], str] = {
     RefundCard: "CARD_REFUND_BEFORE_SETTLEMENT",
 }
 
+_KNOWN_COMMAND_TYPES = frozenset(
+    {
+        AuthorizeCard,
+        DeclineCardAuthorization,
+        ClearCard,
+        SettleCard,
+        ReverseCardAuthorization,
+        ReportCardFraud,
+        OpenCardDispute,
+        ChargebackCard,
+        RecoverCard,
+        RefundCard,
+    }
+)
+
 
 def _mapping_state(value: FrozenState) -> Mapping[str, FrozenState]:
     if not isinstance(value, Mapping):
@@ -310,7 +352,7 @@ def _opening_state(command: _OpenCardCommand) -> dict[str, object]:
         "fee_account": payload["fee_account"],
         "chargeback_account": payload["chargeback_account"],
         "last_event_id": "",
-        "idempotency_keys": (),
+        "idempotency_records": (),
     }
 
 
@@ -324,6 +366,27 @@ def _invalid_code(current: CardState, command_type: type[Command]) -> str:
     }:
         return "CARD_REVERSE_AFTER_SETTLEMENT"
     return _MISSING_CODES.get(command_type, "CARD_INVALID_TRANSITION")
+
+
+def _is_idempotent_retry(
+    state: Mapping[str, FrozenState],
+    command: CardCommand,
+) -> tuple[bool, tuple[FrozenState, ...]]:
+    records = cast(
+        tuple[FrozenState, ...],
+        _state_value(state, "idempotency_records", tuple),
+    )
+    for record in records:
+        if type(record) is not tuple or len(record) != 2:
+            raise LifecycleError("CARD_STATE_CORRUPT")
+        key, command_name = record
+        if type(key) is not str or type(command_name) is not str:
+            raise LifecycleError("CARD_STATE_CORRUPT")
+        if key == command.idempotency_key:
+            if command_name == command.name:
+                return True, records
+            raise LifecycleError("CARD_IDEMPOTENCY_KEY_COLLISION")
+    return False, records
 
 
 def _post_effect(
@@ -422,7 +485,7 @@ class CardRailAdapter:
             raise ValueError("card adapter requires a card scenario")
 
     def handle(self, command: Command, context: RailContext) -> list[PaymentEvent]:
-        if not isinstance(command, CardCommand):
+        if not isinstance(command, CardCommand) or type(command) not in _KNOWN_COMMAND_TYPES:
             raise LifecycleError("CARD_UNKNOWN_COMMAND")
         payment_id = command.payment_id
         try:
@@ -434,8 +497,8 @@ class CardRailAdapter:
                 ) from None
             state = _mapping_state(cast(FrozenState, _opening_state(command)))
 
-        keys = cast(tuple[FrozenState, ...], _state_value(state, "idempotency_keys", tuple))
-        if command.idempotency_key in keys:
+        is_retry, records = _is_idempotent_retry(state, command)
+        if is_retry:
             return []
         current = CardState(cast(str, _state_value(state, "state", str)))
         try:
@@ -449,7 +512,10 @@ class CardRailAdapter:
         updated = dict(state)
         updated["state"] = next_state.value
         updated["last_event_id"] = event_id
-        updated["idempotency_keys"] = (*keys, command.idempotency_key)
+        updated["idempotency_records"] = (
+            *records,
+            (command.idempotency_key, command.name),
+        )
         context.set_entity_state(payment_id, updated)
         return [_event(context, updated, kind, event_id, previous_event_id)]
 

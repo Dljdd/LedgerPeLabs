@@ -58,7 +58,18 @@ def _money(label: str, value: object, currency: str, *, positive: bool) -> Decim
         exponent = _EXPONENTS[currency]
     except KeyError as error:
         raise ValueError(f"unsupported currency: {currency}") from error
-    return amount.quantize(Decimal(1).scaleb(-exponent), rounding=ROUND_HALF_EVEN)
+    quantized = amount.quantize(
+        Decimal(1).scaleb(-exponent),
+        rounding=ROUND_HALF_EVEN,
+    )
+    if positive and quantized <= 0:
+        raise ValueError(f"{label} must be finite and positive")
+    return quantized
+
+
+def _require_distinct_accounts(*accounts: str) -> None:
+    if len(set(accounts)) != len(accounts):
+        raise ValueError("A2A account roles must be pairwise distinct")
 
 
 class A2ACommand(Command):
@@ -105,24 +116,36 @@ class InitiateA2A(A2ACommand):
         checked_amount = _money("amount", amount, checked_currency, positive=True)
         checked_fee = _money("fee", fee, checked_currency, positive=False)
         checked_payment_id = _text("payment_id", payment_id)
+        checked_payer = _text("payer_account", payer_account)
+        checked_payee = _text("payee_account", payee_account)
+        checked_fee_account = _text("fee_account", fee_account)
+        checked_frozen = _text("frozen_account", frozen_account)
+        _require_distinct_accounts(
+            checked_payer,
+            checked_payee,
+            checked_fee_account,
+            checked_frozen,
+        )
         super().__init__(
             "a2a.initiate",
             {
                 "payment_id": checked_payment_id,
                 "amount": checked_amount,
                 "currency": checked_currency,
-                "payer_account": _text("payer_account", payer_account),
-                "payee_account": _text("payee_account", payee_account),
+                "payer_account": checked_payer,
+                "payee_account": checked_payee,
                 "actor_id": _uuid_text("actor_id", actor_id),
                 "counterparty_id": _uuid_text("counterparty_id", counterparty_id),
                 "campaign_id": _uuid_text("campaign_id", campaign_id),
                 "trace_id": _uuid_text("trace_id", trace_id),
                 "fee": checked_fee,
-                "fee_account": _text("fee_account", fee_account),
-                "frozen_account": _text("frozen_account", frozen_account),
+                "fee_account": checked_fee_account,
+                "frozen_account": checked_frozen,
                 "idempotency_key": _text(
                     "idempotency_key",
-                    idempotency_key or f"a2a.initiate:{checked_payment_id}",
+                    idempotency_key
+                    if idempotency_key is not None
+                    else f"a2a.initiate:{checked_payment_id}",
                 ),
             },
         )
@@ -140,7 +163,9 @@ class _FollowupA2ACommand(A2ACommand):
                 "payment_id": checked_payment_id,
                 "idempotency_key": _text(
                     "idempotency_key",
-                    idempotency_key or f"{self._NAME}:{checked_payment_id}",
+                    idempotency_key
+                    if idempotency_key is not None
+                    else f"{self._NAME}:{checked_payment_id}",
                 ),
             },
         )
@@ -229,6 +254,19 @@ _MISSING_CODES: Mapping[type[Command], str] = {
     ReturnA2A: "A2A_RETURN_BEFORE_POST",
 }
 
+_KNOWN_COMMAND_TYPES = frozenset(
+    {
+        InitiateA2A,
+        AcceptA2A,
+        RejectA2A,
+        PostA2A,
+        ReportA2AFraud,
+        FreezeA2AFunds,
+        RecoverA2A,
+        ReturnA2A,
+    }
+)
+
 
 def _mapping_state(value: FrozenState) -> Mapping[str, FrozenState]:
     if not isinstance(value, Mapping):
@@ -264,7 +302,7 @@ def _opening_state(command: InitiateA2A) -> dict[str, object]:
         "fee_account": payload["fee_account"],
         "frozen_account": payload["frozen_account"],
         "last_event_id": "",
-        "idempotency_keys": (),
+        "idempotency_records": (),
     }
 
 
@@ -278,6 +316,27 @@ def _invalid_code(current: A2AState, command_type: type[Command]) -> str:
     }:
         return "A2A_REJECT_AFTER_ACCEPT"
     return _MISSING_CODES.get(command_type, "A2A_INVALID_TRANSITION")
+
+
+def _is_idempotent_retry(
+    state: Mapping[str, FrozenState],
+    command: A2ACommand,
+) -> tuple[bool, tuple[FrozenState, ...]]:
+    records = cast(
+        tuple[FrozenState, ...],
+        _state_value(state, "idempotency_records", tuple),
+    )
+    for record in records:
+        if type(record) is not tuple or len(record) != 2:
+            raise LifecycleError("A2A_STATE_CORRUPT")
+        key, command_name = record
+        if type(key) is not str or type(command_name) is not str:
+            raise LifecycleError("A2A_STATE_CORRUPT")
+        if key == command.idempotency_key:
+            if command_name == command.name:
+                return True, records
+            raise LifecycleError("A2A_IDEMPOTENCY_KEY_COLLISION")
+    return False, records
 
 
 def _post_effect(
@@ -361,7 +420,7 @@ class A2ARailAdapter:
             raise ValueError("A2A adapter requires an A2A scenario")
 
     def handle(self, command: Command, context: RailContext) -> list[PaymentEvent]:
-        if not isinstance(command, A2ACommand):
+        if not isinstance(command, A2ACommand) or type(command) not in _KNOWN_COMMAND_TYPES:
             raise LifecycleError("A2A_UNKNOWN_COMMAND")
         payment_id = command.payment_id
         try:
@@ -373,8 +432,8 @@ class A2ARailAdapter:
                 ) from None
             state = _mapping_state(cast(FrozenState, _opening_state(command)))
 
-        keys = cast(tuple[FrozenState, ...], _state_value(state, "idempotency_keys", tuple))
-        if command.idempotency_key in keys:
+        is_retry, records = _is_idempotent_retry(state, command)
+        if is_retry:
             return []
         current = A2AState(cast(str, _state_value(state, "state", str)))
         try:
@@ -388,7 +447,10 @@ class A2ARailAdapter:
         updated = dict(state)
         updated["state"] = next_state.value
         updated["last_event_id"] = event_id
-        updated["idempotency_keys"] = (*keys, command.idempotency_key)
+        updated["idempotency_records"] = (
+            *records,
+            (command.idempotency_key, command.name),
+        )
         context.set_entity_state(payment_id, updated)
         return [_event(context, updated, kind, event_id, previous_event_id)]
 

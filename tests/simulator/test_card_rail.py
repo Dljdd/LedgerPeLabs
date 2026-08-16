@@ -14,6 +14,7 @@ from apar.simulator.clock import Command
 from apar.simulator.engine import SimulationEngine, SimulationFailedError
 from apar.simulator.rails.card import (
     AuthorizeCard,
+    CardCommand,
     CardRailAdapter,
     ChargebackCard,
     ClearCard,
@@ -70,18 +71,26 @@ def _authorize(
     fee: Decimal = Decimal("0.00"),
     currency: str = "USD",
     idempotency_key: str = "card-authorize-1",
+    payer_account: str = "payer",
+    payee_account: str = "merchant",
+    hold_account: str = "card:holds",
+    fee_account: str = "card:fees",
+    chargeback_account: str = "card:chargebacks",
 ) -> AuthorizeCard:
     return AuthorizeCard(
         PAYMENT_ID,
         amount=amount,
         currency=currency,
-        payer_account="payer",
-        payee_account="merchant",
+        payer_account=payer_account,
+        payee_account=payee_account,
         actor_id=PAYER_ID,
         counterparty_id=PAYEE_ID,
         campaign_id=CAMPAIGN_ID,
         trace_id=TRACE_ID,
         fee=fee,
+        hold_account=hold_account,
+        fee_account=fee_account,
+        chargeback_account=chargeback_account,
         idempotency_key=idempotency_key,
     )
 
@@ -245,6 +254,38 @@ def test_card_duplicate_authorization_key_is_a_complete_noop() -> None:
     assert engine.ledger.balance("card:holds") == Decimal("10.00")
 
 
+def test_card_idempotency_key_collision_with_different_command_fails_closed() -> None:
+    """Catch one key silently suppressing a different card lifecycle command."""
+    engine = _engine()
+    _schedule(
+        engine,
+        _authorize(idempotency_key="shared-key"),
+        ClearCard(PAYMENT_ID, idempotency_key="shared-key"),
+    )
+
+    with pytest.raises(LifecycleError) as error:
+        engine.run()
+
+    assert error.value.code == "CARD_IDEMPOTENCY_KEY_COLLISION"
+    assert len(engine.ledger.entries) == 1
+    assert engine.ledger.balance("payer") == Decimal("90.00")
+    assert engine.ledger.balance("card:holds") == Decimal("10.00")
+
+
+def test_card_idempotency_state_records_key_and_command_identity() -> None:
+    """Catch closed state retaining keys without the command identity they retry."""
+    engine = _engine()
+    _schedule(engine, _authorize(), ClearCard(PAYMENT_ID))
+    engine.run()
+
+    state = engine.entity_state(PAYMENT_ID)
+    assert isinstance(state, Mapping)
+    assert state["idempotency_records"] == (
+        ("card-authorize-1", "card.authorize"),
+        ("card.clear:card-payment-1", "card.clear"),
+    )
+
+
 def test_card_rejects_overdraft_atomically() -> None:
     """Catch card holds bypassing the ledger's no-overdraft invariant."""
     engine = _engine(payer_balance=Decimal("5.00"))
@@ -270,6 +311,74 @@ def test_card_quantizes_supported_currency_before_events_and_postings() -> None:
     assert engine.ledger.balance("payer", "KWD") == Decimal("89.444")
     assert engine.ledger.balance("card:holds", "KWD") == Decimal("10.556")
     engine.ledger.assert_conserved()
+
+
+@pytest.mark.parametrize(
+    ("currency", "amount"),
+    [
+        ("USD", Decimal("0.004")),
+        ("JPY", Decimal("0.4")),
+        ("KWD", Decimal("0.0004")),
+    ],
+)
+def test_card_rejects_principal_that_quantizes_to_zero(
+    currency: str,
+    amount: Decimal,
+) -> None:
+    """Catch a nominally positive card amount becoming a zero-value hold."""
+    with pytest.raises(ValueError, match="amount must be finite and positive"):
+        _authorize(currency=currency, amount=amount)
+
+
+def test_card_zero_fee_remains_valid_after_quantization() -> None:
+    """Catch the principal fix accidentally rejecting an explicit zero fee."""
+    command = _authorize(fee=Decimal("0"))
+
+    assert command.payload["fee"] == Decimal("0.00")
+
+
+_CARD_ACCOUNT_ROLES = (
+    "payer_account",
+    "payee_account",
+    "hold_account",
+    "fee_account",
+    "chargeback_account",
+)
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        (first, second)
+        for index, first in enumerate(_CARD_ACCOUNT_ROLES)
+        for second in _CARD_ACCOUNT_ROLES[index + 1 :]
+    ],
+)
+def test_card_rejects_every_account_role_alias(first: str, second: str) -> None:
+    """Catch dictionary-leg collapse for any pair of card accounting roles."""
+    accounts = {
+        "payer_account": "payer",
+        "payee_account": "merchant",
+        "hold_account": "card:holds",
+        "fee_account": "card:fees",
+        "chargeback_account": "card:chargebacks",
+    }
+    accounts[second] = accounts[first]
+
+    with pytest.raises(ValueError, match="card account roles must be pairwise distinct"):
+        _authorize(**accounts)  # type: ignore[arg-type]
+
+
+def test_card_hold_cannot_alias_payer_and_engine_remains_unchanged() -> None:
+    """Catch a fictitious hold that debits and credits the same account."""
+    engine = _engine()
+
+    with pytest.raises(ValueError, match="card account roles must be pairwise distinct"):
+        _authorize(hold_account="payer")
+
+    assert engine.ledger.entries == ()
+    assert engine.ledger.balance("payer") == Decimal("100.00")
+    assert engine.run() == ()
 
 
 @pytest.mark.parametrize(
@@ -345,6 +454,45 @@ def test_card_command_rejects_mutable_string_subclass() -> None:
             campaign_id=CAMPAIGN_ID,
             trace_id=TRACE_ID,
         )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        CardCommand("card.clear"),
+        type("UnknownCardCommand", (CardCommand,), {})(
+            "card.clear",
+            {"payment_id": PAYMENT_ID, "idempotency_key": "unknown"},
+        ),
+        type("UnknownClearCard", (ClearCard,), {})(PAYMENT_ID),
+    ],
+)
+def test_card_rejects_unknown_concrete_command_before_payload_access(
+    command: Command,
+) -> None:
+    """Catch public rail base commands leaking KeyError or spoofing known names."""
+    engine = _engine()
+    _schedule(engine, command)
+
+    with pytest.raises(LifecycleError) as error:
+        engine.run()
+
+    assert error.value.code == "CARD_UNKNOWN_COMMAND"
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: _authorize(idempotency_key=""),
+        lambda: ClearCard(PAYMENT_ID, idempotency_key=""),
+    ],
+)
+def test_card_rejects_explicit_empty_idempotency_key(
+    build: Callable[[], Command],
+) -> None:
+    """Catch an explicitly invalid key being replaced with a generated default."""
+    with pytest.raises(ValueError, match="idempotency_key must not be empty"):
+        build()
 
 
 def test_card_same_seed_replays_byte_identically() -> None:
