@@ -321,4 +321,3 @@ def test_a2a_same_seed_replays_byte_identically() -> None:
     second.run()
 
     assert first.serialize_events() == second.serialize_events()
-
