@@ -306,3 +306,89 @@ G0 PASS: 20 threat cards, contracts, registry, compiler, API, and artifact store
   `src/apar/trust/verifier.py`, `src/apar/trust/__init__.py`,
   `src/apar/simulator/rails/agentic.py`, `tests/trust/test_verifier.py`, and
   `tests/simulator/test_agentic_rail.py`.
+
+## Fix round 3/5
+
+### Review findings addressed
+
+1. No-step-up requests now use an exact `None` authentication-evidence representation.
+   Any string reference—including one colliding with the trusted evidence registry—is
+   rejected at the canonical request boundary. Their persisted receipt record uses an empty
+   internal lineage sentinel, which remains receipt-bound but is excluded from evidence
+   replay tracking and duplicate-evidence checks. Multiple no-step-up records therefore do
+   not consume or poison trusted step-up evidence, including across agents.
+2. Every public `preview`, `prepare_commit`, and `commit` attempt revokes all prior ephemeral
+   previews/plans before inspecting any request, receipt, outcome, timestamp, or subclass.
+   Public apply/discard attempts likewise revoke a pending plan before validating the caller
+   candidate. The public methods delegate to private validated helpers so standalone
+   `commit` and the adapter retain their successful single-thread path without making stale
+   capabilities reusable.
+3. `TrustCommitPlan` is now a frozen, identity-only capability with value equality disabled.
+   It owns a canonically reconstructed exact `IntegrityReceipt` and exposes no state record,
+   preview hash, nonce, or caller-controlled commit fields. The verifier separately retains
+   a private canonical receipt and state record. Projection and apply require the exact
+   issued plan instance; apply writes and returns only the private retained values. Forged,
+   copied, subclassed, cross-verifier, mutated, duplicate, or malformed plans cannot commit.
+
+### RED evidence
+
+The first focused run after adding the reviewed exploit tests produced 23 failures:
+
+```text
+23 failed, 62 passed
+```
+
+The failures reproduced all three findings:
+
+- `None` was rejected for no-step-up requests while arbitrary and registry-colliding strings
+  were accepted and written into evidence-shaped state;
+- malformed request, receipt, timestamp, and subclass attempts left an existing preview
+  reusable at the public preview/prepare/commit boundaries;
+- value-equal reconstructed and cross-verifier plans were accepted, a caller-mutated public
+  receipt was returned as committed, and malformed apply attempts left the real plan usable.
+
+Additional RED cycles showed that the public agentic command fingerprint rejected the new
+exact `None` representation and that a mutable empty-string subclass could enter restored
+no-step-up state before exact scalar validation was added.
+
+### GREEN evidence
+
+```text
+.venv/bin/python -m pytest tests/trust tests/simulator/test_agentic_rail.py -q
+112 passed
+
+.venv/bin/python -m pytest -q
+500 passed
+
+.venv/bin/ruff check src tests
+All checks passed!
+
+.venv/bin/mypy --strict src
+Success: no issues found in 33 source files
+
+.venv/bin/mypy src
+Success: no issues found in 33 source files
+
+.venv/bin/python scripts/verify_g0.py
+G0 PASS: 20 threat cards, contracts, registry, compiler, API, and artifact store
+```
+
+`git diff --check` passed and `validation_spike/` is unchanged from `cdc4c96`.
+
+### Coverage and tradeoffs
+
+- Coverage includes no-step-up arbitrary/colliding references, cross-agent poisoning,
+  legitimate step-up after no-step-up activity, public command/engine round-trip, exact empty
+  state scalar ownership, malformed objects and subclasses at every public transaction
+  boundary, copied and reconstructed plans, cross-verifier reuse, caller mutation, malformed
+  apply, duplicate apply, discard identity, and valid state round-trip.
+- The public plan intentionally remains inspectable for its synthetic final receipt so the
+  adapter can construct a prevalidated event before posting. That receipt is a detached
+  canonical copy; the verifier never trusts it for apply. The actual record and committed
+  receipt remain private and verifier-owned.
+- The identity capability is deliberately process-local and single-threaded, matching the
+  engine boundary. Distributed execution would replace Python object identity with a durable
+  transaction handle guarded by a database/ledger transaction.
+- Round-3 files: `src/apar/trust/verifier.py`,
+  `src/apar/simulator/rails/agentic.py`, `tests/trust/test_verifier.py`, and
+  `tests/simulator/test_agentic_rail.py`.

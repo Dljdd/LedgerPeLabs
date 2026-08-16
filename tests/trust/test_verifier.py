@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, fields, replace
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from types import MappingProxyType
@@ -21,6 +21,7 @@ from apar.trust.verifier import (
     AuthenticationRequirement,
     IntegrityReceipt,
     ReceiptOutcome,
+    TrustCommitPlan,
     TrustVerifier,
     TrustVerifierStateError,
 )
@@ -42,6 +43,18 @@ PRODUCT_ID = "flight-1"
 USER_ENTITY_ID = "00000000-0000-4000-8000-000000000303"
 BENEFICIARY_ENTITY_ID = "00000000-0000-4000-8000-000000000304"
 AUTH_EVIDENCE_ID = "auth-evidence-1"
+
+
+class AgentPaymentRequestSubclass(AgentPaymentRequest):
+    pass
+
+
+class IntegrityReceiptSubclass(IntegrityReceipt):
+    pass
+
+
+class DatetimeSubclass(datetime):
+    pass
 
 
 @pytest.fixture
@@ -111,6 +124,29 @@ def _unsigned_request(mandate: AgentMandate, **updates: object) -> AgentPaymentR
 def _sign(request: AgentPaymentRequest, private_key: Ed25519PrivateKey) -> AgentPaymentRequest:
     return request.model_copy(
         update={"signature": private_key.sign(request.signing_bytes())}
+    )
+
+
+def _request_subclass(request: AgentPaymentRequest) -> AgentPaymentRequestSubclass:
+    values = {field.name: getattr(request, field.name) for field in fields(request)}
+    return AgentPaymentRequestSubclass(**values)
+
+
+def _receipt_subclass(receipt: IntegrityReceipt) -> IntegrityReceiptSubclass:
+    values = {field.name: getattr(receipt, field.name) for field in fields(receipt)}
+    return IntegrityReceiptSubclass(**values)
+
+
+def _datetime_subclass(value: datetime) -> DatetimeSubclass:
+    return DatetimeSubclass(
+        value.year,
+        value.month,
+        value.day,
+        value.hour,
+        value.minute,
+        value.second,
+        value.microsecond,
+        tzinfo=UTC,
     )
 
 
@@ -347,7 +383,7 @@ def test_no_step_up_mandate_needs_no_evidence_registry_entry(
     request = _sign(
         _unsigned_request(
             no_step_up,
-            authentication_evidence_ref="no-auth-required",
+            authentication_evidence_ref=None,
         ),
         private_key,
     )
@@ -368,6 +404,105 @@ def test_no_step_up_mandate_needs_no_evidence_registry_entry(
 
     assert receipt.allowed
     assert restored.dump_state() == verifier.dump_state()
+
+
+def test_no_step_up_state_rejects_mutable_empty_reference_alias(
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+) -> None:
+    class MutableStr(str):
+        pass
+
+    no_step_up = mandate.model_copy(
+        update={"required_authentication": AuthenticationRequirement.NONE}
+    )
+    request = _sign(
+        _unsigned_request(no_step_up, authentication_evidence_ref=None), private_key
+    )
+    public_key = private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    verifier = TrustVerifier(
+        registered_agents={(AGENT_ID, KEY_ID): public_key},
+        mandates={MANDATE_ID: no_step_up},
+        authentication_evidence={},
+    )
+    verifier.verify(request, NOW)
+    record = list(cast(tuple[tuple[str, ...], ...], verifier.dump_state()["records"])[0])
+    record[2] = MutableStr("")
+    restored = TrustVerifier(
+        registered_agents={(AGENT_ID, KEY_ID): public_key},
+        mandates={MANDATE_ID: no_step_up},
+        authentication_evidence={},
+    )
+
+    with pytest.raises(TrustVerifierStateError):
+        restored.load_state({"version": 1, "records": (tuple(record),)})
+
+
+@pytest.mark.parametrize("reference", ["arbitrary-reference", AUTH_EVIDENCE_ID])
+def test_no_step_up_request_rejects_any_authentication_evidence_reference(
+    reference: str,
+    mandate: AgentMandate,
+) -> None:
+    no_step_up = mandate.model_copy(
+        update={"required_authentication": AuthenticationRequirement.NONE}
+    )
+
+    with pytest.raises(ValueError, match="must be None"):
+        _unsigned_request(no_step_up, authentication_evidence_ref=reference)
+
+
+def test_no_step_up_activity_cannot_poison_other_agents_step_up_evidence(
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+    valid_request: AgentPaymentRequest,
+) -> None:
+    no_step_key = Ed25519PrivateKey.from_private_bytes(bytes(reversed(range(32))))
+    no_step_agent = "agent-no-step"
+    no_step_mandate = mandate.model_copy(
+        update={
+            "mandate_id": "mandate-no-step",
+            "agent_id": no_step_agent,
+            "user_ref": "user-no-step",
+            "user_entity_id": "00000000-0000-4000-8000-000000000351",
+            "beneficiary_entity_id": "00000000-0000-4000-8000-000000000352",
+            "required_authentication": AuthenticationRequirement.NONE,
+        }
+    )
+    no_step_request = _sign(
+        _unsigned_request(
+            no_step_mandate,
+            request_id="request-no-step",
+            payment_id="payment-no-step",
+            agent_id=no_step_agent,
+            key_id="key-no-step",
+            nonce="nonce-no-step",
+            authentication_evidence_ref=None,
+            actor_id=no_step_mandate.user_entity_id,
+            counterparty_id=no_step_mandate.beneficiary_entity_id,
+        ),
+        no_step_key,
+    )
+    verifier = TrustVerifier(
+        registered_agents={
+            (AGENT_ID, KEY_ID): private_key.public_key().public_bytes(
+                Encoding.Raw, PublicFormat.Raw
+            ),
+            (no_step_agent, "key-no-step"): no_step_key.public_key().public_bytes(
+                Encoding.Raw, PublicFormat.Raw
+            ),
+        },
+        mandates={
+            MANDATE_ID: mandate,
+            no_step_mandate.mandate_id: no_step_mandate,
+        },
+        authentication_evidence={AUTH_EVIDENCE_ID: _authentication_evidence()},
+    )
+
+    no_step_receipt = verifier.verify(no_step_request, NOW)
+    step_up_receipt = verifier.verify(valid_request, NOW)
+
+    assert no_step_receipt.allowed
+    assert step_up_receipt.allowed
 
 
 def test_authentication_evidence_is_single_use_across_new_request_and_nonce(
@@ -896,6 +1031,199 @@ def test_prepared_commit_is_single_use_and_discardable(
     assert receipt.outcome is ReceiptOutcome.APPROVE
 
 
+def test_equality_equivalent_reconstructed_plan_is_not_an_issued_capability(
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+    valid_request: AgentPaymentRequest,
+) -> None:
+    verifier = _verifier(mandate, private_key)
+    preview = verifier.preview(valid_request, NOW)
+    prepared = verifier.prepare_commit(
+        valid_request, preview, ReceiptOutcome.APPROVE, NOW
+    )
+    assert isinstance(prepared, TrustCommitPlan)
+    reconstructed = replace(prepared)
+
+    with pytest.raises(ValueError, match="not issued or was already consumed"):
+        verifier.apply_commit(reconstructed)
+    with pytest.raises(ValueError, match="not issued or was already consumed"):
+        verifier.apply_commit(prepared)
+
+    assert verifier.dump_state()["records"] == ()
+
+
+def test_projected_state_requires_exact_issued_plan_instance(
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+    valid_request: AgentPaymentRequest,
+) -> None:
+    verifier = _verifier(mandate, private_key)
+    preview = verifier.preview(valid_request, NOW)
+    prepared = verifier.prepare_commit(
+        valid_request, preview, ReceiptOutcome.APPROVE, NOW
+    )
+    assert isinstance(prepared, TrustCommitPlan)
+
+    with pytest.raises(ValueError, match="not issued or was already consumed"):
+        verifier.projected_state(replace(prepared))
+
+    assert verifier.projected_state(prepared)["records"] != ()
+
+
+def test_discard_requires_exact_plan_identity_and_revokes_before_rejection(
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+    valid_request: AgentPaymentRequest,
+) -> None:
+    verifier = _verifier(mandate, private_key)
+    preview = verifier.preview(valid_request, NOW)
+    prepared = verifier.prepare_commit(
+        valid_request, preview, ReceiptOutcome.APPROVE, NOW
+    )
+    assert isinstance(prepared, TrustCommitPlan)
+
+    with pytest.raises(ValueError, match="not issued or was already consumed"):
+        verifier.discard_commit(replace(prepared))
+    with pytest.raises(ValueError, match="not issued or was already consumed"):
+        verifier.discard_commit(prepared)
+
+    assert verifier.dump_state()["records"] == ()
+
+
+def test_cross_verifier_plan_rejects_and_revokes_receiving_verifier_plan(
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+    valid_request: AgentPaymentRequest,
+) -> None:
+    first = _verifier(mandate, private_key)
+    second = _verifier(mandate, private_key)
+    first_preview = first.preview(valid_request, NOW)
+    second_preview = second.preview(valid_request, NOW)
+    first_plan = first.prepare_commit(
+        valid_request, first_preview, ReceiptOutcome.APPROVE, NOW
+    )
+    second_plan = second.prepare_commit(
+        valid_request, second_preview, ReceiptOutcome.APPROVE, NOW
+    )
+    assert isinstance(first_plan, TrustCommitPlan)
+    assert isinstance(second_plan, TrustCommitPlan)
+
+    with pytest.raises(ValueError, match="not issued or was already consumed"):
+        second.apply_commit(first_plan)
+    with pytest.raises(ValueError, match="not issued or was already consumed"):
+        second.apply_commit(second_plan)
+
+    assert second.dump_state()["records"] == ()
+    assert first.apply_commit(first_plan).allowed
+
+
+def test_apply_uses_internal_canonical_plan_not_mutated_public_view(
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+    valid_request: AgentPaymentRequest,
+) -> None:
+    verifier = _verifier(mandate, private_key)
+    preview = verifier.preview(valid_request, NOW)
+    prepared = verifier.prepare_commit(
+        valid_request, preview, ReceiptOutcome.APPROVE, NOW
+    )
+    assert isinstance(prepared, TrustCommitPlan)
+    canonical_receipt = prepared.receipt
+    object.__setattr__(
+        prepared,
+        "receipt",
+        canonical_receipt.model_copy(update={"receipt_hash": "f" * 64}),
+    )
+
+    applied = verifier.apply_commit(prepared)
+    restored = _verifier(mandate, private_key)
+    restored.load_state(verifier.dump_state())
+
+    assert applied == canonical_receipt
+    assert restored.dump_state() == verifier.dump_state()
+
+
+def test_trust_commit_plan_rejects_noncanonical_receipt_and_subclasses(
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+    valid_request: AgentPaymentRequest,
+) -> None:
+    verifier = _verifier(mandate, private_key)
+    preview = verifier.preview(valid_request, NOW)
+    prepared = verifier.prepare_commit(
+        valid_request, preview, ReceiptOutcome.APPROVE, NOW
+    )
+    assert isinstance(prepared, TrustCommitPlan)
+
+    with pytest.raises(TypeError, match="exact IntegrityReceipt"):
+        TrustCommitPlan(cast(IntegrityReceipt, object()))
+    with pytest.raises(TypeError, match="exact IntegrityReceipt"):
+        TrustCommitPlan(_receipt_subclass(prepared.receipt))
+
+    class MutableStr(str):
+        pass
+
+    aliased_receipt = object.__new__(IntegrityReceipt)
+    for field in fields(prepared.receipt):
+        value = getattr(prepared.receipt, field.name)
+        if field.name == "receipt_hash":
+            value = MutableStr(value)
+        object.__setattr__(aliased_receipt, field.name, value)
+
+    with pytest.raises(ValueError, match="receipt_hash"):
+        TrustCommitPlan(aliased_receipt)
+
+
+@pytest.mark.parametrize("malformed", ["object", "subclass"])
+def test_malformed_apply_attempt_revokes_plan_before_validation(
+    malformed: str,
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+    valid_request: AgentPaymentRequest,
+) -> None:
+    verifier = _verifier(mandate, private_key)
+    preview = verifier.preview(valid_request, NOW)
+    prepared = verifier.prepare_commit(
+        valid_request, preview, ReceiptOutcome.APPROVE, NOW
+    )
+    assert isinstance(prepared, TrustCommitPlan)
+    candidate: object = object()
+    if malformed == "subclass":
+        class PlanSubclass(TrustCommitPlan):
+            pass
+
+        candidate = PlanSubclass(prepared.receipt)
+
+    with pytest.raises((TypeError, ValueError)):
+        verifier.apply_commit(cast(TrustCommitPlan, candidate))
+    with pytest.raises(ValueError, match="not issued or was already consumed"):
+        verifier.apply_commit(prepared)
+
+    assert verifier.dump_state()["records"] == ()
+
+
+def test_valid_plan_applies_once_and_round_trips_state(
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+    valid_request: AgentPaymentRequest,
+) -> None:
+    verifier = _verifier(mandate, private_key)
+    preview = verifier.preview(valid_request, NOW)
+    prepared = verifier.prepare_commit(
+        valid_request, preview, ReceiptOutcome.APPROVE, NOW
+    )
+    assert isinstance(prepared, TrustCommitPlan)
+
+    receipt = verifier.apply_commit(prepared)
+    restored = _verifier(mandate, private_key)
+    restored.load_state(verifier.dump_state())
+
+    assert receipt.outcome is ReceiptOutcome.APPROVE
+    assert restored.dump_state() == verifier.dump_state()
+    with pytest.raises(ValueError, match="not issued or was already consumed"):
+        verifier.apply_commit(prepared)
+
+
 def test_new_preview_attempt_revokes_abandoned_preview_even_when_it_rejects(
     mandate: AgentMandate,
     private_key: Ed25519PrivateKey,
@@ -914,6 +1242,150 @@ def test_new_preview_attempt_revokes_abandoned_preview_even_when_it_rejects(
 
     assert rejected.reason_code is ReasonCode.PAYEE_BINDING_MISMATCH
     assert stale_commit.reason_code is ReasonCode.EXECUTION_RECEIPT_MISMATCH
+    assert verifier.dump_state()["records"] == ()
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    ["request_object", "request_subclass", "now_object", "now_subclass"],
+)
+def test_every_malformed_preview_attempt_revokes_existing_capability(
+    malformed: str,
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+    valid_request: AgentPaymentRequest,
+) -> None:
+    verifier = _verifier(mandate, private_key)
+    existing = verifier.preview(valid_request, NOW)
+    request: object = valid_request
+    now: object = NOW
+    if malformed == "request_object":
+        request = object()
+    elif malformed == "request_subclass":
+        request = _request_subclass(valid_request)
+    elif malformed == "now_object":
+        now = object()
+    else:
+        now = _datetime_subclass(NOW)
+
+    with pytest.raises((TypeError, ValueError)):
+        verifier.preview(
+            cast(AgentPaymentRequest, request),
+            cast(datetime, now),
+        )
+
+    stale = verifier.commit(valid_request, existing, ReceiptOutcome.APPROVE, NOW)
+
+    assert stale.reason_code is ReasonCode.EXECUTION_RECEIPT_MISMATCH
+    assert verifier.dump_state()["records"] == ()
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        "request_object",
+        "request_subclass",
+        "receipt_object",
+        "receipt_subclass",
+        "outcome_object",
+        "now_object",
+        "now_subclass",
+    ],
+)
+def test_every_malformed_prepare_attempt_revokes_existing_capability(
+    malformed: str,
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+    valid_request: AgentPaymentRequest,
+) -> None:
+    verifier = _verifier(mandate, private_key)
+    existing = verifier.preview(valid_request, NOW)
+    request: object = valid_request
+    preview: object = existing
+    outcome: object = ReceiptOutcome.APPROVE
+    now: object = NOW
+    if malformed == "request_object":
+        request = object()
+    elif malformed == "request_subclass":
+        request = _request_subclass(valid_request)
+    elif malformed == "receipt_object":
+        preview = object()
+    elif malformed == "receipt_subclass":
+        preview = _receipt_subclass(existing)
+    elif malformed == "outcome_object":
+        outcome = "approve"
+    elif malformed == "now_object":
+        now = object()
+    else:
+        now = _datetime_subclass(NOW)
+
+    with pytest.raises((TypeError, ValueError)):
+        verifier.prepare_commit(
+            cast(AgentPaymentRequest, request),
+            cast(IntegrityReceipt, preview),
+            cast(ReceiptOutcome, outcome),
+            cast(datetime, now),
+        )
+
+    stale = verifier.prepare_commit(
+        valid_request, existing, ReceiptOutcome.APPROVE, NOW
+    )
+
+    assert isinstance(stale, IntegrityReceipt)
+    assert stale.reason_code is ReasonCode.EXECUTION_RECEIPT_MISMATCH
+    assert verifier.dump_state()["records"] == ()
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        "request_object",
+        "request_subclass",
+        "receipt_object",
+        "receipt_subclass",
+        "outcome_object",
+        "now_object",
+        "now_subclass",
+    ],
+)
+def test_every_malformed_commit_attempt_revokes_existing_capability(
+    malformed: str,
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+    valid_request: AgentPaymentRequest,
+) -> None:
+    verifier = _verifier(mandate, private_key)
+    existing = verifier.preview(valid_request, NOW)
+    request: object = valid_request
+    preview: object = existing
+    outcome: object = ReceiptOutcome.APPROVE
+    now: object = NOW
+    if malformed == "request_object":
+        request = object()
+    elif malformed == "request_subclass":
+        request = _request_subclass(valid_request)
+    elif malformed == "receipt_object":
+        preview = object()
+    elif malformed == "receipt_subclass":
+        preview = _receipt_subclass(existing)
+    elif malformed == "outcome_object":
+        outcome = "approve"
+    elif malformed == "now_object":
+        now = object()
+    else:
+        now = _datetime_subclass(NOW)
+
+    with pytest.raises((TypeError, ValueError)):
+        verifier.commit(
+            cast(AgentPaymentRequest, request),
+            cast(IntegrityReceipt, preview),
+            cast(ReceiptOutcome, outcome),
+            cast(datetime, now),
+        )
+
+    stale = verifier.commit(valid_request, existing, ReceiptOutcome.APPROVE, NOW)
+
+    assert stale.reason_code is ReasonCode.EXECUTION_RECEIPT_MISMATCH
     assert verifier.dump_state()["records"] == ()
 
 

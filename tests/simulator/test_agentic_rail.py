@@ -188,6 +188,35 @@ def test_agentic_command_is_public_immutable_engine_command() -> None:
     assert isinstance(command.payload, Mapping)
 
 
+def test_no_step_up_request_round_trips_through_public_command_and_engine() -> None:
+    mandate = _mandate().model_copy(
+        update={"required_authentication": AuthenticationRequirement.NONE}
+    )
+    request = _request(mandate=mandate, authentication_evidence_ref=None)
+    public_key = _private_key().public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    verifier = TrustVerifier(
+        registered_agents={(AGENT_ID, KEY_ID): public_key},
+        mandates={MANDATE_ID: mandate},
+        authentication_evidence={},
+    )
+    engine = SimulationEngine(
+        _bundle(),
+        {
+            Rail.AGENTIC: lambda: AgenticRailAdapter(
+                verifier, lambda _request, _receipt: Action.APPROVE
+            )
+        },
+        opening_balances={USER_REF: Decimal("100.00")},
+    )
+    command = _command(request)
+    engine.schedule(NOW, 0, command)
+
+    event = engine.run()[0]
+
+    assert command.request == request
+    assert event.rail_data["receipt_outcome"] == ReceiptOutcome.APPROVE.value
+
+
 def test_payee_substitution_declines_before_scorer_and_post() -> None:
     scorer = Mock(return_value=Action.APPROVE)
     request = _request(payee_id="attacker")

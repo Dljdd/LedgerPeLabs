@@ -135,7 +135,7 @@ def _request_from_payload(payload: Mapping[str, object]) -> AgentPaymentRequest:
         credential_scope=cast(str, payload["credential_scope"]),
         consent_ref=cast(str, payload["consent_ref"]),
         authentication_evidence_ref=cast(
-            str, payload["authentication_evidence_ref"]
+            str | None, payload["authentication_evidence_ref"]
         ),
         nonce=cast(str, payload["nonce"]),
         created_at=cast(datetime, payload["created_at"]),
@@ -207,7 +207,9 @@ def _payload_fingerprint(payload: Mapping[str, object]) -> str:
         if type(key) is not str:
             raise TypeError("agentic command payload keys must be exact strings")
         value = payload[key]
-        if type(value) is str:
+        if value is None:
+            kind, text = "none", ""
+        elif type(value) is str:
             kind, text = "str", value
         elif type(value) is int:
             kind, text = "int", str(value)
