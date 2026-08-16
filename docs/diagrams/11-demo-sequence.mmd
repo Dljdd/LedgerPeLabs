@@ -1,0 +1,21 @@
+sequenceDiagram
+    participant J as Judge
+    participant UI as Prototype
+    participant R as Assurance range
+    participant D as Layered defense
+    participant E as Evaluator
+    J->>UI: Open reviewed GenAI threat
+    UI->>R: Compile approved scenario
+    R->>D: Replay obvious campaign
+    D-->>UI: Baseline catches obvious pattern
+    J->>UI: Start bounded adaptation
+    R->>D: Submit adaptive candidates
+    D-->>R: Coarse decision feedback
+    R-->>UI: Invalid attempts rejected; valid evasion found
+    R->>D: Replay champion and challenger
+    D->>E: Decisions, actions, evidence and costs
+    E-->>UI: Hidden gates and business metrics
+    J->>UI: Open agentic integrity attack
+    UI-->>J: Deterministic rejection and audit chain
+    J->>UI: Open promotion report
+

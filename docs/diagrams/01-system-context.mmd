@@ -1,0 +1,15 @@
+flowchart LR
+    Evidence[Public and authorized evidence] --> Registry[Threat registry]
+    Analyst[Threat analyst] --> Registry
+    Registry --> Compiler[Scenario compiler]
+    Compiler --> Range[Adaptive assurance range]
+    Range --> Champion[Champion controls]
+    Range --> Challenger[Challenger controls]
+    Champion --> Evaluator[Independent evaluator]
+    Challenger --> Evaluator
+    Evaluator --> Report[Promotion or rejection report]
+    Reviewer[Human reviewer] --> Report
+    Report --> Decision{Approve change?}
+    Decision -->|No| Backlog[Research backlog]
+    Decision -->|Yes| Export[Governed model or policy export]
+

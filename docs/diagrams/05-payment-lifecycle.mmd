@@ -1,0 +1,16 @@
+stateDiagram-v2
+    [*] --> Initiated
+    Initiated --> Authenticated: authentication succeeds
+    Initiated --> Rejected: integrity or policy failure
+    Authenticated --> Authorized: approve or challenge passes
+    Authenticated --> Declined: issuer or policy declines
+    Authorized --> Cleared: clearing event
+    Cleared --> Settled: settlement event
+    Settled --> Reported: scam, fraud or dispute report
+    Reported --> Recovered: recovery succeeds
+    Reported --> LossFinal: recovery window closes
+    Rejected --> [*]
+    Declined --> [*]
+    Recovered --> [*]
+    LossFinal --> [*]
+

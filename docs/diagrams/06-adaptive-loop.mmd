@@ -1,0 +1,12 @@
+flowchart LR
+    Init[Initial campaign policy] --> Propose[Propose candidate]
+    Propose --> Public[Public plausibility and safety checks]
+    Public -->|Reject| Learn[Record bounded failure]
+    Public -->|Pass| Replay[Replay against frozen defender]
+    Replay --> Feedback[Approve, challenge, decline, delay and realized value]
+    Feedback --> Learn
+    Learn --> Budget{Budget remains?}
+    Budget -->|Yes| Propose
+    Budget -->|No| Hidden[Hidden economic and causal oracle]
+    Hidden --> Eval[Final hidden-valid utility]
+

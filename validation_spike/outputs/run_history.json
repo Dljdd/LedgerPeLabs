@@ -1,0 +1,62 @@
+[
+  {
+    "started_utc": "2026-08-16T09:54:49.718925+00:00",
+    "completed_utc": "2026-08-16T09:54:51.838636+00:00",
+    "status": "completed",
+    "source_sha256": "8505ad4f7fb0e0379784ef4105b3651e64b31c7dc4a0be782251ce1227e893e0",
+    "preregistration_sha256": "37e8f2340d215cc74132324efbf04b6f34be645863d1d01a102baeffa8304af0",
+    "verdicts": {
+      "H1": "SUPPORTED",
+      "H2": "SUPPORTED",
+      "H3": "PARTIALLY SUPPORTED",
+      "H4": "SUPPORTED",
+      "H5": "SUPPORTED"
+    },
+    "note": "Initial result-producing run"
+  },
+  {
+    "started_utc": "2026-08-16T09:56:15.443462+00:00",
+    "completed_utc": "2026-08-16T09:56:18.382149+00:00",
+    "status": "completed",
+    "source_sha256": "78359f31a0c2300a2917d860b6f0e354f8a727224a5e413a7b3eaa5e68b7a1e7",
+    "preregistration_sha256": "37e8f2340d215cc74132324efbf04b6f34be645863d1d01a102baeffa8304af0",
+    "verdicts": {
+      "H1": "SUPPORTED",
+      "H2": "SUPPORTED",
+      "H3": "PARTIALLY SUPPORTED",
+      "H4": "SUPPORTED",
+      "H5": "SUPPORTED"
+    },
+    "note": "Reporting-only rerun adding runtime and class-rate fields; no experimental logic, seeds, thresholds, or verdict rules changed"
+  },
+  {
+    "started_utc": "2026-08-16T09:57:40.227903+00:00",
+    "completed_utc": "2026-08-16T09:57:47.203779+00:00",
+    "status": "completed",
+    "source_sha256": "78359f31a0c2300a2917d860b6f0e354f8a727224a5e413a7b3eaa5e68b7a1e7",
+    "preregistration_sha256": "37e8f2340d215cc74132324efbf04b6f34be645863d1d01a102baeffa8304af0",
+    "verdicts": {
+      "H1": "SUPPORTED",
+      "H2": "SUPPORTED",
+      "H3": "PARTIALLY SUPPORTED",
+      "H4": "SUPPORTED",
+      "H5": "SUPPORTED"
+    },
+    "note": "Reporting-only rerun adding runtime and class-rate fields; no experimental logic, seeds, thresholds, or verdict rules changed"
+  },
+  {
+    "started_utc": "2026-08-16T10:11:57.568511+00:00",
+    "completed_utc": "2026-08-16T10:12:01.745362+00:00",
+    "status": "completed",
+    "source_sha256": "78359f31a0c2300a2917d860b6f0e354f8a727224a5e413a7b3eaa5e68b7a1e7",
+    "preregistration_sha256": "37e8f2340d215cc74132324efbf04b6f34be645863d1d01a102baeffa8304af0",
+    "verdicts": {
+      "H1": "SUPPORTED",
+      "H2": "SUPPORTED",
+      "H3": "PARTIALLY SUPPORTED",
+      "H4": "SUPPORTED",
+      "H5": "SUPPORTED"
+    },
+    "note": "Reporting-only rerun adding runtime and class-rate fields; no experimental logic, seeds, thresholds, or verdict rules changed"
+  }
+]

@@ -1,0 +1,25 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node
+node_modules/
+web/node_modules/
+web/dist/
+dist/
+
+# Local application and agent state
+.apar/
+.superpowers/
+.worktrees/

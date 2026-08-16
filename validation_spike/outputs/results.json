@@ -1,0 +1,893 @@
+{
+  "experiment": "adaptive_payment_security_range_validation_spike",
+  "started_utc": "2026-08-16T10:11:57.568511+00:00",
+  "completed_utc": "2026-08-16T10:12:01.745362+00:00",
+  "predeclared_seeds": [
+    11,
+    23,
+    37,
+    51,
+    73
+  ],
+  "environment": {
+    "python": "3.12.13 (main, Aug  7 2026, 02:15:23) [Clang 22.1.3 ]",
+    "platform": "macOS-15.1-arm64-arm-64bit",
+    "numpy": "2.3.5",
+    "pandas": "2.2.3"
+  },
+  "hashes": {
+    "preregistration_sha256": "37e8f2340d215cc74132324efbf04b6f34be645863d1d01a102baeffa8304af0",
+    "source_sha256": "78359f31a0c2300a2917d860b6f0e354f8a727224a5e413a7b3eaa5e68b7a1e7"
+  },
+  "runtime_seconds": 4.237266874999477,
+  "reporting_note": "This run adds runtime and class-rate reporting after the initial result-producing run. Experimental logic, seeds, thresholds, and verdict rules are unchanged; both source hashes remain in run_history.json.",
+  "verdicts": {
+    "H1": "SUPPORTED",
+    "H2": "SUPPORTED",
+    "H3": "PARTIALLY SUPPORTED",
+    "H4": "SUPPORTED",
+    "H5": "SUPPORTED"
+  },
+  "aggregate": {
+    "metrics": {
+      "development": {
+        "baseline": {
+          "average_precision": {
+            "mean": 0.13717783915219733,
+            "std": 0.008817987089468945
+          },
+          "campaign_detection": {
+            "mean": 0.0,
+            "std": 0.0
+          },
+          "false_positive_rate": {
+            "mean": 0.010787855221986128,
+            "std": 0.002743266115009781
+          }
+        },
+        "temporal": {
+          "average_precision": {
+            "mean": 0.8794454977543278,
+            "std": 0.005165975012754717
+          },
+          "campaign_detection": {
+            "mean": 0.7794871794871795,
+            "std": 0.038886540738725876
+          },
+          "false_positive_rate": {
+            "mean": 0.010781875718416592,
+            "std": 0.0015936499809750815
+          }
+        }
+      },
+      "hidden": {
+        "baseline": {
+          "average_precision": {
+            "mean": 0.05821212405355843,
+            "std": 0.0031020085760742823
+          },
+          "campaign_detection": {
+            "mean": 0.0,
+            "std": 0.0
+          },
+          "false_positive_rate": {
+            "mean": 0.013752481343095552,
+            "std": 0.00466842345286586
+          }
+        },
+        "temporal": {
+          "average_precision": {
+            "mean": 0.4385500500742493,
+            "std": 0.015766861658409972
+          },
+          "campaign_detection": {
+            "mean": 0.8871794871794872,
+            "std": 0.014044168141158116
+          },
+          "false_positive_rate": {
+            "mean": 0.05010388027361355,
+            "std": 0.0033407145314644257
+          }
+        }
+      }
+    },
+    "triage": {
+      "risk_only": {
+        "heldout_mule_value_capture": {
+          "mean": 0.002128469851538827,
+          "std": 0.0029802289335543668
+        },
+        "heldout_mule_event_capture": {
+          "mean": 0.0027777777777777775,
+          "std": 0.0038036288715636536
+        },
+        "travel_share_of_reviews": {
+          "mean": 0.4755909558067831,
+          "std": 0.041653175053694196
+        },
+        "fraud_share_of_reviews": {
+          "mean": 0.5,
+          "std": 0.04331508841292192
+        }
+      },
+      "novelty_aware": {
+        "heldout_mule_value_capture": {
+          "mean": 0.04471585929354082,
+          "std": 0.023517648520596107
+        },
+        "heldout_mule_event_capture": {
+          "mean": 0.03194444444444445,
+          "std": 0.014400306495366472
+        },
+        "travel_share_of_reviews": {
+          "mean": 0.0373792394655704,
+          "std": 0.017211639353436333
+        },
+        "fraud_share_of_reviews": {
+          "mean": 0.9540082219938334,
+          "std": 0.012092442575282752
+        }
+      },
+      "random": {
+        "heldout_mule_value_capture": {
+          "mean": 0.02157787644488985,
+          "std": 0.0163287264911853
+        },
+        "heldout_mule_event_capture": {
+          "mean": 0.020833333333333336,
+          "std": 0.01388888888888889
+        },
+        "travel_share_of_reviews": {
+          "mean": 0.045971223021582734,
+          "std": 0.013997382321988484
+        },
+        "fraud_share_of_reviews": {
+          "mean": 0.07327852004110996,
+          "std": 0.023541964031434007
+        }
+      }
+    },
+    "attack_search": {
+      "evasion_seed_rate": 1.0,
+      "seeds_with_hidden_valid_evasion": 5,
+      "seeds_with_hidden_rejected_evasion": 5,
+      "mean_evasion_count": 12.8
+    },
+    "tests": {
+      "id_permutation_invariance": {
+        "passed": 5,
+        "total": 5
+      },
+      "future_event_independence": {
+        "passed": 5,
+        "total": 5
+      },
+      "metadata_removal_invariance": {
+        "passed": 5,
+        "total": 5
+      },
+      "all_forbidden_features_rejected": {
+        "passed": 5,
+        "total": 5
+      },
+      "equal_source_timestamp_rejected": {
+        "passed": 5,
+        "total": 5
+      },
+      "future_source_timestamp_rejected": {
+        "passed": 5,
+        "total": 5
+      },
+      "clean_event_time_check": {
+        "passed": 5,
+        "total": 5
+      },
+      "chronological_split": {
+        "passed": 5,
+        "total": 5
+      },
+      "campaign_isolation": {
+        "passed": 5,
+        "total": 5
+      }
+    },
+    "event_counts": {
+      "development_total": {
+        "mean": 6968.0,
+        "std": 0.0
+      },
+      "development_train": {
+        "mean": 4282.6,
+        "std": 38.875442119672414
+      },
+      "development_test": {
+        "mean": 2685.4,
+        "std": 38.875442119672414
+      },
+      "hidden_total": {
+        "mean": 6988.6,
+        "std": 14.010710188994704
+      },
+      "development_fraud_rate": {
+        "mean": 0.11021814006888633,
+        "std": 0.0
+      },
+      "development_train_fraud_rate": {
+        "mean": 0.09807776692477807,
+        "std": 0.000895339439558809
+      },
+      "development_test_fraud_rate": {
+        "mean": 0.12961117555118803,
+        "std": 0.0018602603599948261
+      },
+      "hidden_fraud_rate": {
+        "mean": 0.0678249612803421,
+        "std": 0.00013600351471360994
+      },
+      "hidden_travel": {
+        "mean": 314.6,
+        "std": 14.010710188994702
+      }
+    },
+    "hypothesis_inputs": {
+      "h1_development_ap_gain": 0.7422676586021304,
+      "h1_development_campaign_detection_gain": 0.7794871794871795,
+      "h2_hidden_ap_gain": 0.3803379260206909,
+      "h2_hidden_gain_fraction_of_development": 0.5123999700282769,
+      "h3_novelty_minus_risk_value_capture": 0.042587389442001994,
+      "h3_novelty_minus_risk_travel_share": -0.4382117163412127
+    }
+  },
+  "per_seed": [
+    {
+      "seed": 11,
+      "event_counts": {
+        "development_total": 6968,
+        "development_train": 4324,
+        "development_test": 2644,
+        "hidden_total": 6993,
+        "development_fraud_events": 768,
+        "development_train_fraud_events": 420,
+        "development_test_fraud_events": 348,
+        "hidden_fraud_events": 474,
+        "development_fraud_rate": 0.11021814006888633,
+        "development_train_fraud_rate": 0.0971322849213691,
+        "development_test_fraud_rate": 0.13161875945537066,
+        "hidden_fraud_rate": 0.06778206778206779,
+        "hidden_travel": 319,
+        "development_campaigns": 89,
+        "hidden_campaigns": 39
+      },
+      "thresholds": {
+        "baseline": 0.7092822677016978,
+        "temporal": 0.6246206145324769
+      },
+      "metrics": {
+        "development": {
+          "baseline": {
+            "average_precision": 0.1345712726374964,
+            "campaign_detection": 0.0,
+            "false_positive_rate": 0.014808362369337979
+          },
+          "temporal": {
+            "average_precision": 0.8801628284086265,
+            "campaign_detection": 0.7948717948717948,
+            "false_positive_rate": 0.009581881533101045
+          }
+        },
+        "hidden": {
+          "baseline": {
+            "average_precision": 0.06164942264486086,
+            "campaign_detection": 0.0,
+            "false_positive_rate": 0.02024850437183617
+          },
+          "temporal": {
+            "average_precision": 0.45375293468287686,
+            "campaign_detection": 0.8974358974358975,
+            "false_positive_rate": 0.04924068108605614
+          }
+        }
+      },
+      "triage": {
+        "risk_only": {
+          "heldout_mule_value_capture": 0.00620128219862349,
+          "heldout_mule_event_capture": 0.006944444444444444,
+          "travel_share_of_reviews": 0.4316546762589928,
+          "fraud_share_of_reviews": 0.5467625899280576,
+          "capacity": 139
+        },
+        "novelty_aware": {
+          "heldout_mule_value_capture": 0.06416632800920358,
+          "heldout_mule_event_capture": 0.041666666666666664,
+          "travel_share_of_reviews": 0.02877697841726619,
+          "fraud_share_of_reviews": 0.9640287769784173,
+          "capacity": 139
+        },
+        "random": {
+          "heldout_mule_value_capture": 0.03321583992777414,
+          "heldout_mule_event_capture": 0.034722222222222224,
+          "travel_share_of_reviews": 0.050359712230215826,
+          "fraud_share_of_reviews": 0.06474820143884892,
+          "capacity": 139
+        }
+      },
+      "attack_search": {
+        "query_budget": 40,
+        "queries_used": 40,
+        "evasion_found": true,
+        "evasion_count": 10,
+        "hidden_valid_evasion_count": 2,
+        "hidden_rejected_evasion_count": 8,
+        "selected_visible_best": {
+          "query": 12,
+          "visible_valid": true,
+          "evaded": true,
+          "hidden_valid": true,
+          "hidden_reasons": [],
+          "visible_utility": 1026.0,
+          "params": {
+            "total_value": 1100,
+            "splits": 3,
+            "spacing_minutes": 5,
+            "accounts": 4,
+            "warmup_days": 7,
+            "shared_device": true,
+            "trusted_device": false,
+            "beneficiary_count": 1,
+            "capability_trusted_device": false
+          }
+        },
+        "all_hidden_rejection_reasons": [
+          "hidden_execution_duration_240m",
+          "hidden_maximum_12_splits",
+          "hidden_maximum_14d_warmup",
+          "hidden_minimum_value_700",
+          "hidden_missing_trusted_device_capability"
+        ]
+      },
+      "tests": {
+        "id_permutation_invariance": true,
+        "future_event_independence": true,
+        "metadata_removal_invariance": true,
+        "deliberate_forbidden_features": [
+          "generator_regime_code",
+          "scenario_id_code",
+          "future_campaign_total"
+        ],
+        "rejected_forbidden_features": [
+          "generator_regime_code",
+          "scenario_id_code",
+          "future_campaign_total"
+        ],
+        "all_forbidden_features_rejected": true,
+        "equal_source_timestamp_rejected": true,
+        "future_source_timestamp_rejected": true,
+        "clean_event_time_check": true,
+        "chronological_split": true,
+        "campaign_isolation": true
+      },
+      "runtime_seconds": 1.4036120840000876
+    },
+    {
+      "seed": 23,
+      "event_counts": {
+        "development_total": 6968,
+        "development_train": 4303,
+        "development_test": 2665,
+        "hidden_total": 6974,
+        "development_fraud_events": 768,
+        "development_train_fraud_events": 420,
+        "development_test_fraud_events": 348,
+        "hidden_fraud_events": 474,
+        "development_fraud_rate": 0.11021814006888633,
+        "development_train_fraud_rate": 0.09760632117127585,
+        "development_test_fraud_rate": 0.13058161350844277,
+        "hidden_fraud_rate": 0.06796673358187554,
+        "hidden_travel": 300,
+        "development_campaigns": 89,
+        "hidden_campaigns": 39
+      },
+      "thresholds": {
+        "baseline": 0.6559140506032372,
+        "temporal": 0.6034006811172704
+      },
+      "metrics": {
+        "development": {
+          "baseline": {
+            "average_precision": 0.12638913111525607,
+            "campaign_detection": 0.0,
+            "false_positive_rate": 0.010358221838584376
+          },
+          "temporal": {
+            "average_precision": 0.8832427184761129,
+            "campaign_detection": 0.8205128205128205,
+            "false_positive_rate": 0.013379369874838154
+          }
+        },
+        "hidden": {
+          "baseline": {
+            "average_precision": 0.057122872591747684,
+            "campaign_detection": 0.0,
+            "false_positive_rate": 0.012461538461538461
+          },
+          "temporal": {
+            "average_precision": 0.45679867624135356,
+            "campaign_detection": 0.8974358974358975,
+            "false_positive_rate": 0.054
+          }
+        }
+      },
+      "triage": {
+        "risk_only": {
+          "heldout_mule_value_capture": 0.004441067059070644,
+          "heldout_mule_event_capture": 0.006944444444444444,
+          "travel_share_of_reviews": 0.4460431654676259,
+          "fraud_share_of_reviews": 0.539568345323741,
+          "capacity": 139
+        },
+        "novelty_aware": {
+          "heldout_mule_value_capture": 0.04259862808585369,
+          "heldout_mule_event_capture": 0.034722222222222224,
+          "travel_share_of_reviews": 0.02877697841726619,
+          "fraud_share_of_reviews": 0.9568345323741008,
+          "capacity": 139
+        },
+        "random": {
+          "heldout_mule_value_capture": 0.005555714742074031,
+          "heldout_mule_event_capture": 0.006944444444444444,
+          "travel_share_of_reviews": 0.050359712230215826,
+          "fraud_share_of_reviews": 0.04316546762589928,
+          "capacity": 139
+        }
+      },
+      "attack_search": {
+        "query_budget": 40,
+        "queries_used": 40,
+        "evasion_found": true,
+        "evasion_count": 14,
+        "hidden_valid_evasion_count": 6,
+        "hidden_rejected_evasion_count": 8,
+        "selected_visible_best": {
+          "query": 35,
+          "visible_valid": true,
+          "evaded": true,
+          "hidden_valid": true,
+          "hidden_reasons": [],
+          "visible_utility": 1046.0,
+          "params": {
+            "total_value": 1100,
+            "splits": 3,
+            "spacing_minutes": 45,
+            "accounts": 3,
+            "warmup_days": 3,
+            "shared_device": false,
+            "trusted_device": false,
+            "beneficiary_count": 2,
+            "capability_trusted_device": false
+          }
+        },
+        "all_hidden_rejection_reasons": [
+          "hidden_execution_duration_240m",
+          "hidden_maximum_12_splits",
+          "hidden_maximum_14d_warmup",
+          "hidden_minimum_value_700",
+          "hidden_missing_trusted_device_capability"
+        ]
+      },
+      "tests": {
+        "id_permutation_invariance": true,
+        "future_event_independence": true,
+        "metadata_removal_invariance": true,
+        "deliberate_forbidden_features": [
+          "generator_regime_code",
+          "scenario_id_code",
+          "future_campaign_total"
+        ],
+        "rejected_forbidden_features": [
+          "generator_regime_code",
+          "scenario_id_code",
+          "future_campaign_total"
+        ],
+        "all_forbidden_features_rejected": true,
+        "equal_source_timestamp_rejected": true,
+        "future_source_timestamp_rejected": true,
+        "clean_event_time_check": true,
+        "chronological_split": true,
+        "campaign_isolation": true
+      },
+      "runtime_seconds": 0.7798400829997263
+    },
+    {
+      "seed": 37,
+      "event_counts": {
+        "development_total": 6968,
+        "development_train": 4271,
+        "development_test": 2697,
+        "hidden_total": 7005,
+        "development_fraud_events": 768,
+        "development_train_fraud_events": 420,
+        "development_test_fraud_events": 348,
+        "hidden_fraud_events": 474,
+        "development_fraud_rate": 0.11021814006888633,
+        "development_train_fraud_rate": 0.09833762584874736,
+        "development_test_fraud_rate": 0.12903225806451613,
+        "hidden_fraud_rate": 0.06766595289079229,
+        "hidden_travel": 331,
+        "development_campaigns": 89,
+        "hidden_campaigns": 39
+      },
+      "thresholds": {
+        "baseline": 0.7332050711758171,
+        "temporal": 0.6235291454546992
+      },
+      "metrics": {
+        "development": {
+          "baseline": {
+            "average_precision": 0.14983999232560963,
+            "campaign_detection": 0.0,
+            "false_positive_rate": 0.008514261387824606
+          },
+          "temporal": {
+            "average_precision": 0.8808490842802136,
+            "campaign_detection": 0.7948717948717948,
+            "false_positive_rate": 0.011068539804171988
+          }
+        },
+        "hidden": {
+          "baseline": {
+            "average_precision": 0.05402300325551347,
+            "campaign_detection": 0.0,
+            "false_positive_rate": 0.008880722707089266
+          },
+          "temporal": {
+            "average_precision": 0.43231471206906485,
+            "campaign_detection": 0.8717948717948718,
+            "false_positive_rate": 0.05282498851630684
+          }
+        }
+      },
+      "triage": {
+        "risk_only": {
+          "heldout_mule_value_capture": 0.0,
+          "heldout_mule_event_capture": 0.0,
+          "travel_share_of_reviews": 0.4642857142857143,
+          "fraud_share_of_reviews": 0.5,
+          "capacity": 140
+        },
+        "novelty_aware": {
+          "heldout_mule_value_capture": 0.0651830837155893,
+          "heldout_mule_event_capture": 0.041666666666666664,
+          "travel_share_of_reviews": 0.02142857142857143,
+          "fraud_share_of_reviews": 0.9642857142857143,
+          "capacity": 140
+        },
+        "random": {
+          "heldout_mule_value_capture": 0.04106990099842374,
+          "heldout_mule_event_capture": 0.034722222222222224,
+          "travel_share_of_reviews": 0.05,
+          "fraud_share_of_reviews": 0.07142857142857142,
+          "capacity": 140
+        }
+      },
+      "attack_search": {
+        "query_budget": 40,
+        "queries_used": 40,
+        "evasion_found": true,
+        "evasion_count": 12,
+        "hidden_valid_evasion_count": 2,
+        "hidden_rejected_evasion_count": 10,
+        "selected_visible_best": {
+          "query": 13,
+          "visible_valid": true,
+          "evaded": true,
+          "hidden_valid": false,
+          "hidden_reasons": [
+            "hidden_execution_duration_240m",
+            "hidden_maximum_12_splits"
+          ],
+          "visible_utility": 1002.0,
+          "params": {
+            "total_value": 1100,
+            "splits": 14,
+            "spacing_minutes": 45,
+            "accounts": 3,
+            "warmup_days": 3,
+            "shared_device": false,
+            "trusted_device": false,
+            "beneficiary_count": 4,
+            "capability_trusted_device": false
+          }
+        },
+        "all_hidden_rejection_reasons": [
+          "hidden_execution_duration_240m",
+          "hidden_maximum_12_splits",
+          "hidden_maximum_14d_warmup",
+          "hidden_minimum_value_700",
+          "hidden_missing_trusted_device_capability"
+        ]
+      },
+      "tests": {
+        "id_permutation_invariance": true,
+        "future_event_independence": true,
+        "metadata_removal_invariance": true,
+        "deliberate_forbidden_features": [
+          "generator_regime_code",
+          "scenario_id_code",
+          "future_campaign_total"
+        ],
+        "rejected_forbidden_features": [
+          "generator_regime_code",
+          "scenario_id_code",
+          "future_campaign_total"
+        ],
+        "all_forbidden_features_rejected": true,
+        "equal_source_timestamp_rejected": true,
+        "future_source_timestamp_rejected": true,
+        "clean_event_time_check": true,
+        "chronological_split": true,
+        "campaign_isolation": true
+      },
+      "runtime_seconds": 0.5188451670001086
+    },
+    {
+      "seed": 51,
+      "event_counts": {
+        "development_total": 6968,
+        "development_train": 4222,
+        "development_test": 2746,
+        "hidden_total": 6997,
+        "development_fraud_events": 768,
+        "development_train_fraud_events": 420,
+        "development_test_fraud_events": 348,
+        "hidden_fraud_events": 474,
+        "development_fraud_rate": 0.11021814006888633,
+        "development_train_fraud_rate": 0.0994789199431549,
+        "development_test_fraud_rate": 0.12672978878368535,
+        "hidden_fraud_rate": 0.06774331856509933,
+        "hidden_travel": 323,
+        "development_campaigns": 89,
+        "hidden_campaigns": 39
+      },
+      "thresholds": {
+        "baseline": 0.7285270355833753,
+        "temporal": 0.6414588107555604
+      },
+      "metrics": {
+        "development": {
+          "baseline": {
+            "average_precision": 0.14123481436231658,
+            "campaign_detection": 0.0,
+            "false_positive_rate": 0.012093411175979984
+          },
+          "temporal": {
+            "average_precision": 0.882500308981858,
+            "campaign_detection": 0.7692307692307693,
+            "false_positive_rate": 0.010425354462051709
+          }
+        },
+        "hidden": {
+          "baseline": {
+            "average_precision": 0.060899696439853504,
+            "campaign_detection": 0.0,
+            "false_positive_rate": 0.016710102713475394
+          },
+          "temporal": {
+            "average_precision": 0.4217018881779154,
+            "campaign_detection": 0.8717948717948718,
+            "false_positive_rate": 0.04568450099647402
+          }
+        }
+      },
+      "triage": {
+        "risk_only": {
+          "heldout_mule_value_capture": 0.0,
+          "heldout_mule_event_capture": 0.0,
+          "travel_share_of_reviews": 0.5323741007194245,
+          "fraud_share_of_reviews": 0.45323741007194246,
+          "capacity": 139
+        },
+        "novelty_aware": {
+          "heldout_mule_value_capture": 0.04447267833520598,
+          "heldout_mule_event_capture": 0.034722222222222224,
+          "travel_share_of_reviews": 0.04316546762589928,
+          "fraud_share_of_reviews": 0.9496402877697842,
+          "capacity": 139
+        },
+        "random": {
+          "heldout_mule_value_capture": 0.02351857085757576,
+          "heldout_mule_event_capture": 0.020833333333333332,
+          "travel_share_of_reviews": 0.02158273381294964,
+          "fraud_share_of_reviews": 0.07913669064748201,
+          "capacity": 139
+        }
+      },
+      "attack_search": {
+        "query_budget": 40,
+        "queries_used": 40,
+        "evasion_found": true,
+        "evasion_count": 12,
+        "hidden_valid_evasion_count": 3,
+        "hidden_rejected_evasion_count": 9,
+        "selected_visible_best": {
+          "query": 16,
+          "visible_valid": true,
+          "evaded": true,
+          "hidden_valid": true,
+          "hidden_reasons": [],
+          "visible_utility": 1034.0,
+          "params": {
+            "total_value": 1100,
+            "splits": 3,
+            "spacing_minutes": 30,
+            "accounts": 4,
+            "warmup_days": 3,
+            "shared_device": true,
+            "trusted_device": false,
+            "beneficiary_count": 4,
+            "capability_trusted_device": false
+          }
+        },
+        "all_hidden_rejection_reasons": [
+          "hidden_execution_duration_240m",
+          "hidden_maximum_12_splits",
+          "hidden_maximum_14d_warmup",
+          "hidden_minimum_value_700",
+          "hidden_missing_trusted_device_capability"
+        ]
+      },
+      "tests": {
+        "id_permutation_invariance": true,
+        "future_event_independence": true,
+        "metadata_removal_invariance": true,
+        "deliberate_forbidden_features": [
+          "generator_regime_code",
+          "scenario_id_code",
+          "future_campaign_total"
+        ],
+        "rejected_forbidden_features": [
+          "generator_regime_code",
+          "scenario_id_code",
+          "future_campaign_total"
+        ],
+        "all_forbidden_features_rejected": true,
+        "equal_source_timestamp_rejected": true,
+        "future_source_timestamp_rejected": true,
+        "clean_event_time_check": true,
+        "chronological_split": true,
+        "campaign_isolation": true
+      },
+      "runtime_seconds": 0.468610582999645
+    },
+    {
+      "seed": 73,
+      "event_counts": {
+        "development_total": 6968,
+        "development_train": 4293,
+        "development_test": 2675,
+        "hidden_total": 6974,
+        "development_fraud_events": 768,
+        "development_train_fraud_events": 420,
+        "development_test_fraud_events": 348,
+        "hidden_fraud_events": 474,
+        "development_fraud_rate": 0.11021814006888633,
+        "development_train_fraud_rate": 0.09783368273934312,
+        "development_test_fraud_rate": 0.13009345794392524,
+        "hidden_fraud_rate": 0.06796673358187554,
+        "hidden_travel": 300,
+        "development_campaigns": 89,
+        "hidden_campaigns": 39
+      },
+      "thresholds": {
+        "baseline": 0.7082335207362407,
+        "temporal": 0.637555978065809
+      },
+      "metrics": {
+        "development": {
+          "baseline": {
+            "average_precision": 0.13385398532030796,
+            "campaign_detection": 0.0,
+            "false_positive_rate": 0.008165019338203695
+          },
+          "temporal": {
+            "average_precision": 0.8704725486248286,
+            "campaign_detection": 0.717948717948718,
+            "false_positive_rate": 0.009454232917920068
+          }
+        },
+        "hidden": {
+          "baseline": {
+            "average_precision": 0.057365625335816676,
+            "campaign_detection": 0.0,
+            "false_positive_rate": 0.010461538461538461
+          },
+          "temporal": {
+            "average_precision": 0.4281820392000357,
+            "campaign_detection": 0.8974358974358975,
+            "false_positive_rate": 0.048769230769230766
+          }
+        }
+      },
+      "triage": {
+        "risk_only": {
+          "heldout_mule_value_capture": 0.0,
+          "heldout_mule_event_capture": 0.0,
+          "travel_share_of_reviews": 0.5035971223021583,
+          "fraud_share_of_reviews": 0.460431654676259,
+          "capacity": 139
+        },
+        "novelty_aware": {
+          "heldout_mule_value_capture": 0.007158578321851579,
+          "heldout_mule_event_capture": 0.006944444444444444,
+          "travel_share_of_reviews": 0.06474820143884892,
+          "fraud_share_of_reviews": 0.935251798561151,
+          "capacity": 139
+        },
+        "random": {
+          "heldout_mule_value_capture": 0.004529355698601571,
+          "heldout_mule_event_capture": 0.006944444444444444,
+          "travel_share_of_reviews": 0.05755395683453238,
+          "fraud_share_of_reviews": 0.1079136690647482,
+          "capacity": 139
+        }
+      },
+      "attack_search": {
+        "query_budget": 40,
+        "queries_used": 40,
+        "evasion_found": true,
+        "evasion_count": 16,
+        "hidden_valid_evasion_count": 4,
+        "hidden_rejected_evasion_count": 12,
+        "selected_visible_best": {
+          "query": 36,
+          "visible_valid": true,
+          "evaded": true,
+          "hidden_valid": false,
+          "hidden_reasons": [
+            "hidden_maximum_14d_warmup"
+          ],
+          "visible_utility": 1022.0,
+          "params": {
+            "total_value": 1100,
+            "splits": 3,
+            "spacing_minutes": 60,
+            "accounts": 2,
+            "warmup_days": 21,
+            "shared_device": true,
+            "trusted_device": false,
+            "beneficiary_count": 1,
+            "capability_trusted_device": true
+          }
+        },
+        "all_hidden_rejection_reasons": [
+          "hidden_execution_duration_240m",
+          "hidden_maximum_12_splits",
+          "hidden_maximum_14d_warmup",
+          "hidden_minimum_value_700",
+          "hidden_missing_trusted_device_capability"
+        ]
+      },
+      "tests": {
+        "id_permutation_invariance": true,
+        "future_event_independence": true,
+        "metadata_removal_invariance": true,
+        "deliberate_forbidden_features": [
+          "generator_regime_code",
+          "scenario_id_code",
+          "future_campaign_total"
+        ],
+        "rejected_forbidden_features": [
+          "generator_regime_code",
+          "scenario_id_code",
+          "future_campaign_total"
+        ],
+        "all_forbidden_features_rejected": true,
+        "equal_source_timestamp_rejected": true,
+        "future_source_timestamp_rejected": true,
+        "clean_event_time_check": true,
+        "chronological_split": true,
+        "campaign_isolation": true
+      },
+      "runtime_seconds": 1.004443457999514
+    }
+  ]
+}

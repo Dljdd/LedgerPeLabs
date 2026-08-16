@@ -1,0 +1,14 @@
+flowchart LR
+    Source[Versioned source events] --> Availability[Availability-time gate]
+    Availability --> State[Past-only feature state]
+    State --> Bundle[Serialized preprocessing and model]
+    Bundle --> Score[Score and reason codes]
+    Score --> Policy[Versioned action policy]
+    Policy --> Decision[Decision artifact]
+    Source --> Provenance[Source event IDs]
+    State --> Provenance
+    Bundle --> Provenance
+    Policy --> Provenance
+    Decision --> Provenance
+    Provenance --> Store[(Immutable run store)]
+

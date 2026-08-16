@@ -1,0 +1,19 @@
+sequenceDiagram
+    participant A as Threat analyst
+    participant R as Registry
+    participant C as Scenario compiler
+    participant S as Simulator
+    participant T as Trust and defense plane
+    participant E as Evaluator
+    participant H as Human reviewer
+    A->>R: Submit evidence-backed threat card
+    R-->>A: Review and coverage result
+    A->>C: Approve scenario compilation
+    C->>S: Versioned scenario bundle
+    S->>T: Ordered payment and control events
+    T-->>S: Bounded decision feedback
+    S->>E: Events, decisions, lineage and costs
+    T->>E: Model bundle, actions and reasons
+    E->>H: Hidden results and gate report
+    H-->>E: Approve, reject or request changes
+

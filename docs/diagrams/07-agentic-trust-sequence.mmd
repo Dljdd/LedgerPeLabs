@@ -1,0 +1,21 @@
+sequenceDiagram
+    participant U as User or consent service
+    participant A as Registered agent
+    participant V as Trust verifier
+    participant R as Risk controls
+    participant O as Decision owner
+    U->>A: Signed mandate and consent reference
+    A->>V: Signed request, cart, token scope, nonce and expiry
+    V->>V: Verify identity and signature
+    V->>V: Verify mandate, merchant, payee, amount and category
+    V->>V: Verify cart and payment-intent binding
+    V->>V: Verify nonce, expiry and replay state
+    alt Integrity failure
+        V-->>A: Reject with deterministic reason
+    else Integrity passes
+        V->>R: Verified request and integrity evidence
+        R->>O: Risk, recommended action and reasons
+        O-->>A: Approve, challenge or decline
+        A->>V: Signed execution receipt
+    end
+

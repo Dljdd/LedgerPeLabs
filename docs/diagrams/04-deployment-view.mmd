@@ -1,0 +1,15 @@
+flowchart LR
+    Browser[Judge browser] --> Web[Local web application]
+    Web --> API[Application API]
+    API --> Orchestrator[Run orchestrator]
+    Orchestrator --> Registry[(Threat and scenario store)]
+    Orchestrator --> Replay[Event replay engine]
+    Replay --> State[(Feature state)]
+    Replay --> Score[Trust, rules and model scoring]
+    Replay --> Graph[Async graph and case worker]
+    Score --> Artifacts[(Immutable artifact store)]
+    Graph --> Artifacts
+    Orchestrator --> Eval[Evaluation worker]
+    Eval --> Artifacts
+    Web --> Artifacts
+

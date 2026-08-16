@@ -1,0 +1,18 @@
+flowchart TB
+    DevGen[Development generator] --> Train[Chronological training]
+    DevGen --> Cal[Past-only calibration]
+    DevGen --> DevTest[Development test]
+    Train --> Freeze[Freeze model and policy bundle]
+    Cal --> Freeze
+    Freeze --> DevTest
+    Freeze --> Shift[Known benign and mechanism shifts]
+    Freeze --> Cold[Cold-entity tests]
+    Freeze --> Unknown[Held-out attack family]
+    HiddenGen[Separately implemented hidden generator] --> Hidden[Hidden test]
+    Freeze --> Hidden
+    DevTest --> Gate[Independent promotion gate]
+    Shift --> Gate
+    Cold --> Gate
+    Unknown --> Gate
+    Hidden --> Gate
+

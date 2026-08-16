@@ -1,0 +1,12 @@
+flowchart LR
+    Events[Decision and payment events] --> Link[Entity and temporal linking]
+    Link --> Candidate[Campaign candidate]
+    Candidate --> Group[Deduplicate and group]
+    Group --> Case[Investigator case]
+    Case --> Evidence[Chronology, entities, flow and reasons]
+    Evidence --> Disposition{Disposition}
+    Disposition -->|Fraud or scam| Mature[Delayed matured label]
+    Disposition -->|Legitimate| Benign[Benign outcome]
+    Mature --> Feedback[Future training window]
+    Benign --> Feedback
+

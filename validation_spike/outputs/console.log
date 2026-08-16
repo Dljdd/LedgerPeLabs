@@ -1,0 +1,21 @@
+Adaptive Payment Security Range validation spike
+Seeds: [11, 23, 37, 51, 73]
+Preregistration SHA256: 37e8f2340d215cc74132324efbf04b6f34be645863d1d01a102baeffa8304af0
+Seed 11: dev AP 0.135/0.880; hidden AP 0.062/0.454; runtime 1.404s
+Seed 23: dev AP 0.126/0.883; hidden AP 0.057/0.457; runtime 0.780s
+Seed 37: dev AP 0.150/0.881; hidden AP 0.054/0.432; runtime 0.519s
+Seed 51: dev AP 0.141/0.883; hidden AP 0.061/0.422; runtime 0.469s
+Seed 73: dev AP 0.134/0.870; hidden AP 0.057/0.428; runtime 1.004s
+
+Verdicts:
+  H1: SUPPORTED
+  H2: SUPPORTED
+  H3: PARTIALLY SUPPORTED
+  H4: SUPPORTED
+  H5: SUPPORTED
+
+Development AP gain: +0.742
+Hidden AP gain: +0.380
+Novelty minus risk-only mule value capture: +0.043
+Evasion seed rate: 100%
+Total runtime: 4.237s
