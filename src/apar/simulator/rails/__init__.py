@@ -1,5 +1,5 @@
 """Public rail-adapter boundary for simulation engines."""
 
-from apar.simulator.rails.base import RailAdapter
+from apar.simulator.rails.base import LedgerReader, RailAdapter, RailContext, RandomCapability
 
-__all__ = ["RailAdapter"]
+__all__ = ["LedgerReader", "RailAdapter", "RailContext", "RandomCapability"]
