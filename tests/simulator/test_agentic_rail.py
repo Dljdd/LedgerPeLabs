@@ -27,8 +27,9 @@ from apar.simulator.rails.base import FrozenState, LifecycleError
 from apar.trust.verifier import (
     AgentMandate,
     AgentPaymentRequest,
+    AuthenticationEvidence,
+    AuthenticationOutcome,
     AuthenticationRequirement,
-    AuthenticationState,
     IntegrityReceipt,
     ReceiptOutcome,
     TrustVerifier,
@@ -65,6 +66,8 @@ def _mandate() -> AgentMandate:
         agent_id=AGENT_ID,
         user_ref="user-1",
         consent_ref="consent-1",
+        user_entity_id=ACTOR_ID,
+        beneficiary_entity_id=COUNTERPARTY_ID,
         merchant_id=MERCHANT_ID,
         payee_id=PAYEE_ID,
         cart_hash=CART_HASH,
@@ -100,7 +103,7 @@ def _request(**updates: object) -> AgentPaymentRequest:
         "credential_id": CREDENTIAL_ID,
         "credential_scope": CREDENTIAL_SCOPE,
         "consent_ref": "consent-1",
-        "authentication_state": AuthenticationState.STEP_UP_SATISFIED,
+        "authentication_evidence_ref": "auth-evidence-1",
         "nonce": "nonce-1",
         "created_at": NOW,
         "expires_at": NOW + timedelta(minutes=5),
@@ -123,6 +126,20 @@ def _verifier() -> TrustVerifier:
     return TrustVerifier(
         registered_agents={(AGENT_ID, KEY_ID): public_key},
         mandates={MANDATE_ID: _mandate()},
+        authentication_evidence={
+            "auth-evidence-1": AuthenticationEvidence(
+                evidence_id="auth-evidence-1",
+                agent_id=AGENT_ID,
+                user_ref=USER_REF,
+                mandate_id=MANDATE_ID,
+                nonce="nonce-1",
+                payment_intent_hash=PAYMENT_INTENT_HASH,
+                request_id="request-1",
+                outcome=AuthenticationOutcome.STEP_UP_VERIFIED,
+                issued_at=NOW - timedelta(seconds=5),
+                expires_at=NOW + timedelta(minutes=2),
+            )
+        },
     )
 
 
@@ -205,6 +222,15 @@ def test_success_scores_once_posts_once_and_persists_closed_nonce_state() -> Non
     assert isinstance(state, Mapping)
     assert state["version"] == 1
     assert isinstance(state["records"], tuple)
+    assert events[0].actor_id == ACTOR_ID
+    assert events[0].counterparty_id == COUNTERPARTY_ID
+    assert events[0].party_refs == {
+        "user_ref": USER_REF,
+        "merchant_id": MERCHANT_ID,
+        "payee_id": PAYEE_ID,
+        "user_entity_id": ACTOR_ID,
+        "beneficiary_entity_id": COUNTERPARTY_ID,
+    }
 
 
 def test_nonce_replay_declines_without_second_score_or_post() -> None:
@@ -254,6 +280,30 @@ def test_challenge_emits_semantic_challenge_event_and_outcome_receipt() -> None:
     assert engine.ledger.entries == ()
 
 
+@pytest.mark.parametrize(
+    "identity_update",
+    [
+        {"actor_id": "00000000-0000-4000-8000-000000000399"},
+        {"counterparty_id": "00000000-0000-4000-8000-000000000398"},
+    ],
+)
+def test_substituted_graph_identity_fails_before_score_or_effect(
+    identity_update: dict[str, object],
+) -> None:
+    scorer = Mock(return_value=Action.APPROVE)
+    request = _request(**identity_update)
+    engine = _engine(scorer)
+    engine.schedule(NOW, 0, _command(request))
+
+    event = engine.run()[0]
+
+    assert event.rail_data["reason_code"] == "AUTHORITY_IDENTITY_MISMATCH"
+    scorer.assert_not_called()
+    assert engine.ledger.entries == ()
+    with pytest.raises(KeyError):
+        engine.entity_state(AGENTIC_TRUST_STATE_ID)
+
+
 def test_scorer_exception_leaves_nonce_state_unchanged_and_retry_succeeds() -> None:
     verifier = _verifier()
     state_before = verifier.dump_state()
@@ -273,14 +323,17 @@ def test_scorer_exception_leaves_nonce_state_unchanged_and_retry_succeeds() -> N
 
     assert verifier.dump_state() == state_before
     abandoned = cast(IntegrityReceipt, captured_receipts[0])
-    rejected_commit = verifier.commit(_request(), abandoned, ReceiptOutcome.APPROVE)
+    rejected_commit = verifier.commit(
+        _request(), abandoned, ReceiptOutcome.APPROVE, NOW
+    )
     assert rejected_commit.reason_code is ReasonCode.EXECUTION_RECEIPT_MISMATCH
     retry = AgenticRailAdapter(
         verifier,
         lambda _request, _receipt: Action.APPROVE,
     ).process(_request(), now=NOW)
     assert retry.action is Action.APPROVE
-    assert retry.integrity_receipt.outcome is ReceiptOutcome.APPROVE
+    assert retry.integrity_receipt.outcome is ReceiptOutcome.PREVIEW
+    assert verifier.dump_state() == state_before
 
 
 @pytest.mark.parametrize("bad_output", [None, "approve", 0.5, float("nan")])
@@ -298,6 +351,77 @@ def test_malformed_or_nonfinite_scorer_output_is_failure_atomic(
         adapter.process(_request(), now=NOW)
 
     assert verifier.dump_state() == state_before
+
+
+def test_approve_overdraft_leaves_verifier_ledger_event_and_entity_state_empty() -> None:
+    scorer = Mock(return_value=Action.APPROVE)
+    verifier = _verifier()
+    adapter = AgenticRailAdapter(verifier, scorer)
+    engine = SimulationEngine(
+        _bundle(),
+        {Rail.AGENTIC: lambda: adapter},
+        opening_balances={USER_REF: Decimal("5.00")},
+    )
+    engine.schedule(NOW, 0, _command())
+    state_before = verifier.dump_state()
+
+    with pytest.raises(ValueError, match="overdraw"):
+        engine.run()
+
+    assert verifier.dump_state() == state_before
+    assert engine.ledger.entries == ()
+    assert engine._events == []
+    assert AGENTIC_TRUST_STATE_ID not in engine._entity_state
+
+    retry = SimulationEngine(
+        _bundle(),
+        {Rail.AGENTIC: lambda: AgenticRailAdapter(verifier, scorer)},
+        opening_balances={USER_REF: Decimal("100.00")},
+    )
+    retry.schedule(NOW, 0, _command())
+
+    event = retry.run()[0]
+
+    assert event.rail_data["receipt_outcome"] == ReceiptOutcome.APPROVE.value
+    assert len(retry.ledger.entries) == 1
+
+
+def test_unexpected_ledger_post_failure_does_not_commit_receipt_or_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scorer = Mock(return_value=Action.APPROVE)
+    verifier = _verifier()
+    adapter = AgenticRailAdapter(verifier, scorer)
+    engine = SimulationEngine(
+        _bundle(),
+        {Rail.AGENTIC: lambda: adapter},
+        opening_balances={USER_REF: Decimal("100.00")},
+    )
+    engine.schedule(NOW, 0, _command())
+    state_before = verifier.dump_state()
+
+    def reject_post(_entry: object) -> None:
+        raise ValueError("synthetic posting validation error")
+
+    monkeypatch.setattr(engine._ledger, "post", reject_post)
+    with pytest.raises(ValueError, match="posting validation"):
+        engine.run()
+
+    assert verifier.dump_state() == state_before
+    assert engine._events == []
+    assert AGENTIC_TRUST_STATE_ID not in engine._entity_state
+
+    retry = SimulationEngine(
+        _bundle(),
+        {Rail.AGENTIC: lambda: AgenticRailAdapter(verifier, scorer)},
+        opening_balances={USER_REF: Decimal("100.00")},
+    )
+    retry.schedule(NOW, 0, _command())
+
+    event = retry.run()[0]
+
+    assert event.rail_data["receipt_outcome"] == ReceiptOutcome.APPROVE.value
+    assert len(retry.ledger.entries) == 1
 
 
 def test_agentic_receipts_and_events_replay_deterministically() -> None:

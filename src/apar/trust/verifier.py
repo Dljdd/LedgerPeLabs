@@ -117,10 +117,8 @@ class AuthenticationRequirement(StrEnum):
     STEP_UP = "step_up"
 
 
-class AuthenticationState(StrEnum):
-    NOT_REQUIRED = "not_required"
-    NOT_PERFORMED = "not_performed"
-    STEP_UP_SATISFIED = "step_up_satisfied"
+class AuthenticationOutcome(StrEnum):
+    STEP_UP_VERIFIED = "step_up_verified"
 
 
 class ReceiptOutcome(StrEnum):
@@ -145,6 +143,43 @@ class _CopyableRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class AuthenticationEvidence(_CopyableRecord):
+    """Trusted synthetic authentication result held outside the signed request."""
+
+    evidence_id: str
+    agent_id: str
+    user_ref: str
+    mandate_id: str
+    nonce: str
+    payment_intent_hash: str
+    request_id: str
+    outcome: AuthenticationOutcome
+    issued_at: datetime
+    expires_at: datetime
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "evidence_id", _text("evidence_id", self.evidence_id))
+        object.__setattr__(self, "agent_id", _text("agent_id", self.agent_id))
+        object.__setattr__(self, "user_ref", _text("user_ref", self.user_ref))
+        object.__setattr__(self, "mandate_id", _text("mandate_id", self.mandate_id))
+        object.__setattr__(self, "nonce", _text("nonce", self.nonce))
+        object.__setattr__(
+            self,
+            "payment_intent_hash",
+            _digest("payment_intent_hash", self.payment_intent_hash),
+        )
+        object.__setattr__(self, "request_id", _text("request_id", self.request_id))
+        if type(self.outcome) is not AuthenticationOutcome:
+            raise TypeError("outcome must be an exact AuthenticationOutcome")
+        issued_at = _utc("issued_at", self.issued_at)
+        expires_at = _utc("expires_at", self.expires_at)
+        if expires_at <= issued_at:
+            raise ValueError("authentication evidence expires_at must be after issued_at")
+        object.__setattr__(self, "issued_at", issued_at)
+        object.__setattr__(self, "expires_at", expires_at)
+
+
+@dataclass(frozen=True, slots=True)
 class AgentMandate(_CopyableRecord):
     """Canonical user consent and delegated-purchase bounds."""
 
@@ -152,6 +187,8 @@ class AgentMandate(_CopyableRecord):
     version: int
     agent_id: str
     user_ref: str
+    user_entity_id: str
+    beneficiary_entity_id: str
     consent_ref: str
     merchant_id: str
     payee_id: str
@@ -173,6 +210,14 @@ class AgentMandate(_CopyableRecord):
             raise TypeError("version must be a positive exact integer")
         object.__setattr__(self, "agent_id", _text("agent_id", self.agent_id))
         object.__setattr__(self, "user_ref", _text("user_ref", self.user_ref))
+        object.__setattr__(
+            self, "user_entity_id", _uuid_text("user_entity_id", self.user_entity_id)
+        )
+        object.__setattr__(
+            self,
+            "beneficiary_entity_id",
+            _uuid_text("beneficiary_entity_id", self.beneficiary_entity_id),
+        )
         object.__setattr__(self, "consent_ref", _text("consent_ref", self.consent_ref))
         object.__setattr__(self, "merchant_id", _text("merchant_id", self.merchant_id))
         object.__setattr__(self, "payee_id", _text("payee_id", self.payee_id))
@@ -228,6 +273,8 @@ class AgentMandate(_CopyableRecord):
                 ["version", str(self.version)],
                 ["agent_id", self.agent_id],
                 ["user_ref", self.user_ref],
+                ["user_entity_id", self.user_entity_id],
+                ["beneficiary_entity_id", self.beneficiary_entity_id],
                 ["consent_ref", self.consent_ref],
                 ["merchant_id", self.merchant_id],
                 ["payee_id", self.payee_id],
@@ -266,7 +313,7 @@ class AgentPaymentRequest(_CopyableRecord):
     credential_id: str
     credential_scope: str
     consent_ref: str
-    authentication_state: AuthenticationState
+    authentication_evidence_ref: str
     nonce: str
     created_at: datetime
     expires_at: datetime
@@ -308,8 +355,11 @@ class AgentPaymentRequest(_CopyableRecord):
             _text("credential_scope", self.credential_scope),
         )
         object.__setattr__(self, "consent_ref", _text("consent_ref", self.consent_ref))
-        if type(self.authentication_state) is not AuthenticationState:
-            raise TypeError("authentication_state must be an exact AuthenticationState")
+        object.__setattr__(
+            self,
+            "authentication_evidence_ref",
+            _text("authentication_evidence_ref", self.authentication_evidence_ref),
+        )
         object.__setattr__(self, "nonce", _text("nonce", self.nonce))
         created_at = _utc("created_at", self.created_at)
         expires_at = _utc("expires_at", self.expires_at)
@@ -354,7 +404,7 @@ class AgentPaymentRequest(_CopyableRecord):
                 ["credential_id", self.credential_id],
                 ["credential_scope", self.credential_scope],
                 ["consent_ref", self.consent_ref],
-                ["authentication_state", self.authentication_state.value],
+                ["authentication_evidence_ref", self.authentication_evidence_ref],
                 ["nonce", self.nonce],
                 ["created_at", _timestamp_text(self.created_at)],
                 ["expires_at", _timestamp_text(self.expires_at)],
@@ -416,10 +466,13 @@ class TrustVerifierStateError(RuntimeError):
         super().__init__(self.code)
 
 
-type _StateRecord = tuple[str, str, str, str, str, str, str]
+type _StateRecord = tuple[str, str, str, str, str, str, str, str]
 
 
 def _receipt_digest(
+    agent_id: str,
+    nonce: str,
+    authentication_evidence_ref: str,
     request_hash: str,
     signature_hash: str,
     previous_receipt_hash: str,
@@ -429,6 +482,9 @@ def _receipt_digest(
         _canonical_bytes(
             "apar.synthetic-integrity-receipt.v1",
             [
+                ["agent_id", agent_id],
+                ["nonce", nonce],
+                ["authentication_evidence_ref", authentication_evidence_ref],
                 ["request_hash", request_hash],
                 ["signature_hash", signature_hash],
                 ["previous_receipt_hash", previous_receipt_hash],
@@ -436,6 +492,15 @@ def _receipt_digest(
             ],
         )
     ).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class TrustCommitPlan:
+    """Verifier-issued, single-use final receipt plan for atomic rail execution."""
+
+    preview_hash: str
+    receipt: IntegrityReceipt
+    record: _StateRecord
 
 
 class TrustVerifier:
@@ -446,6 +511,7 @@ class TrustVerifier:
         *,
         registered_agents: Mapping[tuple[str, str], bytes],
         mandates: Mapping[str, AgentMandate],
+        authentication_evidence: Mapping[str, AuthenticationEvidence],
     ) -> None:
         keys: dict[tuple[str, str], Ed25519PublicKey] = {}
         for identity, raw_key in registered_agents.items():
@@ -465,23 +531,38 @@ class TrustVerifier:
             if type(mandate) is not AgentMandate or mandate.mandate_id != key:
                 raise TypeError("mandates must contain exact AgentMandate values keyed by ID")
             approved[key] = mandate
+        evidence_registry: dict[str, AuthenticationEvidence] = {}
+        for evidence_id, evidence in authentication_evidence.items():
+            key = _text("authentication evidence mapping key", evidence_id)
+            if type(evidence) is not AuthenticationEvidence or evidence.evidence_id != key:
+                raise TypeError(
+                    "authentication_evidence must contain exact AuthenticationEvidence "
+                    "values keyed by ID"
+                )
+            evidence_registry[key] = evidence
         self._keys = MappingProxyType(keys)
         self._agent_ids = frozenset(agent_id for agent_id, _ in keys)
         self._mandates = MappingProxyType(approved)
+        self._authentication_evidence = MappingProxyType(evidence_registry)
         self._records: tuple[_StateRecord, ...] = ()
-        self._pending_previews: dict[str, IntegrityReceipt] = {}
+        self._pending_preview: tuple[IntegrityReceipt, datetime] | None = None
+        self._pending_commit: TrustCommitPlan | None = None
 
     def verify(self, request: AgentPaymentRequest, now: datetime) -> IntegrityReceipt:
         preview = self.preview(request, now)
         if not preview.allowed:
             return preview
-        return self.commit(request, preview, ReceiptOutcome.VERIFIED)
+        return self.commit(request, preview, ReceiptOutcome.VERIFIED, now)
 
     def preview(self, request: AgentPaymentRequest, now: datetime) -> IntegrityReceipt:
         """Evaluate without consuming a nonce so downstream scoring stays atomic."""
         if type(request) is not AgentPaymentRequest:
             raise TypeError("request must be an exact AgentPaymentRequest")
         checked_now = _utc("now", now)
+        # The public two-phase surface has one deterministic active transaction.
+        # Any new attempt abandons prior ephemeral work, including when it rejects.
+        self._pending_preview = None
+        self._pending_commit = None
 
         public_key = self._keys.get((request.agent_id, request.key_id))
         if public_key is None:
@@ -499,6 +580,12 @@ class TrustVerifier:
             or request.mandate.agent_id != request.agent_id
         ):
             return self._failure(request, ReasonCode.MANDATE_SCOPE_VIOLATION)
+
+        if (
+            request.actor_id != approved.user_entity_id
+            or request.counterparty_id != approved.beneficiary_entity_id
+        ):
+            return self._failure(request, ReasonCode.AUTHORITY_IDENTITY_MISMATCH)
 
         if request.amount > approved.max_amount:
             return self._failure(request, ReasonCode.AMOUNT_LIMIT_EXCEEDED)
@@ -523,14 +610,6 @@ class TrustVerifier:
         if request.consent_ref != approved.consent_ref:
             return self._failure(request, ReasonCode.CONSENT_BINDING_MISMATCH)
         if (
-            approved.required_authentication is AuthenticationRequirement.STEP_UP
-            and request.authentication_state is not AuthenticationState.STEP_UP_SATISFIED
-        ) or (
-            approved.required_authentication is AuthenticationRequirement.NONE
-            and request.authentication_state is not AuthenticationState.NOT_REQUIRED
-        ):
-            return self._failure(request, ReasonCode.AUTHENTICATION_REQUIRED)
-        if (
             request.created_at < approved.issued_at
             or request.expires_at > approved.expires_at
         ):
@@ -545,7 +624,7 @@ class TrustVerifier:
 
         if any(
             agent_id == request.agent_id and nonce == request.nonce
-            for agent_id, nonce, _, _, _, _, _ in self._records
+            for agent_id, nonce, _, _, _, _, _, _ in self._records
         ):
             return self._failure(request, ReasonCode.NONCE_REPLAY)
 
@@ -553,8 +632,43 @@ class TrustVerifier:
         if request.prior_receipt_hash != previous:
             return self._failure(request, ReasonCode.RECEIPT_CHAIN_BROKEN)
 
+        # Trusted step-up evidence follows the invariant base ordering above. It is
+        # registry-owned, so the agent signs only its synthetic reference.
+        if any(
+            evidence_ref == request.authentication_evidence_ref
+            for _, _, evidence_ref, _, _, _, _, _ in self._records
+        ):
+            return self._failure(
+                request, ReasonCode.AUTHENTICATION_EVIDENCE_REPLAY
+            )
+        if approved.required_authentication is AuthenticationRequirement.STEP_UP:
+            evidence = self._authentication_evidence.get(
+                request.authentication_evidence_ref
+            )
+            if evidence is None:
+                return self._failure(
+                    request, ReasonCode.AUTHENTICATION_EVIDENCE_MISSING
+                )
+            if (
+                evidence.agent_id != request.agent_id
+                or evidence.user_ref != approved.user_ref
+                or evidence.mandate_id != approved.mandate_id
+                or evidence.nonce != request.nonce
+                or evidence.payment_intent_hash != request.payment_intent_hash
+                or evidence.request_id != request.request_id
+                or evidence.outcome is not AuthenticationOutcome.STEP_UP_VERIFIED
+            ):
+                return self._failure(
+                    request, ReasonCode.AUTHENTICATION_EVIDENCE_MISMATCH
+                )
+            if checked_now < evidence.issued_at or checked_now >= evidence.expires_at:
+                return self._failure(
+                    request, ReasonCode.AUTHENTICATION_EVIDENCE_EXPIRED
+                )
+
         preview = self._allowed_receipt(request, previous, ReceiptOutcome.PREVIEW)
-        self._pending_previews[preview.receipt_hash] = preview
+        self._pending_preview = (preview, checked_now)
+        self._pending_commit = None
         return preview
 
     def commit(
@@ -562,12 +676,29 @@ class TrustVerifier:
         request: AgentPaymentRequest,
         preview: IntegrityReceipt,
         outcome: ReceiptOutcome,
+        now: datetime,
     ) -> IntegrityReceipt:
         """Atomically consume replay state only after a valid final outcome exists."""
+        prepared = self.prepare_commit(request, preview, outcome, now)
+        if type(prepared) is IntegrityReceipt:
+            return prepared
+        return self.apply_commit(cast(TrustCommitPlan, prepared))
+
+    def prepare_commit(
+        self,
+        request: AgentPaymentRequest,
+        preview: IntegrityReceipt,
+        outcome: ReceiptOutcome,
+        now: datetime,
+    ) -> TrustCommitPlan | IntegrityReceipt:
+        """Validate a final result without consuming persistent replay state."""
         if type(request) is not AgentPaymentRequest:
             raise TypeError("request must be an exact AgentPaymentRequest")
         if type(preview) is not IntegrityReceipt:
             raise TypeError("preview must be an exact IntegrityReceipt")
+        issued_preview = self._pending_preview
+        self._pending_preview = None
+        self._pending_commit = None
         if type(outcome) is not ReceiptOutcome or outcome not in {
             ReceiptOutcome.VERIFIED,
             ReceiptOutcome.APPROVE,
@@ -575,45 +706,83 @@ class TrustVerifier:
             ReceiptOutcome.DECLINE,
         }:
             raise TypeError("outcome must be an exact final ReceiptOutcome")
+        checked_now = _utc("now", now)
         previous = self._last_receipt(request.agent_id)
         expected_preview = self._allowed_receipt(
             request,
             previous,
             ReceiptOutcome.PREVIEW,
         )
-        issued_preview = self._pending_previews.get(preview.receipt_hash)
-        if preview != expected_preview or issued_preview != preview:
+        if preview != expected_preview or issued_preview is None or issued_preview[0] != preview:
             return self._failure(request, ReasonCode.EXECUTION_RECEIPT_MISMATCH)
+        if checked_now < issued_preview[1]:
+            return self._failure(request, ReasonCode.EXECUTION_RECEIPT_MISMATCH)
+        evidence = self._authentication_evidence.get(request.authentication_evidence_ref)
+        if (
+            request.mandate.required_authentication is AuthenticationRequirement.STEP_UP
+            and evidence is not None
+            and (checked_now < evidence.issued_at or checked_now >= evidence.expires_at)
+        ):
+            return self._failure(request, ReasonCode.AUTHENTICATION_EVIDENCE_EXPIRED)
+        if (
+            checked_now < request.created_at
+            or checked_now < request.mandate.issued_at
+            or checked_now >= request.expires_at
+            or checked_now >= request.mandate.expires_at
+        ):
+            return self._failure(request, ReasonCode.MANDATE_EXPIRED)
         if any(
             agent_id == request.agent_id and nonce == request.nonce
-            for agent_id, nonce, _, _, _, _, _ in self._records
+            for agent_id, nonce, _, _, _, _, _, _ in self._records
         ):
             return self._failure(request, ReasonCode.NONCE_REPLAY)
         if request.prior_receipt_hash != previous:
             return self._failure(request, ReasonCode.RECEIPT_CHAIN_BROKEN)
 
         final = self._allowed_receipt(request, previous, outcome)
-        self._records = (
-            *self._records,
-            (
-                request.agent_id,
-                request.nonce,
-                final.previous_receipt_hash,
-                final.request_hash,
-                final.signature_hash,
-                final.outcome.value,
-                final.receipt_hash,
-            ),
+        record: _StateRecord = (
+            request.agent_id,
+            request.nonce,
+            request.authentication_evidence_ref,
+            final.previous_receipt_hash,
+            final.request_hash,
+            final.signature_hash,
+            final.outcome.value,
+            final.receipt_hash,
         )
-        self._pending_previews.pop(preview.receipt_hash, None)
-        return final
+        plan = TrustCommitPlan(preview.receipt_hash, final, record)
+        self._pending_commit = plan
+        return plan
+
+    def projected_state(self, plan: TrustCommitPlan) -> Mapping[str, object]:
+        """Return the closed state that one currently issued plan will commit."""
+        self._require_pending_plan(plan)
+        return MappingProxyType({"version": 1, "records": (*self._records, plan.record)})
+
+    def apply_commit(self, plan: TrustCommitPlan) -> IntegrityReceipt:
+        """Apply one verifier-issued plan through a total, single-thread operation."""
+        self._require_pending_plan(plan)
+        self._records = (*self._records, plan.record)
+        self._pending_commit = None
+        return plan.receipt
+
+    def discard_commit(self, plan: TrustCommitPlan) -> None:
+        """Discard a prepared outcome after external execution cannot complete."""
+        if type(plan) is not TrustCommitPlan:
+            raise TypeError("plan must be an exact TrustCommitPlan")
+        if self._pending_commit == plan:
+            self._pending_commit = None
+
+    def _require_pending_plan(self, plan: TrustCommitPlan) -> None:
+        if type(plan) is not TrustCommitPlan or self._pending_commit != plan:
+            raise ValueError("commit plan was not issued or was already consumed")
 
     def discard_preview(self, preview: IntegrityReceipt) -> None:
         """Revoke one issued preview after downstream scoring cannot finalize it."""
         if type(preview) is not IntegrityReceipt:
             raise TypeError("preview must be an exact IntegrityReceipt")
-        if self._pending_previews.get(preview.receipt_hash) == preview:
-            self._pending_previews.pop(preview.receipt_hash, None)
+        if self._pending_preview is not None and self._pending_preview[0] == preview:
+            self._pending_preview = None
 
     def dump_state(self) -> Mapping[str, object]:
         return MappingProxyType({"version": 1, "records": self._records})
@@ -634,18 +803,20 @@ class TrustVerifier:
                 raise TypeError("verifier state records must be an exact tuple")
             records: list[_StateRecord] = []
             seen_nonces: set[tuple[str, str]] = set()
+            seen_evidence_refs: set[str] = set()
             last_receipts: dict[str, str] = {}
             for raw_record in records_value:
-                if type(raw_record) is not tuple or len(raw_record) != 7:
+                if type(raw_record) is not tuple or len(raw_record) != 8:
                     raise ValueError("verifier state record is malformed")
                 agent_id = _text("state agent_id", raw_record[0])
                 if agent_id not in self._agent_ids:
                     raise ValueError("verifier state agent is not registered")
                 nonce = _text("state nonce", raw_record[1])
-                previous = _digest("state previous receipt", raw_record[2], allow_empty=True)
-                request_hash = _digest("state request hash", raw_record[3])
-                signature_hash = _digest("state signature hash", raw_record[4])
-                outcome = ReceiptOutcome(_text("state outcome", raw_record[5]))
+                evidence_ref = _text("state authentication evidence ref", raw_record[2])
+                previous = _digest("state previous receipt", raw_record[3], allow_empty=True)
+                request_hash = _digest("state request hash", raw_record[4])
+                signature_hash = _digest("state signature hash", raw_record[5])
+                outcome = ReceiptOutcome(_text("state outcome", raw_record[6]))
                 if outcome not in {
                     ReceiptOutcome.VERIFIED,
                     ReceiptOutcome.APPROVE,
@@ -653,13 +824,20 @@ class TrustVerifier:
                     ReceiptOutcome.DECLINE,
                 }:
                     raise ValueError("verifier state outcome is not final")
-                receipt = _digest("state receipt", raw_record[6])
+                receipt = _digest("state receipt", raw_record[7])
                 nonce_key = (agent_id, nonce)
                 if nonce_key in seen_nonces:
                     raise ValueError("verifier state nonce is duplicated")
+                if evidence_ref in seen_evidence_refs:
+                    raise ValueError(
+                        "verifier state authentication evidence is duplicated"
+                    )
                 if previous != last_receipts.get(agent_id, ""):
                     raise ValueError("verifier state receipt chain is broken")
                 if receipt != _receipt_digest(
+                    agent_id,
+                    nonce,
+                    evidence_ref,
                     request_hash,
                     signature_hash,
                     previous,
@@ -667,11 +845,13 @@ class TrustVerifier:
                 ):
                     raise ValueError("verifier state receipt is not reproducible")
                 seen_nonces.add(nonce_key)
+                seen_evidence_refs.add(evidence_ref)
                 last_receipts[agent_id] = receipt
                 records.append(
                     (
                         agent_id,
                         nonce,
+                        evidence_ref,
                         previous,
                         request_hash,
                         signature_hash,
@@ -680,12 +860,13 @@ class TrustVerifier:
                     )
                 )
             self._records = tuple(records)
-            self._pending_previews.clear()
+            self._pending_preview = None
+            self._pending_commit = None
         except (KeyError, RuntimeError, TypeError, ValueError) as error:
             raise TrustVerifierStateError from error
 
     def _last_receipt(self, agent_id: str) -> str:
-        for record_agent, _, _, _, _, _, receipt in reversed(self._records):
+        for record_agent, _, _, _, _, _, _, receipt in reversed(self._records):
             if record_agent == agent_id:
                 return receipt
         return ""
@@ -734,6 +915,9 @@ class TrustVerifier:
             allowed=True,
             reason_code=None,
             receipt_hash=_receipt_digest(
+                request.agent_id,
+                request.nonce,
+                request.authentication_evidence_ref,
                 request_hash,
                 signature_hash,
                 previous,
@@ -749,10 +933,12 @@ class TrustVerifier:
 __all__ = [
     "AgentMandate",
     "AgentPaymentRequest",
+    "AuthenticationEvidence",
+    "AuthenticationOutcome",
     "AuthenticationRequirement",
-    "AuthenticationState",
     "IntegrityReceipt",
     "ReceiptOutcome",
     "TrustVerifier",
+    "TrustCommitPlan",
     "TrustVerifierStateError",
 ]

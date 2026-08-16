@@ -6,6 +6,7 @@ from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from types import MappingProxyType
+from typing import cast
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -15,8 +16,9 @@ from apar.contracts.decisions import ReasonCode
 from apar.trust.verifier import (
     AgentMandate,
     AgentPaymentRequest,
+    AuthenticationEvidence,
+    AuthenticationOutcome,
     AuthenticationRequirement,
-    AuthenticationState,
     IntegrityReceipt,
     ReceiptOutcome,
     TrustVerifier,
@@ -37,6 +39,9 @@ CREDENTIAL_ID = "synthetic-token-1"
 CREDENTIAL_SCOPE = "single_merchant_single_use"
 CATEGORY = "TRAVEL"
 PRODUCT_ID = "flight-1"
+USER_ENTITY_ID = "00000000-0000-4000-8000-000000000303"
+BENEFICIARY_ENTITY_ID = "00000000-0000-4000-8000-000000000304"
+AUTH_EVIDENCE_ID = "auth-evidence-1"
 
 
 @pytest.fixture
@@ -52,6 +57,8 @@ def mandate() -> AgentMandate:
         agent_id=AGENT_ID,
         user_ref=USER_REF,
         consent_ref=CONSENT_REF,
+        user_entity_id=USER_ENTITY_ID,
+        beneficiary_entity_id=BENEFICIARY_ENTITY_ID,
         merchant_id=MERCHANT_ID,
         payee_id=PAYEE_ID,
         cart_hash=CART_HASH,
@@ -86,7 +93,7 @@ def _unsigned_request(mandate: AgentMandate, **updates: object) -> AgentPaymentR
         "credential_id": CREDENTIAL_ID,
         "credential_scope": CREDENTIAL_SCOPE,
         "consent_ref": CONSENT_REF,
-        "authentication_state": AuthenticationState.STEP_UP_SATISFIED,
+        "authentication_evidence_ref": AUTH_EVIDENCE_ID,
         "nonce": "nonce-1",
         "created_at": NOW,
         "expires_at": NOW + timedelta(minutes=5),
@@ -118,12 +125,36 @@ def valid_request(
 def _verifier(
     mandate: AgentMandate,
     private_key: Ed25519PrivateKey,
+    *,
+    authentication_evidence: dict[str, AuthenticationEvidence] | None = None,
 ) -> TrustVerifier:
     public_key = private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
     return TrustVerifier(
         registered_agents={(AGENT_ID, KEY_ID): public_key},
         mandates={MANDATE_ID: mandate},
+        authentication_evidence=(
+            authentication_evidence
+            if authentication_evidence is not None
+            else {AUTH_EVIDENCE_ID: _authentication_evidence()}
+        ),
     )
+
+
+def _authentication_evidence(**updates: object) -> AuthenticationEvidence:
+    values: dict[str, object] = {
+        "evidence_id": AUTH_EVIDENCE_ID,
+        "agent_id": AGENT_ID,
+        "user_ref": USER_REF,
+        "mandate_id": MANDATE_ID,
+        "nonce": "nonce-1",
+        "payment_intent_hash": PAYMENT_INTENT_HASH,
+        "request_id": "request-1",
+        "outcome": AuthenticationOutcome.STEP_UP_VERIFIED,
+        "issued_at": NOW - timedelta(seconds=5),
+        "expires_at": NOW + timedelta(minutes=2),
+    }
+    values.update(updates)
+    return AuthenticationEvidence(**values)  # type: ignore[arg-type]
 
 
 def test_valid_request_returns_deterministic_synthetic_receipt(
@@ -240,8 +271,8 @@ def test_bound_request_fields_fail_with_ordered_reason(
         ({"credential_scope": "multi_merchant"}, ReasonCode.TOKEN_SCOPE_VIOLATION),
         ({"consent_ref": "different-consent"}, ReasonCode.CONSENT_BINDING_MISMATCH),
         (
-            {"authentication_state": AuthenticationState.NOT_PERFORMED},
-            ReasonCode.AUTHENTICATION_REQUIRED,
+            {"authentication_evidence_ref": "missing-evidence"},
+            ReasonCode.AUTHENTICATION_EVIDENCE_MISSING,
         ),
     ],
 )
@@ -263,6 +294,104 @@ def test_missing_consent_is_rejected_at_canonical_boundary(
 ) -> None:
     with pytest.raises(ValueError, match="consent_ref must not be empty"):
         _unsigned_request(mandate, consent_ref="")
+
+
+def test_missing_authentication_reference_is_rejected_at_canonical_boundary(
+    mandate: AgentMandate,
+) -> None:
+    with pytest.raises(ValueError, match="authentication_evidence_ref must not be empty"):
+        _unsigned_request(mandate, authentication_evidence_ref="")
+
+
+@pytest.mark.parametrize(
+    ("evidence", "reason"),
+    [
+        (
+            _authentication_evidence(user_ref="different-user"),
+            ReasonCode.AUTHENTICATION_EVIDENCE_MISMATCH,
+        ),
+        (
+            _authentication_evidence(
+                issued_at=NOW - timedelta(minutes=2),
+                expires_at=NOW,
+            ),
+            ReasonCode.AUTHENTICATION_EVIDENCE_EXPIRED,
+        ),
+    ],
+)
+def test_trusted_authentication_evidence_mismatch_or_expiry_rejects(
+    evidence: AuthenticationEvidence,
+    reason: ReasonCode,
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+    valid_request: AgentPaymentRequest,
+) -> None:
+    verifier = _verifier(
+        mandate,
+        private_key,
+        authentication_evidence={AUTH_EVIDENCE_ID: evidence},
+    )
+
+    receipt = verifier.verify(valid_request, NOW)
+
+    assert receipt.reason_code is reason
+
+
+def test_no_step_up_mandate_needs_no_evidence_registry_entry(
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+) -> None:
+    no_step_up = mandate.model_copy(
+        update={"required_authentication": AuthenticationRequirement.NONE}
+    )
+    request = _sign(
+        _unsigned_request(
+            no_step_up,
+            authentication_evidence_ref="no-auth-required",
+        ),
+        private_key,
+    )
+    public_key = private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    verifier = TrustVerifier(
+        registered_agents={(AGENT_ID, KEY_ID): public_key},
+        mandates={MANDATE_ID: no_step_up},
+        authentication_evidence={},
+    )
+    receipt = verifier.verify(request, NOW)
+    restored = TrustVerifier(
+        registered_agents={(AGENT_ID, KEY_ID): public_key},
+        mandates={MANDATE_ID: no_step_up},
+        authentication_evidence={},
+    )
+
+    restored.load_state(verifier.dump_state())
+
+    assert receipt.allowed
+    assert restored.dump_state() == verifier.dump_state()
+
+
+def test_authentication_evidence_is_single_use_across_new_request_and_nonce(
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+    valid_request: AgentPaymentRequest,
+) -> None:
+    verifier = _verifier(mandate, private_key)
+    first = verifier.verify(valid_request, NOW)
+    replayed = _sign(
+        _unsigned_request(
+            mandate,
+            request_id="request-2",
+            payment_id="agentic-payment-2",
+            nonce="nonce-2",
+            prior_receipt_hash=first.receipt_hash,
+            authentication_evidence_ref=AUTH_EVIDENCE_ID,
+        ),
+        private_key,
+    )
+
+    receipt = verifier.verify(replayed, NOW)
+
+    assert receipt.reason_code is ReasonCode.AUTHENTICATION_EVIDENCE_REPLAY
 
 
 def test_expiry_boundary_is_closed(
@@ -390,7 +519,19 @@ def test_broken_receipt_chain_does_not_consume_nonce(
     private_key: Ed25519PrivateKey,
     valid_request: AgentPaymentRequest,
 ) -> None:
-    verifier = _verifier(mandate, private_key)
+    second_evidence = _authentication_evidence(
+        evidence_id="auth-evidence-2",
+        nonce="nonce-2",
+        request_id="request-2",
+    )
+    verifier = _verifier(
+        mandate,
+        private_key,
+        authentication_evidence={
+            AUTH_EVIDENCE_ID: _authentication_evidence(),
+            second_evidence.evidence_id: second_evidence,
+        },
+    )
     first = verifier.verify(valid_request, NOW)
     broken = _sign(
         _unsigned_request(
@@ -398,6 +539,7 @@ def test_broken_receipt_chain_does_not_consume_nonce(
             request_id="request-2",
             payment_id="agentic-payment-2",
             nonce="nonce-2",
+            authentication_evidence_ref=second_evidence.evidence_id,
             prior_receipt_hash="f" * 64,
         ),
         private_key,
@@ -479,10 +621,23 @@ def test_verifier_state_round_trips_and_continues_receipt_chain(
     private_key: Ed25519PrivateKey,
     valid_request: AgentPaymentRequest,
 ) -> None:
-    first_verifier = _verifier(mandate, private_key)
+    second_evidence = _authentication_evidence(
+        evidence_id="auth-evidence-2",
+        nonce="nonce-2",
+        request_id="request-2",
+    )
+    evidence = {
+        AUTH_EVIDENCE_ID: _authentication_evidence(),
+        second_evidence.evidence_id: second_evidence,
+    }
+    first_verifier = _verifier(
+        mandate, private_key, authentication_evidence=evidence
+    )
     first = first_verifier.verify(valid_request, NOW)
     state = first_verifier.dump_state()
-    second_verifier = _verifier(mandate, private_key)
+    second_verifier = _verifier(
+        mandate, private_key, authentication_evidence=evidence
+    )
     second_verifier.load_state(state)
     request = _sign(
         _unsigned_request(
@@ -490,6 +645,7 @@ def test_verifier_state_round_trips_and_continues_receipt_chain(
             request_id="request-2",
             payment_id="agentic-payment-2",
             nonce="nonce-2",
+            authentication_evidence_ref=second_evidence.evidence_id,
             prior_receipt_hash=first.receipt_hash,
         ),
         private_key,
@@ -499,6 +655,143 @@ def test_verifier_state_round_trips_and_continues_receipt_chain(
 
     assert second.allowed
     assert second.previous_receipt_hash == first.receipt_hash
+
+
+def test_nonce_only_state_record_relabel_breaks_receipt_commitment(
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+    valid_request: AgentPaymentRequest,
+) -> None:
+    source = _verifier(mandate, private_key)
+    source.verify(valid_request, NOW)
+    state = source.dump_state()
+    records = cast(tuple[tuple[str, ...], ...], state["records"])
+    changed = list(records[0])
+    changed[1] = "relabeled-nonce"
+    corrupted = MappingProxyType({"version": 1, "records": (tuple(changed),)})
+
+    with pytest.raises(TrustVerifierStateError) as error:
+        _verifier(mandate, private_key).load_state(corrupted)
+
+    assert "not reproducible" in str(error.value.__cause__)
+
+
+def test_agent_only_state_record_relabel_breaks_receipt_commitment(
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+    valid_request: AgentPaymentRequest,
+) -> None:
+    second_key = Ed25519PrivateKey.from_private_bytes(bytes(reversed(range(32))))
+    second_agent = "agent-registered-2"
+    public_keys = {
+        (AGENT_ID, KEY_ID): private_key.public_key().public_bytes(
+            Encoding.Raw, PublicFormat.Raw
+        ),
+        (second_agent, "key-2"): second_key.public_key().public_bytes(
+            Encoding.Raw, PublicFormat.Raw
+        ),
+    }
+    source = _verifier(mandate, private_key)
+    source.verify(valid_request, NOW)
+    records = cast(tuple[tuple[str, ...], ...], source.dump_state()["records"])
+    changed = list(records[0])
+    changed[0] = second_agent
+    verifier = TrustVerifier(
+        registered_agents=public_keys,
+        mandates={MANDATE_ID: mandate},
+        authentication_evidence={AUTH_EVIDENCE_ID: _authentication_evidence()},
+    )
+
+    with pytest.raises(TrustVerifierStateError) as error:
+        verifier.load_state({"version": 1, "records": (tuple(changed),)})
+
+    assert "not reproducible" in str(error.value.__cause__)
+
+
+def test_legitimate_multi_agent_interleaved_receipt_chains_round_trip(
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+    valid_request: AgentPaymentRequest,
+) -> None:
+    second_key = Ed25519PrivateKey.from_private_bytes(bytes(reversed(range(32))))
+    second_agent = "agent-registered-2"
+    second_mandate = mandate.model_copy(
+        update={
+            "mandate_id": "mandate-2",
+            "agent_id": second_agent,
+            "user_ref": "user-2",
+            "user_entity_id": "00000000-0000-4000-8000-000000000305",
+            "beneficiary_entity_id": "00000000-0000-4000-8000-000000000306",
+        }
+    )
+    evidence_a2 = _authentication_evidence(
+        evidence_id="auth-evidence-a2",
+        nonce="nonce-a2",
+        request_id="request-a2",
+    )
+    evidence_b1 = _authentication_evidence(
+        evidence_id="auth-evidence-b1",
+        agent_id=second_agent,
+        user_ref="user-2",
+        mandate_id="mandate-2",
+        nonce="nonce-b1",
+        request_id="request-b1",
+    )
+    public_keys = {
+        (AGENT_ID, KEY_ID): private_key.public_key().public_bytes(
+            Encoding.Raw, PublicFormat.Raw
+        ),
+        (second_agent, "key-2"): second_key.public_key().public_bytes(
+            Encoding.Raw, PublicFormat.Raw
+        ),
+    }
+    evidence = {
+        AUTH_EVIDENCE_ID: _authentication_evidence(),
+        evidence_a2.evidence_id: evidence_a2,
+        evidence_b1.evidence_id: evidence_b1,
+    }
+    verifier = TrustVerifier(
+        registered_agents=public_keys,
+        mandates={MANDATE_ID: mandate, second_mandate.mandate_id: second_mandate},
+        authentication_evidence=evidence,
+    )
+    first_a = verifier.verify(valid_request, NOW)
+    unsigned_b = _unsigned_request(
+        second_mandate,
+        request_id="request-b1",
+        payment_id="payment-b1",
+        agent_id=second_agent,
+        key_id="key-2",
+        nonce="nonce-b1",
+        authentication_evidence_ref=evidence_b1.evidence_id,
+        actor_id=second_mandate.user_entity_id,
+        counterparty_id=second_mandate.beneficiary_entity_id,
+    )
+    first_b = _sign(unsigned_b, second_key)
+    receipt_b = verifier.verify(first_b, NOW)
+    request_a2 = _sign(
+        _unsigned_request(
+            mandate,
+            request_id="request-a2",
+            payment_id="payment-a2",
+            nonce="nonce-a2",
+            authentication_evidence_ref=evidence_a2.evidence_id,
+            prior_receipt_hash=first_a.receipt_hash,
+        ),
+        private_key,
+    )
+    second_a = verifier.verify(request_a2, NOW)
+    frozen = verifier.dump_state()
+    restored = TrustVerifier(
+        registered_agents=public_keys,
+        mandates={MANDATE_ID: mandate, second_mandate.mandate_id: second_mandate},
+        authentication_evidence=evidence,
+    )
+
+    restored.load_state(frozen)
+
+    assert receipt_b.allowed and second_a.allowed
+    assert restored.dump_state() == frozen
 
 
 def test_well_shaped_but_unverifiable_receipt_record_is_state_corrupt(
@@ -515,6 +808,7 @@ def test_well_shaped_but_unverifiable_receipt_record_is_state_corrupt(
                 (
                     AGENT_ID,
                     "forged-nonce",
+                    "auth-forged",
                     "",
                     request_hash,
                     signature_hash,
@@ -542,15 +836,14 @@ def test_outcome_receipt_tamper_fails_without_consuming_nonce(
     tampered = preview.model_copy(update={"receipt_hash": "f" * 64})
     state_before = verifier.dump_state()
 
-    rejected = verifier.commit(valid_request, tampered, ReceiptOutcome.APPROVE)
+    rejected = verifier.commit(valid_request, tampered, ReceiptOutcome.APPROVE, NOW)
     state_after_rejection = verifier.dump_state()
-    accepted = verifier.commit(valid_request, preview, ReceiptOutcome.APPROVE)
+    accepted = verifier.commit(valid_request, preview, ReceiptOutcome.APPROVE, NOW)
 
     assert rejected.reason_code is ReasonCode.EXECUTION_RECEIPT_MISMATCH
     assert state_after_rejection == state_before
-    assert verifier.dump_state() != state_before
-    assert accepted.allowed
-    assert accepted.outcome is ReceiptOutcome.APPROVE
+    assert verifier.dump_state() == state_before
+    assert accepted.reason_code is ReasonCode.EXECUTION_RECEIPT_MISMATCH
 
 
 def test_commit_rejects_preview_not_issued_by_same_verifier_instance(
@@ -567,10 +860,131 @@ def test_commit_rejects_preview_not_issued_by_same_verifier_instance(
         valid_request,
         foreign_preview,
         ReceiptOutcome.APPROVE,
+        NOW,
     )
 
     assert receipt.reason_code is ReasonCode.EXECUTION_RECEIPT_MISMATCH
     assert committing.dump_state() == state_before
+
+
+def test_prepared_commit_is_single_use_and_discardable(
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+    valid_request: AgentPaymentRequest,
+) -> None:
+    verifier = _verifier(mandate, private_key)
+    preview = verifier.preview(valid_request, NOW)
+    prepared = verifier.prepare_commit(
+        valid_request, preview, ReceiptOutcome.APPROVE, NOW
+    )
+    assert not isinstance(prepared, IntegrityReceipt)
+    projected = verifier.projected_state(prepared)
+
+    verifier.discard_commit(prepared)
+
+    assert verifier.dump_state()["records"] == ()
+    with pytest.raises(ValueError, match="not issued or was already consumed"):
+        verifier.apply_commit(prepared)
+    assert projected["records"] != ()
+
+    retry_preview = verifier.preview(valid_request, NOW)
+    receipt = verifier.commit(
+        valid_request, retry_preview, ReceiptOutcome.APPROVE, NOW
+    )
+
+    assert receipt.allowed
+    assert receipt.outcome is ReceiptOutcome.APPROVE
+
+
+def test_new_preview_attempt_revokes_abandoned_preview_even_when_it_rejects(
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+    valid_request: AgentPaymentRequest,
+) -> None:
+    verifier = _verifier(mandate, private_key)
+    abandoned = verifier.preview(valid_request, NOW)
+    invalid = _sign(
+        _unsigned_request(mandate, payee_id="substituted-payee"), private_key
+    )
+
+    rejected = verifier.preview(invalid, NOW)
+    stale_commit = verifier.commit(
+        valid_request, abandoned, ReceiptOutcome.APPROVE, NOW
+    )
+
+    assert rejected.reason_code is ReasonCode.PAYEE_BINDING_MISMATCH
+    assert stale_commit.reason_code is ReasonCode.EXECUTION_RECEIPT_MISMATCH
+    assert verifier.dump_state()["records"] == ()
+
+
+def test_malformed_commit_attempt_still_consumes_ephemeral_preview(
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+    valid_request: AgentPaymentRequest,
+) -> None:
+    verifier = _verifier(mandate, private_key)
+    preview = verifier.preview(valid_request, NOW)
+
+    with pytest.raises(TypeError, match="final ReceiptOutcome"):
+        verifier.commit(
+            valid_request,
+            preview,
+            cast(ReceiptOutcome, "approve"),
+            NOW,
+        )
+
+    stale = verifier.commit(valid_request, preview, ReceiptOutcome.APPROVE, NOW)
+
+    assert stale.reason_code is ReasonCode.EXECUTION_RECEIPT_MISMATCH
+    assert verifier.dump_state()["records"] == ()
+
+
+def test_commit_cannot_precede_preview_issuance(
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+) -> None:
+    request = _sign(
+        _unsigned_request(mandate, created_at=NOW - timedelta(minutes=1)),
+        private_key,
+    )
+    verifier = _verifier(mandate, private_key)
+    preview = verifier.preview(request, NOW)
+
+    receipt = verifier.commit(
+        request,
+        preview,
+        ReceiptOutcome.APPROVE,
+        NOW - timedelta(seconds=1),
+    )
+
+    assert receipt.reason_code is ReasonCode.EXECUTION_RECEIPT_MISMATCH
+    assert verifier.dump_state()["records"] == ()
+
+
+def test_commit_rejects_after_request_or_authentication_expiry_without_retention(
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+    valid_request: AgentPaymentRequest,
+) -> None:
+    verifier = _verifier(mandate, private_key)
+    preview = verifier.preview(valid_request, NOW)
+
+    expired = verifier.commit(
+        valid_request,
+        preview,
+        ReceiptOutcome.APPROVE,
+        NOW + timedelta(minutes=5),
+    )
+    retry = verifier.commit(
+        valid_request,
+        preview,
+        ReceiptOutcome.APPROVE,
+        NOW,
+    )
+
+    assert expired.reason_code is ReasonCode.AUTHENTICATION_EVIDENCE_EXPIRED
+    assert retry.reason_code is ReasonCode.EXECUTION_RECEIPT_MISMATCH
+    assert verifier.dump_state()["records"] == ()
 
 
 def test_failure_receipt_hash_binds_failed_canonical_request_and_signature(
@@ -613,7 +1027,9 @@ def test_failure_receipt_hash_binds_failed_canonical_request_and_signature(
     ],
 )
 def test_corrupt_verifier_state_fails_with_stable_error(corrupt: dict[str, object]) -> None:
-    verifier = TrustVerifier(registered_agents={}, mandates={})
+    verifier = TrustVerifier(
+        registered_agents={}, mandates={}, authentication_evidence={}
+    )
 
     with pytest.raises(TrustVerifierStateError) as error:
         verifier.load_state(MappingProxyType(corrupt))
@@ -649,4 +1065,5 @@ def test_verifier_rejects_malformed_registered_public_key(
         TrustVerifier(
             registered_agents={(AGENT_ID, KEY_ID): b"short"},
             mandates={MANDATE_ID: mandate},
+            authentication_evidence={},
         )

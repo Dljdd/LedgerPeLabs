@@ -20,9 +20,9 @@ from apar.trust.verifier import (
     AgentMandate,
     AgentPaymentRequest,
     AuthenticationRequirement,
-    AuthenticationState,
     IntegrityReceipt,
     ReceiptOutcome,
+    TrustCommitPlan,
     TrustVerifier,
     TrustVerifierStateError,
 )
@@ -52,6 +52,8 @@ def _request_payload(request: AgentPaymentRequest) -> dict[str, object]:
         "mandate_version": mandate.version,
         "mandate_agent_id": mandate.agent_id,
         "user_ref": mandate.user_ref,
+        "user_entity_id": mandate.user_entity_id,
+        "beneficiary_entity_id": mandate.beneficiary_entity_id,
         "mandate_consent_ref": mandate.consent_ref,
         "mandate_merchant_id": mandate.merchant_id,
         "mandate_payee_id": mandate.payee_id,
@@ -77,7 +79,7 @@ def _request_payload(request: AgentPaymentRequest) -> dict[str, object]:
         "credential_id": request.credential_id,
         "credential_scope": request.credential_scope,
         "consent_ref": request.consent_ref,
-        "authentication_state": request.authentication_state.value,
+        "authentication_evidence_ref": request.authentication_evidence_ref,
         "nonce": request.nonce,
         "created_at": request.created_at,
         "expires_at": request.expires_at,
@@ -96,6 +98,8 @@ def _request_from_payload(payload: Mapping[str, object]) -> AgentPaymentRequest:
         version=cast(int, payload["mandate_version"]),
         agent_id=cast(str, payload["mandate_agent_id"]),
         user_ref=cast(str, payload["user_ref"]),
+        user_entity_id=cast(str, payload["user_entity_id"]),
+        beneficiary_entity_id=cast(str, payload["beneficiary_entity_id"]),
         consent_ref=cast(str, payload["mandate_consent_ref"]),
         merchant_id=cast(str, payload["mandate_merchant_id"]),
         payee_id=cast(str, payload["mandate_payee_id"]),
@@ -130,8 +134,8 @@ def _request_from_payload(payload: Mapping[str, object]) -> AgentPaymentRequest:
         credential_id=cast(str, payload["credential_id"]),
         credential_scope=cast(str, payload["credential_scope"]),
         consent_ref=cast(str, payload["consent_ref"]),
-        authentication_state=AuthenticationState(
-            cast(str, payload["authentication_state"])
+        authentication_evidence_ref=cast(
+            str, payload["authentication_evidence_ref"]
         ),
         nonce=cast(str, payload["nonce"]),
         created_at=cast(datetime, payload["created_at"]),
@@ -155,6 +159,8 @@ _REQUEST_KEYS = frozenset(
         "mandate_version",
         "mandate_agent_id",
         "user_ref",
+        "user_entity_id",
+        "beneficiary_entity_id",
         "mandate_consent_ref",
         "mandate_merchant_id",
         "mandate_payee_id",
@@ -180,7 +186,7 @@ _REQUEST_KEYS = frozenset(
         "credential_id",
         "credential_scope",
         "consent_ref",
-        "authentication_state",
+        "authentication_evidence_ref",
         "nonce",
         "created_at",
         "expires_at",
@@ -333,16 +339,7 @@ class AgenticRailAdapter:
         if type(action) is not Action:
             self._verifier.discard_preview(preview)
             raise TypeError("agentic risk scorer must return an exact Action")
-        outcome = {
-            Action.APPROVE: ReceiptOutcome.APPROVE,
-            Action.CHALLENGE: ReceiptOutcome.CHALLENGE,
-            Action.DECLINE: ReceiptOutcome.DECLINE,
-        }[action]
-        final = self._verifier.commit(request, preview, outcome)
-        if not final.allowed:
-            assert final.reason_code is not None
-            return AgenticDecision(Action.DECLINE, (final.reason_code,), final)
-        return AgenticDecision(action, (), final)
+        return AgenticDecision(action, (), preview)
 
     def handle(self, command: Command, context: RailContext) -> list[PaymentEvent]:
         canonical = _canonical_command(command)
@@ -357,11 +354,39 @@ class AgenticRailAdapter:
 
         request = canonical.request
         decision = self.process(request, now=context.now)
-        event_id = context.new_uuid()
-        event = self._event(context, canonical, decision, event_id)
+        if not decision.integrity_receipt.allowed:
+            event_id = context.new_uuid()
+            return [self._event(context, canonical, decision, event_id)]
 
-        if decision.integrity_receipt.allowed:
-            if decision.action is Action.APPROVE:
+        outcome = {
+            Action.APPROVE: ReceiptOutcome.APPROVE,
+            Action.CHALLENGE: ReceiptOutcome.CHALLENGE,
+            Action.DECLINE: ReceiptOutcome.DECLINE,
+        }[decision.action]
+        prepared = self._verifier.prepare_commit(
+            request,
+            decision.integrity_receipt,
+            outcome,
+            context.now,
+        )
+        if type(prepared) is IntegrityReceipt:
+            assert prepared.reason_code is not None
+            rejected = AgenticDecision(
+                Action.DECLINE,
+                (prepared.reason_code,),
+                prepared,
+            )
+            event_id = context.new_uuid()
+            return [self._event(context, canonical, rejected, event_id)]
+
+        plan = cast(TrustCommitPlan, prepared)
+        final_decision = AgenticDecision(decision.action, (), plan.receipt)
+        event_id = context.new_uuid()
+        event = self._event(context, canonical, final_decision, event_id)
+        projected_state = self._verifier.projected_state(plan)
+
+        try:
+            if final_decision.action is Action.APPROVE:
                 context.post(
                     LedgerEntry(
                         f"{event_id}:agentic-payment",
@@ -370,7 +395,11 @@ class AgenticRailAdapter:
                         request.currency,
                     )
                 )
-            context.set_entity_state(AGENTIC_TRUST_STATE_ID, self._verifier.dump_state())
+            context.set_entity_state(AGENTIC_TRUST_STATE_ID, projected_state)
+        except Exception:
+            self._verifier.discard_commit(plan)
+            raise
+        self._verifier.apply_commit(plan)
         return [event]
 
     @staticmethod
@@ -405,6 +434,13 @@ class AgenticRailAdapter:
             decision_at=context.now,
             actor_id=request.actor_id,
             counterparty_id=request.counterparty_id,
+            party_refs={
+                "user_ref": request.mandate.user_ref,
+                "merchant_id": request.merchant_id,
+                "payee_id": request.payee_id,
+                "user_entity_id": request.mandate.user_entity_id,
+                "beneficiary_entity_id": request.mandate.beneficiary_entity_id,
+            },
             rail_data={
                 "payment_id": request.payment_id,
                 "request_id": request.request_id,
