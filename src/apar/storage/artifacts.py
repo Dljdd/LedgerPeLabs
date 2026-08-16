@@ -21,6 +21,7 @@ _DIGEST_LENGTH = 64
 _MANIFEST_FILENAME = "manifest.json"
 _PAYLOAD_FILENAME = "payload"
 _RENAME_EXCL = 0x00000004
+_RENAME_NOREPLACE = 0x00000001
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,9 +228,20 @@ class ArtifactStore:
 
     @staticmethod
     def _rename_directory_no_replace(root_fd: int, source_name: str, destination_name: str) -> None:
-        """Use Darwin's exclusive directory rename; unsupported systems fail closed."""
-        if sys.platform != "darwin":
-            raise RuntimeError("artifact publication requires Darwin renameatx_np support")
+        """Dispatch to a platform's native exclusive directory rename, never a fallback."""
+        if sys.platform == "darwin":
+            ArtifactStore._darwin_rename_no_replace(root_fd, source_name, destination_name)
+            return
+        if sys.platform == "linux":
+            ArtifactStore._linux_rename_no_replace(root_fd, source_name, destination_name)
+            return
+        raise RuntimeError(
+            "artifact publication has no safe implementation on unsupported platform"
+        )
+
+    @staticmethod
+    def _darwin_rename_no_replace(root_fd: int, source_name: str, destination_name: str) -> None:
+        """Call Darwin renameatx_np with RENAME_EXCL."""
         try:
             renameatx_np = ctypes.CDLL(None, use_errno=True).renameatx_np
         except AttributeError as error:
@@ -256,6 +268,42 @@ class ArtifactStore:
         error_number = ctypes.get_errno()
         if error_number == errno.EEXIST:
             raise FileExistsError(error_number, os.strerror(error_number), destination_name)
+        raise OSError(error_number, os.strerror(error_number), destination_name)
+
+    @staticmethod
+    def _linux_rename_no_replace(root_fd: int, source_name: str, destination_name: str) -> None:
+        """Call Linux libc renameat2 with RENAME_NOREPLACE."""
+        try:
+            renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+        except AttributeError as error:
+            raise RuntimeError(
+                "artifact publication requires Linux libc renameat2 support"
+            ) from error
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            root_fd,
+            os.fsencode(source_name),
+            root_fd,
+            os.fsencode(destination_name),
+            _RENAME_NOREPLACE,
+        )
+        if result == 0:
+            return
+        error_number = ctypes.get_errno()
+        if error_number == errno.EEXIST:
+            raise FileExistsError(error_number, os.strerror(error_number), destination_name)
+        unsupported_errors = {errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP, errno.ENOTSUP}
+        if error_number in unsupported_errors:
+            raise RuntimeError(
+                "Linux filesystem does not support renameat2 RENAME_NOREPLACE"
+            ) from OSError(error_number, os.strerror(error_number), destination_name)
         raise OSError(error_number, os.strerror(error_number), destination_name)
 
     def _open_root_directory(self) -> int:

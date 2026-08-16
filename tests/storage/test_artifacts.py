@@ -1,5 +1,7 @@
 """Tests for immutable, content-addressed local artifacts."""
 
+import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -12,6 +14,7 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 
+import apar.storage.artifacts as artifacts
 from apar.storage.artifacts import ArtifactRef, ArtifactStore
 
 
@@ -221,3 +224,65 @@ def test_read_rejects_payload_swap_before_descriptor_open(
         store.read(ref)
 
     assert swapped
+
+
+def test_exclusive_rename_selects_darwin_implementation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Catches Darwin dispatch accidentally using an overwrite-capable fallback."""
+    calls: list[tuple[int, str, str]] = []
+
+    def rename_on_darwin(root_fd: int, source_name: str, destination_name: str) -> None:
+        calls.append((root_fd, source_name, destination_name))
+
+    monkeypatch.setattr(artifacts.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        ArtifactStore, "_darwin_rename_no_replace", staticmethod(rename_on_darwin)
+    )
+
+    ArtifactStore._rename_directory_no_replace(7, "source", "destination")
+
+    assert calls == [(7, "source", "destination")]
+
+
+def test_exclusive_rename_selects_linux_implementation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Catches Linux publication being rejected before calling renameat2."""
+    calls: list[tuple[int, str, str]] = []
+
+    def rename_on_linux(root_fd: int, source_name: str, destination_name: str) -> None:
+        calls.append((root_fd, source_name, destination_name))
+
+    monkeypatch.setattr(artifacts.sys, "platform", "linux")
+    monkeypatch.setattr(
+        ArtifactStore, "_linux_rename_no_replace", staticmethod(rename_on_linux)
+    )
+
+    ArtifactStore._rename_directory_no_replace(7, "source", "destination")
+
+    assert calls == [(7, "source", "destination")]
+
+
+def test_linux_exclusive_rename_translates_eexist(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Catches Linux EEXIST bypassing the concurrent-winner convergence path."""
+
+    class RenameAt2:
+        argtypes: object
+        restype: object
+
+        def __call__(self, *args: object) -> int:
+            ctypes.set_errno(errno.EEXIST)
+            return -1
+
+    class LibC:
+        renameat2 = RenameAt2()
+
+    monkeypatch.setattr(artifacts.ctypes, "CDLL", lambda *args, **kwargs: LibC())
+
+    with pytest.raises(FileExistsError):
+        ArtifactStore._linux_rename_no_replace(7, "source", "destination")
+
+
+def test_exclusive_rename_rejects_unsupported_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Catches an unsupported platform silently falling back to normal rename."""
+    monkeypatch.setattr(artifacts.sys, "platform", "freebsd")
+
+    with pytest.raises(RuntimeError, match="unsupported platform"):
+        ArtifactStore._rename_directory_no_replace(7, "source", "destination")
