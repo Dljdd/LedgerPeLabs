@@ -349,6 +349,33 @@ class MutableUtcTz(tzinfo):
         return self.name
 
 
+class MutableScheduledTimeAdapter:
+    """Mutate a scheduled timestamp's tzinfo after handing it to the engine."""
+
+    def __init__(self) -> None:
+        self.mutable_utc = MutableUtcTz()
+
+    def initialize(self, engine: RailContext) -> None:
+        due = datetime(
+            2026,
+            8,
+            16,
+            12,
+            0,
+            1,
+            123456,
+            tzinfo=self.mutable_utc,
+            fold=1,
+        )
+        engine.schedule(due, 0, Command("mutable-time"))
+        self.mutable_utc.offset = timedelta(hours=5, minutes=30)
+        self.mutable_utc.name = "IST"
+
+    def handle(self, command: Command, engine: RailContext) -> list[PaymentEvent]:
+        assert engine.now.tzinfo is UTC
+        return [_event(event_id=engine.new_uuid(), event_time=engine.now)]
+
+
 class StatePhase(Enum):
     """Enum canonicalization case for the closed state algebra."""
 
@@ -1135,6 +1162,79 @@ def test_open_fields_keep_exact_finite_numbers_and_infinity_text() -> None:
         "integer": 3,
         "decimal": "1.25",
         "literal": "Infinity",
+    }
+
+
+def test_engine_owns_the_normalized_clock_timestamp_in_both_queues() -> None:
+    """Catch the engine due-time mirror retaining a mutable scheduled datetime."""
+    engine = _engine(MutableScheduledTimeAdapter)
+    event = engine.run()[0]
+    expected = datetime(
+        2026,
+        8,
+        16,
+        12,
+        0,
+        1,
+        123456,
+        tzinfo=UTC,
+        fold=1,
+    )
+
+    assert type(engine.now) is datetime
+    assert engine.now.tzinfo is UTC
+    assert engine.now == expected
+    assert engine.now.fold == 1
+    assert event.event_time == expected
+
+
+@pytest.mark.parametrize(
+    "unordered",
+    [{"first", "second"}, frozenset({"first", "second"})],
+)
+def test_event_admission_rejects_nested_unordered_artifact_values(
+    unordered: object,
+) -> None:
+    """Catch set iteration order entering canonical event JSON artifacts."""
+    engine = _engine(InitializingAdapter)
+
+    with pytest.raises(TypeError, match="event contains unordered container"):
+        engine.emit(_event(extensions={"nested": [{"values": unordered}]}))
+
+    _assert_terminal_failure(engine)
+
+
+@pytest.mark.parametrize(
+    "unordered",
+    [{"first", "second"}, frozenset({"first", "second"})],
+)
+def test_bundle_admission_rejects_nested_unordered_artifact_values(
+    unordered: object,
+) -> None:
+    """Catch set iteration order entering canonical scenario JSON artifacts."""
+    bundle = _bundle()
+    bundle.extensions["nested"] = {"values": unordered}
+
+    with pytest.raises(TypeError, match="scenario bundle contains unordered container"):
+        SimulationEngine(bundle, {Rail.A2A: InitializingAdapter})
+
+
+def test_artifact_admission_preserves_ordered_list_and_tuple_values() -> None:
+    """Catch unordered-input hardening rejecting deterministic sequences."""
+    engine = _engine(InitializingAdapter)
+
+    engine.emit(
+        _event(
+            extensions={
+                "list": ["first", "second"],
+                "tuple": ("third", "fourth"),
+            }
+        )
+    )
+
+    assert engine.events[0].extensions == {
+        "list": ["first", "second"],
+        "tuple": ["third", "fourth"],
     }
 
 

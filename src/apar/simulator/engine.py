@@ -150,7 +150,9 @@ def _validate_finite_tree(value: object, *, label: str) -> None:
             _validate_finite_tree(key, label=label)
             _validate_finite_tree(item, label=label)
         return
-    if isinstance(value, (list, tuple, set, frozenset)):
+    if isinstance(value, (set, frozenset)):
+        raise TypeError(f"{label} contains unordered container")
+    if isinstance(value, (list, tuple)):
         for item in value:
             _validate_finite_tree(item, label=label)
 
@@ -427,8 +429,8 @@ class SimulationEngine:
         """Request a future command without exposing queue internals."""
         self._ensure_healthy()
         try:
-            self._clock.schedule(at, priority, command)
-            heapq.heappush(self._scheduled_times, at)
+            normalized_at = self._clock.schedule(at, priority, command)
+            heapq.heappush(self._scheduled_times, normalized_at)
         except Exception as error:
             self._mark_failed(error)
             raise

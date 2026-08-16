@@ -2,13 +2,30 @@
 
 from collections.abc import Mapping
 from dataclasses import FrozenInstanceError
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from decimal import Decimal
 from enum import Enum, StrEnum
 
 import pytest
 
 from apar.simulator.clock import Command, SimulationClock
+
+
+class MutableUtcTz(tzinfo):
+    """Caller-owned UTC tzinfo whose answers can change after admission."""
+
+    def __init__(self) -> None:
+        self.offset = timedelta(0)
+        self.name = "UTC"
+
+    def utcoffset(self, _value: datetime | None) -> timedelta:
+        return self.offset
+
+    def dst(self, _value: datetime | None) -> timedelta:
+        return timedelta(0)
+
+    def tzname(self, _value: datetime | None) -> str:
+        return self.name
 
 
 @pytest.fixture
@@ -47,6 +64,87 @@ def test_pop_advances_clock_to_popped_command_time(clock: SimulationClock, now: 
 
     assert clock.pop().at == due
     assert clock.now == due
+
+
+def test_constructor_detaches_caller_owned_utc_tzinfo() -> None:
+    """Catch the initial clock retaining mutable caller timezone identity."""
+    mutable_utc = MutableUtcTz()
+    source = datetime(
+        2026,
+        8,
+        16,
+        12,
+        0,
+        0,
+        123456,
+        tzinfo=mutable_utc,
+        fold=1,
+    )
+
+    clock = SimulationClock(source)
+    mutable_utc.offset = timedelta(hours=5, minutes=30)
+    mutable_utc.name = "IST"
+
+    assert type(clock.now) is datetime
+    assert clock.now is not source
+    assert clock.now.tzinfo is UTC
+    assert clock.now == datetime(
+        2026,
+        8,
+        16,
+        12,
+        0,
+        0,
+        123456,
+        tzinfo=UTC,
+        fold=1,
+    )
+    assert clock.now.fold == 1
+
+
+def test_schedule_detaches_tzinfo_without_changing_queue_order() -> None:
+    """Catch queued timestamps changing meaning or order through a tzinfo alias."""
+    clock = SimulationClock(datetime(2026, 8, 16, 12, 0, tzinfo=UTC))
+    mutable_utc = MutableUtcTz()
+    source = datetime(
+        2026,
+        8,
+        16,
+        12,
+        2,
+        0,
+        654321,
+        tzinfo=mutable_utc,
+        fold=1,
+    )
+    admitted = clock.schedule(source, 0, Command("later"))
+    clock.schedule(
+        datetime(2026, 8, 16, 12, 1, tzinfo=UTC),
+        0,
+        Command("earlier"),
+    )
+
+    mutable_utc.offset = timedelta(hours=5, minutes=30)
+    mutable_utc.name = "IST"
+    earlier = clock.pop()
+    later = clock.pop()
+
+    assert [earlier.command.name, later.command.name] == ["earlier", "later"]
+    assert later.at is admitted
+    assert later.at is not source
+    assert later.at.tzinfo is UTC
+    assert later.at == datetime(
+        2026,
+        8,
+        16,
+        12,
+        2,
+        0,
+        654321,
+        tzinfo=UTC,
+        fold=1,
+    )
+    assert clock.now is later.at
 
 
 def test_schedule_rejects_naive_timestamp(clock: SimulationClock) -> None:

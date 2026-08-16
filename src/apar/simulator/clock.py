@@ -5,7 +5,7 @@ from __future__ import annotations
 import heapq
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import Enum, StrEnum
 from types import MappingProxyType
@@ -65,6 +65,23 @@ def _is_utc(value: datetime) -> bool:
     )
 
 
+def _normalize_utc(value: datetime, *, message: str) -> datetime:
+    """Validate and detach one timestamp from caller-owned timezone identity."""
+    if not _is_utc(value):
+        raise ValueError(message)
+    return datetime(
+        value.year,
+        value.month,
+        value.day,
+        value.hour,
+        value.minute,
+        value.second,
+        value.microsecond,
+        tzinfo=UTC,
+        fold=value.fold,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class Command:
     """An immutable, typed command envelope for a rail adapter to execute later."""
@@ -92,9 +109,10 @@ class SimulationClock:
     """Own a stable priority queue ordered by time, priority, then insertion order."""
 
     def __init__(self, now: datetime) -> None:
-        if not _is_utc(now):
-            raise ValueError("simulation clock time must be a UTC timestamp")
-        self._now = now
+        self._now = _normalize_utc(
+            now,
+            message="simulation clock time must be a UTC timestamp",
+        )
         self._sequence = 0
         self._queue: list[tuple[datetime, int, int, ScheduledCommand]] = []
 
@@ -103,20 +121,26 @@ class SimulationClock:
         """Return the current UTC simulation time."""
         return self._now
 
-    def schedule(self, at: datetime, priority: int, command: Command) -> None:
-        """Schedule one command, rejecting ambiguous or time-travelling input."""
-        if not _is_utc(at):
-            raise ValueError("scheduled time must be a UTC timestamp")
-        if at < self._now:
+    def schedule(self, at: datetime, priority: int, command: Command) -> datetime:
+        """Schedule one command and return its owned normalized UTC timestamp."""
+        normalized_at = _normalize_utc(
+            at,
+            message="scheduled time must be a UTC timestamp",
+        )
+        if normalized_at < self._now:
             raise ValueError("cannot schedule earlier than the current simulation time")
         if isinstance(priority, bool) or not isinstance(priority, int):
             raise TypeError("priority must be an integer")
         if not isinstance(command, Command):
             raise TypeError("command must be a Command")
 
-        scheduled = ScheduledCommand(at, priority, self._sequence, command)
-        heapq.heappush(self._queue, (at, priority, self._sequence, scheduled))
+        scheduled = ScheduledCommand(normalized_at, priority, self._sequence, command)
+        heapq.heappush(
+            self._queue,
+            (normalized_at, priority, self._sequence, scheduled),
+        )
         self._sequence += 1
+        return normalized_at
 
     def pop(self) -> ScheduledCommand:
         """Pop the next command and advance the simulation time to its event time."""
