@@ -3,6 +3,8 @@
 from collections.abc import Mapping
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta, timezone
+from decimal import Decimal
+from enum import Enum
 
 import pytest
 
@@ -26,6 +28,16 @@ def test_queue_orders_by_time_priority_then_sequence(clock: SimulationClock, now
     clock.schedule(now, 1, Command("first-tie"))
 
     assert [clock.pop().command.name for _ in range(3)] == ["first", "first-tie", "second"]
+
+
+def test_queue_orders_distinct_timestamps_before_priority(
+    clock: SimulationClock, now: datetime
+) -> None:
+    """Catch priority incorrectly taking precedence over event time."""
+    clock.schedule(now + timedelta(seconds=2), 0, Command("later-high"))
+    clock.schedule(now + timedelta(seconds=1), 99, Command("earlier-low"))
+
+    assert [clock.pop().command.name for _ in range(2)] == ["earlier-low", "later-high"]
 
 
 def test_pop_advances_clock_to_popped_command_time(clock: SimulationClock, now: datetime) -> None:
@@ -87,3 +99,45 @@ def test_command_freezes_nested_payload_values() -> None:
     assert isinstance(nested, Mapping)
     with pytest.raises(TypeError):
         nested["id"] = "p2"  # type: ignore[index]
+
+
+class PayloadKind(Enum):
+    """A valid immutable payload scalar for command tests."""
+
+    AUTHORIZE = "authorize"
+
+
+class MutablePayload:
+    """A deliberately unsupported mutable object for command tests."""
+
+    value = "mutable"
+
+
+@pytest.mark.parametrize("unsupported", [bytearray(b"p1"), MutablePayload()])
+def test_command_rejects_unsupported_mutable_payload_values(unsupported: object) -> None:
+    """Catch unsupported values being retained as mutable payload aliases."""
+    with pytest.raises(TypeError, match="unsupported command payload value"):
+        Command("authorize", {"payment": unsupported})
+
+
+def test_command_freezes_supported_nested_payload_values(now: datetime) -> None:
+    """Catch rejecting or mutating supported structured payload data."""
+    command = Command(
+        "authorize",
+        {
+            "amount": Decimal("10.00"),
+            "created_at": now,
+            "receipt": b"receipt",
+            "kind": PayloadKind.AUTHORIZE,
+            "nested": [{"payment_ids": {"p1", "p2"}}],
+        },
+    )
+
+    assert command.payload["amount"] == Decimal("10.00")
+    assert command.payload["created_at"] == now
+    assert command.payload["receipt"] == b"receipt"
+    assert command.payload["kind"] is PayloadKind.AUTHORIZE
+    nested = command.payload["nested"]
+    assert isinstance(nested, tuple)
+    assert isinstance(nested[0], Mapping)
+    assert nested[0]["payment_ids"] == frozenset({"p1", "p2"})

@@ -6,25 +6,43 @@ import heapq
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from decimal import Decimal
+from enum import Enum
 from types import MappingProxyType
 
 
 def _immutable_mapping(values: Mapping[str, object]) -> Mapping[str, object]:
     """Copy a command payload so scheduled commands cannot be changed in place."""
-    return MappingProxyType({key: _freeze(value) for key, value in values.items()})
+    return _freeze_mapping(values)
+
+
+def _freeze_mapping(values: Mapping[str, object]) -> Mapping[str, object]:
+    """Copy and freeze a mapping whose keys are safe command-payload names."""
+    frozen: dict[str, object] = {}
+    for key, value in values.items():
+        if not isinstance(key, str):
+            raise TypeError("command payload mapping keys must be strings")
+        frozen[key] = _freeze(value)
+    return MappingProxyType(frozen)
 
 
 def _freeze(value: object) -> object:
-    """Recursively make standard structured payload values immutable."""
+    """Recursively freeze the explicit payload types supported by commands."""
+    if value is None or isinstance(value, (bool, bytes, Decimal, Enum, float, int, str, datetime)):
+        return value
     if isinstance(value, Mapping):
-        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+        return _freeze_mapping(value)
     if isinstance(value, list):
         return tuple(_freeze(item) for item in value)
     if isinstance(value, tuple):
         return tuple(_freeze(item) for item in value)
-    if isinstance(value, set):
-        return frozenset(_freeze(item) for item in value)
-    return value
+    if isinstance(value, (frozenset, set)):
+        frozen_items = tuple(_freeze(item) for item in value)
+        try:
+            return frozenset(frozen_items)
+        except TypeError as error:
+            raise TypeError("unsupported command payload value in set") from error
+    raise TypeError(f"unsupported command payload value: {type(value).__name__}")
 
 
 def _is_utc(value: datetime) -> bool:

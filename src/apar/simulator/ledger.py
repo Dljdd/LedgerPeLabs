@@ -33,26 +33,18 @@ class LedgerEntry:
 
 
 class Ledger:
-    """Track account balances through validated, append-only double-entry postings.
-
-    ``external_adjustments`` are value changes deliberately outside the append-only
-    ledger.  A positive adjustment represents value removed from the ledger, so the
-    conservation identity is ``current total + adjustment == opening total``.
-    """
+    """Track account balances through validated, append-only double-entry postings."""
 
     def __init__(
         self,
         opening_balances: Mapping[AccountReference, Decimal] | None = None,
         *,
         allow_credit: Collection[AccountReference] | None = None,
-        external_adjustments: Mapping[str, Decimal] | None = None,
     ) -> None:
         self._allow_credit = frozenset(allow_credit or ())
         self._balances: dict[tuple[str, str], Decimal] = {}
         self._entries: list[LedgerEntry] = []
-        self._external_adjustments = self._normalize_external_adjustments(
-            external_adjustments or {}
-        )
+        self._entry_ids: set[str] = set()
 
         for account, amount in (opening_balances or {}).items():
             account_name, currency = self._parse_account_reference(account)
@@ -62,9 +54,6 @@ class Ledger:
             self._balances[(account_name, currency)] = normalized
 
         self._opening_totals = self._totals_by_currency(self._balances)
-        for currency, adjustment in self._external_adjustments.items():
-            prior_total = self._opening_totals.get(currency, Decimal(0))
-            self._opening_totals[currency] = prior_total + adjustment
 
     @property
     def entries(self) -> tuple[LedgerEntry, ...]:
@@ -78,6 +67,10 @@ class Ledger:
 
     def post(self, entry: LedgerEntry) -> None:
         """Validate and atomically append a balanced posting."""
+        if not entry.entry_id.strip():
+            raise ValueError("entry_id must not be empty")
+        if entry.entry_id in self._entry_ids:
+            raise ValueError(f"duplicate ledger entry_id: {entry.entry_id}")
         currency = entry.currency
         self._currency_exponent(currency)
         debits = self._normalize_legs(entry.debit, currency)
@@ -101,36 +94,28 @@ class Ledger:
         normalized_entry = LedgerEntry(entry.entry_id, debits, credits, currency)
         self._balances = new_balances
         self._entries.append(normalized_entry)
+        self._entry_ids.add(entry.entry_id)
 
     def assert_conserved(self) -> None:
         """Raise if append-only postings have changed value in any currency."""
         current_totals = self._totals_by_currency(self._balances)
-        currencies = (
-            set(current_totals) | set(self._opening_totals) | set(self._external_adjustments)
-        )
+        currencies = set(current_totals) | set(self._opening_totals)
         for currency in currencies:
             current = current_totals.get(currency, Decimal(0))
-            adjustment = self._external_adjustments.get(currency, Decimal(0))
             opening = self._opening_totals.get(currency, Decimal(0))
-            if current + adjustment != opening:
+            if current != opening:
                 raise AssertionError(f"ledger value is not conserved for currency: {currency}")
-
-    def _normalize_external_adjustments(
-        self, adjustments: Mapping[str, Decimal]
-    ) -> dict[str, Decimal]:
-        return {
-            currency: self._quantize(amount, currency)
-            for currency, amount in adjustments.items()
-        }
 
     def _normalize_legs(self, legs: CurrencyAmount, currency: str) -> dict[str, Decimal]:
         normalized: dict[str, Decimal] = {}
         for account, amount in legs.items():
             if not account:
                 raise ValueError("account must not be empty")
+            if not isinstance(amount, Decimal):
+                raise TypeError("ledger amounts must be Decimal")
+            if not amount.is_finite() or amount < 0:
+                raise ValueError("posting legs must be finite and non-negative")
             value = self._quantize(amount, currency)
-            if value < 0:
-                raise ValueError("posting legs must be non-negative")
             normalized[account] = value
         return normalized
 
@@ -155,6 +140,8 @@ class Ledger:
         exponent = self._currency_exponent(currency)
         if not isinstance(amount, Decimal):
             raise TypeError("ledger amounts must be Decimal")
+        if not amount.is_finite():
+            raise ValueError("ledger amounts must be finite")
         return amount.quantize(Decimal(1).scaleb(-exponent), rounding=ROUND_HALF_EVEN)
 
     @staticmethod

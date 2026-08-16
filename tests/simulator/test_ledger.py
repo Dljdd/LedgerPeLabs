@@ -71,6 +71,28 @@ def test_ledger_rejects_negative_posting_leg(ledger: Ledger) -> None:
         ledger.post(entry)
 
 
+@pytest.mark.parametrize("amount", [Decimal("-0.001"), Decimal("NaN"), Decimal("Infinity")])
+def test_ledger_rejects_invalid_raw_amount_before_quantization(
+    ledger: Ledger, amount: Decimal
+) -> None:
+    """Catch quantization masking a negative or non-finite posting leg."""
+    entry = LedgerEntry("invalid-raw", {"payer": amount}, {"payee": amount})
+
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        ledger.post(entry)
+
+
+def test_ledger_accepts_balanced_zero_value_posting(ledger: Ledger) -> None:
+    """Define zero as a valid non-negative, balanced posting amount."""
+    entry = LedgerEntry("zero", {"payer": Decimal("0")}, {"payee": Decimal("-0")})
+
+    ledger.post(entry)
+
+    assert ledger.entries == (entry,)
+    assert ledger.balance("payer") == Decimal("0")
+    assert ledger.balance("payee") == Decimal("0")
+
+
 def test_ledger_rejects_overdraft_without_credit_configuration(ledger: Ledger) -> None:
     """Catch spending from an unfunded account."""
     entry = LedgerEntry("overdraft", {"payer": Decimal("1")}, {"payee": Decimal("1")})
@@ -89,15 +111,14 @@ def test_ledger_accepts_explicit_opening_balances() -> None:
     ledger.assert_conserved()
 
 
-def test_ledger_conservation_accounts_for_declared_external_adjustments() -> None:
-    """Catch conservation checks that silently ignore declared off-ledger value movement."""
-    ledger = Ledger(
-        opening_balances={"payer": Decimal("90.00")},
-        external_adjustments={"USD": Decimal("10.00")},
-    )
+def test_ledger_detects_internal_balance_drift() -> None:
+    """Catch value creation or loss that bypasses append-only postings."""
+    ledger = Ledger(opening_balances={"payer": Decimal("10.00")})
     ledger.post(LedgerEntry("transfer", {"payer": Decimal("4")}, {"payee": Decimal("4")}))
+    ledger._balances[("payee", "USD")] += Decimal("0.01")  # type: ignore[attr-defined]
 
-    ledger.assert_conserved()
+    with pytest.raises(AssertionError, match="not conserved"):
+        ledger.assert_conserved()
 
 
 def test_ledger_history_is_append_only(ledger: Ledger) -> None:
@@ -110,6 +131,31 @@ def test_ledger_history_is_append_only(ledger: Ledger) -> None:
     with pytest.raises(AttributeError):
         funded.entries.append(entry)  # type: ignore[attr-defined]
     assert funded.entries == (entry,)
+
+
+def test_ledger_rejects_empty_entry_id(ledger: Ledger) -> None:
+    """Catch anonymous postings that cannot be audited or deduplicated."""
+    entry = LedgerEntry("", {"payer": Decimal("0")}, {"payee": Decimal("0")})
+
+    with pytest.raises(ValueError, match="entry_id must not be empty"):
+        ledger.post(entry)
+
+    assert ledger.entries == ()
+
+
+def test_ledger_rejects_duplicate_entry_id_atomically() -> None:
+    """Catch duplicate audit records changing balances or append-only history."""
+    ledger = Ledger(opening_balances={"payer": Decimal("10")})
+    first = LedgerEntry("transfer", {"payer": Decimal("4")}, {"payee": Decimal("4")})
+    duplicate = LedgerEntry("transfer", {"payer": Decimal("2")}, {"payee": Decimal("2")})
+    ledger.post(first)
+
+    with pytest.raises(ValueError, match="duplicate ledger entry_id"):
+        ledger.post(duplicate)
+
+    assert ledger.entries == (first,)
+    assert ledger.balance("payer") == Decimal("6.00")
+    assert ledger.balance("payee") == Decimal("4.00")
 
 
 @given(
