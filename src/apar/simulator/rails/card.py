@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping
 from decimal import ROUND_HALF_EVEN, Decimal
 from enum import StrEnum
+from types import MappingProxyType
 from typing import ClassVar, cast
 from uuid import UUID
 
@@ -14,6 +17,7 @@ from apar.simulator.ledger import LedgerEntry
 from apar.simulator.rails.base import FrozenState, LifecycleError, RailContext
 
 _EXPONENTS = {"EUR": 2, "JPY": 0, "KWD": 3, "USD": 2}
+_MAPPING_PROXY_TYPE: type[object] = type(MappingProxyType({}))
 
 
 class CardState(StrEnum):
@@ -74,10 +78,33 @@ def _require_distinct_accounts(*accounts: str) -> None:
         raise ValueError("card account roles must be pairwise distinct")
 
 
+def _payload_fingerprint(payload: Mapping[str, object]) -> str:
+    tagged: list[list[str]] = []
+    for key in sorted(payload):
+        if type(key) is not str:
+            raise TypeError("command payload keys must be exact strings")
+        value = payload[key]
+        if type(value) is str:
+            tagged.append([key, "str", value])
+        elif type(value) is Decimal:
+            tagged.append([key, "decimal", str(value)])
+        else:
+            raise TypeError("card command payload contains unsupported value type")
+    encoded = json.dumps(tagged, separators=(",", ":"), ensure_ascii=True).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
 class CardCommand(Command):
     """Immutable public command base exposing campaign metadata to generators."""
 
-    __slots__ = ()
+    __slots__ = ("_operation_identity", "_request_fingerprint")
+
+    _operation_identity: str
+    _request_fingerprint: str
+
+    def _seal(self, operation_identity: str) -> None:
+        object.__setattr__(self, "_operation_identity", operation_identity)
+        object.__setattr__(self, "_request_fingerprint", _payload_fingerprint(self.payload))
 
     @property
     def payment_id(self) -> str:
@@ -156,6 +183,7 @@ class _OpenCardCommand(CardCommand):
                 ),
             },
         )
+        self._seal(self._NAME)
 
 
 class AuthorizeCard(_OpenCardCommand):
@@ -208,6 +236,7 @@ class _FollowupCardCommand(CardCommand):
                 ),
             },
         )
+        self._seal(self._NAME)
 
 
 class ClearCard(_FollowupCardCommand):
@@ -301,26 +330,93 @@ _MISSING_CODES: Mapping[type[Command], str] = {
     RefundCard: "CARD_REFUND_BEFORE_SETTLEMENT",
 }
 
-_KNOWN_COMMAND_TYPES = frozenset(
+_COMMAND_OPERATIONS: Mapping[type[Command], str] = {
+    AuthorizeCard: "card.authorize",
+    DeclineCardAuthorization: "card.decline",
+    ClearCard: "card.clear",
+    SettleCard: "card.settle",
+    ReverseCardAuthorization: "card.reverse",
+    ReportCardFraud: "card.report",
+    OpenCardDispute: "card.dispute",
+    ChargebackCard: "card.chargeback",
+    RecoverCard: "card.recover",
+    RefundCard: "card.refund",
+}
+_KNOWN_COMMAND_TYPES = frozenset(_COMMAND_OPERATIONS)
+_OPEN_PAYLOAD_KEYS = frozenset(
     {
-        AuthorizeCard,
-        DeclineCardAuthorization,
-        ClearCard,
-        SettleCard,
-        ReverseCardAuthorization,
-        ReportCardFraud,
-        OpenCardDispute,
-        ChargebackCard,
-        RecoverCard,
-        RefundCard,
+        "payment_id",
+        "amount",
+        "currency",
+        "payer_account",
+        "payee_account",
+        "actor_id",
+        "counterparty_id",
+        "campaign_id",
+        "trace_id",
+        "fee",
+        "hold_account",
+        "fee_account",
+        "chargeback_account",
+        "idempotency_key",
     }
 )
+_FOLLOWUP_PAYLOAD_KEYS = frozenset({"payment_id", "idempotency_key"})
 
 
-def _mapping_state(value: FrozenState) -> Mapping[str, FrozenState]:
-    if not isinstance(value, Mapping):
-        raise LifecycleError("CARD_STATE_CORRUPT")
-    return value
+def _canonical_command(command: Command) -> CardCommand:
+    command_type = type(command)
+    if not isinstance(command, CardCommand) or command_type not in _KNOWN_COMMAND_TYPES:
+        raise LifecycleError("CARD_UNKNOWN_COMMAND")
+    operation = _COMMAND_OPERATIONS[command_type]
+    try:
+        if type(command.name) is not str or command.name != operation:
+            raise ValueError("command name does not match concrete operation")
+        if type(command.payload) is not _MAPPING_PROXY_TYPE:
+            raise TypeError("command payload must be an owned immutable mapping")
+        payload = command.payload
+        expected_keys = (
+            _OPEN_PAYLOAD_KEYS
+            if command_type in {AuthorizeCard, DeclineCardAuthorization}
+            else _FOLLOWUP_PAYLOAD_KEYS
+        )
+        if set(payload) != expected_keys:
+            raise ValueError("command payload fields do not match concrete operation")
+        incoming_fingerprint = _payload_fingerprint(payload)
+        if command._operation_identity != operation:
+            raise ValueError("command operation attestation does not match")
+        if command._request_fingerprint != incoming_fingerprint:
+            raise ValueError("command payload attestation does not match")
+
+        if command_type in {AuthorizeCard, DeclineCardAuthorization}:
+            opening_type = cast(type[_OpenCardCommand], command_type)
+            canonical: CardCommand = opening_type(
+                cast(str, payload["payment_id"]),
+                amount=cast(Decimal, payload["amount"]),
+                currency=cast(str, payload["currency"]),
+                payer_account=cast(str, payload["payer_account"]),
+                payee_account=cast(str, payload["payee_account"]),
+                actor_id=cast(str, payload["actor_id"]),
+                counterparty_id=cast(str, payload["counterparty_id"]),
+                campaign_id=cast(str, payload["campaign_id"]),
+                trace_id=cast(str, payload["trace_id"]),
+                fee=cast(Decimal, payload["fee"]),
+                hold_account=cast(str, payload["hold_account"]),
+                fee_account=cast(str, payload["fee_account"]),
+                chargeback_account=cast(str, payload["chargeback_account"]),
+                idempotency_key=cast(str, payload["idempotency_key"]),
+            )
+        else:
+            followup_type = cast(type[_FollowupCardCommand], command_type)
+            canonical = followup_type(
+                cast(str, payload["payment_id"]),
+                idempotency_key=cast(str, payload["idempotency_key"]),
+            )
+        if canonical._request_fingerprint != incoming_fingerprint:
+            raise ValueError("command payload is not canonical")
+        return canonical
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise LifecycleError("CARD_COMMAND_INVALID") from error
 
 
 def _state_value(
@@ -332,6 +428,98 @@ def _state_value(
     if type(value) is not expected:
         raise LifecycleError("CARD_STATE_CORRUPT")
     return value
+
+
+_STATE_KEYS = frozenset(
+    {
+        "state",
+        "payment_id",
+        "amount",
+        "currency",
+        "payer_account",
+        "payee_account",
+        "actor_id",
+        "counterparty_id",
+        "campaign_id",
+        "trace_id",
+        "fee",
+        "hold_account",
+        "fee_account",
+        "chargeback_account",
+        "last_event_id",
+        "idempotency_records",
+    }
+)
+
+
+def _validated_state(value: object) -> Mapping[str, FrozenState]:
+    try:
+        if type(value) not in (dict, _MAPPING_PROXY_TYPE):
+            raise TypeError("state must be an owned mapping")
+        state = cast(Mapping[str, FrozenState], value)
+        if set(state) != _STATE_KEYS or any(type(key) is not str for key in state):
+            raise ValueError("state fields do not match card schema")
+
+        CardState(_text("state", state["state"]))
+        _text("payment_id", state["payment_id"])
+        currency = _text("currency", state["currency"])
+        amount_value = state["amount"]
+        fee_value = state["fee"]
+        if type(amount_value) is not Decimal or type(fee_value) is not Decimal:
+            raise TypeError("state money must be exact Decimal")
+        amount = amount_value
+        fee = fee_value
+        if amount.as_tuple() != _money(
+            "amount", amount, currency, positive=True
+        ).as_tuple():
+            raise ValueError("state amount must be canonically quantized")
+        if fee.as_tuple() != _money("fee", fee, currency, positive=False).as_tuple():
+            raise ValueError("state fee must be canonically quantized")
+        if fee > amount:
+            raise ValueError("state fee must not exceed amount")
+
+        payer = _text("payer_account", state["payer_account"])
+        payee = _text("payee_account", state["payee_account"])
+        hold = _text("hold_account", state["hold_account"])
+        fee_account = _text("fee_account", state["fee_account"])
+        chargeback = _text("chargeback_account", state["chargeback_account"])
+        _require_distinct_accounts(payer, payee, hold, fee_account, chargeback)
+        _uuid_text("actor_id", state["actor_id"])
+        _uuid_text("counterparty_id", state["counterparty_id"])
+        _uuid_text("campaign_id", state["campaign_id"])
+        _uuid_text("trace_id", state["trace_id"])
+
+        last_event_id = state["last_event_id"]
+        if type(last_event_id) is not str:
+            raise TypeError("last_event_id must be an exact string")
+        if last_event_id:
+            _uuid_text("last_event_id", last_event_id)
+
+        records = state["idempotency_records"]
+        if type(records) is not tuple:
+            raise TypeError("idempotency_records must be an exact tuple")
+        seen_keys: set[str] = set()
+        operations = frozenset(_COMMAND_OPERATIONS.values())
+        for record in records:
+            if type(record) is not tuple or len(record) != 3:
+                raise ValueError("idempotency record must contain three fields")
+            key, operation, fingerprint = record
+            if type(key) is not str or not key:
+                raise ValueError("idempotency record key must be a non-empty string")
+            if type(operation) is not str or operation not in operations:
+                raise ValueError("idempotency record operation is invalid")
+            if (
+                type(fingerprint) is not str
+                or len(fingerprint) != 64
+                or any(character not in "0123456789abcdef" for character in fingerprint)
+            ):
+                raise ValueError("idempotency record fingerprint is invalid")
+            if key in seen_keys:
+                raise ValueError("idempotency record keys must be unique")
+            seen_keys.add(key)
+        return state
+    except (KeyError, TypeError, ValueError) as error:
+        raise LifecycleError("CARD_STATE_CORRUPT") from error
 
 
 def _opening_state(command: _OpenCardCommand) -> dict[str, object]:
@@ -376,14 +564,15 @@ def _is_idempotent_retry(
         tuple[FrozenState, ...],
         _state_value(state, "idempotency_records", tuple),
     )
+    operation = _COMMAND_OPERATIONS[type(command)]
+    fingerprint = command._request_fingerprint
     for record in records:
-        if type(record) is not tuple or len(record) != 2:
-            raise LifecycleError("CARD_STATE_CORRUPT")
-        key, command_name = record
-        if type(key) is not str or type(command_name) is not str:
-            raise LifecycleError("CARD_STATE_CORRUPT")
+        key, recorded_operation, recorded_fingerprint = cast(
+            tuple[str, str, str],
+            record,
+        )
         if key == command.idempotency_key:
-            if command_name == command.name:
+            if recorded_operation == operation and recorded_fingerprint == fingerprint:
                 return True, records
             raise LifecycleError("CARD_IDEMPOTENCY_KEY_COLLISION")
     return False, records
@@ -485,39 +674,51 @@ class CardRailAdapter:
             raise ValueError("card adapter requires a card scenario")
 
     def handle(self, command: Command, context: RailContext) -> list[PaymentEvent]:
-        if not isinstance(command, CardCommand) or type(command) not in _KNOWN_COMMAND_TYPES:
-            raise LifecycleError("CARD_UNKNOWN_COMMAND")
-        payment_id = command.payment_id
+        canonical = _canonical_command(command)
+        payment_id = canonical.payment_id
         try:
-            state = _mapping_state(context.entity_state(payment_id))
+            raw_state: object = context.entity_state(payment_id)
         except KeyError:
-            if not isinstance(command, _OpenCardCommand):
+            if type(canonical) not in {AuthorizeCard, DeclineCardAuthorization}:
                 raise LifecycleError(
-                    _MISSING_CODES.get(type(command), "CARD_INVALID_TRANSITION")
+                    _MISSING_CODES.get(type(canonical), "CARD_INVALID_TRANSITION")
                 ) from None
-            state = _mapping_state(cast(FrozenState, _opening_state(command)))
+            raw_state = _opening_state(cast(_OpenCardCommand, canonical))
+        state = _validated_state(raw_state)
 
-        is_retry, records = _is_idempotent_retry(state, command)
+        is_retry, records = _is_idempotent_retry(state, canonical)
         if is_retry:
             return []
         current = CardState(cast(str, _state_value(state, "state", str)))
         try:
-            next_state, kind, effect = _TRANSITIONS[(current, type(command))]
+            next_state, kind, effect = _TRANSITIONS[(current, type(canonical))]
         except KeyError as error:
-            raise LifecycleError(_invalid_code(current, type(command))) from error
+            raise LifecycleError(_invalid_code(current, type(canonical))) from error
 
         event_id = context.new_uuid()
         previous_event_id = cast(str, _state_value(state, "last_event_id", str))
-        _post_effect(context, state, effect, event_id)
         updated = dict(state)
         updated["state"] = next_state.value
         updated["last_event_id"] = event_id
         updated["idempotency_records"] = (
             *records,
-            (command.idempotency_key, command.name),
+            (
+                canonical.idempotency_key,
+                _COMMAND_OPERATIONS[type(canonical)],
+                canonical._request_fingerprint,
+            ),
         )
-        context.set_entity_state(payment_id, updated)
-        return [_event(context, updated, kind, event_id, previous_event_id)]
+        validated_updated = _validated_state(updated)
+        prospective_event = _event(
+            context,
+            validated_updated,
+            kind,
+            event_id,
+            previous_event_id,
+        )
+        _post_effect(context, validated_updated, effect, event_id)
+        context.set_entity_state(payment_id, validated_updated)
+        return [prospective_event]
 
 
 __all__ = [

@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from datetime import timedelta
 from decimal import Decimal
+from types import MappingProxyType
+from typing import cast
 
 import pytest
 
@@ -25,6 +27,7 @@ from apar.simulator.rails.a2a import (
     ReportA2AFraud,
     ReturnA2A,
 )
+from apar.simulator.rails.base import FrozenState
 from tests.factories import NOW, make_scenario_config, make_threat_card
 
 PAYMENT_ID = "a2a-payment-1"
@@ -229,6 +232,51 @@ def test_a2a_idempotency_key_collision_with_different_command_fails_closed() -> 
     assert engine.ledger.balance("payer") == Decimal("100.00")
 
 
+def test_a2a_duplicate_constructor_with_identical_request_is_noop() -> None:
+    """Catch request fingerprints depending on object identity rather than payload."""
+    engine = _engine()
+    _schedule(engine, _initiate(idempotency_key="same"), _initiate(idempotency_key="same"))
+
+    events = engine.run()
+
+    assert len(events) == 1
+    assert engine.ledger.entries == ()
+
+
+@pytest.mark.parametrize(
+    "second",
+    [
+        lambda: _initiate(idempotency_key="same", amount=Decimal("11.00")),
+        lambda: _initiate(idempotency_key="same", fee=Decimal("1.00")),
+        lambda: _initiate(idempotency_key="same", payee_account="payee-2"),
+        lambda: InitiateA2A(
+            PAYMENT_ID,
+            amount=Decimal("10.00"),
+            currency="USD",
+            payer_account="payer",
+            payee_account="payee",
+            actor_id="00000000-0000-4000-8000-000000000999",
+            counterparty_id=PAYEE_ID,
+            campaign_id=CAMPAIGN_ID,
+            trace_id=TRACE_ID,
+            idempotency_key="same",
+        ),
+    ],
+)
+def test_a2a_same_key_changed_opening_request_collides(
+    second: Callable[[], InitiateA2A],
+) -> None:
+    """Catch amount, fee, account, or identity changes masquerading as retries."""
+    engine = _engine()
+    _schedule(engine, _initiate(idempotency_key="same"), second())
+
+    with pytest.raises(LifecycleError) as error:
+        engine.run()
+
+    assert error.value.code == "A2A_IDEMPOTENCY_KEY_COLLISION"
+    assert engine.ledger.entries == ()
+
+
 def test_a2a_same_command_same_key_remains_complete_noop() -> None:
     """Catch collision detection breaking legitimate A2A retry idempotency."""
     engine = _engine()
@@ -398,10 +446,12 @@ def test_a2a_state_is_closed_ordered_primitives() -> None:
     state = engine.entity_state(PAYMENT_ID)
     assert isinstance(state, Mapping)
     assert state["state"] == "accepted"
-    assert state["idempotency_records"] == (
+    records = cast(tuple[tuple[str, str, str], ...], state["idempotency_records"])
+    assert [(record[0], record[1]) for record in records] == [
         ("a2a-initiate-1", "a2a.initiate"),
         ("a2a.accept:a2a-payment-1", "a2a.accept"),
-    )
+    ]
+    assert all(len(record) == 3 and len(record[2]) == 64 for record in records)
 
 
 @pytest.mark.parametrize(
@@ -438,6 +488,70 @@ def test_a2a_rejects_unknown_concrete_command_before_payload_access(
     assert error.value.code == "A2A_UNKNOWN_COMMAND"
 
 
+def _forge_a2a_initiation(
+    change: Callable[[dict[str, object]], None] | None = None,
+    *,
+    mutable_payload: bool = False,
+    name: str | None = None,
+) -> InitiateA2A:
+    command = _initiate()
+    payload = dict(command.payload)
+    if change is not None:
+        change(payload)
+    forged_payload = payload if mutable_payload else MappingProxyType(payload)
+    object.__setattr__(command, "payload", forged_payload)
+    if name is not None:
+        object.__setattr__(command, "name", name)
+    return command
+
+
+def _drop_a2a_field(payload: dict[str, object], field: str) -> None:
+    payload.pop(field)
+
+
+@pytest.mark.parametrize(
+    "forge",
+    [
+        lambda: _forge_a2a_initiation(name="a2a.accept"),
+        lambda: _forge_a2a_initiation(mutable_payload=True),
+        lambda: _forge_a2a_initiation(
+            lambda payload: _drop_a2a_field(payload, "payment_id")
+        ),
+        lambda: _forge_a2a_initiation(
+            lambda payload: payload.__setitem__("frozen_account", "payee")
+        ),
+        lambda: _forge_a2a_initiation(
+            lambda payload: payload.__setitem__("actor_id", "not-a-uuid")
+        ),
+        lambda: _forge_a2a_initiation(
+            lambda payload: payload.__setitem__("amount", Decimal("NaN"))
+        ),
+        lambda: _forge_a2a_initiation(
+            lambda payload: payload.__setitem__("amount", Decimal("0.004"))
+        ),
+        lambda: _forge_a2a_initiation(
+            lambda payload: payload.__setitem__("idempotency_key", "altered")
+        ),
+        lambda: _forge_a2a_initiation(
+            lambda payload: payload.__setitem__("extra", "forged")
+        ),
+    ],
+)
+def test_a2a_forged_known_command_fails_before_any_effect(
+    forge: Callable[[], InitiateA2A],
+) -> None:
+    """Catch forged exact-type commands bypassing canonical constructor admission."""
+    engine = _engine()
+    _schedule(engine, forge())
+
+    with pytest.raises(LifecycleError) as error:
+        engine.run()
+
+    assert error.value.code == "A2A_COMMAND_INVALID"
+    assert engine.ledger.entries == ()
+    assert engine.ledger.balance("payer") == Decimal("100.00")
+
+
 @pytest.mark.parametrize(
     "build",
     [
@@ -465,3 +579,40 @@ def test_a2a_same_seed_replays_byte_identically() -> None:
     second.run()
 
     assert first.serialize_events() == second.serialize_events()
+
+
+def _corrupt_a2a_state(change: Callable[[dict[str, object]], None]) -> SimulationEngine:
+    engine = _engine()
+    _schedule(engine, _initiate())
+    engine.run()
+    state = engine.entity_state(PAYMENT_ID)
+    assert isinstance(state, Mapping)
+    corrupted = cast(dict[str, object], dict(state))
+    change(corrupted)
+    engine._entity_state[PAYMENT_ID] = cast(FrozenState, MappingProxyType(corrupted))
+    engine.schedule(NOW, 0, AcceptA2A(PAYMENT_ID))
+    return engine
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda state: _drop_a2a_field(state, "idempotency_records"),
+        lambda state: state.__setitem__("state", "invented"),
+        lambda state: state.__setitem__("idempotency_records", (("bad",),)),
+        lambda state: state.__setitem__("frozen_account", "payee"),
+        lambda state: state.__setitem__("amount", Decimal("NaN")),
+        lambda state: state.__setitem__("extra", "unexpected"),
+    ],
+)
+def test_a2a_corrupt_state_maps_to_stable_error_before_new_effect(
+    change: Callable[[dict[str, object]], None],
+) -> None:
+    """Catch malformed closed state leaking raw errors or posting new value."""
+    engine = _corrupt_a2a_state(change)
+
+    with pytest.raises(LifecycleError) as error:
+        engine.run()
+
+    assert error.value.code == "A2A_STATE_CORRUPT"
+    assert engine.ledger.entries == ()

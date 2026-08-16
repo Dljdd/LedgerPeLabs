@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from datetime import timedelta
 from decimal import Decimal
+from types import MappingProxyType
+from typing import cast
 
 import pytest
 
@@ -12,6 +14,7 @@ from apar.compiler.compiler import compile_scenario
 from apar.contracts.events import EventKind, Rail
 from apar.simulator.clock import Command
 from apar.simulator.engine import SimulationEngine, SimulationFailedError
+from apar.simulator.rails.base import FrozenState
 from apar.simulator.rails.card import (
     AuthorizeCard,
     CardCommand,
@@ -280,10 +283,57 @@ def test_card_idempotency_state_records_key_and_command_identity() -> None:
 
     state = engine.entity_state(PAYMENT_ID)
     assert isinstance(state, Mapping)
-    assert state["idempotency_records"] == (
+    records = cast(tuple[tuple[str, str, str], ...], state["idempotency_records"])
+    assert [(record[0], record[1]) for record in records] == [
         ("card-authorize-1", "card.authorize"),
         ("card.clear:card-payment-1", "card.clear"),
-    )
+    ]
+    assert all(len(record) == 3 and len(record[2]) == 64 for record in records)
+
+
+def test_card_duplicate_constructor_with_identical_request_is_noop() -> None:
+    """Catch request fingerprints depending on object identity rather than payload."""
+    engine = _engine()
+    _schedule(engine, _authorize(idempotency_key="same"), _authorize(idempotency_key="same"))
+
+    events = engine.run()
+
+    assert len(events) == 1
+    assert len(engine.ledger.entries) == 1
+
+
+@pytest.mark.parametrize(
+    "second",
+    [
+        lambda: _authorize(idempotency_key="same", amount=Decimal("11.00")),
+        lambda: _authorize(idempotency_key="same", fee=Decimal("1.00")),
+        lambda: _authorize(idempotency_key="same", payee_account="merchant-2"),
+        lambda: AuthorizeCard(
+            PAYMENT_ID,
+            amount=Decimal("10.00"),
+            currency="USD",
+            payer_account="payer",
+            payee_account="merchant",
+            actor_id="00000000-0000-4000-8000-000000000999",
+            counterparty_id=PAYEE_ID,
+            campaign_id=CAMPAIGN_ID,
+            trace_id=TRACE_ID,
+            idempotency_key="same",
+        ),
+    ],
+)
+def test_card_same_key_changed_opening_request_collides(
+    second: Callable[[], AuthorizeCard],
+) -> None:
+    """Catch amount, fee, account, or identity changes masquerading as retries."""
+    engine = _engine()
+    _schedule(engine, _authorize(idempotency_key="same"), second())
+
+    with pytest.raises(LifecycleError) as error:
+        engine.run()
+
+    assert error.value.code == "CARD_IDEMPOTENCY_KEY_COLLISION"
+    assert len(engine.ledger.entries) == 1
 
 
 def test_card_rejects_overdraft_atomically() -> None:
@@ -480,6 +530,70 @@ def test_card_rejects_unknown_concrete_command_before_payload_access(
     assert error.value.code == "CARD_UNKNOWN_COMMAND"
 
 
+def _forge_card_authorization(
+    change: Callable[[dict[str, object]], None] | None = None,
+    *,
+    mutable_payload: bool = False,
+    name: str | None = None,
+) -> AuthorizeCard:
+    command = _authorize()
+    payload = dict(command.payload)
+    if change is not None:
+        change(payload)
+    forged_payload = payload if mutable_payload else MappingProxyType(payload)
+    object.__setattr__(command, "payload", forged_payload)
+    if name is not None:
+        object.__setattr__(command, "name", name)
+    return command
+
+
+def _drop_card_field(payload: dict[str, object], field: str) -> None:
+    payload.pop(field)
+
+
+@pytest.mark.parametrize(
+    "forge",
+    [
+        lambda: _forge_card_authorization(name="card.clear"),
+        lambda: _forge_card_authorization(mutable_payload=True),
+        lambda: _forge_card_authorization(
+            lambda payload: _drop_card_field(payload, "payment_id")
+        ),
+        lambda: _forge_card_authorization(
+            lambda payload: payload.__setitem__("hold_account", "payer")
+        ),
+        lambda: _forge_card_authorization(
+            lambda payload: payload.__setitem__("actor_id", "not-a-uuid")
+        ),
+        lambda: _forge_card_authorization(
+            lambda payload: payload.__setitem__("amount", Decimal("NaN"))
+        ),
+        lambda: _forge_card_authorization(
+            lambda payload: payload.__setitem__("amount", Decimal("0.004"))
+        ),
+        lambda: _forge_card_authorization(
+            lambda payload: payload.__setitem__("idempotency_key", "altered")
+        ),
+        lambda: _forge_card_authorization(
+            lambda payload: payload.__setitem__("extra", "forged")
+        ),
+    ],
+)
+def test_card_forged_known_command_fails_before_any_effect(
+    forge: Callable[[], AuthorizeCard],
+) -> None:
+    """Catch forged exact-type commands bypassing canonical constructor admission."""
+    engine = _engine()
+    _schedule(engine, forge())
+
+    with pytest.raises(LifecycleError) as error:
+        engine.run()
+
+    assert error.value.code == "CARD_COMMAND_INVALID"
+    assert engine.ledger.entries == ()
+    assert engine.ledger.balance("payer") == Decimal("100.00")
+
+
 @pytest.mark.parametrize(
     "build",
     [
@@ -507,3 +621,40 @@ def test_card_same_seed_replays_byte_identically() -> None:
     second.run()
 
     assert first.serialize_events() == second.serialize_events()
+
+
+def _corrupt_card_state(change: Callable[[dict[str, object]], None]) -> SimulationEngine:
+    engine = _engine()
+    _schedule(engine, _authorize())
+    engine.run()
+    state = engine.entity_state(PAYMENT_ID)
+    assert isinstance(state, Mapping)
+    corrupted = cast(dict[str, object], dict(state))
+    change(corrupted)
+    engine._entity_state[PAYMENT_ID] = cast(FrozenState, MappingProxyType(corrupted))
+    engine.schedule(NOW, 0, ClearCard(PAYMENT_ID))
+    return engine
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda state: _drop_card_field(state, "idempotency_records"),
+        lambda state: state.__setitem__("state", "invented"),
+        lambda state: state.__setitem__("idempotency_records", (("bad",),)),
+        lambda state: state.__setitem__("hold_account", "payer"),
+        lambda state: state.__setitem__("amount", Decimal("NaN")),
+        lambda state: state.__setitem__("extra", "unexpected"),
+    ],
+)
+def test_card_corrupt_state_maps_to_stable_error_before_new_effect(
+    change: Callable[[dict[str, object]], None],
+) -> None:
+    """Catch malformed closed state leaking raw errors or posting new value."""
+    engine = _corrupt_card_state(change)
+
+    with pytest.raises(LifecycleError) as error:
+        engine.run()
+
+    assert error.value.code == "CARD_STATE_CORRUPT"
+    assert len(engine.ledger.entries) == 1
