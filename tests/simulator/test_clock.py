@@ -127,6 +127,12 @@ class MutableAttributeKind(Enum):
     REVIEW = "review"
 
 
+class PayloadKeyKind(StrEnum):
+    """A string enum used as a payload-key compatibility case."""
+
+    PAYMENT = "payment"
+
+
 class MutablePayload:
     """A deliberately unsupported mutable object for command tests."""
 
@@ -189,3 +195,41 @@ def test_command_canonicalizes_enum_member_with_mutable_attribute() -> None:
 
     assert command.payload["kind"] == "review"
     assert type(command.payload["kind"]) is str
+
+
+def test_command_rejects_mutable_string_subclass_keys_at_all_levels() -> None:
+    """Catch caller-owned string-subclass keys being retained in payload mappings."""
+    top_level = MutableStr("top")
+    top_level.state = []
+    nested = MutableStr("nested")
+    nested.state = []
+
+    with pytest.raises(TypeError, match="exact strings or StrEnum"):
+        Command("authorize", {top_level: "value"})
+    with pytest.raises(TypeError, match="exact strings or StrEnum"):
+        Command("authorize", {"outer": {nested: "value"}})
+
+
+def test_command_canonicalizes_strenum_keys_at_all_levels() -> None:
+    """Catch StrEnum key identities or mutable member attributes reaching the queue."""
+    key = PayloadKeyKind.PAYMENT
+    key.state = []
+    command = Command("authorize", {key: "top", "outer": {key: "nested"}})
+    key.state.append("changed")
+
+    assert command.payload["payment"] == "top"
+    assert type(next(iter(command.payload))) is str
+    nested = command.payload["outer"]
+    assert isinstance(nested, Mapping)
+    assert nested["payment"] == "nested"
+    assert type(next(iter(nested))) is str
+
+
+def test_command_preserves_ordinary_string_keys() -> None:
+    """Catch strict key validation rejecting normal top-level or nested string keys."""
+    command = Command("authorize", {"payment": {"id": "p1"}})
+
+    assert command.payload["payment"]
+    nested = command.payload["payment"]
+    assert isinstance(nested, Mapping)
+    assert nested["id"] == "p1"

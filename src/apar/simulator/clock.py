@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
-from enum import Enum
+from enum import Enum, StrEnum
 from types import MappingProxyType
 
 
@@ -17,13 +17,22 @@ def _immutable_mapping(values: Mapping[str, object]) -> Mapping[str, object]:
 
 
 def _freeze_mapping(values: Mapping[str, object]) -> Mapping[str, object]:
-    """Copy and freeze a mapping whose keys are safe command-payload names."""
+    """Copy and freeze a mapping with exact-string or canonicalized StrEnum keys."""
     frozen: dict[str, object] = {}
     for key, value in values.items():
-        if not isinstance(key, str):
-            raise TypeError("command payload mapping keys must be strings")
-        frozen[key] = _freeze(value)
+        frozen[_freeze_key(key)] = _freeze(value)
     return MappingProxyType(frozen)
+
+
+def _freeze_key(key: object) -> str:
+    """Return a key detached from caller-owned string-like objects."""
+    if type(key) is str:
+        return key
+    if isinstance(key, StrEnum):
+        value = _freeze(key.value)
+        if type(value) is str:
+            return value
+    raise TypeError("command payload mapping keys must be exact strings or StrEnum")
 
 
 def _freeze(value: object) -> object:
