@@ -6,7 +6,7 @@ import heapq
 import json
 from collections.abc import Collection, Mapping
 from contextvars import ContextVar
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import Enum
 from math import isfinite
@@ -35,8 +35,33 @@ from apar.simulator.rails.base import (
 
 _FAILED_MESSAGE = "simulation engine is terminally failed"
 _MAPPING_PROXY_TYPE: type[object] = type(MappingProxyType({}))
-_ACTIVE_ENGINE: ContextVar[SimulationEngine | None] = ContextVar(
-    "apar_active_simulation_engine",
+
+
+class _CallbackScope:
+    """Revocable per-invocation authority shared by copied execution contexts."""
+
+    __slots__ = ("_active", "_engine_reference")
+
+    def __init__(self, engine: SimulationEngine) -> None:
+        self._active = True
+        self._engine_reference: ReferenceType[SimulationEngine] | None = ref(engine)
+
+    def resolve(self) -> SimulationEngine:
+        """Resolve the weak owner only while its adapter callback remains active."""
+        reference = self._engine_reference
+        engine = reference() if reference is not None else None
+        if not self._active or engine is None:
+            raise RuntimeError("adapter context is inactive")
+        return engine
+
+    def revoke(self) -> None:
+        """Invalidate this invocation everywhere, including copied contexts/tasks."""
+        self._active = False
+        self._engine_reference = None
+
+
+_ACTIVE_SCOPE: ContextVar[_CallbackScope | None] = ContextVar(
+    "apar_active_simulation_scope",
     default=None,
 )
 _LIVE_ADAPTERS: dict[int, ReferenceType[object]] = {}
@@ -48,11 +73,11 @@ class SimulationFailedError(RuntimeError):
 
 
 def _active_engine() -> SimulationEngine:
-    """Resolve callback-local dispatch without retaining an owner on the facade."""
-    engine = _ACTIVE_ENGINE.get()
-    if engine is None:
+    """Resolve callback-local dispatch through revocable invocation authority."""
+    scope = _ACTIVE_SCOPE.get()
+    if scope is None:
         raise RuntimeError("adapter context is inactive")
-    return engine
+    return scope.resolve()
 
 
 def _release_adapter(adapter_id: int, reference: ReferenceType[object]) -> None:
@@ -104,14 +129,22 @@ def _validate_finite_tree(value: object, *, label: str) -> None:
     if isinstance(value, Enum):
         _validate_finite_tree(value.value, label=label)
         return
-    if isinstance(value, float):
+    if type(value) is bool or type(value) is int:
+        return
+    if isinstance(value, int):
+        raise TypeError(f"{label} contains unsupported numeric subclass")
+    if type(value) is float:
         if not isfinite(value):
             raise ValueError(f"{label} contains non-finite number")
         return
-    if isinstance(value, Decimal):
-        if not value.is_finite():
+    if isinstance(value, float):
+        raise TypeError(f"{label} contains unsupported numeric subclass")
+    if type(value) is Decimal:
+        if not Decimal.is_finite(value):
             raise ValueError(f"{label} contains non-finite number")
         return
+    if isinstance(value, Decimal):
+        raise TypeError(f"{label} contains unsupported numeric subclass")
     if isinstance(value, Mapping):
         for key, item in value.items():
             _validate_finite_tree(key, label=label)
@@ -150,7 +183,17 @@ def _freeze_state(value: object) -> FrozenState:
         timestamp = value
         if not _is_utc(timestamp):
             raise ValueError("entity state datetime must be a UTC timestamp")
-        return timestamp
+        return datetime(
+            timestamp.year,
+            timestamp.month,
+            timestamp.day,
+            timestamp.hour,
+            timestamp.minute,
+            timestamp.second,
+            timestamp.microsecond,
+            tzinfo=UTC,
+            fold=timestamp.fold,
+        )
     if type(value) in (dict, _MAPPING_PROXY_TYPE):
         mapping = cast(Mapping[object, object], value)
         frozen: dict[str, FrozenState] = {}
@@ -162,12 +205,6 @@ def _freeze_state(value: object) -> FrozenState:
     if type(value) in (list, tuple):
         sequence = cast(list[object] | tuple[object, ...], value)
         return tuple(_freeze_state(item) for item in sequence)
-    if type(value) in (set, frozenset):
-        members = cast(set[object] | frozenset[object], value)
-        try:
-            return frozenset(_freeze_state(item) for item in members)
-        except TypeError as error:
-            raise TypeError("entity state set members must be hashable") from error
     raise TypeError(f"unsupported entity state: {type(value).__name__}")
 
 
@@ -512,18 +549,22 @@ class SimulationEngine:
         return tuple(_validated_event(event) for event in events)
 
     def _invoke_initialize(self, adapter: RailAdapter) -> None:
-        token = _ACTIVE_ENGINE.set(self)
+        scope = _CallbackScope(self)
+        token = _ACTIVE_SCOPE.set(scope)
         try:
             adapter.initialize(_RAIL_CONTEXT)
         finally:
-            _ACTIVE_ENGINE.reset(token)
+            scope.revoke()
+            _ACTIVE_SCOPE.reset(token)
 
     def _invoke_handle(self, adapter: RailAdapter, command: Command) -> list[PaymentEvent]:
-        token = _ACTIVE_ENGINE.set(self)
+        scope = _CallbackScope(self)
+        token = _ACTIVE_SCOPE.set(scope)
         try:
             return adapter.handle(command, _RAIL_CONTEXT)
         finally:
-            _ACTIVE_ENGINE.reset(token)
+            scope.revoke()
+            _ACTIVE_SCOPE.reset(token)
 
     def _append_batch(self, candidates: list[PaymentEvent]) -> None:
         """Validate and canonically order a whole batch before append."""

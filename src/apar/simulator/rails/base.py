@@ -25,7 +25,6 @@ type FrozenState = (
     | datetime
     | Mapping[str, FrozenState]
     | tuple[FrozenState, ...]
-    | frozenset[FrozenState]
 )
 
 
@@ -110,11 +109,11 @@ class RailContext(Protocol):
         ...
 
     def entity_state(self, entity_id: str) -> FrozenState:
-        """Read recursively immutable, engine-owned entity state."""
+        """Read recursively immutable, deterministically ordered entity state."""
         ...
 
     def set_entity_state(self, entity_id: str, state: object) -> None:
-        """Store engine-owned entity state."""
+        """Store closed state; unordered containers and custom objects are rejected."""
         ...
 
     def new_uuid(self) -> str:

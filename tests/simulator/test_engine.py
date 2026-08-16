@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
+import gc
 import json
 from collections.abc import Mapping
-from datetime import datetime, timedelta, timezone
+from contextvars import Context, copy_context
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from decimal import Decimal
 from enum import Enum
 from functools import partial
 from types import MappingProxyType
 from typing import ClassVar
 from uuid import UUID
+from weakref import ReferenceType, ref
 
 import numpy as np
 import pytest
@@ -317,6 +321,34 @@ class MutableStateStr(str):
     """String subclass used as a mutable mapping key."""
 
 
+class MutableFloat(float):
+    """Float subclass that must not enter open contract fields."""
+
+
+class LyingDecimal(Decimal):
+    """Decimal subclass that lies about a non-finite underlying value."""
+
+    def is_finite(self) -> bool:
+        return True
+
+
+class MutableUtcTz(tzinfo):
+    """Caller-owned UTC tzinfo whose semantics can change after admission."""
+
+    def __init__(self) -> None:
+        self.offset = timedelta(0)
+        self.name = "UTC"
+
+    def utcoffset(self, value: datetime | None) -> timedelta:
+        return self.offset
+
+    def dst(self, value: datetime | None) -> timedelta:
+        return timedelta(0)
+
+    def tzname(self, value: datetime | None) -> str:
+        return self.name
+
+
 class StatePhase(Enum):
     """Enum canonicalization case for the closed state algebra."""
 
@@ -367,6 +399,45 @@ class CaptureContextThenFailAdapter:
         raise RuntimeError("capture initialize failed")
 
     def handle(self, command: Command, engine: RailContext) -> list[PaymentEvent]:
+        return []
+
+
+class CopyContextRetentionAdapter:
+    """Copy an active execution context so callback authority can be challenged."""
+
+    captured_execution_context: ClassVar[Context | None] = None
+    captured_rail_context: ClassVar[RailContext | None] = None
+
+    def initialize(self, engine: RailContext) -> None:
+        type(self).captured_execution_context = copy_context()
+        type(self).captured_rail_context = engine
+
+    def handle(self, command: Command, engine: RailContext) -> list[PaymentEvent]:
+        return []
+
+
+class AsyncTaskRetentionAdapter:
+    """Create a child task while callback authority is dynamically active."""
+
+    gate: ClassVar[asyncio.Event | None] = None
+    task: ClassVar[asyncio.Task[Exception | None] | None] = None
+
+    def initialize(self, engine: RailContext) -> None:
+        engine.schedule(NOW, 0, Command("spawn-retained-task"))
+
+    def handle(self, command: Command, engine: RailContext) -> list[PaymentEvent]:
+        gate = asyncio.Event()
+        type(self).gate = gate
+
+        async def mutate_after_callback() -> Exception | None:
+            await gate.wait()
+            try:
+                engine.set_entity_state("late", "mutation")
+            except Exception as error:
+                return error
+            return None
+
+        type(self).task = asyncio.create_task(mutate_after_callback())
         return []
 
 
@@ -779,7 +850,7 @@ def test_entity_state_freezes_a_closed_nested_lifecycle_algebra() -> None:
         "phase": LifecycleState.AUTHORIZED,
         "custom_phase": StatePhase.READY,
         "history": history,
-        "flags": {"trusted", "reviewed"},
+        "flags": ["trusted", "reviewed"],
         "amount": Decimal("12.50"),
         "at": NOW,
         "metadata": None,
@@ -794,7 +865,7 @@ def test_entity_state_freezes_a_closed_nested_lifecycle_algebra() -> None:
     assert type(frozen["phase"]) is str
     assert frozen["custom_phase"] == "ready"
     assert frozen["history"] == (MappingProxyType({"phase": "initiated"}),)
-    assert frozen["flags"] == frozenset({"trusted", "reviewed"})
+    assert frozen["flags"] == ("trusted", "reviewed")
     with pytest.raises(TypeError):
         frozen["phase"] = "rejected"  # type: ignore[index]
 
@@ -808,6 +879,8 @@ def test_entity_state_freezes_a_closed_nested_lifecycle_algebra() -> None:
         (Decimal("NaN"), "finite"),
         (datetime(2026, 8, 16, 12), "UTC"),
         ({MutableStateStr("key"): "value"}, "exact strings"),
+        ({"unordered"}, "unsupported entity state"),
+        (frozenset({"unordered"}), "unsupported entity state"),
     ],
 )
 def test_entity_state_rejects_values_outside_the_closed_algebra(
@@ -936,6 +1009,133 @@ def test_nested_engine_callback_restores_outer_context() -> None:
     assert outer.entity_state("outer") == MappingProxyType(
         {"callback": ("restored",)}
     )
+
+
+def test_copied_execution_context_cannot_reuse_revoked_callback_authority() -> None:
+    """Catch copy_context retaining a live engine token after callback return."""
+    CopyContextRetentionAdapter.captured_execution_context = None
+    CopyContextRetentionAdapter.captured_rail_context = None
+    engine = _engine(CopyContextRetentionAdapter)
+    engine.run()
+    execution_context = CopyContextRetentionAdapter.captured_execution_context
+    rail_context = CopyContextRetentionAdapter.captured_rail_context
+    assert execution_context is not None
+    assert rail_context is not None
+
+    with pytest.raises(RuntimeError, match="adapter context is inactive"):
+        execution_context.run(
+            rail_context.set_entity_state,
+            "late",
+            "copied-context-mutation",
+        )
+
+    retained_engine: ReferenceType[SimulationEngine] = ref(engine)
+    del engine
+    gc.collect()
+    assert retained_engine() is None
+
+
+def test_child_async_task_cannot_reuse_inherited_callback_authority() -> None:
+    """Catch create_task inheriting a usable engine token beyond callback return."""
+
+    async def exercise() -> None:
+        AsyncTaskRetentionAdapter.gate = None
+        AsyncTaskRetentionAdapter.task = None
+        engine = _engine(AsyncTaskRetentionAdapter)
+        engine.run()
+        gate = AsyncTaskRetentionAdapter.gate
+        task = AsyncTaskRetentionAdapter.task
+        assert gate is not None
+        assert task is not None
+
+        gate.set()
+        error = await task
+
+        assert isinstance(error, RuntimeError)
+        assert str(error) == "adapter context is inactive"
+        with pytest.raises(KeyError, match="late"):
+            engine.entity_state("late")
+
+    asyncio.run(exercise())
+
+
+def test_entity_state_detaches_caller_owned_utc_tzinfo() -> None:
+    """Catch a mutable custom tzinfo changing an admitted entity timestamp."""
+    mutable_utc = MutableUtcTz()
+    source = datetime(
+        2026,
+        8,
+        16,
+        12,
+        34,
+        56,
+        123456,
+        tzinfo=mutable_utc,
+        fold=1,
+    )
+    engine = _engine(InitializingAdapter)
+
+    engine.set_entity_state("timestamp", source)
+    mutable_utc.offset = timedelta(hours=5, minutes=30)
+    mutable_utc.name = "IST"
+    owned = engine.entity_state("timestamp")
+
+    assert type(owned) is datetime
+    assert owned is not source
+    assert owned.tzinfo is UTC
+    assert owned == datetime(
+        2026,
+        8,
+        16,
+        12,
+        34,
+        56,
+        123456,
+        tzinfo=UTC,
+        fold=1,
+    )
+    assert owned.fold == 1
+
+
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        MutableFloat("0.5"),
+        MutableFloat("NaN"),
+        MutableFloat("Infinity"),
+        MutableStateInt(3),
+        LyingDecimal("Infinity"),
+    ],
+)
+def test_open_fields_reject_numeric_scalar_subclasses(unsafe: object) -> None:
+    """Catch numeric subclasses overriding or carrying mutable scalar semantics."""
+    engine = _engine(InitializingAdapter)
+
+    with pytest.raises(TypeError, match="unsupported numeric subclass"):
+        engine.emit(_event(extensions={"unsafe": unsafe}))
+
+
+def test_open_fields_keep_exact_finite_numbers_and_infinity_text() -> None:
+    """Catch subclass hardening accidentally rejecting safe exact scalar values."""
+    engine = _engine(InitializingAdapter)
+
+    engine.emit(
+        _event(
+            extensions={
+                "float": 0.5,
+                "integer": 3,
+                "decimal": Decimal("1.25"),
+                "literal": "Infinity",
+            }
+        )
+    )
+
+    assert engine.events[0].extensions == {
+        "float": 0.5,
+        "integer": 3,
+        "decimal": "1.25",
+        "literal": "Infinity",
+    }
 
 
 @pytest.mark.parametrize(
