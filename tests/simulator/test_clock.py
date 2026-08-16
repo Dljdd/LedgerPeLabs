@@ -254,7 +254,7 @@ def test_command_freezes_supported_nested_payload_values(now: datetime) -> None:
             "receipt": b"receipt",
             "kind": PayloadKind.AUTHORIZE,
             "text_kind": PayloadTextKind.CAPTURE,
-            "nested": [{"payment_ids": {"p1", "p2"}}],
+            "nested": [{"payment_ids": ["p1", "p2"]}],
         },
     )
 
@@ -268,7 +268,115 @@ def test_command_freezes_supported_nested_payload_values(now: datetime) -> None:
     nested = command.payload["nested"]
     assert isinstance(nested, tuple)
     assert isinstance(nested[0], Mapping)
-    assert nested[0]["payment_ids"] == frozenset({"p1", "p2"})
+    assert nested[0]["payment_ids"] == ("p1", "p2")
+
+
+def test_command_detaches_top_level_and_nested_datetime_tzinfo() -> None:
+    """Catch command payloads retaining caller-owned timezone identities."""
+    mutable_utc = MutableUtcTz()
+    top_source = datetime(
+        2026,
+        8,
+        16,
+        12,
+        1,
+        2,
+        123456,
+        tzinfo=mutable_utc,
+        fold=1,
+    )
+    nested_source = datetime(
+        2026,
+        8,
+        16,
+        12,
+        3,
+        4,
+        654321,
+        tzinfo=mutable_utc,
+    )
+
+    command = Command(
+        "authorize",
+        {"at": top_source, "nested": [{"at": nested_source}]},
+    )
+    mutable_utc.offset = timedelta(hours=5, minutes=30)
+    mutable_utc.name = "IST"
+    top = command.payload["at"]
+    nested_items = command.payload["nested"]
+
+    assert type(top) is datetime
+    assert top is not top_source
+    assert top.tzinfo is UTC
+    assert top == datetime(
+        2026,
+        8,
+        16,
+        12,
+        1,
+        2,
+        123456,
+        tzinfo=UTC,
+        fold=1,
+    )
+    assert top.fold == 1
+    assert isinstance(nested_items, tuple)
+    assert isinstance(nested_items[0], Mapping)
+    nested = nested_items[0]["at"]
+    assert type(nested) is datetime
+    assert nested is not nested_source
+    assert nested.tzinfo is UTC
+    assert nested == datetime(
+        2026,
+        8,
+        16,
+        12,
+        3,
+        4,
+        654321,
+        tzinfo=UTC,
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"at": datetime(2026, 8, 16, 12, 0)},
+        {
+            "nested": {
+                "at": datetime(
+                    2026,
+                    8,
+                    16,
+                    12,
+                    0,
+                    tzinfo=timezone(timedelta(hours=5, minutes=30)),
+                )
+            }
+        },
+    ],
+)
+def test_command_rejects_non_utc_datetime_at_every_depth(
+    payload: Mapping[str, object],
+) -> None:
+    """Catch ambiguous or local-time datetime values entering command payloads."""
+    with pytest.raises(ValueError, match="command payload datetime must be UTC"):
+        Command("authorize", payload)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"payment_ids": {"p1", "p2"}},
+        {"nested": [{"payment_ids": frozenset({"p1", "p2"})}]},
+    ],
+)
+def test_command_rejects_unordered_containers_at_every_depth(
+    payload: Mapping[str, object],
+) -> None:
+    """Catch hash iteration order entering deterministic command payloads."""
+    with pytest.raises(TypeError, match="command payload contains unordered container"):
+        Command("authorize", payload)
 
 
 def test_command_rejects_mutable_scalar_subclasses() -> None:

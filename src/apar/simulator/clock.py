@@ -39,7 +39,12 @@ def _freeze(value: object) -> object:
     """Recursively freeze the explicit payload types supported by commands."""
     if isinstance(value, Enum):
         return _freeze(value.value)
-    if value is None or type(value) in (bool, bytes, Decimal, float, int, str, datetime):
+    if type(value) is datetime:
+        return normalize_utc_datetime(
+            value,
+            message="command payload datetime must be UTC",
+        )
+    if value is None or type(value) in (bool, bytes, Decimal, float, int, str):
         return value
     if isinstance(value, Mapping):
         return _freeze_mapping(value)
@@ -48,11 +53,7 @@ def _freeze(value: object) -> object:
     if isinstance(value, tuple):
         return tuple(_freeze(item) for item in value)
     if isinstance(value, (frozenset, set)):
-        frozen_items = tuple(_freeze(item) for item in value)
-        try:
-            return frozenset(frozen_items)
-        except TypeError as error:
-            raise TypeError("unsupported command payload value in set") from error
+        raise TypeError("command payload contains unordered container")
     raise TypeError(f"unsupported command payload value: {type(value).__name__}")
 
 
@@ -65,7 +66,7 @@ def _is_utc(value: datetime) -> bool:
     )
 
 
-def _normalize_utc(value: datetime, *, message: str) -> datetime:
+def normalize_utc_datetime(value: datetime, *, message: str) -> datetime:
     """Validate and detach one timestamp from caller-owned timezone identity."""
     if not _is_utc(value):
         raise ValueError(message)
@@ -109,7 +110,7 @@ class SimulationClock:
     """Own a stable priority queue ordered by time, priority, then insertion order."""
 
     def __init__(self, now: datetime) -> None:
-        self._now = _normalize_utc(
+        self._now = normalize_utc_datetime(
             now,
             message="simulation clock time must be a UTC timestamp",
         )
@@ -123,7 +124,7 @@ class SimulationClock:
 
     def schedule(self, at: datetime, priority: int, command: Command) -> datetime:
         """Schedule one command and return its owned normalized UTC timestamp."""
-        normalized_at = _normalize_utc(
+        normalized_at = normalize_utc_datetime(
             at,
             message="scheduled time must be a UTC timestamp",
         )

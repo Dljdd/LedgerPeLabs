@@ -349,6 +349,25 @@ class MutableUtcTz(tzinfo):
         return self.name
 
 
+class SwitchingCutoffTz(tzinfo):
+    """Report UTC once, then change offset if the cutoff is consulted again."""
+
+    def __init__(self) -> None:
+        self.offset_calls = 0
+
+    def utcoffset(self, value: datetime | None) -> timedelta:
+        self.offset_calls += 1
+        if self.offset_calls == 1:
+            return timedelta(0)
+        return timedelta(hours=-5, minutes=-30)
+
+    def dst(self, value: datetime | None) -> timedelta:
+        return timedelta(0)
+
+    def tzname(self, value: datetime | None) -> str:
+        return "UTC"
+
+
 class MutableScheduledTimeAdapter:
     """Mutate a scheduled timestamp's tzinfo after handing it to the engine."""
 
@@ -599,6 +618,32 @@ def test_run_until_stops_before_future_work_and_can_resume() -> None:
     all_events = engine.run()
 
     assert [event.event_time for event in first] == [NOW + timedelta(seconds=1)]
+    assert [event.event_time for event in all_events] == [
+        NOW + timedelta(seconds=1),
+        NOW + timedelta(seconds=2),
+    ]
+
+
+def test_run_cutoff_is_detached_before_every_queue_comparison() -> None:
+    """Catch a changing tzinfo widening the cutoff after UTC validation."""
+    switching_utc = SwitchingCutoffTz()
+    cutoff = datetime(
+        2026,
+        8,
+        16,
+        12,
+        0,
+        1,
+        500000,
+        tzinfo=switching_utc,
+    )
+    engine = _engine(TwoEventAdapter)
+
+    bounded = engine.run(until=cutoff)
+    all_events = engine.run()
+
+    assert switching_utc.offset_calls == 1
+    assert [event.event_time for event in bounded] == [NOW + timedelta(seconds=1)]
     assert [event.event_time for event in all_events] == [
         NOW + timedelta(seconds=1),
         NOW + timedelta(seconds=2),

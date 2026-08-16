@@ -6,7 +6,7 @@ import heapq
 import json
 from collections.abc import Collection, Mapping
 from contextvars import ContextVar
-from datetime import UTC, datetime, timedelta
+from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 from math import isfinite
@@ -22,7 +22,7 @@ from pydantic_core import PydanticSerializationError
 
 from apar.contracts.events import PaymentEvent, Rail
 from apar.contracts.scenarios import ScenarioBundle
-from apar.simulator.clock import Command, SimulationClock
+from apar.simulator.clock import Command, SimulationClock, normalize_utc_datetime
 from apar.simulator.ledger import AccountReference, Ledger, LedgerEntry
 from apar.simulator.rails.base import (
     AdapterFactory,
@@ -183,18 +183,9 @@ def _freeze_state(value: object) -> FrozenState:
         return amount
     if type(value) is datetime:
         timestamp = value
-        if not _is_utc(timestamp):
-            raise ValueError("entity state datetime must be a UTC timestamp")
-        return datetime(
-            timestamp.year,
-            timestamp.month,
-            timestamp.day,
-            timestamp.hour,
-            timestamp.minute,
-            timestamp.second,
-            timestamp.microsecond,
-            tzinfo=UTC,
-            fold=timestamp.fold,
+        return normalize_utc_datetime(
+            timestamp,
+            message="entity state datetime must be a UTC timestamp",
         )
     if type(value) in (dict, _MAPPING_PROXY_TYPE):
         mapping = cast(Mapping[object, object], value)
@@ -208,15 +199,6 @@ def _freeze_state(value: object) -> FrozenState:
         sequence = cast(list[object] | tuple[object, ...], value)
         return tuple(_freeze_state(item) for item in sequence)
     raise TypeError(f"unsupported entity state: {type(value).__name__}")
-
-
-def _is_utc(value: datetime) -> bool:
-    """Return whether a timestamp is explicitly UTC, rather than merely offset-zero."""
-    return (
-        value.tzinfo is not None
-        and value.utcoffset() == timedelta(0)
-        and value.tzname() == "UTC"
-    )
 
 
 def _reject_json_constant(value: str) -> object:
@@ -483,11 +465,16 @@ class SimulationEngine:
     def run(self, until: datetime | None = None) -> tuple[PaymentEvent, ...]:
         """Run due commands through the scenario rail, optionally to a UTC cutoff."""
         self._ensure_healthy()
-        if until is not None:
-            if not _is_utc(until):
-                raise ValueError("simulation cutoff must be a UTC timestamp")
-            if until < self._clock.now:
-                raise ValueError("simulation cutoff cannot precede current simulation time")
+        normalized_until = (
+            normalize_utc_datetime(
+                until,
+                message="simulation cutoff must be a UTC timestamp",
+            )
+            if until is not None
+            else None
+        )
+        if normalized_until is not None and normalized_until < self._clock.now:
+            raise ValueError("simulation cutoff cannot precede current simulation time")
 
         try:
             adapter = self._adapter
@@ -498,7 +485,8 @@ class SimulationEngine:
                 self._initialized = True
 
             while self._scheduled_times and (
-                until is None or self._scheduled_times[0] <= until
+                normalized_until is None
+                or self._scheduled_times[0] <= normalized_until
             ):
                 expected_at = heapq.heappop(self._scheduled_times)
                 scheduled = self._clock.pop()
