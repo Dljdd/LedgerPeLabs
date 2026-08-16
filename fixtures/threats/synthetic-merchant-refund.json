@@ -6,13 +6,33 @@
   "family": "synthetic_merchant_refund",
   "confidence": 0.91,
   "implementation_status": "deep_scenario",
-  "rails": ["card"],
+  "rails": [
+    "card"
+  ],
   "viewpoint": "acquirer_and_network",
-  "channels": ["merchant_onboarding", "merchant_processing"],
-  "lifecycle_stages": ["onboarding", "sale", "refund", "settlement"],
-  "genai_capability": {"synthetic_profile_generation": true, "document_variation": true},
+  "channels": [
+    "merchant_onboarding",
+    "merchant_processing"
+  ],
+  "lifecycle_stages": [
+    "onboarding",
+    "sale",
+    "refund",
+    "settlement"
+  ],
+  "genai_capability": {
+    "synthetic_profile_generation": true,
+    "document_variation": true
+  },
   "attacker_objective": "improper_refund_value",
-  "observables": ["merchant_identity_linkage", "merchant_age", "refund_velocity", "refund_beneficiary_concentration", "sale_refund_ratio"],
+  "observables": [
+    "merchant_identity_linkage",
+    "merchant_age",
+    "refund_velocity",
+    "refund_beneficiary_concentration",
+    "sale_refund_ratio"
+  ],
+  "defender_knowledge_boundary": "decision-available payment signals only",
   "simulation_status": "simulatable",
   "safety_class": "synthetic_only",
   "evidence": [
@@ -61,11 +81,55 @@
     "attacker_mode": "decision_only",
     "attacker_objective": "improper_refund_value",
     "query_budget": 50,
-    "feedback": ["action", "reason_family"],
+    "feedback": [
+      "action",
+      "reason_family"
+    ],
     "benign_entity_count": 4500,
     "illicit_entity_count": 55,
     "duration_hours": 48,
     "seed": 260827,
+    "campaign_stages": [
+      {
+        "stage_id": "onboarding",
+        "description": "Synthetic onboarding stage"
+      },
+      {
+        "stage_id": "sale",
+        "description": "Synthetic sale stage"
+      },
+      {
+        "stage_id": "refund",
+        "description": "Synthetic refund stage"
+      },
+      {
+        "stage_id": "settlement",
+        "description": "Synthetic settlement stage"
+      }
+    ],
+    "transition_rules": [
+      {
+        "from_stage": "onboarding",
+        "to_stage": "sale",
+        "condition": "stage_completed"
+      },
+      {
+        "from_stage": "sale",
+        "to_stage": "refund",
+        "condition": "stage_completed"
+      },
+      {
+        "from_stage": "refund",
+        "to_stage": "settlement",
+        "condition": "stage_completed"
+      }
+    ],
+    "replay": {
+      "random_seed": 260827,
+      "simulation_start": "2026-08-16T00:00:00Z",
+      "generator_version": "0.1.0",
+      "event_ordering": "event_time_then_event_id"
+    },
     "export_level": "sanitized"
   }
 }

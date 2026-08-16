@@ -5,7 +5,12 @@ from urllib.parse import urlparse
 from pydantic import ValidationError
 
 from apar.compiler.errors import CompilerError
-from apar.contracts.scenarios import FeedbackField, ScenarioBundle, ScenarioConfig
+from apar.contracts.scenarios import (
+    FeedbackField,
+    ReplayManifest,
+    ScenarioBundle,
+    ScenarioConfig,
+)
 from apar.registry.models import ThreatCard
 
 _SAFE_CLASS = "synthetic_only"
@@ -126,9 +131,21 @@ def compile_scenario(card: ThreatCard, config: ScenarioConfig) -> ScenarioBundle
         illicit_entity_count=config.illicit_entity_count,
         duration_hours=config.duration_hours,
         seed=config.seed,
+        campaign_stages=config.campaign_stages,
+        transition_rules=config.transition_rules,
         economics=config.economics,
         lifecycle=config.lifecycle,
         hidden_validity=config.hidden_validity,
+        defender_knowledge_boundary=card.defender_knowledge_boundary,
+        replay_manifest=ReplayManifest(
+            scenario_id=config.scenario_id,
+            scenario_version=config.version,
+            threat_card_ref=f"{card.threat_id}@{card.version}",
+            random_seed=config.replay.random_seed,
+            simulation_start=config.replay.simulation_start,
+            generator_version=config.replay.generator_version,
+            event_ordering=config.replay.event_ordering,
+        ),
         safety={"synthetic_only": True, "export_level": config.export_level},
         extensions=config.extensions,
     )

@@ -6,13 +6,31 @@
   "family": "mule_network",
   "confidence": 0.95,
   "implementation_status": "evidence_only",
-  "rails": ["a2a"],
+  "rails": [
+    "a2a"
+  ],
   "viewpoint": "network_with_bank_enrichment",
-  "channels": ["bank_transfer"],
-  "lifecycle_stages": ["receipt", "dispersion", "layering"],
-  "genai_capability": {"workflow_automation": true, "adaptive_search": true},
+  "channels": [
+    "bank_transfer"
+  ],
+  "lifecycle_stages": [
+    "receipt",
+    "dispersion",
+    "layering"
+  ],
+  "genai_capability": {
+    "workflow_automation": true,
+    "adaptive_search": true
+  },
   "attacker_objective": "settled_layered_value",
-  "observables": ["fan_in", "fan_out", "inbound_outbound_delay", "multi_hop_depth", "beneficiary_concentration"],
+  "observables": [
+    "fan_in",
+    "fan_out",
+    "inbound_outbound_delay",
+    "multi_hop_depth",
+    "beneficiary_concentration"
+  ],
+  "defender_knowledge_boundary": "decision-available payment signals only",
   "simulation_status": "simulatable",
   "safety_class": "synthetic_only",
   "evidence": [
@@ -49,11 +67,46 @@
     "attacker_mode": "decision_only",
     "attacker_objective": "settled_layered_value",
     "query_budget": 40,
-    "feedback": ["action", "reason_family"],
+    "feedback": [
+      "action",
+      "reason_family"
+    ],
     "benign_entity_count": 5000,
     "illicit_entity_count": 60,
     "duration_hours": 24,
     "seed": 260830,
+    "campaign_stages": [
+      {
+        "stage_id": "receipt",
+        "description": "Synthetic receipt stage"
+      },
+      {
+        "stage_id": "dispersion",
+        "description": "Synthetic dispersion stage"
+      },
+      {
+        "stage_id": "layering",
+        "description": "Synthetic layering stage"
+      }
+    ],
+    "transition_rules": [
+      {
+        "from_stage": "receipt",
+        "to_stage": "dispersion",
+        "condition": "stage_completed"
+      },
+      {
+        "from_stage": "dispersion",
+        "to_stage": "layering",
+        "condition": "stage_completed"
+      }
+    ],
+    "replay": {
+      "random_seed": 260830,
+      "simulation_start": "2026-08-16T00:00:00Z",
+      "generator_version": "0.1.0",
+      "event_ordering": "event_time_then_event_id"
+    },
     "export_level": "sanitized"
   }
 }

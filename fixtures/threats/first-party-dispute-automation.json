@@ -6,13 +6,29 @@
   "family": "first_party_misuse",
   "confidence": 0.94,
   "implementation_status": "evidence_only",
-  "rails": ["card"],
+  "rails": [
+    "card"
+  ],
   "viewpoint": "merchant_and_issuer",
-  "channels": ["dispute_portal"],
-  "lifecycle_stages": ["purchase", "dispute"],
-  "genai_capability": {"content_generation": true, "iteration_speed": true},
+  "channels": [
+    "dispute_portal"
+  ],
+  "lifecycle_stages": [
+    "purchase",
+    "dispute"
+  ],
+  "genai_capability": {
+    "content_generation": true,
+    "iteration_speed": true
+  },
   "attacker_objective": "improper_dispute_value",
-  "observables": ["repeat_dispute_rate", "device_purchase_linkage", "delivery_evidence_indicator", "dispute_latency"],
+  "observables": [
+    "repeat_dispute_rate",
+    "device_purchase_linkage",
+    "delivery_evidence_indicator",
+    "dispute_latency"
+  ],
+  "defender_knowledge_boundary": "decision-available payment signals only",
   "simulation_status": "simulatable",
   "safety_class": "synthetic_only",
   "evidence": [
@@ -49,11 +65,37 @@
     "attacker_mode": "static",
     "attacker_objective": "improper_dispute_value",
     "query_budget": 30,
-    "feedback": ["action", "reason_family"],
+    "feedback": [
+      "action",
+      "reason_family"
+    ],
     "benign_entity_count": 4000,
     "illicit_entity_count": 50,
     "duration_hours": 72,
     "seed": 260825,
+    "campaign_stages": [
+      {
+        "stage_id": "purchase",
+        "description": "Synthetic purchase stage"
+      },
+      {
+        "stage_id": "dispute",
+        "description": "Synthetic dispute stage"
+      }
+    ],
+    "transition_rules": [
+      {
+        "from_stage": "purchase",
+        "to_stage": "dispute",
+        "condition": "stage_completed"
+      }
+    ],
+    "replay": {
+      "random_seed": 260825,
+      "simulation_start": "2026-08-16T00:00:00Z",
+      "generator_version": "0.1.0",
+      "event_ordering": "event_time_then_event_id"
+    },
     "export_level": "sanitized"
   }
 }

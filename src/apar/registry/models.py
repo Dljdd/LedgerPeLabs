@@ -53,7 +53,7 @@ class ThreatCard(ExternalContract):
     attacker_objective: str
     attacker_costs: dict[str, str] = Field(default_factory=dict)
     observables: list[str]
-    defender_knowledge_boundary: str = "decision-available payment signals only"
+    defender_knowledge_boundary: str = Field(min_length=1)
     simulation_status: str = "simulatable"
     safety_class: str | None
     evidence: list[EvidenceRecord]

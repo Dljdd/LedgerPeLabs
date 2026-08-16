@@ -7,7 +7,15 @@ from typing import Any
 from apar.contracts.decisions import Action, Decision, ReasonCode
 from apar.contracts.events import EventKind, PaymentEvent, Rail
 from apar.contracts.reports import EvaluationReport, PromotionDecision
-from apar.contracts.scenarios import AttackerMode, FeedbackField, ScenarioConfig
+from apar.contracts.scenarios import (
+    AttackerMode,
+    CampaignStage,
+    FeedbackField,
+    ReplayConfig,
+    ReplayOrdering,
+    ScenarioConfig,
+    StageTransition,
+)
 from apar.registry.models import EvidenceRecord, ThreatCard
 
 NOW = datetime(2026, 8, 16, 12, tzinfo=UTC)
@@ -28,19 +36,26 @@ def make_threat_card(**overrides: Any) -> ThreatCard:
         genai_capability={"personalization": True, "iteration_speed": True},
         attacker_objective="expected_net_settled_value",
         observables=["beneficiary_age", "device_fan_out", "transfer_velocity"],
+        defender_knowledge_boundary="decision-available payment signals only",
         safety_class="synthetic_only",
         evidence=[
             EvidenceRecord(
-                evidence_id="uk-finance-fraud-report-2025",
-                direct_source_url="https://www.ukfinance.org.uk/policy-and-guidance/reports",
-                source_type="official_report",
-                publisher="UK Finance",
-                published_on=date(2025, 5, 28),
+                evidence_id="fca-app-fraud-controls-2023",
+                direct_source_url=(
+                    "https://www.fca.org.uk/publications/multi-firm-reviews/"
+                    "anti-fraud-controls-complaint-handling-firms-focus-app-fraud"
+                ),
+                source_type="regulator_guidance",
+                publisher="Financial Conduct Authority",
+                published_on=date(2023, 11, 7),
                 accessed_on=date(2026, 8, 16),
-                claim="APP fraud uses social engineering to induce authorized transfers.",
+                claim=(
+                    "The FCA states that APP fraud happens when someone is tricked into "
+                    "sending money to a fraudster posing as a genuine payee."
+                ),
                 is_project_inference=False,
                 quality_grade="A",
-                reviewer_notes="Primary industry evidence; scenario remains synthetic.",
+                reviewer_notes="Direct public FCA review; scenario remains synthetic.",
             )
         ],
         default_config=ScenarioConfig(
@@ -61,6 +76,34 @@ def make_threat_card(**overrides: Any) -> ThreatCard:
             illicit_entity_count=60,
             duration_hours=24,
             seed=260_816,
+            campaign_stages=[
+                CampaignStage(
+                    stage_id="persuasion", description="Synthetic persuasion stage"
+                ),
+                CampaignStage(stage_id="transfer", description="Synthetic transfer stage"),
+                CampaignStage(
+                    stage_id="mule_dispersion",
+                    description="Synthetic mule dispersion stage",
+                ),
+            ],
+            transition_rules=[
+                StageTransition(
+                    from_stage="persuasion",
+                    to_stage="transfer",
+                    condition="stage_completed",
+                ),
+                StageTransition(
+                    from_stage="transfer",
+                    to_stage="mule_dispersion",
+                    condition="stage_completed",
+                ),
+            ],
+            replay=ReplayConfig(
+                random_seed=260_816,
+                simulation_start=NOW,
+                generator_version="0.1.0",
+                event_ordering=ReplayOrdering.EVENT_TIME_THEN_EVENT_ID,
+            ),
             export_level="sanitized",
             economics={"acquisition_cost": "configured", "mule_commission": "configured"},
             lifecycle={"label_delay_days": "configured"},
@@ -112,6 +155,29 @@ def make_scenario_config(**overrides: Any) -> ScenarioConfig:
         illicit_entity_count=60,
         duration_hours=24,
         seed=260_816,
+        campaign_stages=[
+            CampaignStage(stage_id="persuasion", description="Synthetic persuasion stage"),
+            CampaignStage(stage_id="transfer", description="Synthetic transfer stage"),
+            CampaignStage(
+                stage_id="mule_dispersion", description="Synthetic mule dispersion stage"
+            ),
+        ],
+        transition_rules=[
+            StageTransition(
+                from_stage="persuasion", to_stage="transfer", condition="stage_completed"
+            ),
+            StageTransition(
+                from_stage="transfer",
+                to_stage="mule_dispersion",
+                condition="stage_completed",
+            ),
+        ],
+        replay=ReplayConfig(
+            random_seed=260_816,
+            simulation_start=NOW,
+            generator_version="0.1.0",
+            event_ordering=ReplayOrdering.EVENT_TIME_THEN_EVENT_ID,
+        ),
         export_level="sanitized",
         economics={"acquisition_cost": "configured", "mule_commission": "configured"},
         lifecycle={"label_delay_days": "configured"},

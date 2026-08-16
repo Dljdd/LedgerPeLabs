@@ -6,13 +6,29 @@
   "family": "card_testing_cnp",
   "confidence": 0.96,
   "implementation_status": "deep_scenario",
-  "rails": ["card"],
+  "rails": [
+    "card"
+  ],
   "viewpoint": "network_native",
-  "channels": ["ecommerce"],
-  "lifecycle_stages": ["authorization_testing", "monetization"],
-  "genai_capability": {"iteration_speed": true, "adaptive_search": true},
+  "channels": [
+    "ecommerce"
+  ],
+  "lifecycle_stages": [
+    "authorization_testing",
+    "monetization"
+  ],
+  "genai_capability": {
+    "iteration_speed": true,
+    "adaptive_search": true
+  },
   "attacker_objective": "validated_account_rate",
-  "observables": ["low_value_authorization_rate", "decline_velocity", "merchant_concentration", "account_retry_count"],
+  "observables": [
+    "low_value_authorization_rate",
+    "decline_velocity",
+    "merchant_concentration",
+    "account_retry_count"
+  ],
+  "defender_knowledge_boundary": "decision-available payment signals only",
   "simulation_status": "simulatable",
   "safety_class": "synthetic_only",
   "evidence": [
@@ -49,11 +65,37 @@
     "attacker_mode": "decision_only",
     "attacker_objective": "validated_account_rate",
     "query_budget": 80,
-    "feedback": ["action", "reason_family"],
+    "feedback": [
+      "action",
+      "reason_family"
+    ],
     "benign_entity_count": 6000,
     "illicit_entity_count": 75,
     "duration_hours": 12,
     "seed": 260821,
+    "campaign_stages": [
+      {
+        "stage_id": "authorization_testing",
+        "description": "Synthetic authorization testing stage"
+      },
+      {
+        "stage_id": "monetization",
+        "description": "Synthetic monetization stage"
+      }
+    ],
+    "transition_rules": [
+      {
+        "from_stage": "authorization_testing",
+        "to_stage": "monetization",
+        "condition": "stage_completed"
+      }
+    ],
+    "replay": {
+      "random_seed": 260821,
+      "simulation_start": "2026-08-16T00:00:00Z",
+      "generator_version": "0.1.0",
+      "event_ordering": "event_time_then_event_id"
+    },
     "export_level": "sanitized"
   }
 }

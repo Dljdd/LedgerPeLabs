@@ -14,19 +14,24 @@ The product is an assurance layer, not a replacement payment-decision engine. It
 
 ## Install and verify the G0 foundation
 
-The supported runtime is Python 3.12. From a clean checkout:
+The supported runtime is Python 3.12. The immutable artifact store is supported on
+macOS (Darwin, using native `renameatx_np`) and Linux filesystems that provide native
+`renameat2(..., RENAME_NOREPLACE)` support. Other platforms, including Windows, are
+not currently supported by the artifact publication boundary.
+
+From a clean checkout on a supported platform, use the virtual environment's
+interpreter directly:
 
 ```bash
 python3.12 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e '.[dev]'
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -e '.[dev]'
 ```
 
 Run the complete G0 contract verification with one command:
 
 ```bash
-python scripts/verify_g0.py
+.venv/bin/python scripts/verify_g0.py
 ```
 
 The command validates all 20 evidence-backed threat cards and exercises the real registry,

@@ -12,7 +12,7 @@ from enum import Enum
 from pathlib import Path
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 import apar.storage.artifacts as artifacts
 from apar.storage.artifacts import ArtifactRef, ArtifactStore
@@ -26,6 +26,10 @@ class CanonicalPayload(BaseModel):
     amount: Decimal
     published_on: date
     stage: Stage
+
+
+class NestedCanonicalPayload(BaseModel):
+    payload: CanonicalPayload
 
 
 def _write_complete_artifact(root: Path, payload: bytes, media_type: str) -> ArtifactRef:
@@ -74,6 +78,44 @@ def test_put_json_canonicalizes_pydantic_json_types(tmp_path: Path) -> None:
     expected = b'{"amount":"12.50","published_on":"2026-08-16","stage":"reviewed"}'
     assert ref.sha256 == hashlib.sha256(expected).hexdigest()
     assert store.read(ref) == expected
+
+
+def test_put_json_rejects_a_copied_invalid_model(tmp_path: Path) -> None:
+    """Catches model_copy bypass values being frozen as trusted JSON artifacts."""
+    store = ArtifactStore(tmp_path)
+    valid = CanonicalPayload(
+        amount=Decimal("12.50"), published_on=date(2026, 8, 16), stage=Stage.REVIEWED
+    )
+    invalid = valid.model_copy(update={"amount": "not-a-decimal"})
+
+    with pytest.raises(ValidationError, match="amount"):
+        store.put_json(invalid)
+
+
+def test_put_json_rejects_a_copied_invalid_nested_model(tmp_path: Path) -> None:
+    """Catches recursive Pydantic validation being skipped before canonical storage."""
+    valid = CanonicalPayload(
+        amount=Decimal("12.50"), published_on=date(2026, 8, 16), stage=Stage.REVIEWED
+    )
+    invalid_child = valid.model_copy(update={"published_on": "not-a-date"})
+    parent = NestedCanonicalPayload(payload=invalid_child)
+
+    with pytest.raises(ValidationError, match="published_on"):
+        ArtifactStore(tmp_path).put_json(parent)
+
+
+def test_put_json_valid_model_matches_its_json_payload(tmp_path: Path) -> None:
+    """Catches model revalidation changing valid canonical artifact bytes."""
+    store = ArtifactStore(tmp_path)
+    model = CanonicalPayload(
+        amount=Decimal("12.50"), published_on=date(2026, 8, 16), stage=Stage.REVIEWED
+    )
+
+    model_ref = store.put_json(model)
+    dict_ref = store.put_json(model.model_dump(mode="json"))
+
+    assert model_ref == dict_ref
+    assert store.read(model_ref) == store.read(dict_ref)
 
 
 def test_existing_digest_cannot_be_overwritten(tmp_path: Path) -> None:

@@ -83,7 +83,9 @@ class ArtifactStore:
         """Canonicalize a validated model or JSON object before immutable storage."""
         json_compatible: object
         if isinstance(payload, BaseModel):
-            json_compatible = payload.model_dump(mode="json")
+            fields = payload.model_dump(mode="python", round_trip=True, warnings=False)
+            validated = type(payload).model_validate(fields)
+            json_compatible = validated.model_dump(mode="json")
         elif isinstance(payload, dict):
             json_compatible = payload
         else:

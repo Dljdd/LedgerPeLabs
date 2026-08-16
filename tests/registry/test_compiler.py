@@ -225,3 +225,10 @@ def test_compiler_emits_a_traceable_bounded_scenario_bundle() -> None:
     assert bundle.illicit_entity_count == 60
     assert bundle.duration_hours == 24
     assert bundle.seed == 260816
+    assert bundle.campaign_stages == card.default_config.campaign_stages
+    assert bundle.transition_rules == card.default_config.transition_rules
+    assert bundle.defender_knowledge_boundary == card.defender_knowledge_boundary
+    assert bundle.replay_manifest.scenario_id == bundle.scenario_id
+    assert bundle.replay_manifest.scenario_version == bundle.version
+    assert bundle.replay_manifest.threat_card_ref == bundle.threat_card_ref
+    assert bundle.replay_manifest.random_seed == bundle.seed

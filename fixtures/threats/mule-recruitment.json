@@ -6,13 +6,31 @@
   "family": "mule_network",
   "confidence": 0.94,
   "implementation_status": "evidence_only",
-  "rails": ["a2a"],
+  "rails": [
+    "a2a"
+  ],
   "viewpoint": "network_with_bank_enrichment",
-  "channels": ["social", "messaging"],
-  "lifecycle_stages": ["recruitment", "account_activation", "transfer"],
-  "genai_capability": {"personalization": true, "content_generation": true},
+  "channels": [
+    "social",
+    "messaging"
+  ],
+  "lifecycle_stages": [
+    "recruitment",
+    "account_activation",
+    "transfer"
+  ],
+  "genai_capability": {
+    "personalization": true,
+    "content_generation": true
+  },
   "attacker_objective": "active_mule_capacity",
-  "observables": ["new_account_indicator", "inbound_outbound_delay", "fan_in", "fan_out"],
+  "observables": [
+    "new_account_indicator",
+    "inbound_outbound_delay",
+    "fan_in",
+    "fan_out"
+  ],
+  "defender_knowledge_boundary": "decision-available payment signals only",
   "simulation_status": "simulatable",
   "safety_class": "synthetic_only",
   "evidence": [
@@ -49,11 +67,46 @@
     "attacker_mode": "static",
     "attacker_objective": "active_mule_capacity",
     "query_budget": 25,
-    "feedback": ["action", "reason_family"],
+    "feedback": [
+      "action",
+      "reason_family"
+    ],
     "benign_entity_count": 4000,
     "illicit_entity_count": 50,
     "duration_hours": 48,
     "seed": 260829,
+    "campaign_stages": [
+      {
+        "stage_id": "recruitment",
+        "description": "Synthetic recruitment stage"
+      },
+      {
+        "stage_id": "account_activation",
+        "description": "Synthetic account activation stage"
+      },
+      {
+        "stage_id": "transfer",
+        "description": "Synthetic transfer stage"
+      }
+    ],
+    "transition_rules": [
+      {
+        "from_stage": "recruitment",
+        "to_stage": "account_activation",
+        "condition": "stage_completed"
+      },
+      {
+        "from_stage": "account_activation",
+        "to_stage": "transfer",
+        "condition": "stage_completed"
+      }
+    ],
+    "replay": {
+      "random_seed": 260829,
+      "simulation_start": "2026-08-16T00:00:00Z",
+      "generator_version": "0.1.0",
+      "event_ordering": "event_time_then_event_id"
+    },
     "export_level": "sanitized"
   }
 }

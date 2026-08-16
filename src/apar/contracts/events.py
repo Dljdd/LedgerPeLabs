@@ -35,13 +35,19 @@ class EventKind(StrEnum):
 
 
 class LifecycleState(StrEnum):
+    INITIATED = "initiated"
+    AUTHENTICATED = "authenticated"
     AUTHORIZED = "authorized"
+    REJECTED = "rejected"
+    DECLINED = "declined"
     CLEARED = "cleared"
     SETTLED = "settled"
+    REPORTED = "reported"
+    RECOVERED = "recovered"
+    LOSS_FINAL = "loss_final"
     REVERSED = "reversed"
     DISPUTED = "disputed"
-    CHARGEDBACK = "chargeback"
-    RECOVERED = "recovered"
+    CHARGEBACK = "chargeback"
 
 
 class PaymentEvent(ExternalContract):

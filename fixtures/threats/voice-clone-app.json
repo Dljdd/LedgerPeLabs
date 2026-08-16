@@ -6,13 +6,28 @@
   "family": "app_scam_mule",
   "confidence": 0.9,
   "implementation_status": "evidence_only",
-  "rails": ["a2a"],
+  "rails": [
+    "a2a"
+  ],
   "viewpoint": "network_with_bank_enrichment",
-  "channels": ["voice"],
-  "lifecycle_stages": ["impersonation", "transfer"],
-  "genai_capability": {"voice_synthesis": true, "personalization": true},
+  "channels": [
+    "voice"
+  ],
+  "lifecycle_stages": [
+    "impersonation",
+    "transfer"
+  ],
+  "genai_capability": {
+    "voice_synthesis": true,
+    "personalization": true
+  },
   "attacker_objective": "authorized_transfer_value",
-  "observables": ["new_beneficiary_indicator", "call_to_transfer_delay", "transfer_velocity"],
+  "observables": [
+    "new_beneficiary_indicator",
+    "call_to_transfer_delay",
+    "transfer_velocity"
+  ],
+  "defender_knowledge_boundary": "decision-available payment signals only",
   "simulation_status": "simulatable",
   "safety_class": "synthetic_only",
   "evidence": [
@@ -49,11 +64,37 @@
     "attacker_mode": "static",
     "attacker_objective": "authorized_transfer_value",
     "query_budget": 20,
-    "feedback": ["action", "reason_family"],
+    "feedback": [
+      "action",
+      "reason_family"
+    ],
     "benign_entity_count": 3000,
     "illicit_entity_count": 40,
     "duration_hours": 24,
     "seed": 260817,
+    "campaign_stages": [
+      {
+        "stage_id": "impersonation",
+        "description": "Synthetic impersonation stage"
+      },
+      {
+        "stage_id": "transfer",
+        "description": "Synthetic transfer stage"
+      }
+    ],
+    "transition_rules": [
+      {
+        "from_stage": "impersonation",
+        "to_stage": "transfer",
+        "condition": "stage_completed"
+      }
+    ],
+    "replay": {
+      "random_seed": 260817,
+      "simulation_start": "2026-08-16T00:00:00Z",
+      "generator_version": "0.1.0",
+      "event_ordering": "event_time_then_event_id"
+    },
     "export_level": "sanitized"
   }
 }

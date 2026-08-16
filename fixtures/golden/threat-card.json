@@ -7,10 +7,20 @@
   "family": "app_scam_mule",
   "confidence": 0.92,
   "implementation_status": "deep_scenario",
-  "rails": ["a2a", "agentic"],
+  "rails": [
+    "a2a",
+    "agentic"
+  ],
   "viewpoint": "network_with_bank_enrichment",
-  "channels": ["messaging", "conversational_agent"],
-  "lifecycle_stages": ["persuasion", "transfer", "mule_dispersion"],
+  "channels": [
+    "messaging",
+    "conversational_agent"
+  ],
+  "lifecycle_stages": [
+    "persuasion",
+    "transfer",
+    "mule_dispersion"
+  ],
   "genai_capability": {
     "personalization": true,
     "iteration_speed": true
@@ -28,20 +38,21 @@
     "beneficiary_fan_in",
     "beneficiary_fan_out"
   ],
+  "defender_knowledge_boundary": "decision-available payment signals only",
   "simulation_status": "simulatable",
   "safety_class": "synthetic_only",
   "evidence": [
     {
-      "evidence_id": "uk-finance-app-fact-2025",
-      "direct_source_url": "https://www.ukfinance.org.uk/policy-and-guidance/reports/annual-fraud-report-2025",
-      "source_type": "industry_body_report",
-      "publisher": "UK Finance",
-      "published_on": "2025-05-27",
+      "evidence_id": "fca-app-fraud-controls-2023",
+      "direct_source_url": "https://www.fca.org.uk/publications/multi-firm-reviews/anti-fraud-controls-complaint-handling-firms-focus-app-fraud",
+      "source_type": "regulator_guidance",
+      "publisher": "Financial Conduct Authority",
+      "published_on": "2023-11-07",
       "accessed_on": "2026-08-16",
-      "claim": "UK Finance defines APP fraud as victims being manipulated by criminals into sending money and reports that criminals adapt their tactics.",
+      "claim": "The FCA states that APP fraud happens when someone is tricked into sending money to a fraudster posing as a genuine payee.",
       "is_project_inference": false,
       "quality_grade": "A",
-      "reviewer_notes": "Direct industry-body report page; fact statement only."
+      "reviewer_notes": "Direct public FCA multi-firm review page; fact statement only."
     },
     {
       "evidence_id": "fbi-ai-scale-fact-2026",
@@ -57,15 +68,15 @@
     },
     {
       "evidence_id": "apar-app-personalization-inference",
-      "direct_source_url": "https://www.ukfinance.org.uk/policy-and-guidance/reports/annual-fraud-report-2025",
-      "source_type": "industry_body_report",
-      "publisher": "UK Finance",
-      "published_on": "2025-05-27",
+      "direct_source_url": "https://www.fca.org.uk/publications/multi-firm-reviews/anti-fraud-controls-complaint-handling-firms-focus-app-fraud",
+      "source_type": "regulator_guidance",
+      "publisher": "Financial Conduct Authority",
+      "published_on": "2023-11-07",
       "accessed_on": "2026-08-16",
       "claim": "APAR infers that synthetic personalization and faster message iteration can be modeled as bounded capability deltas against an otherwise matched APP baseline.",
       "is_project_inference": true,
       "quality_grade": "B",
-      "reviewer_notes": "Project modeling inference, not a claim made by UK Finance."
+      "reviewer_notes": "Project modeling inference, not a claim made by the FCA."
     }
   ],
   "default_config": {
@@ -77,11 +88,46 @@
     "attacker_mode": "decision_only",
     "attacker_objective": "expected_net_settled_value",
     "query_budget": 40,
-    "feedback": ["action", "reason_family"],
+    "feedback": [
+      "action",
+      "reason_family"
+    ],
     "benign_entity_count": 5000,
     "illicit_entity_count": 60,
     "duration_hours": 24,
     "seed": 260816,
+    "campaign_stages": [
+      {
+        "stage_id": "persuasion",
+        "description": "Synthetic persuasion stage"
+      },
+      {
+        "stage_id": "transfer",
+        "description": "Synthetic transfer stage"
+      },
+      {
+        "stage_id": "mule_dispersion",
+        "description": "Synthetic mule dispersion stage"
+      }
+    ],
+    "transition_rules": [
+      {
+        "from_stage": "persuasion",
+        "to_stage": "transfer",
+        "condition": "stage_completed"
+      },
+      {
+        "from_stage": "transfer",
+        "to_stage": "mule_dispersion",
+        "condition": "stage_completed"
+      }
+    ],
+    "replay": {
+      "random_seed": 260816,
+      "simulation_start": "2026-08-16T00:00:00Z",
+      "generator_version": "0.1.0",
+      "event_ordering": "event_time_then_event_id"
+    },
     "economics": {
       "acquisition_cost": "configured",
       "mule_commission": "configured"

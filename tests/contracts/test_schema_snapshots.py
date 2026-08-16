@@ -3,33 +3,145 @@ from typing import Any, cast
 from apar.contracts.decisions import Decision
 from apar.contracts.events import PaymentEvent
 from apar.contracts.reports import EvaluationReport
-from apar.contracts.scenarios import ScenarioBundle, ScenarioConfig
+from apar.contracts.scenarios import (
+    CampaignStage,
+    ReplayConfig,
+    ReplayManifest,
+    ScenarioBundle,
+    ScenarioConfig,
+    StageTransition,
+)
+from apar.registry.models import EvidenceRecord, ThreatCard
 
 
 def test_external_model_schema_required_fields_are_stable() -> None:
-    """Catches accidental removal of fields needed at each external contract boundary."""
+    """Catches any required-field drift at each external contract boundary."""
     required_by_model = {
-        PaymentEvent: {"event_id", "campaign_id", "trace_id", "amount", "event_time"},
-        ScenarioBundle: {"scenario_id", "threat_card_ref", "rail", "attacker_mode"},
+        PaymentEvent: {
+            "schema_version",
+            "event_id",
+            "campaign_id",
+            "trace_id",
+            "rail",
+            "viewpoint",
+            "event_type",
+            "amount",
+            "currency",
+            "event_time",
+            "ingested_at",
+            "available_at",
+            "actor_id",
+            "counterparty_id",
+        },
+        CampaignStage: {"stage_id", "description"},
+        StageTransition: {"from_stage", "to_stage", "condition"},
+        ReplayConfig: {
+            "random_seed",
+            "simulation_start",
+            "generator_version",
+            "event_ordering",
+        },
+        ReplayManifest: {
+            "random_seed",
+            "simulation_start",
+            "generator_version",
+            "event_ordering",
+            "scenario_id",
+            "scenario_version",
+            "threat_card_ref",
+        },
         ScenarioConfig: {
             "scenario_id",
+            "version",
             "rail",
+            "viewpoint",
+            "attacker_mode",
+            "attacker_objective",
+            "query_budget",
+            "feedback",
             "benign_entity_count",
             "illicit_entity_count",
             "duration_hours",
             "seed",
+            "campaign_stages",
+            "transition_rules",
+            "export_level",
+            "replay",
         },
-        Decision: {"decision_id", "event_id", "decision_time", "action", "score"},
+        ScenarioBundle: {
+            "scenario_id",
+            "version",
+            "rail",
+            "viewpoint",
+            "attacker_mode",
+            "attacker_objective",
+            "query_budget",
+            "feedback",
+            "benign_entity_count",
+            "illicit_entity_count",
+            "duration_hours",
+            "seed",
+            "campaign_stages",
+            "transition_rules",
+            "threat_card_ref",
+            "defender_knowledge_boundary",
+            "replay_manifest",
+            "genai_capability",
+            "safety",
+        },
+        Decision: {
+            "decision_id",
+            "event_id",
+            "decision_time",
+            "max_source_timestamp",
+            "score",
+            "action",
+            "model_version",
+        },
         EvaluationReport: {
             "run_id",
             "scenario_id",
             "generator_hash",
             "model_hash",
+            "policy_hash",
+            "evaluator_hash",
+            "reviewer_id",
             "promotion_decision",
+            "reviewed_at",
+        },
+        EvidenceRecord: {
+            "evidence_id",
+            "direct_source_url",
+            "source_type",
+            "publisher",
+            "published_on",
+            "accessed_on",
+            "claim",
+            "is_project_inference",
+            "quality_grade",
+            "reviewer_notes",
+        },
+        ThreatCard: {
+            "threat_id",
+            "title",
+            "version",
+            "status",
+            "family",
+            "confidence",
+            "implementation_status",
+            "rails",
+            "viewpoint",
+            "genai_capability",
+            "attacker_objective",
+            "observables",
+            "defender_knowledge_boundary",
+            "safety_class",
+            "evidence",
+            "default_config",
         },
     }
 
     for model, expected_required in required_by_model.items():
         schema = cast(Any, model).model_json_schema()
-        assert expected_required <= set(schema["properties"])
-        assert expected_required <= set(schema["required"])
+        assert expected_required <= set(schema["properties"]), model.__name__
+        assert expected_required == set(schema["required"]), model.__name__

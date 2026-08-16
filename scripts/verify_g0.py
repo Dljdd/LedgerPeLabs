@@ -6,11 +6,11 @@ import json
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import cast
+from typing import Literal, cast
 from urllib.parse import urlparse
 
 from fastapi.testclient import TestClient
-from pydantic import TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from apar import __version__
 from apar.api import create_app
@@ -28,6 +28,7 @@ PASS_LINE = (
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 PORTFOLIO_ROOT = REPOSITORY_ROOT / "fixtures" / "threats"
 GOLDEN_ROOT = REPOSITORY_ROOT / "fixtures" / "golden"
+GOLDEN_HASH_MANIFEST = GOLDEN_ROOT / "canonical-sha256.json"
 EXPECTED_IDS = {
     "adaptive-card-testing",
     "agentic-cart-tampering",
@@ -70,15 +71,37 @@ class G0VerificationError(RuntimeError):
     """A failed G0 invariant with a concise command-line message."""
 
 
+class GoldenHashManifest(BaseModel):
+    """Strict review pins for the complete canonical golden artifacts."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["1.0.0"]
+    threat_card_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    scenario_bundle_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise G0VerificationError(message)
+
+
+def _require_not_none[ValueT](value: ValueT | None, message: str) -> ValueT:
+    if value is None:
+        raise G0VerificationError(message)
+    return value
 
 
 def _load_raw_object(path: Path) -> dict[str, object]:
     loaded: object = json.loads(path.read_text(encoding="utf-8"))
     _require(isinstance(loaded, dict), f"{path}: fixture must be a JSON object")
     return cast(dict[str, object], loaded)
+
+
+def _load_golden_hash_manifest() -> GoldenHashManifest:
+    return GoldenHashManifest.model_validate_json(
+        GOLDEN_HASH_MANIFEST.read_text(encoding="utf-8")
+    )
 
 
 def _load_portfolio() -> list[ThreatCard]:
@@ -168,7 +191,10 @@ def _load_and_verify_golden(cards: list[ThreatCard]) -> tuple[ThreatCard, Scenar
 
 
 def _verify_real_integrations(
-    cards: list[ThreatCard], golden_card: ThreatCard, golden_config: ScenarioConfig
+    cards: list[ThreatCard],
+    golden_card: ThreatCard,
+    golden_config: ScenarioConfig,
+    pinned_hashes: GoldenHashManifest,
 ) -> None:
     with TemporaryDirectory(prefix="apar-g0-") as temporary_root:
         settings = Settings.from_root(Path(temporary_root))
@@ -180,20 +206,28 @@ def _verify_real_integrations(
             "registry drift",
         )
 
-        registered = repository.get(golden_card.threat_id)
-        _require(registered is not None, "golden card missing from registry")
-        if registered is None:
-            raise G0VerificationError("golden card missing from registry")
+        registered = _require_not_none(
+            repository.get(golden_card.threat_id), "golden card missing from registry"
+        )
         first_bundle = compile_scenario(registered, golden_config)
         second_bundle = compile_scenario(registered, golden_config)
         _require(first_bundle == second_bundle, "compiler output is not deterministic")
         _require(first_bundle.seed == 260816, "compiled seed changed")
 
         store = ArtifactStore(settings.artifact_root)
+        card_ref = store.put_json(golden_card)
         first_ref = store.put_json(first_bundle)
         second_ref = store.put_json(second_bundle)
         _require(first_ref == second_ref, "artifact digest was not reused")
         _require(store.read(first_ref) == store.read(second_ref), "artifact payload changed")
+        _require(
+            card_ref.sha256 == pinned_hashes.threat_card_sha256,
+            "golden threat-card canonical hash changed",
+        )
+        _require(
+            first_ref.sha256 == pinned_hashes.scenario_bundle_sha256,
+            "golden scenario-bundle canonical hash changed",
+        )
 
         with TestClient(create_app(settings)) as client:
             health_response = client.get("/api/v1/health")
@@ -220,7 +254,8 @@ def verify_g0() -> None:
     cards = _load_portfolio()
     _verify_portfolio(cards)
     golden_card, golden_config = _load_and_verify_golden(cards)
-    _verify_real_integrations(cards, golden_card, golden_config)
+    pinned_hashes = _load_golden_hash_manifest()
+    _verify_real_integrations(cards, golden_card, golden_config, pinned_hashes)
 
 
 def main() -> int:

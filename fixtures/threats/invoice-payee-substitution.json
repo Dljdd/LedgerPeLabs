@@ -6,13 +6,31 @@
   "family": "business_email_compromise",
   "confidence": 0.94,
   "implementation_status": "evidence_only",
-  "rails": ["a2a", "agentic"],
+  "rails": [
+    "a2a",
+    "agentic"
+  ],
   "viewpoint": "network_with_bank_enrichment",
-  "channels": ["email", "agent_message"],
-  "lifecycle_stages": ["impersonation", "payee_change", "transfer"],
-  "genai_capability": {"content_generation": true, "personalization": true},
+  "channels": [
+    "email",
+    "agent_message"
+  ],
+  "lifecycle_stages": [
+    "impersonation",
+    "payee_change",
+    "transfer"
+  ],
+  "genai_capability": {
+    "content_generation": true,
+    "personalization": true
+  },
   "attacker_objective": "misdirected_invoice_value",
-  "observables": ["payee_change_indicator", "new_beneficiary_indicator", "invoice_value_deviation"],
+  "observables": [
+    "payee_change_indicator",
+    "new_beneficiary_indicator",
+    "invoice_value_deviation"
+  ],
+  "defender_knowledge_boundary": "decision-available payment signals only",
   "simulation_status": "simulatable",
   "safety_class": "synthetic_only",
   "evidence": [
@@ -49,11 +67,46 @@
     "attacker_mode": "decision_only",
     "attacker_objective": "misdirected_invoice_value",
     "query_budget": 25,
-    "feedback": ["action", "reason_family"],
+    "feedback": [
+      "action",
+      "reason_family"
+    ],
     "benign_entity_count": 3500,
     "illicit_entity_count": 30,
     "duration_hours": 48,
     "seed": 260820,
+    "campaign_stages": [
+      {
+        "stage_id": "impersonation",
+        "description": "Synthetic impersonation stage"
+      },
+      {
+        "stage_id": "payee_change",
+        "description": "Synthetic payee change stage"
+      },
+      {
+        "stage_id": "transfer",
+        "description": "Synthetic transfer stage"
+      }
+    ],
+    "transition_rules": [
+      {
+        "from_stage": "impersonation",
+        "to_stage": "payee_change",
+        "condition": "stage_completed"
+      },
+      {
+        "from_stage": "payee_change",
+        "to_stage": "transfer",
+        "condition": "stage_completed"
+      }
+    ],
+    "replay": {
+      "random_seed": 260820,
+      "simulation_start": "2026-08-16T00:00:00Z",
+      "generator_version": "0.1.0",
+      "event_ordering": "event_time_then_event_id"
+    },
     "export_level": "sanitized"
   }
 }

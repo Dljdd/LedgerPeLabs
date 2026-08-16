@@ -6,13 +6,29 @@
   "family": "card_testing_cnp",
   "confidence": 0.91,
   "implementation_status": "evidence_only",
-  "rails": ["card"],
+  "rails": [
+    "card"
+  ],
   "viewpoint": "merchant_and_network",
-  "channels": ["ecommerce"],
-  "lifecycle_stages": ["checkout", "authorization"],
-  "genai_capability": {"workflow_automation": true, "iteration_speed": true},
+  "channels": [
+    "ecommerce"
+  ],
+  "lifecycle_stages": [
+    "checkout",
+    "authorization"
+  ],
+  "genai_capability": {
+    "workflow_automation": true,
+    "iteration_speed": true
+  },
   "attacker_objective": "fraudulent_purchase_value",
-  "observables": ["checkout_velocity", "failed_authentication_rate", "device_account_ratio", "cnp_indicator"],
+  "observables": [
+    "checkout_velocity",
+    "failed_authentication_rate",
+    "device_account_ratio",
+    "cnp_indicator"
+  ],
+  "defender_knowledge_boundary": "decision-available payment signals only",
   "simulation_status": "simulatable",
   "safety_class": "synthetic_only",
   "evidence": [
@@ -49,11 +65,37 @@
     "attacker_mode": "static",
     "attacker_objective": "fraudulent_purchase_value",
     "query_budget": 50,
-    "feedback": ["action", "reason_family"],
+    "feedback": [
+      "action",
+      "reason_family"
+    ],
     "benign_entity_count": 5500,
     "illicit_entity_count": 65,
     "duration_hours": 12,
     "seed": 260822,
+    "campaign_stages": [
+      {
+        "stage_id": "checkout",
+        "description": "Synthetic checkout stage"
+      },
+      {
+        "stage_id": "authorization",
+        "description": "Synthetic authorization stage"
+      }
+    ],
+    "transition_rules": [
+      {
+        "from_stage": "checkout",
+        "to_stage": "authorization",
+        "condition": "stage_completed"
+      }
+    ],
+    "replay": {
+      "random_seed": 260822,
+      "simulation_start": "2026-08-16T00:00:00Z",
+      "generator_version": "0.1.0",
+      "event_ordering": "event_time_then_event_id"
+    },
     "export_level": "sanitized"
   }
 }

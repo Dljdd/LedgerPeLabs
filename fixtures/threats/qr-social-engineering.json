@@ -6,13 +6,31 @@
   "family": "app_scam_mule",
   "confidence": 0.92,
   "implementation_status": "evidence_only",
-  "rails": ["a2a"],
+  "rails": [
+    "a2a"
+  ],
   "viewpoint": "network_with_bank_enrichment",
-  "channels": ["qr_code", "messaging"],
-  "lifecycle_stages": ["lure", "payment_portal", "transfer"],
-  "genai_capability": {"content_generation": true, "personalization": true},
+  "channels": [
+    "qr_code",
+    "messaging"
+  ],
+  "lifecycle_stages": [
+    "lure",
+    "payment_portal",
+    "transfer"
+  ],
+  "genai_capability": {
+    "content_generation": true,
+    "personalization": true
+  },
   "attacker_objective": "authorized_transfer_value",
-  "observables": ["qr_payment_indicator", "new_beneficiary_indicator", "message_to_payment_delay", "beneficiary_fan_in"],
+  "observables": [
+    "qr_payment_indicator",
+    "new_beneficiary_indicator",
+    "message_to_payment_delay",
+    "beneficiary_fan_in"
+  ],
+  "defender_knowledge_boundary": "decision-available payment signals only",
   "simulation_status": "simulatable",
   "safety_class": "synthetic_only",
   "evidence": [
@@ -49,11 +67,46 @@
     "attacker_mode": "static",
     "attacker_objective": "authorized_transfer_value",
     "query_budget": 25,
-    "feedback": ["action", "reason_family"],
+    "feedback": [
+      "action",
+      "reason_family"
+    ],
     "benign_entity_count": 4000,
     "illicit_entity_count": 45,
     "duration_hours": 24,
     "seed": 260832,
+    "campaign_stages": [
+      {
+        "stage_id": "lure",
+        "description": "Synthetic lure stage"
+      },
+      {
+        "stage_id": "payment_portal",
+        "description": "Synthetic payment portal stage"
+      },
+      {
+        "stage_id": "transfer",
+        "description": "Synthetic transfer stage"
+      }
+    ],
+    "transition_rules": [
+      {
+        "from_stage": "lure",
+        "to_stage": "payment_portal",
+        "condition": "stage_completed"
+      },
+      {
+        "from_stage": "payment_portal",
+        "to_stage": "transfer",
+        "condition": "stage_completed"
+      }
+    ],
+    "replay": {
+      "random_seed": 260832,
+      "simulation_start": "2026-08-16T00:00:00Z",
+      "generator_version": "0.1.0",
+      "event_ordering": "event_time_then_event_id"
+    },
     "export_level": "sanitized"
   }
 }

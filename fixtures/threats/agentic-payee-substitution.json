@@ -6,13 +6,33 @@
   "family": "agentic_intent_abuse",
   "confidence": 0.9,
   "implementation_status": "deep_scenario",
-  "rails": ["agentic", "a2a"],
+  "rails": [
+    "agentic",
+    "a2a"
+  ],
   "viewpoint": "agent_and_network",
-  "channels": ["agent_tool_call", "payment_intent"],
-  "lifecycle_stages": ["intent_capture", "payee_selection", "transfer"],
-  "genai_capability": {"indirect_instruction_exposure": true, "tool_use": true},
+  "channels": [
+    "agent_tool_call",
+    "payment_intent"
+  ],
+  "lifecycle_stages": [
+    "intent_capture",
+    "payee_selection",
+    "transfer"
+  ],
+  "genai_capability": {
+    "indirect_instruction_exposure": true,
+    "tool_use": true
+  },
   "attacker_objective": "unintended_payee_value",
-  "observables": ["declared_payee_match", "intent_payee_match", "agent_identity", "tool_call_sequence", "confirmation_indicator"],
+  "observables": [
+    "declared_payee_match",
+    "intent_payee_match",
+    "agent_identity",
+    "tool_call_sequence",
+    "confirmation_indicator"
+  ],
+  "defender_knowledge_boundary": "decision-available payment signals only",
   "simulation_status": "simulatable",
   "safety_class": "synthetic_only",
   "evidence": [
@@ -49,11 +69,46 @@
     "attacker_mode": "decision_only",
     "attacker_objective": "unintended_payee_value",
     "query_budget": 40,
-    "feedback": ["action", "reason_family"],
+    "feedback": [
+      "action",
+      "reason_family"
+    ],
     "benign_entity_count": 4000,
     "illicit_entity_count": 45,
     "duration_hours": 24,
     "seed": 260833,
+    "campaign_stages": [
+      {
+        "stage_id": "intent_capture",
+        "description": "Synthetic intent capture stage"
+      },
+      {
+        "stage_id": "payee_selection",
+        "description": "Synthetic payee selection stage"
+      },
+      {
+        "stage_id": "transfer",
+        "description": "Synthetic transfer stage"
+      }
+    ],
+    "transition_rules": [
+      {
+        "from_stage": "intent_capture",
+        "to_stage": "payee_selection",
+        "condition": "stage_completed"
+      },
+      {
+        "from_stage": "payee_selection",
+        "to_stage": "transfer",
+        "condition": "stage_completed"
+      }
+    ],
+    "replay": {
+      "random_seed": 260833,
+      "simulation_start": "2026-08-16T00:00:00Z",
+      "generator_version": "0.1.0",
+      "event_ordering": "event_time_then_event_id"
+    },
     "export_level": "sanitized"
   }
 }

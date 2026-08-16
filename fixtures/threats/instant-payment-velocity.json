@@ -6,13 +6,30 @@
   "family": "instant_payment_fraud",
   "confidence": 0.88,
   "implementation_status": "evidence_only",
-  "rails": ["a2a"],
+  "rails": [
+    "a2a"
+  ],
   "viewpoint": "network_native",
-  "channels": ["instant_payment"],
-  "lifecycle_stages": ["initiation", "risk_assessment", "posting"],
-  "genai_capability": {"iteration_speed": true, "workflow_automation": true},
+  "channels": [
+    "instant_payment"
+  ],
+  "lifecycle_stages": [
+    "initiation",
+    "risk_assessment",
+    "posting"
+  ],
+  "genai_capability": {
+    "iteration_speed": true,
+    "workflow_automation": true
+  },
   "attacker_objective": "rapid_settled_value",
-  "observables": ["account_activity_threshold", "receiver_account_age", "payment_velocity", "receiver_fan_in"],
+  "observables": [
+    "account_activity_threshold",
+    "receiver_account_age",
+    "payment_velocity",
+    "receiver_fan_in"
+  ],
+  "defender_knowledge_boundary": "decision-available payment signals only",
   "simulation_status": "simulatable",
   "safety_class": "synthetic_only",
   "evidence": [
@@ -61,11 +78,46 @@
     "attacker_mode": "decision_only",
     "attacker_objective": "rapid_settled_value",
     "query_budget": 45,
-    "feedback": ["action", "reason_family"],
+    "feedback": [
+      "action",
+      "reason_family"
+    ],
     "benign_entity_count": 5500,
     "illicit_entity_count": 60,
     "duration_hours": 12,
     "seed": 260831,
+    "campaign_stages": [
+      {
+        "stage_id": "initiation",
+        "description": "Synthetic initiation stage"
+      },
+      {
+        "stage_id": "risk_assessment",
+        "description": "Synthetic risk assessment stage"
+      },
+      {
+        "stage_id": "posting",
+        "description": "Synthetic posting stage"
+      }
+    ],
+    "transition_rules": [
+      {
+        "from_stage": "initiation",
+        "to_stage": "risk_assessment",
+        "condition": "stage_completed"
+      },
+      {
+        "from_stage": "risk_assessment",
+        "to_stage": "posting",
+        "condition": "stage_completed"
+      }
+    ],
+    "replay": {
+      "random_seed": 260831,
+      "simulation_start": "2026-08-16T00:00:00Z",
+      "generator_version": "0.1.0",
+      "event_ordering": "event_time_then_event_id"
+    },
     "export_level": "sanitized"
   }
 }

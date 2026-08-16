@@ -188,3 +188,30 @@ def test_golden_app_contract_has_the_fixed_controller_values() -> None:
     assert config.benign_entity_count == 5_000
     assert config.illicit_entity_count == 60
     assert config.feedback == [FeedbackField.ACTION, FeedbackField.REASON_FAMILY]
+
+
+def test_app_card_uses_the_public_fca_app_fraud_source_metadata() -> None:
+    """Catches regression to an authenticated source or inaccurate public metadata."""
+    card = ThreatCard.model_validate_json(
+        (PORTFOLIO_ROOT / "app-personalized-mule.json").read_text()
+    )
+    matching = [
+        record
+        for record in card.evidence
+        if record.evidence_id == "fca-app-fraud-controls-2023"
+    ]
+
+    assert len(matching) == 1
+    source = matching[0]
+    assert source.direct_source_url == (
+        "https://www.fca.org.uk/publications/multi-firm-reviews/"
+        "anti-fraud-controls-complaint-handling-firms-focus-app-fraud"
+    )
+    assert source.publisher == "Financial Conduct Authority"
+    assert source.published_on.isoformat() == "2023-11-07"
+    assert source.accessed_on.isoformat() == "2026-08-16"
+    assert source.source_type == "regulator_guidance"
+    assert source.claim == (
+        "The FCA states that APP fraud happens when someone is tricked into sending "
+        "money to a fraudster posing as a genuine payee."
+    )

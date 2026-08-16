@@ -7,10 +7,20 @@ import pytest
 from pydantic import ValidationError
 
 from apar.contracts.decisions import Action, Decision
-from apar.contracts.events import PaymentEvent
+from apar.contracts.events import LifecycleState, PaymentEvent
 from apar.contracts.reports import EvaluationReport, PromotionDecision
-from apar.contracts.scenarios import AttackerMode, FeedbackField, ScenarioBundle, ScenarioConfig
+from apar.contracts.scenarios import (
+    AttackerMode,
+    CampaignStage,
+    FeedbackField,
+    ReplayConfig,
+    ReplayOrdering,
+    ScenarioBundle,
+    ScenarioConfig,
+    StageTransition,
+)
 from tests.factories import (
+    NOW,
     make_decision,
     make_evaluation_report,
     make_payment_event,
@@ -82,6 +92,26 @@ def test_event_uses_decimal_money_and_is_frozen() -> None:
         event.amount = Decimal("9.99")
 
 
+def test_lifecycle_state_exactly_matches_the_approved_payment_lifecycle() -> None:
+    """Catches missing lifecycle states or the misspelled chargeback member returning."""
+    assert {state.value for state in LifecycleState} == {
+        "initiated",
+        "authenticated",
+        "authorized",
+        "rejected",
+        "declined",
+        "cleared",
+        "settled",
+        "reported",
+        "recovered",
+        "loss_final",
+        "reversed",
+        "disputed",
+        "chargeback",
+    }
+    assert LifecycleState.CHARGEBACK.value == "chargeback"
+
+
 def test_scenario_validates_feedback_and_query_budget() -> None:
     """Catches scenarios that cannot support bounded decision-only attacker feedback."""
     scenario = make_scenario_config(
@@ -129,8 +159,15 @@ def test_scenario_bundle_exposes_execution_bounds_as_first_class_fields() -> Non
     """Catches replay and population parameters being dropped into untyped extensions."""
     config = make_scenario_config()
     bundle = ScenarioBundle(
-        **config.model_dump(exclude={"export_level"}),
+        **config.model_dump(exclude={"export_level", "replay"}),
         threat_card_ref="app-personalized-mule@2",
+        defender_knowledge_boundary="decision-available payment signals only",
+        replay_manifest={
+            **config.replay.model_dump(),
+            "scenario_id": config.scenario_id,
+            "scenario_version": config.version,
+            "threat_card_ref": "app-personalized-mule@2",
+        },
         genai_capability={"personalization": True},
         safety={"synthetic_only": True, "export_level": config.export_level},
     )
@@ -139,6 +176,41 @@ def test_scenario_bundle_exposes_execution_bounds_as_first_class_fields() -> Non
     assert bundle.illicit_entity_count == 60
     assert bundle.duration_hours == 24
     assert bundle.seed == 260816
+
+
+def test_scenario_config_rejects_transition_to_an_undeclared_stage() -> None:
+    """Catches transition rules that cannot be replayed through declared campaign stages."""
+    invalid_transition = StageTransition(
+        from_stage="persuasion",
+        to_stage="cash_out",
+        condition="stage_completed",
+    )
+
+    with pytest.raises(ValidationError, match="declared campaign stage"):
+        ScenarioConfig.model_validate(
+            make_scenario_config(transition_rules=[invalid_transition])
+        )
+
+
+def test_scenario_config_rejects_replay_seed_drift() -> None:
+    """Catches a replay manifest whose seed differs from the scenario execution seed."""
+    replay = ReplayConfig(
+        random_seed=1,
+        simulation_start=NOW,
+        generator_version="0.1.0",
+        event_ordering=ReplayOrdering.EVENT_TIME_THEN_EVENT_ID,
+    )
+
+    with pytest.raises(ValidationError, match="replay random_seed"):
+        ScenarioConfig.model_validate(make_scenario_config(replay=replay))
+
+
+def test_scenario_submodels_are_closed_and_typed() -> None:
+    """Catches transition and replay semantics regressing to extension dictionaries."""
+    stage = CampaignStage(stage_id="persuasion", description="Synthetic persuasion stage")
+
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        CampaignStage.model_validate({**stage.model_dump(), "extension_blob": {}})
 
 
 def test_decision_rejects_future_or_equal_source() -> None:
