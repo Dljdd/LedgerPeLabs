@@ -279,16 +279,18 @@ def test_card_idempotency_state_records_key_and_command_identity() -> None:
     """Catch closed state retaining keys without the command identity they retry."""
     engine = _engine()
     _schedule(engine, _authorize(), ClearCard(PAYMENT_ID))
-    engine.run()
+    events = engine.run()
 
     state = engine.entity_state(PAYMENT_ID)
     assert isinstance(state, Mapping)
-    records = cast(tuple[tuple[str, str, str], ...], state["idempotency_records"])
+    records = cast(tuple[tuple[str, str, str, str], ...], state["idempotency_records"])
     assert [(record[0], record[1]) for record in records] == [
         ("card-authorize-1", "card.authorize"),
         ("card.clear:card-payment-1", "card.clear"),
     ]
-    assert all(len(record) == 3 and len(record[2]) == 64 for record in records)
+    assert all(len(record) == 4 and len(record[2]) == 64 for record in records)
+    assert [record[3] for record in records] == [event.event_id for event in events]
+    assert state["last_event_id"] == records[-1][3]
 
 
 def test_card_duplicate_constructor_with_identical_request_is_noop() -> None:
@@ -676,10 +678,15 @@ def _replace_first_card_record(
     key: str | None = None,
     fingerprint: str | None = None,
 ) -> None:
-    records = cast(tuple[tuple[str, str, str], ...], state["idempotency_records"])
-    original_key, operation, original_fingerprint = records[0]
+    records = cast(tuple[tuple[str, ...], ...], state["idempotency_records"])
+    original_key, operation, original_fingerprint, *event_id = records[0]
     state["idempotency_records"] = (
-        (key or original_key, operation, fingerprint or original_fingerprint),
+        (
+            key or original_key,
+            operation,
+            fingerprint or original_fingerprint,
+            *event_id,
+        ),
         *records[1:],
     )
 
@@ -713,14 +720,67 @@ def test_card_corrupt_state_maps_to_stable_error_before_new_effect(
     assert len(engine.ledger.entries) == 1
 
 
-def _card_clear_record() -> tuple[str, str, str]:
+def _card_clear_record() -> tuple[str, ...]:
     engine = _engine()
     _schedule(engine, _authorize(), ClearCard(PAYMENT_ID))
     engine.run()
     state = engine.entity_state(PAYMENT_ID)
     assert isinstance(state, Mapping)
-    records = cast(tuple[tuple[str, str, str], ...], state["idempotency_records"])
+    records = cast(tuple[tuple[str, ...], ...], state["idempotency_records"])
     return records[1]
+
+
+def test_card_forged_last_event_id_is_state_corrupt() -> None:
+    """Catch a valid but unrelated UUID becoming the next lineage predecessor."""
+    engine = _corrupt_card_state(
+        lambda state: state.__setitem__(
+            "last_event_id",
+            "00000000-0000-4000-8000-000000000999",
+        )
+    )
+
+    with pytest.raises(LifecycleError) as error:
+        engine.run()
+
+    assert error.value.code == "CARD_STATE_CORRUPT"
+    assert len(engine.ledger.entries) == 1
+
+
+@pytest.mark.parametrize("corruption", ["malformed", "duplicate", "unrelated", "reordered"])
+def test_card_corrupt_history_event_ids_fail_before_new_effect(corruption: str) -> None:
+    """Catch malformed, duplicated, foreign, or decreasing record event IDs."""
+    engine = _engine()
+    _schedule(engine, _authorize(), ClearCard(PAYMENT_ID))
+    engine.run()
+    state = engine.entity_state(PAYMENT_ID)
+    assert isinstance(state, Mapping)
+    corrupted = cast(dict[str, object], dict(state))
+    raw_records = cast(tuple[tuple[str, ...], ...], state["idempotency_records"])
+    assert all(len(record) == 4 for record in raw_records)
+    records = cast(tuple[tuple[str, str, str, str], ...], raw_records)
+    first, second = records
+    if corruption == "malformed":
+        replacement = "not-an-event-id"
+        records = (first, (*second[:3], replacement))
+    elif corruption == "duplicate":
+        replacement = first[3]
+        records = (first, (*second[:3], replacement))
+    elif corruption == "unrelated":
+        replacement = "00000000-0000-4000-8000-000000000999"
+        records = (first, (*second[:3], replacement))
+    else:
+        records = ((*first[:3], second[3]), (*second[:3], first[3]))
+        replacement = first[3]
+    corrupted["idempotency_records"] = records
+    corrupted["last_event_id"] = replacement
+    engine._entity_state[PAYMENT_ID] = cast(FrozenState, MappingProxyType(corrupted))
+    engine.schedule(NOW, 0, SettleCard(PAYMENT_ID))
+
+    with pytest.raises(LifecycleError) as error:
+        engine.run()
+
+    assert error.value.code == "CARD_STATE_CORRUPT"
+    assert len(engine.ledger.entries) == 1
 
 
 def test_card_fake_well_formed_clear_record_is_state_corrupt() -> None:

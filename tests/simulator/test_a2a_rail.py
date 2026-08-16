@@ -441,17 +441,19 @@ def test_a2a_state_is_closed_ordered_primitives() -> None:
     """Catch adapters storing mutable models, sets, or unordered lifecycle history."""
     engine = _engine()
     _schedule(engine, _initiate(), AcceptA2A(PAYMENT_ID))
-    engine.run()
+    events = engine.run()
 
     state = engine.entity_state(PAYMENT_ID)
     assert isinstance(state, Mapping)
     assert state["state"] == "accepted"
-    records = cast(tuple[tuple[str, str, str], ...], state["idempotency_records"])
+    records = cast(tuple[tuple[str, str, str, str], ...], state["idempotency_records"])
     assert [(record[0], record[1]) for record in records] == [
         ("a2a-initiate-1", "a2a.initiate"),
         ("a2a.accept:a2a-payment-1", "a2a.accept"),
     ]
-    assert all(len(record) == 3 and len(record[2]) == 64 for record in records)
+    assert all(len(record) == 4 and len(record[2]) == 64 for record in records)
+    assert [record[3] for record in records] == [event.event_id for event in events]
+    assert state["last_event_id"] == records[-1][3]
 
 
 @pytest.mark.parametrize(
@@ -634,10 +636,15 @@ def _replace_first_a2a_record(
     key: str | None = None,
     fingerprint: str | None = None,
 ) -> None:
-    records = cast(tuple[tuple[str, str, str], ...], state["idempotency_records"])
-    original_key, operation, original_fingerprint = records[0]
+    records = cast(tuple[tuple[str, ...], ...], state["idempotency_records"])
+    original_key, operation, original_fingerprint, *event_id = records[0]
     state["idempotency_records"] = (
-        (key or original_key, operation, fingerprint or original_fingerprint),
+        (
+            key or original_key,
+            operation,
+            fingerprint or original_fingerprint,
+            *event_id,
+        ),
         *records[1:],
     )
 
@@ -671,14 +678,67 @@ def test_a2a_corrupt_state_maps_to_stable_error_before_new_effect(
     assert engine.ledger.entries == ()
 
 
-def _a2a_accept_record() -> tuple[str, str, str]:
+def _a2a_accept_record() -> tuple[str, ...]:
     engine = _engine()
     _schedule(engine, _initiate(), AcceptA2A(PAYMENT_ID))
     engine.run()
     state = engine.entity_state(PAYMENT_ID)
     assert isinstance(state, Mapping)
-    records = cast(tuple[tuple[str, str, str], ...], state["idempotency_records"])
+    records = cast(tuple[tuple[str, ...], ...], state["idempotency_records"])
     return records[1]
+
+
+def test_a2a_forged_last_event_id_is_state_corrupt() -> None:
+    """Catch a valid but unrelated UUID becoming the next lineage predecessor."""
+    engine = _corrupt_a2a_state(
+        lambda state: state.__setitem__(
+            "last_event_id",
+            "00000000-0000-4000-8000-000000000999",
+        )
+    )
+
+    with pytest.raises(LifecycleError) as error:
+        engine.run()
+
+    assert error.value.code == "A2A_STATE_CORRUPT"
+    assert engine.ledger.entries == ()
+
+
+@pytest.mark.parametrize("corruption", ["malformed", "duplicate", "unrelated", "reordered"])
+def test_a2a_corrupt_history_event_ids_fail_before_new_effect(corruption: str) -> None:
+    """Catch malformed, duplicated, foreign, or decreasing record event IDs."""
+    engine = _engine()
+    _schedule(engine, _initiate(), AcceptA2A(PAYMENT_ID))
+    engine.run()
+    state = engine.entity_state(PAYMENT_ID)
+    assert isinstance(state, Mapping)
+    corrupted = cast(dict[str, object], dict(state))
+    raw_records = cast(tuple[tuple[str, ...], ...], state["idempotency_records"])
+    assert all(len(record) == 4 for record in raw_records)
+    records = cast(tuple[tuple[str, str, str, str], ...], raw_records)
+    first, second = records
+    if corruption == "malformed":
+        replacement = "not-an-event-id"
+        records = (first, (*second[:3], replacement))
+    elif corruption == "duplicate":
+        replacement = first[3]
+        records = (first, (*second[:3], replacement))
+    elif corruption == "unrelated":
+        replacement = "00000000-0000-4000-8000-000000000999"
+        records = (first, (*second[:3], replacement))
+    else:
+        records = ((*first[:3], second[3]), (*second[:3], first[3]))
+        replacement = first[3]
+    corrupted["idempotency_records"] = records
+    corrupted["last_event_id"] = replacement
+    engine._entity_state[PAYMENT_ID] = cast(FrozenState, MappingProxyType(corrupted))
+    engine.schedule(NOW, 0, PostA2A(PAYMENT_ID))
+
+    with pytest.raises(LifecycleError) as error:
+        engine.run()
+
+    assert error.value.code == "A2A_STATE_CORRUPT"
+    assert engine.ledger.entries == ()
 
 
 def test_a2a_fake_well_formed_accept_record_is_state_corrupt() -> None:

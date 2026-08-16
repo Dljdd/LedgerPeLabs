@@ -53,6 +53,17 @@ def _uuid_text(label: str, value: object) -> str:
     return text
 
 
+def _history_event_position(value: object) -> tuple[str, bytes, int]:
+    event_id = _text("history event_id", value)
+    try:
+        identifier = UUID(event_id)
+    except ValueError as error:
+        raise ValueError("history event_id must be a UUID string") from error
+    if str(identifier) != event_id or identifier.version != 4:
+        raise ValueError("history event_id must be a canonical version-4 UUID")
+    return event_id, identifier.bytes[:10], int.from_bytes(identifier.bytes[10:], "big")
+
+
 def _money(label: str, value: object, currency: str, *, positive: bool) -> Decimal:
     if type(value) is not Decimal:
         raise TypeError(f"{label} must be an exact Decimal")
@@ -536,12 +547,15 @@ def _validated_state(
         if type(records) is not tuple:
             raise TypeError("idempotency_records must be an exact tuple")
         seen_keys: set[str] = set()
+        seen_event_ids: set[str] = set()
+        event_prefix: bytes | None = None
+        previous_event_sequence = -1
         operations = frozenset(_COMMAND_OPERATIONS.values())
         replayed_state = CardState.CREATED
         for index, record in enumerate(records):
-            if type(record) is not tuple or len(record) != 3:
-                raise ValueError("idempotency record must contain three fields")
-            key, operation, fingerprint = record
+            if type(record) is not tuple or len(record) != 4:
+                raise ValueError("idempotency record must contain four fields")
+            key, operation, fingerprint, record_event_id = record
             if type(key) is not str or not key:
                 raise ValueError("idempotency record key must be a non-empty string")
             if type(operation) is not str or operation not in operations:
@@ -555,6 +569,19 @@ def _validated_state(
             if key in seen_keys:
                 raise ValueError("idempotency record keys must be unique")
             seen_keys.add(key)
+            checked_event_id, current_prefix, current_sequence = _history_event_position(
+                record_event_id
+            )
+            if checked_event_id in seen_event_ids:
+                raise ValueError("idempotency record event IDs must be unique")
+            seen_event_ids.add(checked_event_id)
+            if event_prefix is None:
+                event_prefix = current_prefix
+            elif current_prefix != event_prefix:
+                raise ValueError("idempotency record event IDs must share an engine prefix")
+            if current_sequence <= previous_event_sequence:
+                raise ValueError("idempotency record event IDs must increase")
+            previous_event_sequence = current_sequence
             command = _command_from_record(operation, key, state)
             if _payload_fingerprint(command.payload) != fingerprint:
                 raise ValueError("idempotency record fingerprint does not match request")
@@ -573,7 +600,11 @@ def _validated_state(
                 replayed_state = _TRANSITIONS[(replayed_state, command_type)][0]
             except KeyError as error:
                 raise ValueError("card history contains an illegal transition") from error
-        if bool(records) != bool(last_event_id):
+        if records:
+            final_record = cast(tuple[str, str, str, str], records[-1])
+            if last_event_id != final_record[3]:
+                raise ValueError("last_event_id does not match final card history record")
+        elif last_event_id:
             raise ValueError("last_event_id presence does not match card history")
         if replayed_state is not stored_state:
             raise ValueError("stored card state does not match replayed history")
@@ -627,8 +658,8 @@ def _is_idempotent_retry(
     operation = _COMMAND_OPERATIONS[type(command)]
     fingerprint = _payload_fingerprint(command.payload)
     for record in records:
-        key, recorded_operation, recorded_fingerprint = cast(
-            tuple[str, str, str],
+        key, recorded_operation, recorded_fingerprint, _ = cast(
+            tuple[str, str, str, str],
             record,
         )
         if key == command.idempotency_key:
@@ -766,6 +797,7 @@ class CardRailAdapter:
                 canonical.idempotency_key,
                 _COMMAND_OPERATIONS[type(canonical)],
                 _payload_fingerprint(canonical.payload),
+                event_id,
             ),
         )
         validated_updated = _validated_state(updated, payment_id)
