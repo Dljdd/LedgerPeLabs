@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from datetime import timedelta
 from decimal import Decimal
 from types import MappingProxyType
@@ -547,6 +547,25 @@ def _forge_card_authorization(
     return command
 
 
+class ExplodingCardMapping(Mapping[str, object]):
+    """Mapping wrapper whose access hooks must not escape command admission."""
+
+    def __getitem__(self, key: str) -> object:
+        raise RuntimeError("hostile card mapping access")
+
+    def __iter__(self) -> Iterator[str]:
+        raise RuntimeError("hostile card mapping iteration")
+
+    def __len__(self) -> int:
+        raise RuntimeError("hostile card mapping length")
+
+
+def _card_with_exploding_payload() -> AuthorizeCard:
+    command = _authorize()
+    object.__setattr__(command, "payload", MappingProxyType(ExplodingCardMapping()))
+    return command
+
+
 def _drop_card_field(payload: dict[str, object], field: str) -> None:
     payload.pop(field)
 
@@ -572,11 +591,12 @@ def _drop_card_field(payload: dict[str, object], field: str) -> None:
             lambda payload: payload.__setitem__("amount", Decimal("0.004"))
         ),
         lambda: _forge_card_authorization(
-            lambda payload: payload.__setitem__("idempotency_key", "altered")
+            lambda payload: payload.__setitem__("amount", Decimal("1e999999"))
         ),
         lambda: _forge_card_authorization(
             lambda payload: payload.__setitem__("extra", "forged")
         ),
+        _card_with_exploding_payload,
     ],
 )
 def test_card_forged_known_command_fails_before_any_effect(
@@ -592,6 +612,20 @@ def test_card_forged_known_command_fails_before_any_effect(
     assert error.value.code == "CARD_COMMAND_INVALID"
     assert engine.ledger.entries == ()
     assert engine.ledger.balance("payer") == Decimal("100.00")
+
+
+def test_card_reflected_fully_valid_payload_is_treated_as_effective_request() -> None:
+    """Document the trusted in-process boundary without claiming a private seal."""
+    command = _forge_card_authorization(
+        lambda payload: payload.__setitem__("amount", Decimal("11.00"))
+    )
+    engine = _engine()
+    _schedule(engine, command)
+
+    event = engine.run()[0]
+
+    assert event.amount == Decimal("11.00")
+    assert engine.ledger.balance("card:holds") == Decimal("11.00")
 
 
 @pytest.mark.parametrize(
@@ -636,6 +670,20 @@ def _corrupt_card_state(change: Callable[[dict[str, object]], None]) -> Simulati
     return engine
 
 
+def _replace_first_card_record(
+    state: dict[str, object],
+    *,
+    key: str | None = None,
+    fingerprint: str | None = None,
+) -> None:
+    records = cast(tuple[tuple[str, str, str], ...], state["idempotency_records"])
+    original_key, operation, original_fingerprint = records[0]
+    state["idempotency_records"] = (
+        (key or original_key, operation, fingerprint or original_fingerprint),
+        *records[1:],
+    )
+
+
 @pytest.mark.parametrize(
     "change",
     [
@@ -644,6 +692,11 @@ def _corrupt_card_state(change: Callable[[dict[str, object]], None]) -> Simulati
         lambda state: state.__setitem__("idempotency_records", (("bad",),)),
         lambda state: state.__setitem__("hold_account", "payer"),
         lambda state: state.__setitem__("amount", Decimal("NaN")),
+        lambda state: state.__setitem__("amount", Decimal("1e999999")),
+        lambda state: state.__setitem__("state", "cleared"),
+        lambda state: state.__setitem__("payment_id", "different-payment"),
+        lambda state: _replace_first_card_record(state, fingerprint="0" * 64),
+        lambda state: _replace_first_card_record(state, key="changed-key"),
         lambda state: state.__setitem__("extra", "unexpected"),
     ],
 )
@@ -658,3 +711,53 @@ def test_card_corrupt_state_maps_to_stable_error_before_new_effect(
 
     assert error.value.code == "CARD_STATE_CORRUPT"
     assert len(engine.ledger.entries) == 1
+
+
+def _card_clear_record() -> tuple[str, str, str]:
+    engine = _engine()
+    _schedule(engine, _authorize(), ClearCard(PAYMENT_ID))
+    engine.run()
+    state = engine.entity_state(PAYMENT_ID)
+    assert isinstance(state, Mapping)
+    records = cast(tuple[tuple[str, str, str], ...], state["idempotency_records"])
+    return records[1]
+
+
+def test_card_fake_well_formed_clear_record_is_state_corrupt() -> None:
+    """Catch a syntactically valid record advancing history without stored state."""
+    clear_record = _card_clear_record()
+    engine = _corrupt_card_state(
+        lambda state: state.__setitem__(
+            "idempotency_records",
+            (*cast(tuple[object, ...], state["idempotency_records"]), clear_record),
+        )
+    )
+
+    with pytest.raises(LifecycleError) as error:
+        engine.run()
+
+    assert error.value.code == "CARD_STATE_CORRUPT"
+    assert len(engine.ledger.entries) == 1
+
+
+def test_card_terminal_history_cannot_continue_with_clear() -> None:
+    """Catch a valid-looking follow-up record after the decline terminal state."""
+    engine = _engine()
+    _schedule(engine, DeclineCardAuthorization.from_authorization(_authorize()))
+    engine.run()
+    state = engine.entity_state(PAYMENT_ID)
+    assert isinstance(state, Mapping)
+    corrupted = cast(dict[str, object], dict(state))
+    corrupted["idempotency_records"] = (
+        *cast(tuple[object, ...], state["idempotency_records"]),
+        _card_clear_record(),
+    )
+    corrupted["state"] = "cleared"
+    engine._entity_state[PAYMENT_ID] = cast(FrozenState, MappingProxyType(corrupted))
+    engine.schedule(NOW, 0, ClearCard(PAYMENT_ID))
+
+    with pytest.raises(LifecycleError) as error:
+        engine.run()
+
+    assert error.value.code == "CARD_STATE_CORRUPT"
+    assert engine.ledger.entries == ()
