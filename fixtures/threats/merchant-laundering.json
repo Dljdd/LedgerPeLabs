@@ -13,6 +13,7 @@
   "genai_capability": {"synthetic_profile_generation": true, "content_generation": true},
   "attacker_objective": "laundered_settlement_value",
   "observables": ["merchant_return_rate", "originator_return_rate", "merchant_volume_change", "settlement_concentration"],
+  "simulation_status": "simulatable",
   "safety_class": "synthetic_only",
   "evidence": [
     {

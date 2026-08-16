@@ -13,6 +13,7 @@
   "genai_capability": {"personalization": true, "interactive_guidance": true},
   "attacker_objective": "authorized_transfer_value",
   "observables": ["new_device_indicator", "new_beneficiary_indicator", "unusual_transfer_value"],
+  "simulation_status": "simulatable",
   "safety_class": "synthetic_only",
   "evidence": [
     {

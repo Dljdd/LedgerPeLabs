@@ -13,6 +13,7 @@
   "genai_capability": {"iteration_speed": true, "workflow_automation": true},
   "attacker_objective": "rapid_settled_value",
   "observables": ["account_activity_threshold", "receiver_account_age", "payment_velocity", "receiver_fan_in"],
+  "simulation_status": "simulatable",
   "safety_class": "synthetic_only",
   "evidence": [
     {
@@ -26,6 +27,18 @@
       "is_project_inference": false,
       "quality_grade": "A",
       "reviewer_notes": "Direct FedNow service-owner announcement."
+    },
+    {
+      "evidence_id": "psr-faster-payments-fraud-fact-2024",
+      "direct_source_url": "https://www.psr.org.uk/news-and-updates/speeches/speeches/chris-hemsley-speech-at-the-fraud-leaders-summit-on-28-february-2024/",
+      "source_type": "regulator_guidance",
+      "publisher": "Payment Systems Regulator",
+      "published_on": "2024-02-28",
+      "accessed_on": "2026-08-16",
+      "claim": "The UK Payment Systems Regulator states that the speed and convenience of the Faster Payments System have made it a prime target for fraudsters.",
+      "is_project_inference": false,
+      "quality_grade": "A",
+      "reviewer_notes": "Direct dated regulator speech; phenomenon fact only, with no automation inference."
     },
     {
       "evidence_id": "apar-instant-velocity-inference",

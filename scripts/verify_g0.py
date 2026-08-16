@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import cast
 from urllib.parse import urlparse
 
 from fastapi.testclient import TestClient
@@ -73,11 +75,30 @@ def _require(condition: bool, message: str) -> None:
         raise G0VerificationError(message)
 
 
+def _load_raw_object(path: Path) -> dict[str, object]:
+    loaded: object = json.loads(path.read_text(encoding="utf-8"))
+    _require(isinstance(loaded, dict), f"{path}: fixture must be a JSON object")
+    return cast(dict[str, object], loaded)
+
+
 def _load_portfolio() -> list[ThreatCard]:
     paths = sorted(PORTFOLIO_ROOT.glob("*.json"))
     _require(len(paths) == 20, "portfolio must contain exactly 20 JSON files")
     _require({path.stem for path in paths} == EXPECTED_IDS, "portfolio threat IDs changed")
-    return [ThreatCard.model_validate_json(path.read_text(encoding="utf-8")) for path in paths]
+    cards = []
+    for path in paths:
+        raw = _load_raw_object(path)
+        _require(
+            raw.get("simulation_status") == "simulatable",
+            f"{path}: simulation_status must be explicit",
+        )
+        card = ThreatCard.model_validate(raw)
+        _require(
+            path.stem == card.threat_id,
+            f"{path}: filename does not match threat_id",
+        )
+        cards.append(card)
+    return cards
 
 
 def _verify_portfolio(cards: list[ThreatCard]) -> None:
@@ -117,9 +138,13 @@ def _verify_portfolio(cards: list[ThreatCard]) -> None:
 
 
 def _load_and_verify_golden(cards: list[ThreatCard]) -> tuple[ThreatCard, ScenarioConfig]:
-    golden_card = ThreatCard.model_validate_json(
-        (GOLDEN_ROOT / "threat-card.json").read_text(encoding="utf-8")
+    golden_card_path = GOLDEN_ROOT / "threat-card.json"
+    golden_card_raw = _load_raw_object(golden_card_path)
+    _require(
+        golden_card_raw.get("simulation_status") == "simulatable",
+        f"{golden_card_path}: simulation_status must be explicit",
     )
+    golden_card = ThreatCard.model_validate(golden_card_raw)
     golden_config = ScenarioConfig.model_validate_json(
         (GOLDEN_ROOT / "scenario-config.json").read_text(encoding="utf-8")
     )

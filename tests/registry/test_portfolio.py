@@ -1,11 +1,16 @@
 """Validation and curation invariants for the shipped threat portfolio."""
 
+import json
+import shutil
 from pathlib import Path
 from urllib.parse import urlparse
+
+import pytest
 
 from apar.contracts.events import Rail
 from apar.contracts.scenarios import FeedbackField, ScenarioConfig
 from apar.registry.models import ThreatCard
+from scripts import verify_g0 as g0_verifier
 
 PORTFOLIO_ROOT = Path("fixtures/threats")
 EXPECTED_IDS = {
@@ -46,11 +51,73 @@ AUTHORITATIVE_SOURCE_TYPES = {
 }
 
 
-def _load_portfolio() -> list[ThreatCard]:
-    return [
-        ThreatCard.model_validate_json(path.read_text())
-        for path in sorted(PORTFOLIO_ROOT.glob("*.json"))
-    ]
+def _load_portfolio(root: Path = PORTFOLIO_ROOT) -> list[ThreatCard]:
+    cards = []
+    for path in sorted(root.glob("*.json")):
+        raw = json.loads(path.read_text())
+        assert raw.get("simulation_status") == "simulatable", path
+        card = ThreatCard.model_validate(raw)
+        assert path.stem == card.threat_id, f"{path}: filename does not match threat_id"
+        cards.append(card)
+    return cards
+
+
+def _portfolio_with_swapped_bodies(tmp_path: Path) -> Path:
+    swapped_root = tmp_path / "threats"
+    shutil.copytree(PORTFOLIO_ROOT, swapped_root)
+    first = swapped_root / "adaptive-card-testing.json"
+    second = swapped_root / "agentic-cart-tampering.json"
+    first_payload = first.read_bytes()
+    second_payload = second.read_bytes()
+    first.write_bytes(second_payload)
+    second.write_bytes(first_payload)
+    return swapped_root
+
+
+def test_test_loader_rejects_filename_body_swap(tmp_path: Path) -> None:
+    """Catch a same-ID-set body swap that masks filename-to-ID corruption in tests."""
+    swapped_root = _portfolio_with_swapped_bodies(tmp_path)
+
+    with pytest.raises(AssertionError, match="filename does not match threat_id"):
+        _load_portfolio(swapped_root)
+
+
+def test_g0_loader_rejects_filename_body_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catch the G0 command accepting correct ID sets assigned to the wrong files."""
+    swapped_root = _portfolio_with_swapped_bodies(tmp_path)
+    monkeypatch.setattr(g0_verifier, "PORTFOLIO_ROOT", swapped_root)
+
+    with pytest.raises(g0_verifier.G0VerificationError, match="filename does not match threat_id"):
+        g0_verifier._load_portfolio()
+
+
+def test_simulation_status_is_explicit_in_every_raw_threat_fixture() -> None:
+    """Catch fixture omissions that Pydantic would silently fill from a model default."""
+    paths = [*sorted(PORTFOLIO_ROOT.glob("*.json")), Path("fixtures/golden/threat-card.json")]
+
+    for path in paths:
+        raw = json.loads(path.read_text())
+        assert raw.get("simulation_status") == "simulatable", path
+
+
+def test_instant_payment_card_has_direct_faster_payments_abuse_evidence() -> None:
+    """Catch regression to risk tooling that does not evidence instant-payment abuse."""
+    card = ThreatCard.model_validate_json(
+        (PORTFOLIO_ROOT / "instant-payment-velocity.json").read_text()
+    )
+    fact_urls = {
+        record.direct_source_url
+        for record in card.evidence
+        if not record.is_project_inference
+    }
+
+    assert (
+        "https://www.psr.org.uk/news-and-updates/speeches/speeches/"
+        "chris-hemsley-speech-at-the-fraud-leaders-summit-on-28-february-2024/"
+        in fact_urls
+    )
 
 
 def test_portfolio_has_exactly_the_approved_twenty_ids() -> None:

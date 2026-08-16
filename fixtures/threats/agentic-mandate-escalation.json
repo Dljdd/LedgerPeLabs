@@ -13,6 +13,7 @@
   "genai_capability": {"tool_use": true, "autonomous_planning": true},
   "attacker_objective": "out_of_mandate_value",
   "observables": ["mandate_amount_limit", "mandate_merchant_scope", "intent_match", "confirmation_indicator", "agent_identity"],
+  "simulation_status": "simulatable",
   "safety_class": "synthetic_only",
   "evidence": [
     {

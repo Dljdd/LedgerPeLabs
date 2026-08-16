@@ -13,6 +13,7 @@
   "genai_capability": {"iteration_speed": true, "adaptive_search": true},
   "attacker_objective": "validated_account_rate",
   "observables": ["low_value_authorization_rate", "decline_velocity", "merchant_concentration", "account_retry_count"],
+  "simulation_status": "simulatable",
   "safety_class": "synthetic_only",
   "evidence": [
     {

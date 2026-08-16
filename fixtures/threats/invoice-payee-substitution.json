@@ -13,6 +13,7 @@
   "genai_capability": {"content_generation": true, "personalization": true},
   "attacker_objective": "misdirected_invoice_value",
   "observables": ["payee_change_indicator", "new_beneficiary_indicator", "invoice_value_deviation"],
+  "simulation_status": "simulatable",
   "safety_class": "synthetic_only",
   "evidence": [
     {

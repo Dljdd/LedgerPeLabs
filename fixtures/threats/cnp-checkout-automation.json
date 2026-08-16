@@ -13,6 +13,7 @@
   "genai_capability": {"workflow_automation": true, "iteration_speed": true},
   "attacker_objective": "fraudulent_purchase_value",
   "observables": ["checkout_velocity", "failed_authentication_rate", "device_account_ratio", "cnp_indicator"],
+  "simulation_status": "simulatable",
   "safety_class": "synthetic_only",
   "evidence": [
     {

@@ -13,6 +13,7 @@
   "genai_capability": {"voice_synthesis": true, "personalization": true},
   "attacker_objective": "authorized_transfer_value",
   "observables": ["new_beneficiary_indicator", "call_to_transfer_delay", "transfer_velocity"],
+  "simulation_status": "simulatable",
   "safety_class": "synthetic_only",
   "evidence": [
     {

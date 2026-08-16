@@ -13,6 +13,7 @@
   "genai_capability": {"content_generation": true, "iteration_speed": true},
   "attacker_objective": "improper_dispute_value",
   "observables": ["repeat_dispute_rate", "device_purchase_linkage", "delivery_evidence_indicator", "dispute_latency"],
+  "simulation_status": "simulatable",
   "safety_class": "synthetic_only",
   "evidence": [
     {

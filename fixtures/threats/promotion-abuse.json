@@ -13,6 +13,7 @@
   "genai_capability": {"synthetic_profile_generation": true, "workflow_automation": true},
   "attacker_objective": "improper_promotion_value",
   "observables": ["account_device_density", "promotion_redemption_velocity", "shared_payment_instrument_rate", "account_age"],
+  "simulation_status": "simulatable",
   "safety_class": "synthetic_only",
   "evidence": [
     {

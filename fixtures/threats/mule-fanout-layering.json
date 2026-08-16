@@ -13,6 +13,7 @@
   "genai_capability": {"workflow_automation": true, "adaptive_search": true},
   "attacker_objective": "settled_layered_value",
   "observables": ["fan_in", "fan_out", "inbound_outbound_delay", "multi_hop_depth", "beneficiary_concentration"],
+  "simulation_status": "simulatable",
   "safety_class": "synthetic_only",
   "evidence": [
     {

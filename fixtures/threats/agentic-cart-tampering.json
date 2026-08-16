@@ -13,6 +13,7 @@
   "genai_capability": {"indirect_instruction_exposure": true, "tool_use": true},
   "attacker_objective": "unintended_cart_value",
   "observables": ["requested_cart_match", "price_change_indicator", "merchant_identity", "confirmation_indicator", "agent_identity"],
+  "simulation_status": "simulatable",
   "safety_class": "synthetic_only",
   "evidence": [
     {

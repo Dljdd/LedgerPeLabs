@@ -13,6 +13,7 @@
   "genai_capability": {"synthetic_profile_generation": true, "document_variation": true},
   "attacker_objective": "unrecovered_credit_value",
   "observables": ["identity_linkage_density", "thin_file_indicator", "credit_utilization_change", "payment_default_indicator"],
+  "simulation_status": "simulatable",
   "safety_class": "synthetic_only",
   "evidence": [
     {

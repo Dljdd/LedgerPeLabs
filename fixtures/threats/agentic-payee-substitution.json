@@ -13,6 +13,7 @@
   "genai_capability": {"indirect_instruction_exposure": true, "tool_use": true},
   "attacker_objective": "unintended_payee_value",
   "observables": ["declared_payee_match", "intent_payee_match", "agent_identity", "tool_call_sequence", "confirmation_indicator"],
+  "simulation_status": "simulatable",
   "safety_class": "synthetic_only",
   "evidence": [
     {
