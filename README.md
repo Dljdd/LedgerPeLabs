@@ -12,6 +12,26 @@ The product is an assurance layer, not a replacement payment-decision engine. It
 - [Diagram catalog](docs/diagrams/README.md)
 - [Empirical validation spike](validation_spike/README.md)
 
+## Install and verify the G0 foundation
+
+The supported runtime is Python 3.12. From a clean checkout:
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e '.[dev]'
+```
+
+Run the complete G0 contract verification with one command:
+
+```bash
+python scripts/verify_g0.py
+```
+
+The command validates all 20 evidence-backed threat cards and exercises the real registry,
+scenario compiler, API, and immutable artifact store from clean temporary state.
+
 ## Proposed product flow
 
 `Threat evidence -> Threat registry -> Scenario compiler -> Stateful payment simulator -> Champion/challenger controls -> Operational policy -> Hidden evaluation -> Human promotion report`
@@ -22,7 +42,7 @@ The product is an assurance layer, not a replacement payment-decision engine. It
 |---|---|
 | Product and architecture specification | Documented |
 | Empirical falsification spike | Implemented |
-| Threat registry and scenario compiler | Specified, not implemented |
+| Threat registry and scenario compiler | G0 foundation implemented |
 | Rail-specific simulator | Specified, not implemented |
 | Adaptive red-team optimizer | Harness validated; adaptive optimizer not implemented |
 | Defender service | Specified; validation baseline only |

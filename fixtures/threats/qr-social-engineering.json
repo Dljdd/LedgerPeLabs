@@ -1,0 +1,58 @@
+{
+  "threat_id": "qr-social-engineering",
+  "title": "Generated QR-payment social engineering",
+  "version": 1,
+  "status": "approved",
+  "family": "app_scam_mule",
+  "confidence": 0.92,
+  "implementation_status": "evidence_only",
+  "rails": ["a2a"],
+  "viewpoint": "network_with_bank_enrichment",
+  "channels": ["qr_code", "messaging"],
+  "lifecycle_stages": ["lure", "payment_portal", "transfer"],
+  "genai_capability": {"content_generation": true, "personalization": true},
+  "attacker_objective": "authorized_transfer_value",
+  "observables": ["qr_payment_indicator", "new_beneficiary_indicator", "message_to_payment_delay", "beneficiary_fan_in"],
+  "safety_class": "synthetic_only",
+  "evidence": [
+    {
+      "evidence_id": "fbi-qr-scam-fact-2023",
+      "direct_source_url": "https://www.fbi.gov/contact-us/field-offices/elpaso/news/fbi-tech-tuesday-building-a-digital-defense-against-qr-code-scams",
+      "source_type": "government_advisory",
+      "publisher": "Federal Bureau of Investigation",
+      "published_on": "2023-09-19",
+      "accessed_on": "2026-08-16",
+      "claim": "The FBI warns that malicious QR codes can direct victims to fake payment portals and that payments made through bad codes can be difficult to recover.",
+      "is_project_inference": false,
+      "quality_grade": "A",
+      "reviewer_notes": "Direct FBI public warning."
+    },
+    {
+      "evidence_id": "apar-qr-social-inference",
+      "direct_source_url": "https://www.fbi.gov/contact-us/field-offices/elpaso/news/fbi-tech-tuesday-building-a-digital-defense-against-qr-code-scams",
+      "source_type": "government_advisory",
+      "publisher": "Federal Bureau of Investigation",
+      "published_on": "2023-09-19",
+      "accessed_on": "2026-08-16",
+      "claim": "APAR infers generated context can be modeled as a bounded change in synthetic QR-payment conversion without rendering a usable QR code.",
+      "is_project_inference": true,
+      "quality_grade": "B",
+      "reviewer_notes": "Project inference; fixtures contain no QR payloads or deceptive destinations."
+    }
+  ],
+  "default_config": {
+    "scenario_id": "qr-social-engineering-v1",
+    "version": "1.0.0",
+    "rail": "a2a",
+    "viewpoint": "network_with_bank_enrichment",
+    "attacker_mode": "static",
+    "attacker_objective": "authorized_transfer_value",
+    "query_budget": 25,
+    "feedback": ["action", "reason_family"],
+    "benign_entity_count": 4000,
+    "illicit_entity_count": 45,
+    "duration_hours": 24,
+    "seed": 260832,
+    "export_level": "sanitized"
+  }
+}

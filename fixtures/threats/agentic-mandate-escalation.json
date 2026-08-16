@@ -1,0 +1,58 @@
+{
+  "threat_id": "agentic-mandate-escalation",
+  "title": "Agent action beyond the user's payment mandate",
+  "version": 1,
+  "status": "approved",
+  "family": "agentic_intent_abuse",
+  "confidence": 0.88,
+  "implementation_status": "evidence_only",
+  "rails": ["agentic", "card"],
+  "viewpoint": "agent_and_network",
+  "channels": ["agent_tool_call", "payment_intent"],
+  "lifecycle_stages": ["mandate", "authorization", "purchase"],
+  "genai_capability": {"tool_use": true, "autonomous_planning": true},
+  "attacker_objective": "out_of_mandate_value",
+  "observables": ["mandate_amount_limit", "mandate_merchant_scope", "intent_match", "confirmation_indicator", "agent_identity"],
+  "safety_class": "synthetic_only",
+  "evidence": [
+    {
+      "evidence_id": "mastercard-agent-pay-fact-2025",
+      "direct_source_url": "https://newsroom.mastercard.com/news/press/2025/april/mastercard-unveils-agent-pay-pioneering-agentic-payments-technology-to-power-commerce-in-the-age-of-ai/",
+      "source_type": "payment_network_guidance",
+      "publisher": "Mastercard",
+      "published_on": "2025-04-29",
+      "accessed_on": "2026-08-16",
+      "claim": "Mastercard states that consumers need control over what an agent may purchase and that trusted agents and agent-facilitated transactions should be identified and authenticated.",
+      "is_project_inference": false,
+      "quality_grade": "A",
+      "reviewer_notes": "Direct Mastercard Agent Pay announcement."
+    },
+    {
+      "evidence_id": "apar-agentic-mandate-inference",
+      "direct_source_url": "https://newsroom.mastercard.com/news/press/2025/april/mastercard-unveils-agent-pay-pioneering-agentic-payments-technology-to-power-commerce-in-the-age-of-ai/",
+      "source_type": "payment_network_guidance",
+      "publisher": "Mastercard",
+      "published_on": "2025-04-29",
+      "accessed_on": "2026-08-16",
+      "claim": "APAR infers controlled amount and merchant-scope mismatches can test whether synthetic agent payments remain within mandate.",
+      "is_project_inference": true,
+      "quality_grade": "B",
+      "reviewer_notes": "Project inference; no real mandate or payment credential is used."
+    }
+  ],
+  "default_config": {
+    "scenario_id": "agentic-mandate-escalation-v1",
+    "version": "1.0.0",
+    "rail": "agentic",
+    "viewpoint": "agent_and_network",
+    "attacker_mode": "static",
+    "attacker_objective": "out_of_mandate_value",
+    "query_budget": 30,
+    "feedback": ["action", "reason_family"],
+    "benign_entity_count": 4000,
+    "illicit_entity_count": 40,
+    "duration_hours": 24,
+    "seed": 260834,
+    "export_level": "sanitized"
+  }
+}

@@ -1,0 +1,58 @@
+{
+  "threat_id": "mule-fanout-layering",
+  "title": "Mule fan-out and layered transfers",
+  "version": 1,
+  "status": "approved",
+  "family": "mule_network",
+  "confidence": 0.95,
+  "implementation_status": "evidence_only",
+  "rails": ["a2a"],
+  "viewpoint": "network_with_bank_enrichment",
+  "channels": ["bank_transfer"],
+  "lifecycle_stages": ["receipt", "dispersion", "layering"],
+  "genai_capability": {"workflow_automation": true, "adaptive_search": true},
+  "attacker_objective": "settled_layered_value",
+  "observables": ["fan_in", "fan_out", "inbound_outbound_delay", "multi_hop_depth", "beneficiary_concentration"],
+  "safety_class": "synthetic_only",
+  "evidence": [
+    {
+      "evidence_id": "interpol-mule-layering-fact-2022",
+      "direct_source_url": "https://www.interpol.int/en/News-and-Events/News/2022/YourAccountYourCrime-Global-campaign-exposes-use-of-money-mules",
+      "source_type": "government_advisory",
+      "publisher": "INTERPOL",
+      "published_on": "2022-08-10",
+      "accessed_on": "2026-08-16",
+      "claim": "INTERPOL states that mule transfers add layers that move criminal proceeds farther from the original crime and audit trail.",
+      "is_project_inference": false,
+      "quality_grade": "A",
+      "reviewer_notes": "Direct INTERPOL release."
+    },
+    {
+      "evidence_id": "apar-mule-layering-inference",
+      "direct_source_url": "https://www.interpol.int/en/News-and-Events/News/2022/YourAccountYourCrime-Global-campaign-exposes-use-of-money-mules",
+      "source_type": "government_advisory",
+      "publisher": "INTERPOL",
+      "published_on": "2022-08-10",
+      "accessed_on": "2026-08-16",
+      "claim": "APAR infers bounded synthetic graph depth, timing, and fan-out shifts can test network-level detection.",
+      "is_project_inference": true,
+      "quality_grade": "B",
+      "reviewer_notes": "Project inference; no transfer-routing method is supplied."
+    }
+  ],
+  "default_config": {
+    "scenario_id": "mule-fanout-layering-v1",
+    "version": "1.0.0",
+    "rail": "a2a",
+    "viewpoint": "network_with_bank_enrichment",
+    "attacker_mode": "decision_only",
+    "attacker_objective": "settled_layered_value",
+    "query_budget": 40,
+    "feedback": ["action", "reason_family"],
+    "benign_entity_count": 5000,
+    "illicit_entity_count": 60,
+    "duration_hours": 24,
+    "seed": 260830,
+    "export_level": "sanitized"
+  }
+}

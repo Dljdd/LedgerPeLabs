@@ -1,0 +1,58 @@
+{
+  "threat_id": "agentic-payee-substitution",
+  "title": "Agentic intent redirection to an unintended payee",
+  "version": 1,
+  "status": "approved",
+  "family": "agentic_intent_abuse",
+  "confidence": 0.9,
+  "implementation_status": "deep_scenario",
+  "rails": ["agentic", "a2a"],
+  "viewpoint": "agent_and_network",
+  "channels": ["agent_tool_call", "payment_intent"],
+  "lifecycle_stages": ["intent_capture", "payee_selection", "transfer"],
+  "genai_capability": {"indirect_instruction_exposure": true, "tool_use": true},
+  "attacker_objective": "unintended_payee_value",
+  "observables": ["declared_payee_match", "intent_payee_match", "agent_identity", "tool_call_sequence", "confirmation_indicator"],
+  "safety_class": "synthetic_only",
+  "evidence": [
+    {
+      "evidence_id": "openai-prompt-injection-fact-2025",
+      "direct_source_url": "https://openai.com/index/prompt-injections/",
+      "source_type": "original_research",
+      "publisher": "OpenAI",
+      "published_on": "2025-11-07",
+      "accessed_on": "2026-08-16",
+      "claim": "OpenAI describes prompt injection as third-party instructions that can trick an AI into actions the user did not request, with risk increasing as agents access data and take actions.",
+      "is_project_inference": false,
+      "quality_grade": "A",
+      "reviewer_notes": "Direct AI product-owner security publication."
+    },
+    {
+      "evidence_id": "apar-agentic-payee-inference",
+      "direct_source_url": "https://openai.com/index/prompt-injections/",
+      "source_type": "original_research",
+      "publisher": "OpenAI",
+      "published_on": "2025-11-07",
+      "accessed_on": "2026-08-16",
+      "claim": "APAR infers an intent-versus-payee mismatch can represent bounded synthetic agent redirection at the payment boundary.",
+      "is_project_inference": true,
+      "quality_grade": "B",
+      "reviewer_notes": "Project inference; no injection string or live tool is included."
+    }
+  ],
+  "default_config": {
+    "scenario_id": "agentic-payee-substitution-v1",
+    "version": "1.0.0",
+    "rail": "agentic",
+    "viewpoint": "agent_and_network",
+    "attacker_mode": "decision_only",
+    "attacker_objective": "unintended_payee_value",
+    "query_budget": 40,
+    "feedback": ["action", "reason_family"],
+    "benign_entity_count": 4000,
+    "illicit_entity_count": 45,
+    "duration_hours": 24,
+    "seed": 260833,
+    "export_level": "sanitized"
+  }
+}

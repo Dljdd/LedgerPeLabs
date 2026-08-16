@@ -19,6 +19,8 @@ class AttackerMode(StrEnum):
 
 
 class FeedbackField(StrEnum):
+    ACTION = "action"
+    REASON_FAMILY = "reason_family"
     APPROVE = "approve"
     CHALLENGE = "challenge"
     DECLINE = "decline"

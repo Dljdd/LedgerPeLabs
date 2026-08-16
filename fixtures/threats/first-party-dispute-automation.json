@@ -1,0 +1,58 @@
+{
+  "threat_id": "first-party-dispute-automation",
+  "title": "Generated first-party dispute narratives",
+  "version": 1,
+  "status": "approved",
+  "family": "first_party_misuse",
+  "confidence": 0.94,
+  "implementation_status": "evidence_only",
+  "rails": ["card"],
+  "viewpoint": "merchant_and_issuer",
+  "channels": ["dispute_portal"],
+  "lifecycle_stages": ["purchase", "dispute"],
+  "genai_capability": {"content_generation": true, "iteration_speed": true},
+  "attacker_objective": "improper_dispute_value",
+  "observables": ["repeat_dispute_rate", "device_purchase_linkage", "delivery_evidence_indicator", "dispute_latency"],
+  "safety_class": "synthetic_only",
+  "evidence": [
+    {
+      "evidence_id": "mastercard-first-party-fact-2023",
+      "direct_source_url": "https://newsroom.mastercard.com/news/press/2023/october/mastercard-targets-friendly-fraud-to-protect-small-businesses-and-merchants/",
+      "source_type": "payment_network_guidance",
+      "publisher": "Mastercard",
+      "published_on": "2023-10-23",
+      "accessed_on": "2026-08-16",
+      "claim": "Mastercard describes first-party fraud as genuine transactions mistakenly or intentionally challenged by cardholders and identifies transaction, device, delivery, identity, and location insights for review.",
+      "is_project_inference": false,
+      "quality_grade": "A",
+      "reviewer_notes": "Direct Mastercard press release."
+    },
+    {
+      "evidence_id": "apar-dispute-automation-inference",
+      "direct_source_url": "https://newsroom.mastercard.com/news/press/2023/october/mastercard-targets-friendly-fraud-to-protect-small-businesses-and-merchants/",
+      "source_type": "payment_network_guidance",
+      "publisher": "Mastercard",
+      "published_on": "2023-10-23",
+      "accessed_on": "2026-08-16",
+      "claim": "APAR infers generated narrative consistency may be modeled as a bounded capability delta while decisions use payment and fulfillment signals only.",
+      "is_project_inference": true,
+      "quality_grade": "B",
+      "reviewer_notes": "Project inference; no false dispute narrative is generated."
+    }
+  ],
+  "default_config": {
+    "scenario_id": "first-party-dispute-automation-v1",
+    "version": "1.0.0",
+    "rail": "card",
+    "viewpoint": "merchant_and_issuer",
+    "attacker_mode": "static",
+    "attacker_objective": "improper_dispute_value",
+    "query_budget": 30,
+    "feedback": ["action", "reason_family"],
+    "benign_entity_count": 4000,
+    "illicit_entity_count": 50,
+    "duration_hours": 72,
+    "seed": 260825,
+    "export_level": "sanitized"
+  }
+}

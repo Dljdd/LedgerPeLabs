@@ -1,0 +1,58 @@
+{
+  "threat_id": "instant-payment-velocity",
+  "title": "High-velocity instant-payment abuse",
+  "version": 1,
+  "status": "approved",
+  "family": "instant_payment_fraud",
+  "confidence": 0.88,
+  "implementation_status": "evidence_only",
+  "rails": ["a2a"],
+  "viewpoint": "network_native",
+  "channels": ["instant_payment"],
+  "lifecycle_stages": ["initiation", "risk_assessment", "posting"],
+  "genai_capability": {"iteration_speed": true, "workflow_automation": true},
+  "attacker_objective": "rapid_settled_value",
+  "observables": ["account_activity_threshold", "receiver_account_age", "payment_velocity", "receiver_fan_in"],
+  "safety_class": "synthetic_only",
+  "evidence": [
+    {
+      "evidence_id": "fednow-network-intelligence-fact-2026",
+      "direct_source_url": "https://www.frbservices.org/news/fed360/issues/051426/fednow-service-network-intelligence-api",
+      "source_type": "regulator_guidance",
+      "publisher": "Federal Reserve Financial Services",
+      "published_on": "2026-05-14",
+      "accessed_on": "2026-08-16",
+      "claim": "Federal Reserve Financial Services describes receiver account-level network data as an added input for participant risk assessment before an instant payment.",
+      "is_project_inference": false,
+      "quality_grade": "A",
+      "reviewer_notes": "Direct FedNow service-owner announcement."
+    },
+    {
+      "evidence_id": "apar-instant-velocity-inference",
+      "direct_source_url": "https://www.frbservices.org/news/fed360/issues/051426/fednow-service-network-intelligence-api",
+      "source_type": "regulator_guidance",
+      "publisher": "Federal Reserve Financial Services",
+      "published_on": "2026-05-14",
+      "accessed_on": "2026-08-16",
+      "claim": "APAR infers bounded synthetic velocity and receiver-network shifts can test pre-payment controls under instant settlement timing.",
+      "is_project_inference": true,
+      "quality_grade": "B",
+      "reviewer_notes": "Project inference; no real account or payment endpoint is used."
+    }
+  ],
+  "default_config": {
+    "scenario_id": "instant-payment-velocity-v1",
+    "version": "1.0.0",
+    "rail": "a2a",
+    "viewpoint": "network_native",
+    "attacker_mode": "decision_only",
+    "attacker_objective": "rapid_settled_value",
+    "query_budget": 45,
+    "feedback": ["action", "reason_family"],
+    "benign_entity_count": 5500,
+    "illicit_entity_count": 60,
+    "duration_hours": 12,
+    "seed": 260831,
+    "export_level": "sanitized"
+  }
+}

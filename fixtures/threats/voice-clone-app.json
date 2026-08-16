@@ -1,0 +1,58 @@
+{
+  "threat_id": "voice-clone-app",
+  "title": "Voice-cloned APP impersonation",
+  "version": 1,
+  "status": "approved",
+  "family": "app_scam_mule",
+  "confidence": 0.9,
+  "implementation_status": "evidence_only",
+  "rails": ["a2a"],
+  "viewpoint": "network_with_bank_enrichment",
+  "channels": ["voice"],
+  "lifecycle_stages": ["impersonation", "transfer"],
+  "genai_capability": {"voice_synthesis": true, "personalization": true},
+  "attacker_objective": "authorized_transfer_value",
+  "observables": ["new_beneficiary_indicator", "call_to_transfer_delay", "transfer_velocity"],
+  "safety_class": "synthetic_only",
+  "evidence": [
+    {
+      "evidence_id": "ftc-voice-clone-fact-2023",
+      "direct_source_url": "https://consumer.ftc.gov/consumer-alerts/2023/03/scammers-use-ai-enhance-their-family-emergency-schemes",
+      "source_type": "government_advisory",
+      "publisher": "U.S. Federal Trade Commission",
+      "published_on": "2023-03-20",
+      "accessed_on": "2026-08-16",
+      "claim": "The FTC warns that a short audio clip and voice-cloning software can make an impostor sound like a victim's relative.",
+      "is_project_inference": false,
+      "quality_grade": "A",
+      "reviewer_notes": "Direct FTC consumer alert; capability-level fact."
+    },
+    {
+      "evidence_id": "apar-voice-clone-inference",
+      "direct_source_url": "https://consumer.ftc.gov/consumer-alerts/2023/03/scammers-use-ai-enhance-their-family-emergency-schemes",
+      "source_type": "government_advisory",
+      "publisher": "U.S. Federal Trade Commission",
+      "published_on": "2023-03-20",
+      "accessed_on": "2026-08-16",
+      "claim": "APAR infers a synthetic voice-impostor cohort can be compared with a matched text-only persuasion cohort.",
+      "is_project_inference": true,
+      "quality_grade": "B",
+      "reviewer_notes": "Project inference; no audio generation or operational instructions are included."
+    }
+  ],
+  "default_config": {
+    "scenario_id": "voice-clone-app-v1",
+    "version": "1.0.0",
+    "rail": "a2a",
+    "viewpoint": "network_with_bank_enrichment",
+    "attacker_mode": "static",
+    "attacker_objective": "authorized_transfer_value",
+    "query_budget": 20,
+    "feedback": ["action", "reason_family"],
+    "benign_entity_count": 3000,
+    "illicit_entity_count": 40,
+    "duration_hours": 24,
+    "seed": 260817,
+    "export_level": "sanitized"
+  }
+}

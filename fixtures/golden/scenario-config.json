@@ -1,0 +1,26 @@
+{
+  "schema_version": "1.0.0",
+  "scenario_id": "app-personalized-mule-v1",
+  "version": "1.0.0",
+  "rail": "a2a",
+  "viewpoint": "network_with_bank_enrichment",
+  "attacker_mode": "decision_only",
+  "attacker_objective": "expected_net_settled_value",
+  "query_budget": 40,
+  "feedback": ["action", "reason_family"],
+  "benign_entity_count": 5000,
+  "illicit_entity_count": 60,
+  "duration_hours": 24,
+  "seed": 260816,
+  "economics": {
+    "acquisition_cost": "configured",
+    "mule_commission": "configured"
+  },
+  "lifecycle": {
+    "label_delay_days": "configured"
+  },
+  "hidden_validity": {
+    "profile": "hidden-oracle-a"
+  },
+  "export_level": "sanitized"
+}
