@@ -146,6 +146,65 @@ def test_compiler_rejection_matrix_uses_stable_codes(
     assert error.value.code == expected_code
 
 
+def test_compiler_revalidates_copied_threat_identity() -> None:
+    """Catches an invalid copied threat slug entering compiled provenance."""
+    card = make_threat_card()
+    invalid = card.model_copy(update={"threat_id": "NOT A SLUG"})
+
+    with pytest.raises(CompilerError) as error:
+        compile_scenario(invalid, invalid.default_config)
+
+    assert error.value.code == "MISSING_EVIDENCE"
+
+
+def test_compiler_revalidates_copied_evidence_identity() -> None:
+    """Catches an invalid copied evidence slug bypassing the compiler boundary."""
+    card = make_threat_card()
+    invalid_evidence = card.evidence[0].model_copy(update={"evidence_id": "NOT A SLUG"})
+    invalid = card.model_copy(update={"evidence": [invalid_evidence]})
+
+    with pytest.raises(CompilerError) as error:
+        compile_scenario(invalid, invalid.default_config)
+
+    assert error.value.code == "MISSING_EVIDENCE"
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value", "expected_code"),
+    [
+        ("schema_version", "9.0.0", "INVALID_FEEDBACK"),
+        ("version", "not-semver", "INVALID_FEEDBACK"),
+        ("query_budget", 0, "INVALID_FEEDBACK"),
+        ("rail", "cash", "UNSUPPORTED_RAIL"),
+    ],
+)
+def test_compiler_translates_copied_invalid_scenario_fields(
+    field_name: str, invalid_value: object, expected_code: str
+) -> None:
+    """Catches Pydantic validation failures leaking through the compiler API."""
+    card = make_threat_card()
+    invalid = card.default_config.model_copy(update={field_name: invalid_value})
+
+    with pytest.raises(CompilerError) as error:
+        compile_scenario(card, invalid)
+
+    assert error.value.code == expected_code
+
+
+def test_compiler_treats_malformed_url_syntax_as_missing_evidence() -> None:
+    """Catches URL parser failures escaping instead of using the evidence error code."""
+    card = make_threat_card()
+    malformed_evidence = card.evidence[0].model_copy(
+        update={"direct_source_url": "https://["}
+    )
+    invalid = card.model_copy(update={"evidence": [malformed_evidence]})
+
+    with pytest.raises(CompilerError) as error:
+        compile_scenario(invalid, invalid.default_config)
+
+    assert error.value.code == "MISSING_EVIDENCE"
+
+
 def test_compiler_emits_a_traceable_bounded_scenario_bundle() -> None:
     """Catches compilation that drops provenance, bounds, safety, or replay parameters."""
     card = make_threat_card()

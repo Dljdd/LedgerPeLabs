@@ -2,6 +2,8 @@
 
 from urllib.parse import urlparse
 
+from pydantic import ValidationError
+
 from apar.compiler.errors import CompilerError
 from apar.contracts.scenarios import FeedbackField, ScenarioBundle, ScenarioConfig
 from apar.registry.models import ThreatCard
@@ -9,6 +11,41 @@ from apar.registry.models import ThreatCard
 _SAFE_CLASS = "synthetic_only"
 _SAFE_EXPORT_LEVEL = "sanitized"
 _SUPPORTED_FEEDBACK = frozenset(field.value for field in FeedbackField)
+_EVIDENCE_FIELDS = frozenset({"direct_source_url", "evidence", "evidence_id", "threat_id"})
+_RAIL_FIELDS = frozenset({"observables", "rail", "rails", "viewpoint"})
+_SAFETY_FIELDS = frozenset({"export_level", "safety_class", "status"})
+
+
+def _validation_code(error: ValidationError, default: str) -> str:
+    fields = {
+        part
+        for detail in error.errors()
+        for part in detail["loc"]
+        if isinstance(part, str)
+    }
+    if fields & _EVIDENCE_FIELDS:
+        return "MISSING_EVIDENCE"
+    if fields & _RAIL_FIELDS:
+        return "UNSUPPORTED_RAIL"
+    if fields & _SAFETY_FIELDS:
+        return "UNSAFE_EXPORT"
+    return default
+
+
+def _validated_card(card: ThreatCard) -> ThreatCard:
+    try:
+        return ThreatCard.model_validate(card)
+    except ValidationError as error:
+        code = _validation_code(error, "MISSING_EVIDENCE")
+        raise CompilerError(code, "threat card failed validation") from None
+
+
+def _validated_config(config: ScenarioConfig) -> ScenarioConfig:
+    try:
+        return ScenarioConfig.model_validate(config)
+    except ValidationError as error:
+        code = _validation_code(error, "INVALID_FEEDBACK")
+        raise CompilerError(code, "scenario configuration failed validation") from None
 
 
 def _has_direct_source(card: ThreatCard) -> bool:
@@ -16,7 +53,10 @@ def _has_direct_source(card: ThreatCard) -> bool:
         direct_source_url = getattr(evidence, "direct_source_url", None)
         if not isinstance(direct_source_url, str):
             continue
-        parsed = urlparse(direct_source_url)
+        try:
+            parsed = urlparse(direct_source_url)
+        except ValueError:
+            continue
         if parsed.scheme in {"http", "https"} and parsed.netloc:
             return True
     return False
@@ -65,6 +105,8 @@ def _reject_invalid_card(card: ThreatCard, config: ScenarioConfig) -> None:
 
 def compile_scenario(card: ThreatCard, config: ScenarioConfig) -> ScenarioBundle:
     """Compile a reviewed card without adding undocumented scenario assumptions."""
+    card = _validated_card(card)
+    config = _validated_config(config)
     _reject_invalid_card(card, config)
     return ScenarioBundle(
         schema_version=config.schema_version,
