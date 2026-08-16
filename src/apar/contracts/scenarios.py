@@ -4,7 +4,11 @@ from enum import StrEnum
 
 from pydantic import Field, field_validator
 
-from apar.contracts._validation import ExternalContract, validate_schema_version
+from apar.contracts._validation import (
+    ExternalContract,
+    validate_schema_version,
+    validate_semantic_version,
+)
 from apar.contracts.events import Rail
 
 
@@ -41,7 +45,12 @@ class ScenarioBundle(ExternalContract):
     safety: dict[str, str | bool] = Field(default_factory=dict)
     extensions: dict[str, object] = Field(default_factory=dict)
 
-    @field_validator("schema_version", "version")
+    @field_validator("schema_version")
     @classmethod
-    def versions_are_supported(cls, value: str) -> str:
+    def schema_version_is_supported(cls, value: str) -> str:
         return validate_schema_version(value)
+
+    @field_validator("version")
+    @classmethod
+    def version_is_semantic(cls, value: str) -> str:
+        return validate_semantic_version(value, field_name="version")

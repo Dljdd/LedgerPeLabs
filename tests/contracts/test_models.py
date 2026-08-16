@@ -1,6 +1,7 @@
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import ValidationError
@@ -31,6 +32,19 @@ def test_event_rejects_naive_timestamp() -> None:
     with pytest.raises(ValidationError, match="timezone-aware"):
         candidate = make_payment_event(event_time=datetime(2026, 8, 16))
         PaymentEvent.model_validate(candidate.model_dump())
+
+
+def test_event_rejects_named_non_utc_zero_offset_timestamp() -> None:
+    """Catches treating a non-UTC timezone as UTC merely because its offset is zero."""
+    london_winter = datetime(2026, 1, 16, tzinfo=ZoneInfo("Europe/London"))
+    with pytest.raises(ValidationError, match="timezone-aware and UTC"):
+        PaymentEvent.model_validate(make_payment_event(event_time=london_winter).model_dump())
+
+
+def test_event_accepts_canonical_utc_z_timestamp() -> None:
+    """Preserves support for canonical ISO-8601 UTC timestamps at the event boundary."""
+    event = PaymentEvent.model_validate(make_payment_event(event_time="2026-08-16T12:00:00Z"))
+    assert event.event_time.tzname() == "UTC"
 
 
 @pytest.mark.parametrize(
@@ -81,6 +95,13 @@ def test_scenario_validates_feedback_and_query_budget() -> None:
         ScenarioBundle.model_validate(make_scenario_config(query_budget=0).model_dump())
 
 
+def test_scenario_accepts_independent_semantic_scenario_version() -> None:
+    """Catches applying envelope schema-major compatibility to scenario revisions."""
+    scenario = ScenarioBundle.model_validate(make_scenario_config(version="2.0.0").model_dump())
+    assert scenario.schema_version == "1.0.0"
+    assert scenario.version == "2.0.0"
+
+
 def test_decision_rejects_future_or_equal_source() -> None:
     """Catches data leakage from source events at or after the decision moment."""
     now = datetime(2026, 8, 16, tzinfo=UTC)
@@ -105,6 +126,16 @@ def test_decision_validates_uuid_score_and_utc_time() -> None:
         Decision.model_validate(make_decision(score=1.01).model_dump())
     with pytest.raises(ValidationError, match="timezone-aware"):
         Decision.model_validate(make_decision(decision_time=datetime(2026, 8, 16)).model_dump())
+
+
+def test_model_validate_revalidates_existing_contract_instances() -> None:
+    """Catches model_copy overrides bypassing contract validation at the external boundary."""
+    with pytest.raises(ValidationError, match="UUID"):
+        Decision.model_validate(make_decision(decision_id="not-a-uuid"))
+    with pytest.raises(ValidationError, match="less than or equal to 1"):
+        Decision.model_validate(make_decision(score=1.01))
+    with pytest.raises(ValidationError, match="unsupported schema major"):
+        PaymentEvent.model_validate(make_payment_event(schema_version="9.0.0"))
 
 
 def test_evaluation_report_captures_required_audit_metadata() -> None:
