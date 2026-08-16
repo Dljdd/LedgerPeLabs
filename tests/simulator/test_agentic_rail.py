@@ -24,7 +24,15 @@ from apar.simulator.rails.agentic import (
     AgenticRailAdapter,
 )
 from apar.simulator.rails.base import FrozenState, LifecycleError
-from apar.trust.verifier import AgentMandate, AgentPaymentRequest, TrustVerifier
+from apar.trust.verifier import (
+    AgentMandate,
+    AgentPaymentRequest,
+    AuthenticationRequirement,
+    AuthenticationState,
+    IntegrityReceipt,
+    ReceiptOutcome,
+    TrustVerifier,
+)
 from tests.factories import make_scenario_config, make_threat_card
 
 NOW = datetime(2026, 8, 16, 12, tzinfo=UTC)
@@ -32,7 +40,13 @@ AGENT_ID = "agent-registered-1"
 KEY_ID = "key-1"
 MANDATE_ID = "mandate-1"
 PAYEE_ID = "merchant-1"
+MERCHANT_ID = "merchant-entity-1"
 CART_HASH = "1" * 64
+PAYMENT_INTENT_HASH = "3" * 64
+CREDENTIAL_ID = "synthetic-token-1"
+CREDENTIAL_SCOPE = "single_merchant_single_use"
+CATEGORY = "TRAVEL"
+PRODUCT_ID = "flight-1"
 CAMPAIGN_ID = "00000000-0000-4000-8000-000000000301"
 TRACE_ID = "00000000-0000-4000-8000-000000000302"
 ACTOR_ID = "00000000-0000-4000-8000-000000000303"
@@ -51,8 +65,15 @@ def _mandate() -> AgentMandate:
         agent_id=AGENT_ID,
         user_ref="user-1",
         consent_ref="consent-1",
+        merchant_id=MERCHANT_ID,
         payee_id=PAYEE_ID,
         cart_hash=CART_HASH,
+        payment_intent_hash=PAYMENT_INTENT_HASH,
+        permitted_categories=(CATEGORY,),
+        permitted_products=(PRODUCT_ID,),
+        credential_id=CREDENTIAL_ID,
+        credential_scope=CREDENTIAL_SCOPE,
+        required_authentication=AuthenticationRequirement.STEP_UP,
         max_amount=Decimal("100.00"),
         currency="USD",
         issued_at=NOW - timedelta(minutes=5),
@@ -70,8 +91,16 @@ def _request(**updates: object) -> AgentPaymentRequest:
         "mandate": mandate,
         "amount": Decimal("10.00"),
         "currency": "USD",
+        "merchant_id": MERCHANT_ID,
         "payee_id": PAYEE_ID,
         "cart_hash": CART_HASH,
+        "payment_intent_hash": PAYMENT_INTENT_HASH,
+        "category": CATEGORY,
+        "product_id": PRODUCT_ID,
+        "credential_id": CREDENTIAL_ID,
+        "credential_scope": CREDENTIAL_SCOPE,
+        "consent_ref": "consent-1",
+        "authentication_state": AuthenticationState.STEP_UP_SATISFIED,
         "nonce": "nonce-1",
         "created_at": NOW,
         "expires_at": NOW + timedelta(minutes=5),
@@ -209,6 +238,66 @@ def test_risk_decline_occurs_only_after_integrity_and_does_not_post() -> None:
     assert event.rail_data["action"] == "decline"
     assert engine.ledger.entries == ()
     assert isinstance(engine.entity_state(AGENTIC_TRUST_STATE_ID), Mapping)
+
+
+def test_challenge_emits_semantic_challenge_event_and_outcome_receipt() -> None:
+    scorer = Mock(return_value=Action.CHALLENGE)
+    engine = _engine(scorer)
+    engine.schedule(NOW, 0, _command())
+
+    event = engine.run()[0]
+
+    assert event.event_type is EventKind.AUTHENTICATION_CHALLENGE
+    assert event.rail_data["action"] == "challenge"
+    assert event.rail_data["receipt_outcome"] == ReceiptOutcome.CHALLENGE.value
+    assert event.rail_data["integrity"] == "pass"
+    assert engine.ledger.entries == ()
+
+
+def test_scorer_exception_leaves_nonce_state_unchanged_and_retry_succeeds() -> None:
+    verifier = _verifier()
+    state_before = verifier.dump_state()
+    captured_receipts: list[object] = []
+
+    def fail_after_capture(_request: AgentPaymentRequest, receipt: object) -> Action:
+        captured_receipts.append(receipt)
+        raise RuntimeError("score failed")
+
+    failing = AgenticRailAdapter(
+        verifier,
+        fail_after_capture,
+    )
+
+    with pytest.raises(RuntimeError, match="score failed"):
+        failing.process(_request(), now=NOW)
+
+    assert verifier.dump_state() == state_before
+    abandoned = cast(IntegrityReceipt, captured_receipts[0])
+    rejected_commit = verifier.commit(_request(), abandoned, ReceiptOutcome.APPROVE)
+    assert rejected_commit.reason_code is ReasonCode.EXECUTION_RECEIPT_MISMATCH
+    retry = AgenticRailAdapter(
+        verifier,
+        lambda _request, _receipt: Action.APPROVE,
+    ).process(_request(), now=NOW)
+    assert retry.action is Action.APPROVE
+    assert retry.integrity_receipt.outcome is ReceiptOutcome.APPROVE
+
+
+@pytest.mark.parametrize("bad_output", [None, "approve", 0.5, float("nan")])
+def test_malformed_or_nonfinite_scorer_output_is_failure_atomic(
+    bad_output: object,
+) -> None:
+    verifier = _verifier()
+    state_before = verifier.dump_state()
+    adapter = AgenticRailAdapter(
+        verifier,
+        lambda _request, _receipt: cast(Action, bad_output),
+    )
+
+    with pytest.raises(TypeError, match="exact Action"):
+        adapter.process(_request(), now=NOW)
+
+    assert verifier.dump_state() == state_before
 
 
 def test_agentic_receipts_and_events_replay_deterministically() -> None:

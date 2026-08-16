@@ -15,7 +15,10 @@ from apar.contracts.decisions import ReasonCode
 from apar.trust.verifier import (
     AgentMandate,
     AgentPaymentRequest,
+    AuthenticationRequirement,
+    AuthenticationState,
     IntegrityReceipt,
+    ReceiptOutcome,
     TrustVerifier,
     TrustVerifierStateError,
 )
@@ -27,7 +30,13 @@ MANDATE_ID = "mandate-1"
 USER_REF = "user-1"
 CONSENT_REF = "consent-1"
 PAYEE_ID = "merchant-1"
+MERCHANT_ID = "merchant-entity-1"
 CART_HASH = "1" * 64
+PAYMENT_INTENT_HASH = "3" * 64
+CREDENTIAL_ID = "synthetic-token-1"
+CREDENTIAL_SCOPE = "single_merchant_single_use"
+CATEGORY = "TRAVEL"
+PRODUCT_ID = "flight-1"
 
 
 @pytest.fixture
@@ -43,8 +52,15 @@ def mandate() -> AgentMandate:
         agent_id=AGENT_ID,
         user_ref=USER_REF,
         consent_ref=CONSENT_REF,
+        merchant_id=MERCHANT_ID,
         payee_id=PAYEE_ID,
         cart_hash=CART_HASH,
+        payment_intent_hash=PAYMENT_INTENT_HASH,
+        permitted_categories=(CATEGORY,),
+        permitted_products=(PRODUCT_ID,),
+        credential_id=CREDENTIAL_ID,
+        credential_scope=CREDENTIAL_SCOPE,
+        required_authentication=AuthenticationRequirement.STEP_UP,
         max_amount=Decimal("150.00"),
         currency="USD",
         issued_at=NOW - timedelta(hours=1),
@@ -61,8 +77,16 @@ def _unsigned_request(mandate: AgentMandate, **updates: object) -> AgentPaymentR
         "mandate": mandate,
         "amount": Decimal("120.00"),
         "currency": "USD",
+        "merchant_id": MERCHANT_ID,
         "payee_id": PAYEE_ID,
         "cart_hash": CART_HASH,
+        "payment_intent_hash": PAYMENT_INTENT_HASH,
+        "category": CATEGORY,
+        "product_id": PRODUCT_ID,
+        "credential_id": CREDENTIAL_ID,
+        "credential_scope": CREDENTIAL_SCOPE,
+        "consent_ref": CONSENT_REF,
+        "authentication_state": AuthenticationState.STEP_UP_SATISFIED,
         "nonce": "nonce-1",
         "created_at": NOW,
         "expires_at": NOW + timedelta(minutes=5),
@@ -128,6 +152,9 @@ def test_public_trust_records_are_immutable(
         reason_code=ReasonCode.SIGNATURE_INVALID,
         receipt_hash="2" * 64,
         previous_receipt_hash="",
+        request_hash="3" * 64,
+        signature_hash="4" * 64,
+        outcome=ReceiptOutcome.REJECTED,
     )
 
     with pytest.raises(FrozenInstanceError):
@@ -198,6 +225,46 @@ def test_bound_request_fields_fail_with_ordered_reason(
     assert receipt.reason_code is reason
 
 
+@pytest.mark.parametrize(
+    ("updates", "reason"),
+    [
+        ({"merchant_id": "substituted-merchant"}, ReasonCode.MERCHANT_BINDING_MISMATCH),
+        ({"payee_id": "substituted-payee"}, ReasonCode.PAYEE_BINDING_MISMATCH),
+        ({"category": "GAMBLING"}, ReasonCode.CATEGORY_SCOPE_VIOLATION),
+        ({"product_id": "unapproved-product"}, ReasonCode.PRODUCT_SCOPE_VIOLATION),
+        (
+            {"payment_intent_hash": "4" * 64},
+            ReasonCode.PAYMENT_INTENT_HASH_MISMATCH,
+        ),
+        ({"credential_id": "substituted-token"}, ReasonCode.CREDENTIAL_BINDING_MISMATCH),
+        ({"credential_scope": "multi_merchant"}, ReasonCode.TOKEN_SCOPE_VIOLATION),
+        ({"consent_ref": "different-consent"}, ReasonCode.CONSENT_BINDING_MISMATCH),
+        (
+            {"authentication_state": AuthenticationState.NOT_PERFORMED},
+            ReasonCode.AUTHENTICATION_REQUIRED,
+        ),
+    ],
+)
+def test_solution_level_agentic_bindings_reject_deterministically(
+    updates: dict[str, object],
+    reason: ReasonCode,
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+) -> None:
+    request = _sign(_unsigned_request(mandate, **updates), private_key)
+
+    receipt = _verifier(mandate, private_key).verify(request, NOW)
+
+    assert receipt.reason_code is reason
+
+
+def test_missing_consent_is_rejected_at_canonical_boundary(
+    mandate: AgentMandate,
+) -> None:
+    with pytest.raises(ValueError, match="consent_ref must not be empty"):
+        _unsigned_request(mandate, consent_ref="")
+
+
 def test_expiry_boundary_is_closed(
     mandate: AgentMandate,
     private_key: Ed25519PrivateKey,
@@ -213,6 +280,56 @@ def test_expiry_boundary_is_closed(
     )
 
     assert receipt.reason_code is ReasonCode.MANDATE_EXPIRED
+
+
+@pytest.mark.parametrize(
+    ("created_at", "expires_at", "reason"),
+    [
+        (
+            NOW - timedelta(hours=1, microseconds=1),
+            NOW + timedelta(minutes=5),
+            ReasonCode.MANDATE_TIME_SCOPE_VIOLATION,
+        ),
+        (
+            NOW,
+            NOW + timedelta(hours=1, microseconds=1),
+            ReasonCode.MANDATE_TIME_SCOPE_VIOLATION,
+        ),
+    ],
+)
+def test_request_window_must_be_nested_inside_mandate(
+    created_at: datetime,
+    expires_at: datetime,
+    reason: ReasonCode,
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+) -> None:
+    request = _sign(
+        _unsigned_request(mandate, created_at=created_at, expires_at=expires_at),
+        private_key,
+    )
+
+    receipt = _verifier(mandate, private_key).verify(request, NOW)
+
+    assert receipt.reason_code is reason
+
+
+def test_request_window_accepts_exact_mandate_boundaries(
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+) -> None:
+    request = _sign(
+        _unsigned_request(
+            mandate,
+            created_at=mandate.issued_at,
+            expires_at=mandate.expires_at,
+        ),
+        private_key,
+    )
+
+    receipt = _verifier(mandate, private_key).verify(request, NOW)
+
+    assert receipt.allowed
 
 
 @pytest.mark.parametrize("future_field", ["request", "mandate"])
@@ -245,7 +362,12 @@ def test_future_issued_request_or_mandate_fails_time_validity(
 
     receipt = _verifier(verifier_mandate, private_key).verify(request, NOW)
 
-    assert receipt.reason_code is ReasonCode.MANDATE_EXPIRED
+    expected = (
+        ReasonCode.MANDATE_TIME_SCOPE_VIOLATION
+        if future_field == "mandate"
+        else ReasonCode.MANDATE_EXPIRED
+    )
+    assert receipt.reason_code is expected
 
 
 def test_nonce_replay_rejects_without_changing_state(
@@ -384,10 +506,22 @@ def test_well_shaped_but_unverifiable_receipt_record_is_state_corrupt(
     private_key: Ed25519PrivateKey,
 ) -> None:
     verifier = _verifier(mandate, private_key)
+    request_hash = "3" * 64
+    signature_hash = "4" * 64
     forged_state = MappingProxyType(
         {
             "version": 1,
-            "records": ((AGENT_ID, "forged-nonce", "", "2" * 64),),
+            "records": (
+                (
+                    AGENT_ID,
+                    "forged-nonce",
+                    "",
+                    request_hash,
+                    signature_hash,
+                    ReceiptOutcome.APPROVE.value,
+                    "2" * 64,
+                ),
+            ),
         }
     )
 
@@ -395,6 +529,72 @@ def test_well_shaped_but_unverifiable_receipt_record_is_state_corrupt(
         verifier.load_state(forged_state)
 
     assert error.value.code == "AGENTIC_STATE_CORRUPT"
+    assert "not reproducible" in str(error.value.__cause__)
+
+
+def test_outcome_receipt_tamper_fails_without_consuming_nonce(
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+    valid_request: AgentPaymentRequest,
+) -> None:
+    verifier = _verifier(mandate, private_key)
+    preview = verifier.preview(valid_request, NOW)
+    tampered = preview.model_copy(update={"receipt_hash": "f" * 64})
+    state_before = verifier.dump_state()
+
+    rejected = verifier.commit(valid_request, tampered, ReceiptOutcome.APPROVE)
+    state_after_rejection = verifier.dump_state()
+    accepted = verifier.commit(valid_request, preview, ReceiptOutcome.APPROVE)
+
+    assert rejected.reason_code is ReasonCode.EXECUTION_RECEIPT_MISMATCH
+    assert state_after_rejection == state_before
+    assert verifier.dump_state() != state_before
+    assert accepted.allowed
+    assert accepted.outcome is ReceiptOutcome.APPROVE
+
+
+def test_commit_rejects_preview_not_issued_by_same_verifier_instance(
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+    valid_request: AgentPaymentRequest,
+) -> None:
+    issuer = _verifier(mandate, private_key)
+    committing = _verifier(mandate, private_key)
+    foreign_preview = issuer.preview(valid_request, NOW)
+    state_before = committing.dump_state()
+
+    receipt = committing.commit(
+        valid_request,
+        foreign_preview,
+        ReceiptOutcome.APPROVE,
+    )
+
+    assert receipt.reason_code is ReasonCode.EXECUTION_RECEIPT_MISMATCH
+    assert committing.dump_state() == state_before
+
+
+def test_failure_receipt_hash_binds_failed_canonical_request_and_signature(
+    mandate: AgentMandate,
+    private_key: Ed25519PrivateKey,
+) -> None:
+    first = _sign(
+        _unsigned_request(mandate, payee_id="attacker-a"),
+        private_key,
+    )
+    second = _sign(
+        _unsigned_request(mandate, payee_id="attacker-b"),
+        private_key,
+    )
+    verifier = _verifier(mandate, private_key)
+
+    first_receipt = verifier.verify(first, NOW)
+    second_receipt = verifier.verify(second, NOW)
+
+    assert first_receipt.reason_code is ReasonCode.PAYEE_BINDING_MISMATCH
+    assert second_receipt.reason_code is ReasonCode.PAYEE_BINDING_MISMATCH
+    assert first.request_id == second.request_id
+    assert first_receipt.receipt_hash != second_receipt.receipt_hash
+    assert first_receipt.request_hash != second_receipt.request_hash
 
 
 @pytest.mark.parametrize(

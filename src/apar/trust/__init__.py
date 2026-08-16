@@ -3,7 +3,10 @@
 from apar.trust.verifier import (
     AgentMandate,
     AgentPaymentRequest,
+    AuthenticationRequirement,
+    AuthenticationState,
     IntegrityReceipt,
+    ReceiptOutcome,
     TrustVerifier,
     TrustVerifierStateError,
 )
@@ -11,7 +14,10 @@ from apar.trust.verifier import (
 __all__ = [
     "AgentMandate",
     "AgentPaymentRequest",
+    "AuthenticationRequirement",
+    "AuthenticationState",
     "IntegrityReceipt",
+    "ReceiptOutcome",
     "TrustVerifier",
     "TrustVerifierStateError",
 ]

@@ -23,6 +23,7 @@ class Rail(StrEnum):
 class EventKind(StrEnum):
     AUTHORIZATION = "authorization"
     AUTHORIZATION_DECLINED = "authorization_declined"
+    AUTHENTICATION_CHALLENGE = "authentication_challenge"
     CLEARING = "clearing"
     SETTLEMENT = "settlement"
     REVERSAL = "reversal"

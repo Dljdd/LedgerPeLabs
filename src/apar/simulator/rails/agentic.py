@@ -19,7 +19,10 @@ from apar.simulator.rails.base import LifecycleError, RailContext
 from apar.trust.verifier import (
     AgentMandate,
     AgentPaymentRequest,
+    AuthenticationRequirement,
+    AuthenticationState,
     IntegrityReceipt,
+    ReceiptOutcome,
     TrustVerifier,
     TrustVerifierStateError,
 )
@@ -49,17 +52,32 @@ def _request_payload(request: AgentPaymentRequest) -> dict[str, object]:
         "mandate_version": mandate.version,
         "mandate_agent_id": mandate.agent_id,
         "user_ref": mandate.user_ref,
-        "consent_ref": mandate.consent_ref,
+        "mandate_consent_ref": mandate.consent_ref,
+        "mandate_merchant_id": mandate.merchant_id,
         "mandate_payee_id": mandate.payee_id,
         "mandate_cart_hash": mandate.cart_hash,
+        "mandate_payment_intent_hash": mandate.payment_intent_hash,
+        "permitted_categories": mandate.permitted_categories,
+        "permitted_products": mandate.permitted_products,
+        "mandate_credential_id": mandate.credential_id,
+        "mandate_credential_scope": mandate.credential_scope,
+        "required_authentication": mandate.required_authentication.value,
         "max_amount": mandate.max_amount,
         "mandate_currency": mandate.currency,
         "mandate_issued_at": mandate.issued_at,
         "mandate_expires_at": mandate.expires_at,
         "amount": request.amount,
         "currency": request.currency,
+        "merchant_id": request.merchant_id,
         "payee_id": request.payee_id,
         "cart_hash": request.cart_hash,
+        "payment_intent_hash": request.payment_intent_hash,
+        "category": request.category,
+        "product_id": request.product_id,
+        "credential_id": request.credential_id,
+        "credential_scope": request.credential_scope,
+        "consent_ref": request.consent_ref,
+        "authentication_state": request.authentication_state.value,
         "nonce": request.nonce,
         "created_at": request.created_at,
         "expires_at": request.expires_at,
@@ -78,9 +96,18 @@ def _request_from_payload(payload: Mapping[str, object]) -> AgentPaymentRequest:
         version=cast(int, payload["mandate_version"]),
         agent_id=cast(str, payload["mandate_agent_id"]),
         user_ref=cast(str, payload["user_ref"]),
-        consent_ref=cast(str, payload["consent_ref"]),
+        consent_ref=cast(str, payload["mandate_consent_ref"]),
+        merchant_id=cast(str, payload["mandate_merchant_id"]),
         payee_id=cast(str, payload["mandate_payee_id"]),
         cart_hash=cast(str, payload["mandate_cart_hash"]),
+        payment_intent_hash=cast(str, payload["mandate_payment_intent_hash"]),
+        permitted_categories=cast(tuple[str, ...], payload["permitted_categories"]),
+        permitted_products=cast(tuple[str, ...], payload["permitted_products"]),
+        credential_id=cast(str, payload["mandate_credential_id"]),
+        credential_scope=cast(str, payload["mandate_credential_scope"]),
+        required_authentication=AuthenticationRequirement(
+            cast(str, payload["required_authentication"])
+        ),
         max_amount=cast(Decimal, payload["max_amount"]),
         currency=cast(str, payload["mandate_currency"]),
         issued_at=cast(datetime, payload["mandate_issued_at"]),
@@ -94,8 +121,18 @@ def _request_from_payload(payload: Mapping[str, object]) -> AgentPaymentRequest:
         mandate=mandate,
         amount=cast(Decimal, payload["amount"]),
         currency=cast(str, payload["currency"]),
+        merchant_id=cast(str, payload["merchant_id"]),
         payee_id=cast(str, payload["payee_id"]),
         cart_hash=cast(str, payload["cart_hash"]),
+        payment_intent_hash=cast(str, payload["payment_intent_hash"]),
+        category=cast(str, payload["category"]),
+        product_id=cast(str, payload["product_id"]),
+        credential_id=cast(str, payload["credential_id"]),
+        credential_scope=cast(str, payload["credential_scope"]),
+        consent_ref=cast(str, payload["consent_ref"]),
+        authentication_state=AuthenticationState(
+            cast(str, payload["authentication_state"])
+        ),
         nonce=cast(str, payload["nonce"]),
         created_at=cast(datetime, payload["created_at"]),
         expires_at=cast(datetime, payload["expires_at"]),
@@ -118,17 +155,32 @@ _REQUEST_KEYS = frozenset(
         "mandate_version",
         "mandate_agent_id",
         "user_ref",
-        "consent_ref",
+        "mandate_consent_ref",
+        "mandate_merchant_id",
         "mandate_payee_id",
         "mandate_cart_hash",
+        "mandate_payment_intent_hash",
+        "permitted_categories",
+        "permitted_products",
+        "mandate_credential_id",
+        "mandate_credential_scope",
+        "required_authentication",
         "max_amount",
         "mandate_currency",
         "mandate_issued_at",
         "mandate_expires_at",
         "amount",
         "currency",
+        "merchant_id",
         "payee_id",
         "cart_hash",
+        "payment_intent_hash",
+        "category",
+        "product_id",
+        "credential_id",
+        "credential_scope",
+        "consent_ref",
+        "authentication_state",
         "nonce",
         "created_at",
         "expires_at",
@@ -159,6 +211,8 @@ def _payload_fingerprint(payload: Mapping[str, object]) -> str:
             kind, text = "datetime", value.isoformat()
         elif type(value) is bytes:
             kind, text = "bytes", value.hex()
+        elif type(value) is tuple and all(type(item) is str for item in value):
+            kind, text = "tuple[str]", json.dumps(value, separators=(",", ":"))
         else:
             raise TypeError("agentic command payload contains unsupported value type")
         tagged.append([key, kind, text])
@@ -267,14 +321,28 @@ class AgenticRailAdapter:
             raise ValueError("agentic adapter requires an agentic scenario")
 
     def process(self, request: AgentPaymentRequest, *, now: datetime) -> AgenticDecision:
-        receipt = self._verifier.verify(request, now)
-        if not receipt.allowed:
-            assert receipt.reason_code is not None
-            return AgenticDecision(Action.DECLINE, (receipt.reason_code,), receipt)
-        action = self._scorer(request, receipt)
+        preview = self._verifier.preview(request, now)
+        if not preview.allowed:
+            assert preview.reason_code is not None
+            return AgenticDecision(Action.DECLINE, (preview.reason_code,), preview)
+        try:
+            action = self._scorer(request, preview)
+        except Exception:
+            self._verifier.discard_preview(preview)
+            raise
         if type(action) is not Action:
+            self._verifier.discard_preview(preview)
             raise TypeError("agentic risk scorer must return an exact Action")
-        return AgenticDecision(action, (), receipt)
+        outcome = {
+            Action.APPROVE: ReceiptOutcome.APPROVE,
+            Action.CHALLENGE: ReceiptOutcome.CHALLENGE,
+            Action.DECLINE: ReceiptOutcome.DECLINE,
+        }[action]
+        final = self._verifier.commit(request, preview, outcome)
+        if not final.allowed:
+            assert final.reason_code is not None
+            return AgenticDecision(Action.DECLINE, (final.reason_code,), final)
+        return AgenticDecision(action, (), final)
 
     def handle(self, command: Command, context: RailContext) -> list[PaymentEvent]:
         canonical = _canonical_command(command)
@@ -325,6 +393,8 @@ class AgenticRailAdapter:
             event_type=(
                 EventKind.AUTHORIZATION
                 if decision.action is Action.APPROVE and receipt.allowed
+                else EventKind.AUTHENTICATION_CHALLENGE
+                if decision.action is Action.CHALLENGE and receipt.allowed
                 else EventKind.AUTHORIZATION_DECLINED
             ),
             amount=request.amount,
@@ -342,6 +412,7 @@ class AgenticRailAdapter:
                 "reason_code": reason,
                 "action": decision.action.value,
                 "receipt_hash": receipt.receipt_hash,
+                "receipt_outcome": receipt.outcome.value,
             },
             lineage={"synthetic": True},
             privacy={"classification": "synthetic"},
