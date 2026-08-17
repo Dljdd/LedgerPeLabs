@@ -1117,19 +1117,27 @@ does not establish live-fraud effectiveness.
 
 ### Fix Round 1 commits and clean-HEAD postcommit gates
 
-Implementation/report commit: `PENDING_FIX_ROUND_1_IMPLEMENTATION_COMMIT`
+Implementation/report commit: `94da40daf63a7a64f4c7916828173d79c7d1a1a3`
 
-Postcommit verification-report commit: `PENDING_FIX_ROUND_1_REPORT_COMMIT`
+Postcommit verification is recorded by the report-only follow-up whose parent is
+`94da40daf63a7a64f4c7916828173d79c7d1a1a3` (the follow-up hash is necessarily supplied
+by Git after these bytes are committed).
 
 The following outputs are populated only after the implementation commit, from a clean
 tracked HEAD:
 
 ```text
 $ .venv/bin/python scripts/verify_g1_g2.py
-PENDING_CLEAN_HEAD_G1_G2_OUTPUT
+...                                                                      [100%]
+3 passed in 0.59s
+G1 PASS: card and A2A report/recovery conserve value; agentic 23-attack matrix fails closed with 2 controls
+......                                                                   [100%]
+6 passed in 12.42s
+verified Task 6 v3.4 result-only commit chronology and raw evidence; confirmatory_valid=True
+G2 PASS: 4 hidden families; fixed/random/adaptive/cached-LLM matched budgets; boolean-only validity; byte-identical seeded reruns; exact Task6 historical postcommit verification-only recomputation
 
 $ .venv/bin/python scripts/run_task6_holdout.py --verify-postcommit \
     --approved-result-commit d6d3eecbfe2d871af8375e1455814cb5c48f2928 \
     --approved-result-sha256 f82981a987651a7f7ebb10a9011df063b2dc54a56181cae5b838e31de5e658db
-PENDING_CLEAN_HEAD_TASK6_OUTPUT
+verified Task 6 v3.4 result-only commit chronology and raw evidence; confirmatory_valid=True
 ```
