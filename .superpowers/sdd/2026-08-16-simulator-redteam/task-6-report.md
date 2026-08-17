@@ -730,6 +730,12 @@ Those properties are not claimed by this Task 6 repair.
   PASS.
 - `git diff --check`: PASS.
 - `validation_spike/`: unchanged from approved result `d6d3eec`.
+- Historical verification from clean descendant `f0326fa` using the exact command below:
+  PASS (`confirmatory_valid=True`).
+
+  ```text
+  .venv/bin/python scripts/run_task6_holdout.py --verify-postcommit --approved-result-commit d6d3eecbfe2d871af8375e1455814cb5c48f2928 --approved-result-sha256 f82981a987651a7f7ebb10a9011df063b2dc54a56181cae5b838e31de5e658db
+  ```
 
 No confirmatory experiment, reserved-seed search, or evaluator replay was invoked by this
 repair. The tests verify already-frozen raw bytes and ordinary development fixtures only.
