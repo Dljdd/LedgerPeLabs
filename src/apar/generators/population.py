@@ -14,6 +14,8 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 import numpy as np
 
 from apar.contracts.scenarios import ScenarioBundle
+from apar.simulator.clock import Command
+from apar.simulator.rails.a2a import AcceptA2A, InitiateA2A, PostA2A
 
 _BENIGN_ROLES = (
     "victim",
@@ -24,6 +26,7 @@ _BENIGN_ROLES = (
     "agent",
     "organization",
     "institution",
+    "merchant_location",
 )
 _ILLICIT_ROLES = ("mule", "synthetic_merchant", "attacker", "compromised_credential")
 _CHANNELS = ("mobile", "web", "branch", "agent")
@@ -76,6 +79,22 @@ def _closed_text_mapping(label: str, values: object) -> Mapping[str, str]:
     return MappingProxyType(dict(sorted(owned.items())))
 
 
+def _canonical_command_payload(command: Command) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    for key, value in command.payload.items():
+        if type(value) is Decimal:
+            payload[key] = {"decimal": str(value)}
+        elif type(value) is datetime:
+            payload[key] = value.isoformat().replace("+00:00", "Z")
+        elif type(value) in (str, int, float, bool, bytes) or value is None:
+            payload[key] = value.hex() if type(value) is bytes else value
+        elif type(value) is tuple:
+            payload[key] = list(value)
+        else:
+            raise TypeError("benign command payload contains unsupported value")
+    return payload
+
+
 @dataclass(frozen=True, slots=True)
 class PopulationEntity:
     """One pseudonymous actor, endpoint, institution, or technical entity."""
@@ -115,20 +134,90 @@ class PopulationRelationship:
 
 
 @dataclass(frozen=True, slots=True)
+class PopulationAccount:
+    """Explicit account ownership and institution binding."""
+
+    account_id: str
+    owner_entity_id: str
+    institution_entity_id: str
+    currency: str
+    opening_balance: Decimal
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "account_id", _text("account_id", self.account_id))
+        object.__setattr__(
+            self,
+            "owner_entity_id",
+            _uuid_text("owner_entity_id", self.owner_entity_id),
+        )
+        object.__setattr__(
+            self,
+            "institution_entity_id",
+            _uuid_text("institution_entity_id", self.institution_entity_id),
+        )
+        if self.currency != "USD":
+            raise ValueError("population accounts currently support USD only")
+        if (
+            type(self.opening_balance) is not Decimal
+            or not self.opening_balance.is_finite()
+            or self.opening_balance < 0
+            or self.opening_balance != self.opening_balance.quantize(Decimal("0.01"))
+        ):
+            raise ValueError("opening_balance must be a non-negative canonical Decimal")
+
+
+@dataclass(frozen=True, slots=True)
+class BenignActivity:
+    """One scheduled benign shift tied to real population entities and commands."""
+
+    activity_id: str
+    shift: str
+    scheduled_at: datetime
+    actor_id: str
+    counterparty_id: str
+    device_id: str
+    merchant_location_id: str
+    payment_id: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "activity_id", _uuid_text("activity_id", self.activity_id))
+        object.__setattr__(self, "shift", _text("shift", self.shift))
+        object.__setattr__(self, "scheduled_at", _utc("scheduled_at", self.scheduled_at))
+        for field_name in (
+            "actor_id",
+            "counterparty_id",
+            "device_id",
+            "merchant_location_id",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _uuid_text(field_name, getattr(self, field_name)),
+            )
+        object.__setattr__(self, "payment_id", _text("payment_id", self.payment_id))
+
+
+@dataclass(frozen=True, slots=True)
 class Population:
     """Canonical graph, balances, and benign controls consumed by campaigns."""
 
     scenario_id: str
+    bundle: ScenarioBundle
     seed: int
     generated_at: datetime
     horizon_end: datetime
     entities: tuple[PopulationEntity, ...]
     relationships: tuple[PopulationRelationship, ...]
+    accounts: tuple[PopulationAccount, ...]
     opening_balances: Mapping[str, Decimal]
     benign_controls: tuple[str, ...]
+    benign_activities: tuple[BenignActivity, ...]
+    benign_commands: tuple[Command, ...]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "scenario_id", _text("scenario_id", self.scenario_id))
+        if type(self.bundle) is not ScenarioBundle or self.bundle.scenario_id != self.scenario_id:
+            raise TypeError("bundle must be the exact source ScenarioBundle")
         if type(self.seed) is not int:
             raise TypeError("seed must be an exact integer")
         started = _utc("generated_at", self.generated_at)
@@ -151,11 +240,20 @@ class Population:
                 raise TypeError("relationships must contain exact relationship records")
             if edge.source_id not in identifiers or edge.target_id not in identifiers:
                 raise ValueError("relationships must reference declared entities")
+        if type(self.accounts) is not tuple or any(
+            type(account) is not PopulationAccount for account in self.accounts
+        ):
+            raise TypeError("accounts must contain exact PopulationAccount records")
+        for account in self.accounts:
+            if account.owner_entity_id not in identifiers:
+                raise ValueError("account owner must reference a declared entity")
+            if account.institution_entity_id not in identifiers:
+                raise ValueError("account institution must reference a declared entity")
         balances: dict[str, Decimal] = {}
         if type(self.opening_balances) not in (dict, type(MappingProxyType({}))):
             raise TypeError("opening_balances must be an exact mapping")
-        for account, amount in self.opening_balances.items():
-            checked_account = _text("opening balance account", account)
+        for balance_account, amount in self.opening_balances.items():
+            checked_account = _text("opening balance account", balance_account)
             if type(amount) is not Decimal:
                 raise TypeError("opening balances must be exact Decimals")
             if not amount.is_finite() or amount < 0 or amount != amount.quantize(Decimal("0.01")):
@@ -176,6 +274,24 @@ class Population:
         controls = tuple(_text("benign control", item) for item in self.benign_controls)
         if controls != tuple(sorted(set(controls))):
             raise ValueError("benign_controls must be unique and sorted")
+        if type(self.benign_activities) is not tuple or any(
+            type(activity) is not BenignActivity for activity in self.benign_activities
+        ):
+            raise TypeError("benign_activities must contain exact BenignActivity records")
+        for activity in self.benign_activities:
+            if not {
+                activity.actor_id,
+                activity.counterparty_id,
+                activity.device_id,
+                activity.merchant_location_id,
+            } <= identifiers:
+                raise ValueError("benign activity must reference declared entities")
+            if not started <= activity.scheduled_at <= ended:
+                raise ValueError("benign activity must stay within the population horizon")
+        if type(self.benign_commands) is not tuple or any(
+            not isinstance(command, Command) for command in self.benign_commands
+        ):
+            raise TypeError("benign_commands must be an exact tuple of Commands")
 
     def by_role(self, role: str) -> tuple[PopulationEntity, ...]:
         """Return entities with an exact declared role in canonical order."""
@@ -186,6 +302,8 @@ class Population:
         """Serialize the public graph without interpreter-specific object details."""
         document = {
             "scenario_id": self.scenario_id,
+            "bundle_version": self.bundle.version,
+            "bundle_rail": self.bundle.rail.value,
             "seed": self.seed,
             "generated_at": self.generated_at.isoformat().replace("+00:00", "Z"),
             "horizon_end": self.horizon_end.isoformat().replace("+00:00", "Z"),
@@ -207,10 +325,39 @@ class Population:
                 }
                 for edge in self.relationships
             ],
+            "accounts": [
+                {
+                    "account_id": account.account_id,
+                    "owner_entity_id": account.owner_entity_id,
+                    "institution_entity_id": account.institution_entity_id,
+                    "currency": account.currency,
+                    "opening_balance": str(account.opening_balance),
+                }
+                for account in self.accounts
+            ],
             "opening_balances": {
                 account: str(amount) for account, amount in self.opening_balances.items()
             },
             "benign_controls": self.benign_controls,
+            "benign_activities": [
+                {
+                    "activity_id": activity.activity_id,
+                    "shift": activity.shift,
+                    "scheduled_at": activity.scheduled_at.isoformat().replace(
+                        "+00:00", "Z"
+                    ),
+                    "actor_id": activity.actor_id,
+                    "counterparty_id": activity.counterparty_id,
+                    "device_id": activity.device_id,
+                    "merchant_location_id": activity.merchant_location_id,
+                    "payment_id": activity.payment_id,
+                }
+                for activity in self.benign_activities
+            ],
+            "benign_commands": [
+                {"name": command.name, "payload": _canonical_command_payload(command)}
+                for command in self.benign_commands
+            ],
         }
         return json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
 
@@ -228,9 +375,11 @@ class PopulationGenerator:
         """Generate one closed population from visible scenario bounds."""
         if type(bundle) is not ScenarioBundle:
             raise TypeError("bundle must be an exact ScenarioBundle")
-        if bundle.benign_entity_count < 8 or bundle.illicit_entity_count < 4:
-            raise ValueError("population requires at least 8 benign and 4 illicit entities")
-        composite_seed = self._seed ^ bundle.seed
+        if bundle.benign_entity_count < 9 or bundle.illicit_entity_count < 8:
+            raise ValueError("population requires at least 9 benign and 8 illicit entities")
+        composite_seed = int(
+            np.random.SeedSequence([self._seed, bundle.seed]).generate_state(1)[0]
+        )
         self._rng = np.random.default_rng(composite_seed)
         namespace = uuid5(NAMESPACE_URL, f"apar:population:{bundle.scenario_id}:{composite_seed}")
         entities: list[PopulationEntity] = []
@@ -273,7 +422,10 @@ class PopulationGenerator:
             )
         benign = [entity for entity in entities if not entity.illicit]
         device = next(entity for entity in benign if entity.role == "device")
+        devices = [entity for entity in benign if entity.role == "device"]
         beneficiary = next(entity for entity in benign if entity.role == "beneficiary")
+        merchants = [entity for entity in benign if entity.role == "merchant"]
+        locations = [entity for entity in benign if entity.role == "merchant_location"]
         payers = [
             entity
             for entity in benign
@@ -287,6 +439,37 @@ class PopulationGenerator:
                     "shares_device",
                 )
             )
+        illicit_attackers = [
+            entity for entity in entities if entity.illicit and entity.role == "attacker"
+        ]
+        for entity in illicit_attackers[:2]:
+            relationships.append(
+                PopulationRelationship(
+                    entity.entity_id,
+                    device.entity_id,
+                    "uses_shared_device",
+                )
+            )
+        relationships.extend(
+            (
+                PopulationRelationship(
+                    merchants[0].entity_id,
+                    locations[0].entity_id,
+                    "located_at",
+                ),
+                PopulationRelationship(
+                    merchants[-1].entity_id,
+                    locations[-1].entity_id,
+                    "new_merchant_location",
+                ),
+                PopulationRelationship(
+                    payers[2].entity_id,
+                    locations[-1].entity_id,
+                    "travels_to",
+                ),
+            )
+        )
+        for entity in payers[2:4]:
             relationships.append(
                 PopulationRelationship(
                     entity.entity_id,
@@ -315,6 +498,19 @@ class PopulationGenerator:
         ):
             balances[system_account] = Decimal("0.00")
 
+        institution = next(entity for entity in benign if entity.role == "institution")
+        accounts = tuple(
+            PopulationAccount(
+                entity.account_id,
+                entity.entity_id,
+                institution.entity_id,
+                "USD",
+                balances[entity.account_id],
+            )
+            for entity in entities
+            if entity.account_id is not None
+        )
+
         started = bundle.replay_manifest.simulation_start
         owned_start = datetime(
             started.year,
@@ -326,20 +522,85 @@ class PopulationGenerator:
             started.microsecond,
             tzinfo=UTC,
         )
+        benign_campaign_id = str(uuid5(namespace, "benign:campaign"))
+        activities: list[BenignActivity] = []
+        benign_commands: list[Command] = []
+        activity_specs = (
+            ("shared_device", payers[0], beneficiary, device, locations[0]),
+            ("shared_beneficiary", payers[1], beneficiary, devices[-1], locations[0]),
+            ("travel", payers[2], merchants[0], devices[-1], locations[-1]),
+            ("new_merchant", payers[3], merchants[-1], device, locations[-1]),
+        )
+        for index, (shift, actor, counterparty, activity_device, location) in enumerate(
+            activity_specs
+        ):
+            activity_id = str(uuid5(namespace, f"benign:activity:{index}"))
+            payment_id = f"benign:{uuid5(namespace, f'benign:payment:{index}')}"
+            scheduled_at = owned_start + timedelta(
+                minutes=10 * (index + 1) + int(self._rng.integers(0, 5))
+            )
+            amount = Decimal(5 + int(self._rng.integers(0, 16))).quantize(Decimal("0.01"))
+            trace_id = str(uuid5(namespace, f"benign:trace:{index}"))
+            opening = InitiateA2A(
+                payment_id,
+                amount=amount,
+                currency="USD",
+                payer_account=cast(str, actor.account_id),
+                payee_account=cast(str, counterparty.account_id),
+                actor_id=actor.entity_id,
+                counterparty_id=counterparty.entity_id,
+                campaign_id=benign_campaign_id,
+                trace_id=trace_id,
+            )
+            benign_commands.extend(
+                (
+                    opening,
+                    AcceptA2A(
+                        payment_id,
+                        idempotency_key=(
+                            f"a2a.accept:{payment_id}:campaign:{benign_campaign_id}"
+                        ),
+                    ),
+                    PostA2A(
+                        payment_id,
+                        idempotency_key=(
+                            f"a2a.post:{payment_id}:campaign:{benign_campaign_id}"
+                        ),
+                    ),
+                )
+            )
+            activities.append(
+                BenignActivity(
+                    activity_id,
+                    shift,
+                    scheduled_at,
+                    actor.entity_id,
+                    counterparty.entity_id,
+                    activity_device.entity_id,
+                    location.entity_id,
+                    payment_id,
+                )
+            )
         return Population(
             scenario_id=bundle.scenario_id,
+            bundle=bundle,
             seed=self._seed,
             generated_at=owned_start,
             horizon_end=owned_start + timedelta(hours=bundle.duration_hours),
             entities=tuple(entities),
             relationships=tuple(relationships),
+            accounts=accounts,
             opening_balances=balances,
             benign_controls=("new_merchant", "shared_beneficiary", "shared_device", "travel"),
+            benign_activities=tuple(activities),
+            benign_commands=tuple(benign_commands),
         )
 
 
 __all__ = [
     "Population",
+    "BenignActivity",
+    "PopulationAccount",
     "PopulationEntity",
     "PopulationGenerator",
     "PopulationRelationship",

@@ -19,6 +19,7 @@ from apar.generators.campaigns import (
     CampaignGenerator,
     CampaignParams,
     GenerationConstraintError,
+    _CampaignEvaluator,
     campaign_bytes,
     motif_signature,
 )
@@ -85,6 +86,14 @@ def _params(family: str, **updates: object) -> CampaignParams:
         "max_delay_seconds": 300,
         "expected_motif": FAMILIES[family],
     }
+    if family == "agentic_intent_abuse":
+        values.update(
+            {
+                "payment_count": 25,
+                "target_illicit_rate": Decimal("0.92"),
+                "class_rate_tolerance": Decimal("0.01"),
+            }
+        )
     values.update(updates)
     return CampaignParams(**values)  # type: ignore[arg-type]
 
@@ -95,10 +104,9 @@ def test_campaign_has_declared_entities_and_motif(
     population: Population,
 ) -> None:
     params = _params(family)
-    generator = CampaignGenerator(seed=260_816)
-
-    commands = generator.generate(family, population, params)
-    evidence = generator.last_evidence
+    commands, evidence = _CampaignEvaluator(seed=260_816).generate(
+        family, population, params
+    )
 
     assert commands
     assert all(isinstance(command, Command) for command in commands)
@@ -121,16 +129,13 @@ def test_campaign_is_byte_reproducible_across_five_seeds(
 ) -> None:
     population = PopulationGenerator(seed=seed).generate(_bundle(seed))
     params = _params(family, seed=seed)
-    first_generator = CampaignGenerator(seed=seed)
-    second_generator = CampaignGenerator(seed=seed)
-
-    first = first_generator.generate(family, population, params)
-    second = second_generator.generate(family, population, params)
+    first, first_evidence = _CampaignEvaluator(seed=seed).generate(family, population, params)
+    second, second_evidence = _CampaignEvaluator(seed=seed).generate(family, population, params)
 
     assert campaign_bytes(first) == campaign_bytes(second)
     assert (
-        first_generator.last_evidence.canonical_bytes()
-        == second_generator.last_evidence.canonical_bytes()
+        first_evidence.canonical_bytes()
+        == second_evidence.canonical_bytes()
     )
 
 
@@ -140,9 +145,7 @@ def test_class_rate_value_and_schedule_constraints_are_visible_and_satisfied(
     population: Population,
 ) -> None:
     params = _params(family)
-    generator = CampaignGenerator(seed=901)
-    generator.generate(family, population, params)
-    evidence = generator.last_evidence
+    _, evidence = _CampaignEvaluator(seed=901).generate(family, population, params)
 
     assert abs(evidence.illicit_rate - params.target_illicit_rate) <= params.class_rate_tolerance
     assert abs(evidence.value_total - params.target_value_total) <= params.value_tolerance
@@ -180,13 +183,11 @@ def test_deep_family_signatures_are_distinct(population: Population) -> None:
 def test_card_testing_probes_are_low_value_before_a_tighter_success_burst(
     population: Population,
 ) -> None:
-    generator = CampaignGenerator(seed=81)
-    commands = generator.generate(
+    commands, evidence = _CampaignEvaluator(seed=81).generate(
         "card_testing_cnp",
         population,
         _params("card_testing_cnp"),
     )
-    evidence = generator.last_evidence
     probe_positions = [
         index for index, command in enumerate(commands) if type(command) is DeclineCardAuthorization
     ]
@@ -211,13 +212,11 @@ def test_card_testing_probes_are_low_value_before_a_tighter_success_burst(
 def test_a2a_cash_out_explicitly_names_upstream_settled_dependencies(
     population: Population,
 ) -> None:
-    generator = CampaignGenerator(seed=82)
-    commands = generator.generate(
+    commands, evidence = _CampaignEvaluator(seed=82).generate(
         "app_scam_mule",
         population,
         _params("app_scam_mule"),
     )
-    evidence = generator.last_evidence
     openings = [cast(A2ACommand, command) for command in commands if command.name == "a2a.initiate"]
     mule_accounts = {
         entity.account_id for entity in population.by_role("mule") if entity.account_id
@@ -236,30 +235,25 @@ def test_a2a_cash_out_explicitly_names_upstream_settled_dependencies(
 def test_agentic_family_covers_valid_and_bound_integrity_mutations(
     population: Population,
 ) -> None:
-    generator = CampaignGenerator(seed=83)
-    commands = generator.generate(
+    commands, evidence = _CampaignEvaluator(seed=83).generate(
         "agentic_intent_abuse", population, _params("agentic_intent_abuse")
     )
     requests = [
         command.request for command in commands if isinstance(command, AgenticPaymentCommand)
     ]
-    mutation_kinds = set(generator.last_evidence.mutation_kinds)
+    mutation_kinds = set(evidence.mutation_kinds)
 
-    assert generator.last_evidence.agentic_fixture is not None
+    assert evidence.agentic_fixture is not None
     assert {
-        "valid_control",
-        "consent_scope",
-        "merchant",
-        "payee",
-        "cart",
-        "intent",
-        "credential",
-        "authentication_evidence",
-        "nonce_replay",
+        "AGENT_IDENTITY_MISMATCH",
+        "SIGNATURE_INVALID",
+        "MANDATE_SCOPE_VIOLATION",
+        "NONCE_REPLAY",
+        "AUTHENTICATION_EVIDENCE_REPLAY",
     } <= mutation_kinds
     assert len({request.nonce for request in requests}) < len(requests)
     assert all(len(request.signature) == 64 for request in requests)
-    assert b"private" not in generator.last_evidence.canonical_bytes().lower()
+    assert b"private" not in evidence.canonical_bytes().lower()
 
 
 @pytest.mark.parametrize(
@@ -279,9 +273,9 @@ def test_generated_schedule_executes_through_real_rail_and_conserves_value(
 ) -> None:
     bundle = _bundle(seed, rail)
     population = PopulationGenerator(seed=seed).generate(bundle)
-    generator = CampaignGenerator(seed=seed)
-    commands = generator.generate(family, population, _params(family, seed=seed))
-    evidence = generator.last_evidence
+    commands, evidence = _CampaignEvaluator(seed=seed).generate(
+        family, population, _params(family, seed=seed)
+    )
     factory: AdapterFactory
     if rail is Rail.A2A:
 
@@ -348,8 +342,7 @@ def test_impossible_constraints_fail_after_exactly_100_attempts_without_partial_
 
     assert caught.value.code == "GENERATION_CONSTRAINT_UNSATISFIED"
     assert caught.value.attempts == 100
-    with pytest.raises(RuntimeError, match="no successful campaign"):
-        _ = generator.last_evidence
+    assert not hasattr(generator, "last_evidence")
 
     valid = _params("card_testing_cnp")
     after_failure = generator.generate("card_testing_cnp", population, valid)

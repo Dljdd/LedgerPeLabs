@@ -17,8 +17,13 @@ import numpy as np
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
+from apar.contracts.decisions import Action, ReasonCode
+from apar.contracts.events import EventKind, PaymentEvent, Rail
 from apar.generators.population import Population, PopulationEntity
 from apar.simulator.clock import Command
+from apar.simulator.engine import SimulationEngine
+from apar.simulator.ledger import AccountReference
+from apar.simulator.rails import A2ARailAdapter, AgenticRailAdapter, CardRailAdapter
 from apar.simulator.rails.a2a import (
     A2ACommand,
     AcceptA2A,
@@ -30,6 +35,7 @@ from apar.simulator.rails.a2a import (
     ReturnA2A,
 )
 from apar.simulator.rails.agentic import AgenticPaymentCommand
+from apar.simulator.rails.base import AdapterFactory
 from apar.simulator.rails.card import (
     AuthorizeCard,
     CardCommand,
@@ -48,6 +54,8 @@ from apar.trust.verifier import (
     AuthenticationEvidence,
     AuthenticationOutcome,
     AuthenticationRequirement,
+    ReceiptOutcome,
+    TrustVerifier,
 )
 
 APP_SCAM_MULE_MOTIF = "a2a:fan_in>layer>fan_out>cash_out"
@@ -64,6 +72,31 @@ _MOTIFS: Mapping[str, str] = MappingProxyType(
     }
 )
 _CENT = Decimal("0.01")
+_AGENTIC_MUTATIONS = (
+    "identity",
+    "signature",
+    "mandate",
+    "authority_identity",
+    "amount",
+    "currency",
+    "merchant",
+    "payee",
+    "category",
+    "product",
+    "cart",
+    "intent",
+    "credential",
+    "token_scope",
+    "consent",
+    "mandate_time",
+    "expiry",
+    "auth_missing",
+    "auth_mismatch",
+    "auth_expired",
+    "nonce_replay",
+    "receipt_chain",
+    "auth_replay",
+)
 
 
 def _text(label: str, value: object) -> str:
@@ -106,6 +139,14 @@ def _decimal_unit(label: str, value: object) -> Decimal:
     return number
 
 
+class CampaignParameterError(ValueError):
+    """Stable rejection for undeclared, ill-typed, or unbounded policy inputs."""
+
+    def __init__(self, message: str) -> None:
+        self.code = "CAMPAIGN_PARAMETER_INVALID"
+        super().__init__(f"{self.code}: {message}")
+
+
 @dataclass(frozen=True, slots=True)
 class CampaignParams:
     """Visible, bounded campaign variables available to later attacker policies."""
@@ -125,47 +166,112 @@ class CampaignParams:
     min_delay_seconds: int
     max_delay_seconds: int
     expected_motif: str
+    merchant_concentration: Decimal = Decimal("0.70")
+    device_reuse_rate: Decimal = Decimal("0.60")
+    retry_intensity: int = 2
+    mule_count: int = 2
+    mule_layers: int = 1
+    mule_fanout: int = 2
+    cash_out_fraction: Decimal = Decimal("0.30")
+    cash_out_strategy: str = "staged"
+    cash_out_delay_seconds: int = 600
+    recovery_probability: Decimal = Decimal("0.25")
+    agentic_mutations: tuple[str, ...] = _AGENTIC_MUTATIONS
+    agentic_attack_mix: Decimal = Decimal("0.92")
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "campaign_id", _uuid_text("campaign_id", self.campaign_id))
-        if type(self.seed) is not int:
-            raise TypeError("seed must be an exact integer")
-        for label in ("payment_count", "duration_hours", "query_budget", "min_delay_seconds"):
-            value = getattr(self, label)
-            if type(value) is not int or value <= 0:
-                raise TypeError(f"{label} must be a positive exact integer")
-        if (
-            type(self.max_delay_seconds) is not int
-            or self.max_delay_seconds < self.min_delay_seconds
-        ):
-            raise ValueError(
-                "max_delay_seconds must be an exact integer at least min_delay_seconds"
+        try:
+            object.__setattr__(
+                self,
+                "campaign_id",
+                _uuid_text("campaign_id", self.campaign_id),
             )
-        object.__setattr__(
-            self,
-            "target_illicit_rate",
-            _decimal_unit("target_illicit_rate", self.target_illicit_rate),
-        )
-        tolerance = _decimal_unit("class_rate_tolerance", self.class_rate_tolerance)
-        object.__setattr__(self, "class_rate_tolerance", tolerance)
-        target = _money("target_value_total", self.target_value_total, positive=True)
-        value_tolerance = _money("value_tolerance", self.value_tolerance, positive=False)
-        minimum = _money("min_amount", self.min_amount, positive=True)
-        maximum = _money("max_amount", self.max_amount, positive=True)
-        if maximum < minimum:
-            raise ValueError("max_amount must be at least min_amount")
-        object.__setattr__(self, "target_value_total", target)
-        object.__setattr__(self, "value_tolerance", value_tolerance)
-        object.__setattr__(self, "min_amount", minimum)
-        object.__setattr__(self, "max_amount", maximum)
-        if _text("currency", self.currency) != "USD":
-            raise ValueError("campaign generator currently supports USD only")
-        object.__setattr__(self, "expected_motif", _text("expected_motif", self.expected_motif))
+            if type(self.seed) is not int:
+                raise TypeError("seed must be an exact integer")
+            integer_bounds = {
+                "payment_count": (1, 256),
+                "duration_hours": (1, 720),
+                "query_budget": (1, 1000),
+                "min_delay_seconds": (1, 3600),
+                "max_delay_seconds": (1, 3600),
+                "retry_intensity": (0, 10),
+                "mule_count": (2, 16),
+                "mule_layers": (1, 5),
+                "mule_fanout": (1, 16),
+                "cash_out_delay_seconds": (1, 86_400),
+            }
+            for label, (minimum_bound, maximum_bound) in integer_bounds.items():
+                value = getattr(self, label)
+                if type(value) is not int or not minimum_bound <= value <= maximum_bound:
+                    raise TypeError(
+                        f"{label} must be an exact integer in "
+                        f"[{minimum_bound}, {maximum_bound}]"
+                    )
+            if self.max_delay_seconds < self.min_delay_seconds:
+                raise ValueError("max_delay_seconds must be at least min_delay_seconds")
+            for label in (
+                "target_illicit_rate",
+                "class_rate_tolerance",
+                "merchant_concentration",
+                "device_reuse_rate",
+                "cash_out_fraction",
+                "recovery_probability",
+                "agentic_attack_mix",
+            ):
+                object.__setattr__(self, label, _decimal_unit(label, getattr(self, label)))
+            target = _money("target_value_total", self.target_value_total, positive=True)
+            value_tolerance = _money("value_tolerance", self.value_tolerance, positive=False)
+            minimum = _money("min_amount", self.min_amount, positive=True)
+            maximum = _money("max_amount", self.max_amount, positive=True)
+            if target > Decimal("1000000.00"):
+                raise ValueError("target_value_total exceeds the visible cap")
+            if maximum > Decimal("100000.00") or maximum < minimum:
+                raise ValueError("amount bounds are invalid or exceed the visible cap")
+            object.__setattr__(self, "target_value_total", target)
+            object.__setattr__(self, "value_tolerance", value_tolerance)
+            object.__setattr__(self, "min_amount", minimum)
+            object.__setattr__(self, "max_amount", maximum)
+            if _text("currency", self.currency) != "USD":
+                raise ValueError("campaign generator currently supports USD only")
+            object.__setattr__(
+                self,
+                "expected_motif",
+                _text("expected_motif", self.expected_motif),
+            )
+            if self.cash_out_strategy not in {"staged", "burst", "delayed"}:
+                raise ValueError("cash_out_strategy is undeclared")
+            if type(self.agentic_mutations) is not tuple or any(
+                type(value) is not str for value in self.agentic_mutations
+            ):
+                raise TypeError("agentic_mutations must be an exact tuple of exact strings")
+            if (
+                len(set(self.agentic_mutations)) != len(self.agentic_mutations)
+                or not set(self.agentic_mutations) <= set(_AGENTIC_MUTATIONS)
+            ):
+                raise ValueError("agentic_mutations contains duplicates or undeclared values")
+        except (TypeError, ValueError) as error:
+            if isinstance(error, CampaignParameterError):
+                raise
+            raise CampaignParameterError(str(error)) from error
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, object]) -> CampaignParams:
+        """Validate policy output without accepting undeclared dimensions."""
+        if type(values) is not dict:
+            raise CampaignParameterError("campaign parameters must be an exact mapping")
+        declared = set(cls.__dataclass_fields__)
+        unknown = set(values) - declared
+        if unknown:
+            raise CampaignParameterError(f"undeclared fields: {sorted(unknown)}")
+        try:
+            return cls(**values)
+        except TypeError as error:
+            raise CampaignParameterError(str(error)) from error
 
 
 @dataclass(frozen=True, slots=True)
 class AgenticFixture:
-    """Public verifier inputs for synthetic requests; the private key never escapes."""
+    """Evaluator-owned verifier inputs; the synthetic private key never escapes."""
 
     agent_id: str
     key_id: str
@@ -188,7 +294,7 @@ class AgenticFixture:
 
 @dataclass(frozen=True, slots=True)
 class CampaignDependency:
-    """A downstream payment's explicit dependency on earlier settled inflows."""
+    """Evaluator evidence linking downstream payments to settled inflows."""
 
     payment_id: str
     upstream_payment_ids: tuple[str, ...]
@@ -206,7 +312,7 @@ class CampaignDependency:
 
 @dataclass(frozen=True, slots=True)
 class CampaignEvidence:
-    """Deterministic public proof that a generated campaign satisfies its bounds."""
+    """Evaluator-owned proof that a generated campaign satisfies concrete bounds."""
 
     family: str
     campaign_id: str
@@ -216,6 +322,9 @@ class CampaignEvidence:
     illicit_count: int
     illicit_rate: Decimal
     value_total: Decimal
+    attempted_value: Decimal
+    unique_attempted_value: Decimal
+    settled_value: Decimal
     schedule: tuple[datetime, ...]
     graph_digest: str
     schedule_digest: str
@@ -224,6 +333,10 @@ class CampaignEvidence:
     class_labels: tuple[bool, ...]
     mutation_kinds: tuple[str, ...]
     dependencies: tuple[CampaignDependency, ...]
+    observed_reasons: tuple[ReasonCode | None, ...]
+    valid_control_count: int
+    replay_succeeded: bool
+    ledger_conserved: bool
     attempts: int
     agentic_fixture: AgenticFixture | None = None
 
@@ -245,6 +358,9 @@ class CampaignEvidence:
             raise ValueError("illicit_count must be an exact bounded integer")
         _decimal_unit("illicit_rate", self.illicit_rate)
         _money("value_total", self.value_total, positive=True)
+        _money("attempted_value", self.attempted_value, positive=True)
+        _money("unique_attempted_value", self.unique_attempted_value, positive=True)
+        _money("settled_value", self.settled_value, positive=False)
         if type(self.schedule) is not tuple or len(self.schedule) != self.command_count:
             raise ValueError("schedule must contain one timestamp per command")
         for timestamp in self.schedule:
@@ -274,11 +390,20 @@ class CampaignEvidence:
             raise TypeError("dependencies must contain exact CampaignDependency records")
         if len({item.payment_id for item in self.dependencies}) != len(self.dependencies):
             raise ValueError("dependency payment IDs must be unique")
+        if type(self.observed_reasons) is not tuple or any(
+            reason is not None and type(reason) is not ReasonCode
+            for reason in self.observed_reasons
+        ):
+            raise TypeError("observed_reasons must contain exact ReasonCode values or None")
+        if type(self.valid_control_count) is not int or self.valid_control_count < 0:
+            raise TypeError("valid_control_count must be a non-negative exact integer")
+        if type(self.replay_succeeded) is not bool or type(self.ledger_conserved) is not bool:
+            raise TypeError("replay flags must be exact booleans")
         if self.agentic_fixture is not None and type(self.agentic_fixture) is not AgenticFixture:
             raise TypeError("agentic_fixture must be an exact AgenticFixture or None")
 
     def canonical_bytes(self) -> bytes:
-        """Return canonical JSON containing public evidence and public keys only."""
+        """Return canonical evaluator JSON containing no private signing key."""
         fixture: dict[str, object] | None = None
         if self.agentic_fixture is not None:
             fixture = {
@@ -301,6 +426,9 @@ class CampaignEvidence:
             "illicit_count": self.illicit_count,
             "illicit_rate": str(self.illicit_rate),
             "value_total": str(self.value_total),
+            "attempted_value": str(self.attempted_value),
+            "unique_attempted_value": str(self.unique_attempted_value),
+            "settled_value": str(self.settled_value),
             "schedule": [item.isoformat().replace("+00:00", "Z") for item in self.schedule],
             "graph_digest": self.graph_digest,
             "schedule_digest": self.schedule_digest,
@@ -315,6 +443,13 @@ class CampaignEvidence:
                 }
                 for item in self.dependencies
             ],
+            "observed_reasons": [
+                reason.value if reason is not None else None
+                for reason in self.observed_reasons
+            ],
+            "valid_control_count": self.valid_control_count,
+            "replay_succeeded": self.replay_succeeded,
+            "ledger_conserved": self.ledger_conserved,
             "attempts": self.attempts,
             "agentic_fixture": fixture,
         }
@@ -374,21 +509,93 @@ def motif_signature(commands: tuple[Command, ...]) -> str:
         raise ValueError("commands must be a non-empty exact tuple")
     if all(isinstance(command, A2ACommand) for command in commands):
         opens = [command for command in commands if type(command) is InitiateA2A]
+        histories = _operation_histories(commands)
+        if not opens or any(
+            operations[:3] != ("initiate", "accept", "post")
+            for operations in histories.values()
+        ):
+            raise ValueError("A2A motif requires complete initiated-to-posted lifecycles")
         payees = [cast(str, command.payload["payee_account"]) for command in opens]
         payers = [cast(str, command.payload["payer_account"]) for command in opens]
-        if len(set(payees)) < len(payees) and set(payees) & set(payers):
+        bridges = set(payees) & set(payers)
+        layer_edges = [
+            command
+            for command in opens
+            if command.payload["payer_account"] in bridges
+            and command.payload["payee_account"] in bridges
+        ]
+        fan_in = max((payees.count(account) for account in bridges), default=0)
+        fan_out = max((payers.count(account) for account in bridges), default=0)
+        if len(bridges) >= 2 and layer_edges and fan_in >= 2 and fan_out >= 2:
             return APP_SCAM_MULE_MOTIF
     if all(isinstance(command, CardCommand) for command in commands):
-        types = {type(command) for command in commands}
-        if RefundCard in types and ChargebackCard in types and RecoverCard in types:
+        histories = _operation_histories(commands)
+        card_opens = [
+            cast(CardCommand, command)
+            for command in commands
+            if type(command) in {AuthorizeCard, DeclineCardAuthorization}
+        ]
+        if not card_opens:
+            raise ValueError("card motif requires opening attempts")
+        operations = tuple(histories.values())
+        refund_path = ("authorize", "clear", "settle", "refund")
+        chargeback_path = (
+            "authorize",
+            "clear",
+            "settle",
+            "report",
+            "dispute",
+            "chargeback",
+            "recover",
+        )
+        if refund_path in operations and chargeback_path in operations and all(
+            path in {refund_path, chargeback_path} for path in operations
+        ):
             return SYNTHETIC_MERCHANT_REFUND_MOTIF
-        if DeclineCardAuthorization in types and SettleCard in types:
+        declines = [
+            command
+            for command in card_opens
+            if type(command) is DeclineCardAuthorization
+        ]
+        successes = [
+            command
+            for command in card_opens
+            if type(command) is AuthorizeCard
+        ]
+        success_path = ("authorize", "clear", "settle")
+        if (
+            declines
+            and successes
+            and all(histories[command.payment_id] == ("decline",) for command in declines)
+            and all(histories[command.payment_id] == success_path for command in successes)
+            and max(cast(Decimal, command.payload["amount"]) for command in declines)
+            < min(cast(Decimal, command.payload["amount"]) for command in successes)
+            and len({command.payload["payer_account"] for command in card_opens}) >= 2
+            and len({command.payload["payee_account"] for command in card_opens})
+            < len(card_opens)
+        ):
             return CARD_TESTING_CNP_MOTIF
     if all(isinstance(command, AgenticPaymentCommand) for command in commands):
         requests = [cast(AgenticPaymentCommand, command).request for command in commands]
-        if len({request.nonce for request in requests}) < len(requests):
+        if (
+            len(requests) >= 3
+            and len({request.request_id for request in requests}) == len(requests)
+            and len({request.nonce for request in requests}) < len(requests)
+            and len({request.signature for request in requests}) == len(requests)
+        ):
             return AGENTIC_INTENT_ABUSE_MOTIF
     raise ValueError("campaign commands do not satisfy a supported deep motif")
+
+
+def _operation_histories(commands: tuple[Command, ...]) -> dict[str, tuple[str, ...]]:
+    histories: dict[str, list[str]] = {}
+    for command in commands:
+        payment_id = getattr(command, "payment_id", None)
+        if type(payment_id) is not str:
+            raise ValueError("campaign command lacks a payment_id")
+        operation = command.name.split(".", 1)[1]
+        histories.setdefault(payment_id, []).append(operation)
+    return {payment_id: tuple(operations) for payment_id, operations in histories.items()}
 
 
 class CampaignGenerator:
@@ -399,13 +606,6 @@ class CampaignGenerator:
             raise TypeError("seed must be an exact integer")
         self._seed = seed
         self._rng = np.random.default_rng(seed)
-        self._last_evidence: CampaignEvidence | None = None
-
-    @property
-    def last_evidence(self) -> CampaignEvidence:
-        if self._last_evidence is None:
-            raise RuntimeError("no successful campaign generation evidence is available")
-        return self._last_evidence
 
     def generate(
         self,
@@ -413,7 +613,17 @@ class CampaignGenerator:
         population: Population,
         params: CampaignParams,
     ) -> tuple[Command, ...]:
-        """Return public rail commands or fail atomically after exactly 100 attempts."""
+        """Return only commands; evaluator audit data is deliberately discarded."""
+        commands, _audit = self._generate_audited(family, population, params)
+        return commands
+
+    def _generate_audited(
+        self,
+        family: str,
+        population: Population,
+        params: CampaignParams,
+    ) -> tuple[tuple[Command, ...], CampaignEvidence]:
+        """Evaluator-owned generation path, outside the policy-facing surface."""
         checked_family = _text("family", family)
         if checked_family not in _MOTIFS:
             raise ValueError(f"unsupported campaign family: {checked_family}")
@@ -421,7 +631,6 @@ class CampaignGenerator:
             raise TypeError("population must be an exact Population")
         if type(params) is not CampaignParams:
             raise TypeError("params must be an exact CampaignParams")
-        self._last_evidence = None
         prior_state = deepcopy(self._rng.bit_generator.state)
         campaign_tail = int(params.campaign_id.replace("-", "")[-16:], 16)
         composite_seed = self._seed ^ params.seed ^ campaign_tail
@@ -436,10 +645,14 @@ class CampaignGenerator:
                     params,
                 )
                 amounts = self._sample_amounts(params)
-                if checked_family == "card_testing_cnp":
+                if checked_family == "app_scam_mule":
+                    amounts = self._app_amounts(plans, params)
+                elif checked_family == "card_testing_cnp":
                     amounts = tuple(sorted(amounts))
+                elif checked_family == "agentic_intent_abuse":
+                    amounts = self._agentic_amounts(plans, params)
                 commands, fixture = self._materialize(
-                    checked_family, plans, amounts, population, params
+                    checked_family, plans, amounts, schedule, population, params
                 )
                 evidence = self._validate_candidate(
                     checked_family,
@@ -452,10 +665,9 @@ class CampaignGenerator:
                     attempt,
                     fixture,
                 )
-            except (ArithmeticError, TypeError, ValueError):
+            except (ArithmeticError, RuntimeError, TypeError, ValueError):
                 continue
-            self._last_evidence = evidence
-            return commands
+            return commands, evidence
         self._rng.bit_generator.state = prior_state
         raise GenerationConstraintError(100)
 
@@ -471,7 +683,7 @@ class CampaignGenerator:
         victims = self._accounts(population, "victim", "consumer", "organization")
         merchants = self._accounts(population, "merchant", "beneficiary")
         mules = self._accounts(population, "mule")
-        attackers = self._accounts(population, "attacker", "synthetic_merchant")
+        attackers = self._accounts(population, "attacker")
         agents = self._accounts(population, "agent")
         synthetic_merchants = self._accounts(population, "synthetic_merchant")
         plans: list[_PaymentPlan] = []
@@ -480,63 +692,131 @@ class CampaignGenerator:
             payment_id = f"{family}:{uuid5(namespace, f'payment:{index}')}"
             illicit = labels[index]
             if family == "app_scam_mule":
-                incoming_count = max(2, (params.payment_count * 2) // 3)
+                attack_count = illicit_count
+                selected_mules = mules[: params.mule_count]
+                layer_count = params.mule_layers
+                fanout_count = params.mule_fanout
+                incoming_count = attack_count - layer_count - fanout_count
+                if (
+                    len(selected_mules) < layer_count + 1
+                    or incoming_count < 2
+                    or attack_count > params.payment_count
+                ):
+                    raise ValueError("APP motif cannot satisfy declared mule topology")
                 if index < incoming_count:
                     actor = victims[index % len(victims)]
-                    counterparty = mules[0]
+                    counterparty = selected_mules[0]
                     stages: tuple[str, ...] = ("initiate", "accept", "post")
-                    if index == 0:
-                        stages += ("report", "freeze", "recover")
-                else:
-                    actor = mules[0]
+                elif index < incoming_count + layer_count:
+                    layer_index = index - incoming_count
+                    actor = selected_mules[layer_index]
+                    counterparty = selected_mules[layer_index + 1]
+                    stages = ("initiate", "accept", "post")
+                elif index < attack_count:
+                    fanout_index = index - incoming_count - layer_count
+                    actor = selected_mules[
+                        fanout_index % (layer_count + 1)
+                    ]
                     counterparty = attackers[index % len(attackers)]
                     stages = ("initiate", "accept", "post")
-                    if index == params.payment_count - 1:
-                        stages += ("return",)
+                    if index == attack_count - 1:
+                        stages += ("report", "freeze", "recover")
+                else:
+                    actor = victims[index % len(victims)]
+                    counterparty = merchants[index % len(merchants)]
+                    stages = ("initiate", "accept", "post", "return")
             elif family == "card_testing_cnp":
-                actor = victims[index % min(2, len(victims))]
-                counterparty = merchants[0]
-                stages = (
-                    ("decline",)
-                    if index < max(2, params.payment_count // 3)
-                    else (
-                        "authorize",
-                        "clear",
-                        "settle",
+                if illicit:
+                    actor_span = max(
+                        2,
+                        min(
+                            len(attackers),
+                            round(
+                                2
+                                + (len(attackers) - 2)
+                                * float(1 - params.device_reuse_rate)
+                            ),
+                        ),
                     )
-                )
+                    actor = attackers[index % actor_span]
+                    concentrated = max(
+                        1,
+                        round(
+                            len(merchants)
+                            * float(1 - params.merchant_concentration)
+                        ),
+                    )
+                    counterparty = merchants[index % concentrated]
+                    decline_count = max(
+                        1,
+                        min(illicit_count - 1, max(1, params.retry_intensity)),
+                    )
+                    stages = (
+                        ("decline",)
+                        if index < decline_count
+                        else ("authorize", "clear", "settle")
+                    )
+                else:
+                    actor = victims[index % len(victims)]
+                    counterparty = merchants[
+                        (index - illicit_count) % len(merchants)
+                    ]
+                    stages = ("authorize", "clear", "settle")
             elif family == "synthetic_merchant_refund":
-                actor = victims[index % len(victims)]
-                counterparty = synthetic_merchants[0]
-                stages = (
-                    ("authorize", "clear", "settle", "refund")
-                    if index % 2 == 0
-                    else (
-                        "authorize",
-                        "clear",
-                        "settle",
-                        "report",
-                        "dispute",
-                        "chargeback",
-                        "recover",
-                    )
+                actor = (
+                    attackers[index % len(attackers)]
+                    if illicit
+                    else victims[index % len(victims)]
                 )
+                counterparty = (
+                    synthetic_merchants[0] if illicit else merchants[index % len(merchants)]
+                )
+                if illicit:
+                    recovered_count = max(
+                        1,
+                        min(
+                            illicit_count - 1,
+                            round(
+                                Decimal(illicit_count)
+                                * params.recovery_probability
+                            ),
+                        ),
+                    )
+                    stages = (
+                        (
+                            "authorize",
+                            "clear",
+                            "settle",
+                            "report",
+                            "dispute",
+                            "chargeback",
+                            "recover",
+                        )
+                        if index < recovered_count
+                        else ("authorize", "clear", "settle", "refund")
+                    )
+                else:
+                    stages = ("authorize", "clear", "settle", "refund")
             else:
+                isolated = tuple(
+                    mutation
+                    for mutation in params.agentic_mutations
+                    if mutation not in {"nonce_replay", "auth_replay"}
+                )
                 mutation_cycle = (
                     "valid_control",
-                    "consent_scope",
-                    "merchant",
-                    "payee",
-                    "cart",
-                    "intent",
-                    "credential",
-                    "authentication_evidence",
+                    *isolated,
                     "valid_control",
                     "nonce_replay",
+                    "auth_replay",
                 )
-                kind = mutation_cycle[index % len(mutation_cycle)]
+                kind = (
+                    mutation_cycle[index]
+                    if index < len(mutation_cycle)
+                    else "valid_control"
+                )
                 actor = agents[0]
-                counterparty = attackers[0] if kind == "payee" else merchants[0]
+                counterparty = merchants[0]
                 plans.append(
                     _PaymentPlan(
                         payment_id,
@@ -583,8 +863,12 @@ class CampaignGenerator:
     ) -> tuple[datetime, ...]:
         schedule: list[datetime] = []
         current = population.generated_at
+        horizon = min(
+            population.horizon_end,
+            population.generated_at + timedelta(hours=params.duration_hours),
+        )
         for plan in plans:
-            for _stage in plan.stages:
+            for stage_index, _stage in enumerate(plan.stages):
                 delay_low = params.min_delay_seconds
                 delay_high = params.max_delay_seconds
                 if family == "card_testing_cnp":
@@ -593,6 +877,24 @@ class CampaignGenerator:
                         delay_low = params.min_delay_seconds + (span * 2) // 3
                     else:
                         delay_high = params.min_delay_seconds + max(1, span // 4)
+                if (
+                    family == "app_scam_mule"
+                    and stage_index == 0
+                    and plan.actor.role == "mule"
+                    and plan.counterparty.role in {"attacker", "synthetic_merchant"}
+                ):
+                    if params.cash_out_strategy == "burst":
+                        delay_low = params.min_delay_seconds
+                        delay_high = params.min_delay_seconds
+                    elif params.cash_out_strategy == "delayed":
+                        delay_low = params.cash_out_delay_seconds
+                        delay_high = params.cash_out_delay_seconds
+                    else:
+                        delay_low = max(
+                            params.min_delay_seconds,
+                            params.cash_out_delay_seconds // params.mule_fanout,
+                        )
+                        delay_high = params.cash_out_delay_seconds
                 delay = int(
                     self._rng.integers(
                         delay_low,
@@ -600,6 +902,8 @@ class CampaignGenerator:
                     )
                 )
                 current += timedelta(seconds=delay)
+                if current > horizon:
+                    raise ValueError("campaign schedule exceeds a declared horizon")
                 schedule.append(current)
         return tuple(schedule)
 
@@ -633,16 +937,134 @@ class CampaignGenerator:
                 break
         return tuple((Decimal(int(value)) * _CENT).quantize(_CENT) for value in raw)
 
+    def _app_amounts(
+        self,
+        plans: tuple[_PaymentPlan, ...],
+        params: CampaignParams,
+    ) -> tuple[Decimal, ...]:
+        """Make the visible cash-out fraction alter concrete economic flow."""
+        cash_indices = tuple(
+            index
+            for index, plan in enumerate(plans)
+            if plan.actor.role == "mule" and plan.counterparty.role == "attacker"
+        )
+        cash_set = set(cash_indices)
+        layer_indices = tuple(
+            index
+            for index, plan in enumerate(plans)
+            if plan.actor.role == "mule" and plan.counterparty.role == "mule"
+        )
+        inbound_indices = tuple(
+            index
+            for index, plan in enumerate(plans)
+            if plan.actor.role != "mule" and plan.counterparty.role == "mule"
+        )
+        benign_indices = tuple(
+            index
+            for index in range(len(plans))
+            if index not in cash_set
+            and index not in set(layer_indices)
+            and index not in set(inbound_indices)
+        )
+        if not cash_indices or not layer_indices or not inbound_indices:
+            raise ValueError("APP topology requires cash-out and funding payments")
+        cash_target = (params.target_value_total * params.cash_out_fraction).quantize(
+            _CENT,
+            rounding=ROUND_HALF_EVEN,
+        )
+        if not (
+            params.min_amount * len(cash_indices)
+            <= cash_target
+            <= params.max_amount * len(cash_indices)
+        ):
+            raise ValueError("APP cash-out fraction is infeasible under amount bounds")
+        values = [params.min_amount for _plan in plans]
+        cash_remainder = cash_target - params.min_amount * len(cash_indices)
+        for index in cash_indices:
+            change = min(params.max_amount - values[index], cash_remainder)
+            values[index] += change
+            cash_remainder -= change
+
+        # Fund every downstream mule constructively, walking layer edges backwards.
+        required_outflow: dict[str, Decimal] = {}
+        for index in cash_indices:
+            account = plans[index].payer_account
+            required_outflow[account] = (
+                required_outflow.get(account, Decimal("0.00"))
+                + values[index]
+            )
+        for index in reversed(layer_indices):
+            plan = plans[index]
+            required = required_outflow.get(plan.payee_account, Decimal("0.00"))
+            values[index] = max(params.min_amount, required)
+            if values[index] > params.max_amount:
+                raise ValueError("APP layer cannot fund declared downstream cash-out")
+            required_outflow[plan.payer_account] = (
+                required_outflow.get(plan.payer_account, Decimal("0.00"))
+                + values[index]
+            )
+
+        root_account = plans[inbound_indices[0]].payee_account
+        root_required = required_outflow.get(root_account, Decimal("0.00"))
+        inbound_remainder = root_required - params.min_amount * len(inbound_indices)
+        for index in inbound_indices:
+            if inbound_remainder <= 0:
+                break
+            change = min(params.max_amount - values[index], inbound_remainder)
+            values[index] += change
+            inbound_remainder -= change
+        if inbound_remainder > 0:
+            raise ValueError("APP fan-in cannot fund declared mule outflows")
+
+        remainder = params.target_value_total - sum(values, Decimal("0.00"))
+        for index in (*benign_indices, *inbound_indices):
+            if remainder <= 0:
+                break
+            change = min(params.max_amount - values[index], remainder)
+            values[index] += change
+            remainder -= change
+        if remainder != 0:
+            raise ValueError("APP exact value target is infeasible after economic funding")
+        return tuple(value.quantize(_CENT) for value in values)
+
+    def _agentic_amounts(
+        self,
+        plans: tuple[_PaymentPlan, ...],
+        params: CampaignParams,
+    ) -> tuple[Decimal, ...]:
+        """Allocate one isolated over-limit leaf while preserving the exact total."""
+        amount_index = next(
+            (index for index, plan in enumerate(plans) if plan.mutation_kind == "amount"),
+            None,
+        )
+        if amount_index is None or params.max_amount - _CENT < params.min_amount:
+            raise ValueError("agentic amount mutation requires a visible bounded interval")
+        cap = params.max_amount - _CENT
+        values = [params.min_amount for _plan in plans]
+        values[amount_index] = params.max_amount
+        remainder = params.target_value_total - sum(values, Decimal("0.00"))
+        for index in self._rng.permutation(len(values)):
+            checked_index = int(index)
+            if checked_index == amount_index or remainder <= 0:
+                continue
+            change = min(cap - values[checked_index], remainder)
+            values[checked_index] += change
+            remainder -= change
+        if remainder != 0:
+            raise ValueError("agentic value target is infeasible under isolated amount bounds")
+        return tuple(value.quantize(_CENT) for value in values)
+
     def _materialize(
         self,
         family: str,
         plans: tuple[_PaymentPlan, ...],
         amounts: tuple[Decimal, ...],
+        schedule: tuple[datetime, ...],
         population: Population,
         params: CampaignParams,
     ) -> tuple[tuple[Command, ...], AgenticFixture | None]:
         if family == "agentic_intent_abuse":
-            return self._materialize_agentic(plans, amounts, population, params)
+            return self._materialize_agentic(plans, amounts, schedule, population, params)
         commands: list[Command] = []
         for index, (plan, amount) in enumerate(zip(plans, amounts, strict=True)):
             trace_id = self._derived_uuid(params, f"trace:{index}")
@@ -733,9 +1155,12 @@ class CampaignGenerator:
         self,
         plans: tuple[_PaymentPlan, ...],
         amounts: tuple[Decimal, ...],
+        schedule: tuple[datetime, ...],
         population: Population,
         params: CampaignParams,
     ) -> tuple[tuple[Command, ...], AgenticFixture]:
+        if len(plans) < 25 or len(schedule) != len(plans):
+            raise ValueError("agentic matrix requires 23 isolated attacks and two controls")
         private_key = Ed25519PrivateKey.from_private_bytes(self._rng.bytes(32))
         public_key = private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
         agent_id = f"synthetic-agent-{plans[0].actor.entity_id}"
@@ -745,6 +1170,8 @@ class CampaignGenerator:
             for entity in population.entities
             if entity.role == "merchant" and entity.account_id
         )
+        attackers = self._accounts(population, "attacker")
+        mandate_cap = params.max_amount - _CENT
         mandate = AgentMandate(
             mandate_id=f"mandate-{params.campaign_id}",
             version=1,
@@ -762,98 +1189,162 @@ class CampaignGenerator:
             credential_id="synthetic-token-1",
             credential_scope="single_merchant_single_use",
             required_authentication=AuthenticationRequirement.STEP_UP,
-            max_amount=params.max_amount,
+            max_amount=mandate_cap,
             currency=params.currency,
-            issued_at=population.generated_at - timedelta(hours=1),
-            expires_at=population.generated_at + timedelta(hours=params.duration_hours + 1),
+            issued_at=population.generated_at,
+            expires_at=min(
+                population.horizon_end,
+                population.generated_at + timedelta(hours=params.duration_hours),
+            ),
         )
-        commands: list[Command] = []
+        base_created = tuple(timestamp - timedelta(seconds=1) for timestamp in schedule)
+        base_expires = tuple(
+            min(timestamp + timedelta(seconds=30), mandate.expires_at)
+            for timestamp in schedule
+        )
         evidence: list[AuthenticationEvidence] = []
-        first_request: AgentPaymentRequest | None = None
-        for index, (plan, amount) in enumerate(zip(plans, amounts, strict=True)):
-            if plan.mutation_kind == "nonce_replay" and first_request is not None:
-                commands.append(
-                    AgenticPaymentCommand(
-                        first_request,
-                        payer_account=first_request.mandate.user_ref,
-                        payee_account=first_request.payee_id,
-                    )
-                )
+        first_control_index = next(
+            index for index, plan in enumerate(plans) if plan.mutation_kind == "valid_control"
+        )
+        first_auth_ref = f"synthetic-auth-{first_control_index}"
+        first_nonce = f"synthetic-nonce-{first_control_index}"
+        for index, plan in enumerate(plans):
+            kind = plan.mutation_kind
+            if kind == "auth_missing":
                 continue
             request_id = f"agentic-request-{index}"
-            nonce = f"synthetic-nonce-{index}"
-            merchant_id = mandate.merchant_id
-            payee_id = mandate.payee_id
-            cart_hash = mandate.cart_hash
-            intent_hash = mandate.payment_intent_hash
-            credential_id = mandate.credential_id
-            credential_scope = mandate.credential_scope
-            consent_ref = mandate.consent_ref
-            auth_ref: str | None = f"synthetic-auth-{index}"
-            effective_amount = amount
-            if plan.mutation_kind == "consent_scope":
-                consent_ref = "synthetic-consent-substituted"
-            elif plan.mutation_kind == "merchant":
-                merchant_id = plan.counterparty.entity_id
-            elif plan.mutation_kind == "payee":
-                payee_id = plan.payee_account
-            elif plan.mutation_kind == "cart":
-                cart_hash = hashlib.sha256(f"mutated-cart-{index}".encode()).hexdigest()
-            elif plan.mutation_kind == "intent":
-                intent_hash = hashlib.sha256(f"mutated-intent-{index}".encode()).hexdigest()
-            elif plan.mutation_kind == "credential":
-                credential_id = "synthetic-token-substituted"
-                credential_scope = "unbounded"
-            elif plan.mutation_kind == "authentication_evidence":
-                auth_ref = "synthetic-auth-missing"
+            nonce = first_nonce if kind == "nonce_replay" else f"synthetic-nonce-{index}"
+            auth_ref = first_auth_ref if kind == "auth_replay" else f"synthetic-auth-{index}"
+            if kind == "auth_replay":
+                continue
+            intent_hash = (
+                hashlib.sha256(f"mutated-intent-{index}".encode()).hexdigest()
+                if kind == "intent"
+                else mandate.payment_intent_hash
+            )
+            issued_at = base_created[index] - timedelta(seconds=1)
+            expires_at = base_expires[index]
+            evidence_nonce = "mismatched-nonce" if kind == "auth_mismatch" else nonce
+            if kind == "auth_expired":
+                issued_at = schedule[index] - timedelta(seconds=2)
+                expires_at = schedule[index] - timedelta(seconds=1)
+            evidence.append(
+                AuthenticationEvidence(
+                    evidence_id=auth_ref,
+                    agent_id=agent_id,
+                    user_ref=mandate.user_ref,
+                    mandate_id=mandate.mandate_id,
+                    nonce=evidence_nonce,
+                    payment_intent_hash=intent_hash,
+                    request_id=request_id,
+                    outcome=AuthenticationOutcome.STEP_UP_VERIFIED,
+                    issued_at=issued_at,
+                    expires_at=expires_at,
+                )
+            )
+
+        chain_verifier = TrustVerifier(
+            registered_agents={(agent_id, key_id): public_key},
+            mandates={mandate.mandate_id: mandate},
+            authentication_evidence={item.evidence_id: item for item in evidence},
+        )
+        commands: list[Command] = []
+        previous_receipt = ""
+        for index, (plan, amount) in enumerate(zip(plans, amounts, strict=True)):
+            kind = plan.mutation_kind
+            request_id = f"agentic-request-{index}"
+            nonce = first_nonce if kind == "nonce_replay" else f"synthetic-nonce-{index}"
+            auth_ref = first_auth_ref if kind == "auth_replay" else f"synthetic-auth-{index}"
+            request_mandate = (
+                mandate.model_copy(update={"consent_ref": "substituted-mandate-consent"})
+                if kind == "mandate"
+                else mandate
+            )
+            request_agent = "unregistered-synthetic-agent" if kind == "identity" else agent_id
+            request_key = "unregistered-key" if kind == "identity" else key_id
+            actor_id = (
+                attackers[0].entity_id
+                if kind == "authority_identity"
+                else plan.actor.entity_id
+            )
+            merchant_id = attackers[0].entity_id if kind == "merchant" else mandate.merchant_id
+            payee_id = cast(str, attackers[0].account_id) if kind == "payee" else mandate.payee_id
+            created_at = base_created[index]
+            expires_at = base_expires[index]
+            if kind == "mandate_time":
+                created_at = mandate.issued_at - timedelta(seconds=2)
+                expires_at = mandate.issued_at + timedelta(seconds=1)
+            elif kind == "expiry":
+                expires_at = schedule[index]
+            prior_hash = "f" * 64 if kind == "receipt_chain" else previous_receipt
             unsigned = AgentPaymentRequest(
                 request_id=request_id,
                 payment_id=plan.payment_id,
-                agent_id=agent_id,
-                key_id=key_id,
-                mandate=mandate,
-                amount=effective_amount,
-                currency=params.currency,
+                agent_id=request_agent,
+                key_id=request_key,
+                mandate=request_mandate,
+                amount=amount,
+                currency="EUR" if kind == "currency" else params.currency,
                 merchant_id=merchant_id,
                 payee_id=payee_id,
-                cart_hash=cart_hash,
-                payment_intent_hash=intent_hash,
-                category="TRAVEL",
-                product_id="synthetic-flight",
-                credential_id=credential_id,
-                credential_scope=credential_scope,
-                consent_ref=consent_ref,
-                authentication_evidence_ref=auth_ref,
+                cart_hash=(
+                    hashlib.sha256(f"mutated-cart-{index}".encode()).hexdigest()
+                    if kind == "cart"
+                    else mandate.cart_hash
+                ),
+                payment_intent_hash=(
+                    hashlib.sha256(f"mutated-intent-{index}".encode()).hexdigest()
+                    if kind == "intent"
+                    else mandate.payment_intent_hash
+                ),
+                category="RETAIL" if kind == "category" else "TRAVEL",
+                product_id="substituted-product" if kind == "product" else "synthetic-flight",
+                credential_id=(
+                    "synthetic-token-substituted"
+                    if kind == "credential"
+                    else mandate.credential_id
+                ),
+                credential_scope=(
+                    "multi_merchant_reusable"
+                    if kind == "token_scope"
+                    else mandate.credential_scope
+                ),
+                consent_ref=(
+                    "synthetic-consent-substituted"
+                    if kind == "consent"
+                    else mandate.consent_ref
+                ),
+                authentication_evidence_ref=(
+                    "synthetic-auth-missing" if kind == "auth_missing" else auth_ref
+                ),
                 nonce=nonce,
-                created_at=population.generated_at + timedelta(minutes=index),
-                expires_at=population.generated_at + timedelta(minutes=index + 5),
-                prior_receipt_hash="",
+                created_at=created_at,
+                expires_at=expires_at,
+                prior_receipt_hash=prior_hash,
                 campaign_id=params.campaign_id,
                 trace_id=self._derived_uuid(params, f"agentic-trace:{index}"),
-                actor_id=plan.actor.entity_id,
-                counterparty_id=plan.counterparty.entity_id,
+                actor_id=actor_id,
+                counterparty_id=merchant.entity_id,
                 signature=b"",
             )
             request = unsigned.model_copy(
                 update={"signature": private_key.sign(unsigned.signing_bytes())}
             )
-            if first_request is None:
-                first_request = request
-            if auth_ref is not None and plan.mutation_kind != "authentication_evidence":
-                evidence.append(
-                    AuthenticationEvidence(
-                        evidence_id=auth_ref,
-                        agent_id=agent_id,
-                        user_ref=mandate.user_ref,
-                        mandate_id=mandate.mandate_id,
-                        nonce=nonce,
-                        payment_intent_hash=intent_hash,
-                        request_id=request_id,
-                        outcome=AuthenticationOutcome.STEP_UP_VERIFIED,
-                        issued_at=unsigned.created_at - timedelta(seconds=5),
-                        expires_at=unsigned.created_at + timedelta(minutes=2),
-                    )
+            if kind == "signature":
+                request = request.model_copy(update={"signature": bytes(64)})
+            if kind == "valid_control":
+                preview = chain_verifier.preview(request, schedule[index])
+                if not preview.allowed:
+                    raise ValueError("agentic control failed during chain construction")
+                receipt = chain_verifier.commit(
+                    request,
+                    preview,
+                    ReceiptOutcome.APPROVE,
+                    schedule[index],
                 )
+                if not receipt.allowed:
+                    raise ValueError("agentic control could not commit its receipt")
+                previous_receipt = receipt.receipt_hash
             commands.append(
                 AgenticPaymentCommand(
                     request,
@@ -869,6 +1360,65 @@ class CampaignGenerator:
             tuple(evidence),
         )
 
+    @staticmethod
+    def _dry_replay(
+        family: str,
+        commands: tuple[Command, ...],
+        schedule: tuple[datetime, ...],
+        population: Population,
+        fixture: AgenticFixture | None,
+    ) -> tuple[PaymentEvent, ...]:
+        """Execute a candidate through a fresh production rail before acceptance."""
+        factory: AdapterFactory
+        if family == "app_scam_mule":
+            rail = Rail.A2A
+
+            def a2a_factory() -> A2ARailAdapter:
+                return A2ARailAdapter()
+
+            factory = a2a_factory
+        elif family in {"card_testing_cnp", "synthetic_merchant_refund"}:
+            rail = Rail.CARD
+
+            def card_factory() -> CardRailAdapter:
+                return CardRailAdapter()
+
+            factory = card_factory
+        else:
+            rail = Rail.AGENTIC
+            if fixture is None:
+                raise ValueError("agentic replay requires evaluator-owned verifier inputs")
+
+            def agentic_factory() -> AgenticRailAdapter:
+                verifier = TrustVerifier(
+                    registered_agents={(fixture.agent_id, fixture.key_id): fixture.public_key},
+                    mandates={fixture.mandate.mandate_id: fixture.mandate},
+                    authentication_evidence={
+                        item.evidence_id: item for item in fixture.authentication_evidence
+                    },
+                )
+                return AgenticRailAdapter(
+                    verifier,
+                    lambda _request, _receipt: Action.APPROVE,
+                )
+
+            factory = agentic_factory
+
+        bundle = population.bundle.model_copy(update={"rail": rail})
+        engine = SimulationEngine(
+            bundle,
+            {rail: factory},
+            opening_balances=cast(
+                Mapping[AccountReference, Decimal],
+                population.opening_balances,
+            ),
+        )
+        for priority, (timestamp, command) in enumerate(zip(schedule, commands, strict=True)):
+            engine.schedule(timestamp, priority, command)
+        events = engine.run()
+        engine.ledger.assert_conserved()
+        return events
+
     def _validate_candidate(
         self,
         family: str,
@@ -881,48 +1431,134 @@ class CampaignGenerator:
         attempt: int,
         fixture: AgenticFixture | None,
     ) -> CampaignEvidence:
-        if (
-            params.expected_motif != _MOTIFS[family]
-            or motif_signature(commands) != params.expected_motif
-        ):
+        events = self._dry_replay(
+            family,
+            commands,
+            schedule,
+            population,
+            fixture,
+        )
+        opening_commands = tuple(
+            command
+            for command in commands
+            if command.name
+            in {"a2a.initiate", "card.authorize", "card.decline", "agentic.pay"}
+        )
+        if len(opening_commands) != params.payment_count:
+            raise ValueError("payment_count must be derived from concrete opening commands")
+        attempted_value = sum(
+            (cast(Decimal, command.payload["amount"]) for command in opening_commands),
+            Decimal("0.00"),
+        )
+        unique_attempted: dict[str, Decimal] = {}
+        for command in opening_commands:
+            payment_id = cast(str, command.payload["payment_id"])
+            unique_attempted.setdefault(payment_id, cast(Decimal, command.payload["amount"]))
+        unique_attempted_value = sum(unique_attempted.values(), Decimal("0.00"))
+        settled_value = sum(
+            (
+                event.amount
+                for event in events
+                if event.event_type in {EventKind.SETTLEMENT, EventKind.TRANSFER_POSTED}
+                or (
+                    event.rail is Rail.AGENTIC
+                    and event.event_type is EventKind.AUTHORIZATION
+                    and event.rail_data.get("integrity") == "pass"
+                    and event.rail_data.get("action") == Action.APPROVE.value
+                )
+            ),
+            Decimal("0.00"),
+        )
+        observed_reasons = tuple(
+            ReasonCode(cast(str, event.rail_data["reason_code"]))
+            if event.rail_data.get("reason_code")
+            else None
+            for event in events
+            if event.rail is Rail.AGENTIC
+        )
+        entity_illicit = {entity.entity_id: entity.illicit for entity in population.entities}
+        if family == "agentic_intent_abuse":
+            if len(observed_reasons) != len(opening_commands):
+                raise ValueError("agentic commands must each produce one observed outcome")
+            class_labels = tuple(reason is not None for reason in observed_reasons)
+        else:
+            class_labels = tuple(
+                entity_illicit[cast(str, command.payload["actor_id"])]
+                or entity_illicit[cast(str, command.payload["counterparty_id"])]
+                for command in opening_commands
+            )
+        rate = Decimal(sum(class_labels)) / Decimal(len(class_labels))
+        value_total = attempted_value
+        if params.expected_motif != _MOTIFS[family]:
+            raise ValueError("declared motif does not match the selected family")
+        benign_card_control = family == "card_testing_cnp" and rate == 0
+        if not benign_card_control and motif_signature(commands) != params.expected_motif:
             raise ValueError("motif constraint not satisfied")
-        rate = Decimal(sum(plan.illicit for plan in plans)) / Decimal(len(plans))
-        value_total = sum(amounts, Decimal("0.00"))
+        if family == "card_testing_cnp" and rate > 0:
+            attack_actors = {
+                cast(str, command.payload["actor_id"])
+                for command, label in zip(opening_commands, class_labels, strict=True)
+                if label
+            }
+            shared_targets: dict[str, set[str]] = {}
+            for relationship in population.relationships:
+                if (
+                    relationship.source_id in attack_actors
+                    and relationship.relation == "uses_shared_device"
+                ):
+                    shared_targets.setdefault(relationship.target_id, set()).add(
+                        relationship.source_id
+                    )
+            if max((len(actors) for actors in shared_targets.values()), default=0) < 2:
+                raise ValueError("card-testing motif lacks a shared-device attack graph")
         if abs(rate - params.target_illicit_rate) > params.class_rate_tolerance:
             raise ValueError("class rate constraint not satisfied")
+        if (
+            family == "agentic_intent_abuse"
+            and abs(rate - params.agentic_attack_mix) > params.class_rate_tolerance
+        ):
+            raise ValueError("agentic attack mix constraint not satisfied")
         if abs(value_total - params.target_value_total) > params.value_tolerance:
             raise ValueError("value total constraint not satisfied")
-        if any(amount < params.min_amount or amount > params.max_amount for amount in amounts):
+        if any(
+            cast(Decimal, command.payload["amount"]) < params.min_amount
+            or cast(Decimal, command.payload["amount"]) > params.max_amount
+            for command in opening_commands
+        ):
             raise ValueError("amount bounds not satisfied")
         if len(schedule) != len(commands) or schedule != tuple(sorted(schedule)):
             raise ValueError("command schedule is not total and ordered")
-        if not schedule or schedule[-1] - population.generated_at > timedelta(
-            hours=params.duration_hours
+        if (
+            not schedule
+            or schedule[-1]
+            > population.generated_at + timedelta(hours=params.duration_hours)
+            or schedule[-1] > population.horizon_end
         ):
             raise ValueError("timestamp horizon not satisfied")
         declared = {entity.entity_id for entity in population.entities}
-        referenced = {plan.actor.entity_id for plan in plans} | {
-            plan.counterparty.entity_id for plan in plans
+        referenced = {
+            cast(str, command.payload[field])
+            for command in opening_commands
+            for field in ("actor_id", "counterparty_id")
         }
-        accounts = {plan.payer_account for plan in plans} | {plan.payee_account for plan in plans}
+        accounts: set[str] = set()
         for command in commands:
             for key, value in command.payload.items():
                 if key.endswith("_account") and type(value) is str:
                     accounts.add(value)
         if not referenced <= declared or not accounts <= set(population.opening_balances):
             raise ValueError("entity or account references are not population-owned")
-        self._validate_lifecycle(plans, commands)
-        dependencies = self._dependencies(family, plans)
+        dependencies = self._command_dependencies(family, opening_commands)
         graph_document = [
             [
-                plan.payment_id,
-                plan.actor.entity_id,
-                plan.counterparty.entity_id,
-                plan.payer_account,
-                plan.payee_account,
-                str(plan.illicit),
+                command.payload["payment_id"],
+                command.payload["actor_id"],
+                command.payload["counterparty_id"],
+                command.payload["payer_account"],
+                command.payload["payee_account"],
+                str(class_labels[index]),
             ]
-            for plan in plans
+            for index, command in enumerate(opening_commands)
         ]
         graph_document.extend(
             [dependency.payment_id, *dependency.upstream_payment_ids] for dependency in dependencies
@@ -937,9 +1573,13 @@ class CampaignGenerator:
             motif_signature=params.expected_motif,
             payment_count=len(plans),
             command_count=len(commands),
-            illicit_count=sum(plan.illicit for plan in plans),
+            illicit_count=sum(class_labels),
+            # All metrics below are recomputed from concrete commands and outcomes.
             illicit_rate=rate,
             value_total=value_total,
+            attempted_value=attempted_value,
+            unique_attempted_value=unique_attempted_value,
+            settled_value=settled_value,
             schedule=schedule,
             graph_digest=hashlib.sha256(
                 json.dumps(graph_document, separators=(",", ":")).encode()
@@ -949,11 +1589,17 @@ class CampaignGenerator:
             ).hexdigest(),
             declared_entity_ids=tuple(sorted(referenced)),
             account_ids=tuple(sorted(accounts)),
-            class_labels=tuple(plan.illicit for plan in plans),
+            class_labels=class_labels,
             mutation_kinds=tuple(
-                dict.fromkeys(plan.mutation_kind for plan in plans if plan.mutation_kind)
+                dict.fromkeys(
+                    reason.value for reason in observed_reasons if reason is not None
+                )
             ),
             dependencies=dependencies,
+            observed_reasons=observed_reasons,
+            valid_control_count=sum(reason is None for reason in observed_reasons),
+            replay_succeeded=True,
+            ledger_conserved=True,
             attempts=attempt,
             agentic_fixture=fixture,
         )
@@ -970,21 +1616,24 @@ class CampaignGenerator:
             raise ValueError("rail lifecycle order does not match the causal schedule")
 
     @staticmethod
-    def _dependencies(
+    def _command_dependencies(
         family: str,
-        plans: tuple[_PaymentPlan, ...],
+        opening_commands: tuple[Command, ...],
     ) -> tuple[CampaignDependency, ...]:
         if family != "app_scam_mule":
             return ()
         dependencies: list[CampaignDependency] = []
-        for index, plan in enumerate(plans):
+        for index, command in enumerate(opening_commands):
+            payer_account = cast(str, command.payload["payer_account"])
             upstream = tuple(
-                candidate.payment_id
-                for candidate in plans[:index]
-                if candidate.payee_account == plan.payer_account and "post" in candidate.stages
+                cast(str, candidate.payload["payment_id"])
+                for candidate in opening_commands[:index]
+                if candidate.payload["payee_account"] == payer_account
             )
             if upstream:
-                dependencies.append(CampaignDependency(plan.payment_id, upstream))
+                dependencies.append(
+                    CampaignDependency(cast(str, command.payload["payment_id"]), upstream)
+                )
         return tuple(dependencies)
 
     @staticmethod
@@ -996,15 +1645,56 @@ class CampaignGenerator:
         return str(uuid5(namespace, label))
 
 
+class _CampaignEvaluator:
+    """Evaluator-owned closure path; policies receive neither audit state nor fixtures."""
+
+    def __init__(self, *, seed: int) -> None:
+        self.__generator = CampaignGenerator(seed=seed)
+
+    def generate(
+        self,
+        family: str,
+        population: Population,
+        params: CampaignParams,
+    ) -> tuple[tuple[Command, ...], CampaignEvidence]:
+        return self.__generator._generate_audited(family, population, params)
+
+    def validate(
+        self,
+        family: str,
+        commands: tuple[Command, ...],
+        population: Population,
+        params: CampaignParams,
+    ) -> None:
+        """Fail closed when a concrete externally supplied candidate is incomplete."""
+        try:
+            if motif_signature(commands) != _MOTIFS[family]:
+                raise ValueError("family motif mismatch")
+            horizon = min(
+                population.horizon_end,
+                population.generated_at + timedelta(hours=params.duration_hours),
+            )
+            step = max(1, params.min_delay_seconds)
+            schedule = tuple(
+                population.generated_at + timedelta(seconds=step * (index + 1))
+                for index in range(len(commands))
+            )
+            if not schedule or schedule[-1] > horizon:
+                raise ValueError("candidate exceeds evaluator horizon")
+            if family == "agentic_intent_abuse":
+                raise ValueError("agentic candidates require evaluator-owned fixture closure")
+            self.__generator._dry_replay(family, commands, schedule, population, None)
+        except (KeyError, RuntimeError, TypeError, ValueError) as error:
+            raise GenerationConstraintError(100) from error
+
+
 __all__ = [
     "AGENTIC_INTENT_ABUSE_MOTIF",
     "APP_SCAM_MULE_MOTIF",
     "CARD_TESTING_CNP_MOTIF",
     "SYNTHETIC_MERCHANT_REFUND_MOTIF",
-    "AgenticFixture",
-    "CampaignDependency",
-    "CampaignEvidence",
     "CampaignGenerator",
+    "CampaignParameterError",
     "CampaignParams",
     "GenerationConstraintError",
     "campaign_bytes",
