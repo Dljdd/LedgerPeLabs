@@ -2,17 +2,18 @@
 
 This implementation intentionally shares neither population nor campaign-generation code
 with the production range.  It builds a causal entity graph and lifecycle schedule before
-sampling bounded leaf amounts with Python's independent ``random`` implementation.
+sampling bounded leaves from a local, domain-separated NumPy generator.
 """
 
 from __future__ import annotations
 
 import hashlib
-import random
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_HALF_EVEN, Decimal
 from uuid import NAMESPACE_URL, uuid5
+
+import numpy as np
 
 from apar.contracts.events import EventKind, PaymentEvent, Rail
 
@@ -48,13 +49,13 @@ class _IndependentSchedule:
 
     __slots__ = ("_cursor", "_rng")
 
-    def __init__(self, rng: random.Random, seed: int) -> None:
+    def __init__(self, rng: np.random.Generator, seed: int) -> None:
         self._rng = rng
         self._cursor = _START + timedelta(minutes=seed % 43)
 
     def next_stage(self, *, burst: bool) -> datetime:
         floor, ceiling = (2, 13) if burst else (17, 71)
-        self._cursor += timedelta(seconds=self._rng.randint(floor, ceiling))
+        self._cursor += timedelta(seconds=int(self._rng.integers(floor, ceiling + 1)))
         return self._cursor
 
 
@@ -74,9 +75,11 @@ class HiddenCampaignGenerator:
         if not 4 <= count <= 128:
             raise ValueError("count must be in [4, 128]")
 
-        digest = hashlib.sha256(f"hidden-v1:{family}:{seed}".encode()).digest()
-        rng = random.Random(int.from_bytes(digest, "big"))
-        namespace = uuid5(NAMESPACE_URL, f"apar:hidden:v1:{family}:{seed}")
+        digest = hashlib.sha256(
+            f"apar-hidden-numpy-v2:{family}:{seed}".encode()
+        ).digest()
+        rng = np.random.Generator(np.random.PCG64(int.from_bytes(digest, "big")))
+        namespace = uuid5(NAMESPACE_URL, f"apar:hidden:numpy-v2:{family}:{seed}")
         campaign_id = str(uuid5(namespace, "campaign"))
         actors = tuple(str(uuid5(namespace, f"actor:{index}")) for index in range(count + 4))
         flows = self._motif(family, count, actors, rng)
@@ -95,7 +98,7 @@ class HiddenCampaignGenerator:
                 )
                 lineage: dict[str, str | bool] = {
                     "synthetic": True,
-                    "hidden_generator": "independent-v1",
+                    "hidden_generator": "independent-numpy-v2",
                 }
                 if previous:
                     lineage["previous_event_id"] = previous
@@ -104,6 +107,40 @@ class HiddenCampaignGenerator:
                     "hidden_family": family,
                     "hidden_stage": stage_index,
                 }
+                payer_account = f"hidden:account:{flow.actor}"
+                payee_account = f"hidden:account:{flow.counterparty}"
+                fee = (
+                    Decimal("0.00")
+                    if flow.rail is Rail.AGENTIC
+                    else (flow.amount * Decimal("0.01")).quantize(
+                        _CENT, rounding=ROUND_HALF_EVEN
+                    )
+                )
+                rail_data.update(
+                    {
+                        "fee_amount": str(fee),
+                        "payer_account": payer_account,
+                        "payee_account": payee_account,
+                        "fee_account": f"hidden:{flow.rail.value}:fees",
+                    }
+                )
+                auxiliary_openings: dict[str, str] = {"fee_opening_balance": "0.00"}
+                if flow.rail is Rail.CARD:
+                    rail_data.update(
+                        {
+                            "hold_account": "hidden:card:holds",
+                            "chargeback_account": "hidden:card:chargebacks",
+                        }
+                    )
+                    auxiliary_openings.update(
+                        {
+                            "hold_opening_balance": "0.00",
+                            "chargeback_opening_balance": "0.00",
+                        }
+                    )
+                elif flow.rail is Rail.A2A:
+                    rail_data["frozen_account"] = "hidden:a2a:frozen"
+                    auxiliary_openings["frozen_opening_balance"] = "0.00"
                 if flow.integrity_reason:
                     rail_data["integrity"] = (
                         "pass" if event_type is EventKind.AUTHORIZATION else "fail"
@@ -131,6 +168,9 @@ class HiddenCampaignGenerator:
                             "counterparty_role": flow.counterparty_role,
                             "actor_opening_balance": str(flow.actor_opening),
                             "counterparty_opening_balance": str(flow.counterparty_opening),
+                            "payer_opening_balance": str(flow.actor_opening),
+                            "payee_opening_balance": str(flow.counterparty_opening),
+                            **auxiliary_openings,
                         },
                         rail_data=rail_data,
                         lineage=lineage,
@@ -145,7 +185,7 @@ class HiddenCampaignGenerator:
         family: str,
         count: int,
         actors: tuple[str, ...],
-        rng: random.Random,
+        rng: np.random.Generator,
     ) -> tuple[_HiddenFlow, ...]:
         if family == "app_scam_mule":
             return self._app_motif(count, actors, rng)
@@ -156,23 +196,25 @@ class HiddenCampaignGenerator:
         return self._agentic_motif(count, actors, rng)
 
     @staticmethod
-    def _amount(rng: random.Random, low: int, high: int) -> Decimal:
-        sampled = Decimal(str(low + (high - low) * rng.betavariate(2.1, 3.4)))
+    def _amount(rng: np.random.Generator, low: int, high: int) -> Decimal:
+        sampled = Decimal(str(low + (high - low) * float(rng.beta(2.1, 3.4))))
         return sampled.quantize(_CENT, rounding=ROUND_HALF_EVEN)
 
     def _app_motif(
         self,
         count: int,
         actors: tuple[str, ...],
-        rng: random.Random,
+        rng: np.random.Generator,
     ) -> tuple[_HiddenFlow, ...]:
         root_mule, second_mule, cash_endpoint = actors[0], actors[1], actors[2]
         incoming_count = count - 2
         flows: list[_HiddenFlow] = []
-        incoming_total = Decimal("0.00")
+        available_total = Decimal("0.00")
         for index in range(incoming_count):
             amount = self._amount(rng, 42, 210)
-            incoming_total += amount
+            returned = index == 0
+            if not returned:
+                available_total += amount
             flows.append(
                 _HiddenFlow(
                     index,
@@ -188,10 +230,11 @@ class HiddenCampaignGenerator:
                         EventKind.TRANSFER_INITIATED,
                         EventKind.TRANSFER_ACCEPTED,
                         EventKind.TRANSFER_POSTED,
+                        *((EventKind.TRANSFER_RETURNED,) if returned else ()),
                     ),
                 )
             )
-        layer_amount = (incoming_total * Decimal("0.54")).quantize(_CENT)
+        layer_amount = (available_total * Decimal("0.54")).quantize(_CENT)
         flows.append(
             _HiddenFlow(
                 incoming_count,
@@ -238,14 +281,14 @@ class HiddenCampaignGenerator:
         self,
         count: int,
         actors: tuple[str, ...],
-        rng: random.Random,
+        rng: np.random.Generator,
     ) -> tuple[_HiddenFlow, ...]:
         shared_actor = actors[0]
         probes = max(2, count // 2)
         flows: list[_HiddenFlow] = []
         for index in range(count):
             declined = index < probes
-            lifecycle = (
+            lifecycle: tuple[EventKind, ...] = (
                 (EventKind.AUTHORIZATION_DECLINED,)
                 if declined
                 else (
@@ -254,6 +297,8 @@ class HiddenCampaignGenerator:
                     EventKind.SETTLEMENT,
                 )
             )
+            if index == probes:
+                lifecycle = (EventKind.AUTHORIZATION, EventKind.REVERSAL)
             if index == count - 1:
                 lifecycle = (
                     *lifecycle,
@@ -282,7 +327,7 @@ class HiddenCampaignGenerator:
         self,
         count: int,
         actors: tuple[str, ...],
-        rng: random.Random,
+        rng: np.random.Generator,
     ) -> tuple[_HiddenFlow, ...]:
         merchant = actors[0]
         flows: list[_HiddenFlow] = []
@@ -314,7 +359,7 @@ class HiddenCampaignGenerator:
         self,
         count: int,
         actors: tuple[str, ...],
-        rng: random.Random,
+        rng: np.random.Generator,
     ) -> tuple[_HiddenFlow, ...]:
         agent, merchant = actors[0], actors[1]
         reasons = (

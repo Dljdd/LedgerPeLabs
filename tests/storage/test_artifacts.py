@@ -14,7 +14,6 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel, ValidationError
 
-import apar.storage.artifacts as artifacts
 from apar.storage.artifacts import ArtifactRef, ArtifactStore
 
 
@@ -36,8 +35,9 @@ def _write_complete_artifact(root: Path, payload: bytes, media_type: str) -> Art
     digest = hashlib.sha256(payload).hexdigest()
     ref = ArtifactRef(digest, media_type, len(payload), f"{digest}/payload")
     artifact_dir = root / digest
-    artifact_dir.mkdir()
+    artifact_dir.mkdir(mode=0o700)
     (artifact_dir / "payload").write_bytes(payload)
+    (artifact_dir / "payload").chmod(0o600)
     (artifact_dir / "manifest.json").write_text(
         json.dumps(
             {
@@ -52,6 +52,7 @@ def _write_complete_artifact(root: Path, payload: bytes, media_type: str) -> Art
         ),
         encoding="utf-8",
     )
+    (artifact_dir / "manifest.json").chmod(0o600)
     return ref
 
 
@@ -198,7 +199,7 @@ def test_empty_destination_appearing_at_publication_is_never_replaced(
     publish = store._publish_no_replace
 
     def publish_after_empty_destination(source_name: str, destination_name: str) -> None:
-        (tmp_path / digest).mkdir()
+        (tmp_path / digest).mkdir(mode=0o700)
         publish(source_name, destination_name)
 
     monkeypatch.setattr(store, "_publish_no_replace", publish_after_empty_destination)
@@ -249,6 +250,62 @@ def test_read_rejects_digest_directory_symlink_even_when_target_is_inside_root(
         store.read(ref)
 
 
+def test_store_rejects_a_symlink_or_permissive_artifact_root(tmp_path: Path) -> None:
+    """Catch resolving a caller-controlled root symlink or accepting a shared root."""
+    target = tmp_path / "target"
+    target.mkdir(mode=0o700)
+    linked = tmp_path / "linked"
+    linked.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="artifact root"):
+        ArtifactStore(linked)
+
+    target.chmod(0o755)
+    with pytest.raises(ValueError, match="mode-0700"):
+        ArtifactStore(target)
+
+
+def test_store_uses_its_stable_root_descriptor_after_pathname_swap(tmp_path: Path) -> None:
+    """Catch later operations reopening a replaced artifact-root pathname."""
+    root = tmp_path / "artifacts"
+    store = ArtifactStore(root)
+    first = store.put_bytes(b"first", "application/octet-stream")
+    retained = tmp_path / "retained"
+    root.rename(retained)
+    attacker = tmp_path / "attacker"
+    attacker.mkdir(mode=0o700)
+    root.symlink_to(attacker, target_is_directory=True)
+
+    second = store.put_bytes(b"second", "application/octet-stream")
+
+    assert store.read(first) == b"first"
+    assert store.read(second) == b"second"
+    assert (retained / second.sha256 / "payload").read_bytes() == b"second"
+    assert list(attacker.iterdir()) == []
+
+
+@pytest.mark.parametrize("mutation", ["payload_mode", "payload_link", "directory_mode"])
+def test_read_enforces_private_mode_owner_and_link_invariants(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    """Catch mutable/shared artifact material being admitted after publication."""
+    root = tmp_path / "artifacts"
+    store = ArtifactStore(root)
+    ref = store.put_bytes(b"evidence", "application/octet-stream")
+    artifact_dir = root / ref.sha256
+    payload = artifact_dir / "payload"
+    if mutation == "payload_mode":
+        payload.chmod(0o644)
+    elif mutation == "payload_link":
+        os.link(payload, tmp_path / "second-payload-name")
+    else:
+        artifact_dir.chmod(0o755)
+
+    with pytest.raises(ValueError, match="artifact (file|directory)"):
+        store.read(ref)
+
+
 def test_read_rejects_payload_swap_before_descriptor_open(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -262,14 +319,18 @@ def test_read_rejects_payload_swap_before_descriptor_open(
     swapped = False
 
     def swap_before_open(
-        path: str | os.PathLike[str], *args: object, **kwargs: object
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
     ) -> int:
         nonlocal swapped
         if path == "payload" and not swapped:
             payload_path.unlink()
             payload_path.symlink_to(external_payload)
             swapped = True
-        return original_open(path, *args, **kwargs)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
 
     monkeypatch.setattr("apar.storage.artifacts.os.open", swap_before_open)
 
@@ -286,7 +347,7 @@ def test_exclusive_rename_selects_darwin_implementation(monkeypatch: pytest.Monk
     def rename_on_darwin(root_fd: int, source_name: str, destination_name: str) -> None:
         calls.append((root_fd, source_name, destination_name))
 
-    monkeypatch.setattr(artifacts.sys, "platform", "darwin")
+    monkeypatch.setattr("apar.storage.artifacts.sys.platform", "darwin")
     monkeypatch.setattr(
         ArtifactStore, "_darwin_rename_no_replace", staticmethod(rename_on_darwin)
     )
@@ -303,7 +364,7 @@ def test_exclusive_rename_selects_linux_implementation(monkeypatch: pytest.Monke
     def rename_on_linux(root_fd: int, source_name: str, destination_name: str) -> None:
         calls.append((root_fd, source_name, destination_name))
 
-    monkeypatch.setattr(artifacts.sys, "platform", "linux")
+    monkeypatch.setattr("apar.storage.artifacts.sys.platform", "linux")
     monkeypatch.setattr(
         ArtifactStore, "_linux_rename_no_replace", staticmethod(rename_on_linux)
     )
@@ -327,7 +388,7 @@ def test_linux_exclusive_rename_translates_eexist(monkeypatch: pytest.MonkeyPatc
     class LibC:
         renameat2 = RenameAt2()
 
-    monkeypatch.setattr(artifacts.ctypes, "CDLL", lambda *args, **kwargs: LibC())
+    monkeypatch.setattr("apar.storage.artifacts.ctypes.CDLL", lambda *args, **kwargs: LibC())
 
     with pytest.raises(FileExistsError):
         ArtifactStore._linux_rename_no_replace(7, "source", "destination")
@@ -335,7 +396,7 @@ def test_linux_exclusive_rename_translates_eexist(monkeypatch: pytest.MonkeyPatc
 
 def test_exclusive_rename_rejects_unsupported_platform(monkeypatch: pytest.MonkeyPatch) -> None:
     """Catches an unsupported platform silently falling back to normal rename."""
-    monkeypatch.setattr(artifacts.sys, "platform", "freebsd")
+    monkeypatch.setattr("apar.storage.artifacts.sys.platform", "freebsd")
 
     with pytest.raises(RuntimeError, match="unsupported platform"):
         ArtifactStore._rename_directory_no_replace(7, "source", "destination")

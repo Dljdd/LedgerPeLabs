@@ -1,15 +1,18 @@
 """Compiled-scenario and authenticated-run API contracts."""
 
+import json
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import cast
 
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from apar.api.app import create_app
 from apar.config import Settings
 from apar.contracts.events import Rail
-from apar.contracts.scenarios import ScenarioBundle
+from apar.contracts.scenarios import AttackerMode, ScenarioBundle
 from apar.storage.artifacts import ArtifactStore
 from tests.factories import make_scenario_config, make_threat_card
 
@@ -51,6 +54,54 @@ def test_compile_returns_a_verified_scenario_artifact_id(tmp_path: Path) -> None
 
     assert body["scenario_id"] == "app-mule-personalized-v1"
     assert bundle.seed == 960
+    assert bundle.extensions["apar_run_binding_v1"] == {
+        "attacker_mode": AttackerMode.DECISION_ONLY.value,
+        "threat_card_ref": "app-personalized-mule@2",
+        "threat_family": "app_scam_mule",
+    }
+
+
+def test_run_rejects_same_rail_policy_from_a_different_reviewed_family(
+    tmp_path: Path,
+) -> None:
+    """Catch rail-only pairing of card-testing and synthetic-refund policies."""
+    config = make_scenario_config(
+        rail=Rail.CARD,
+        query_budget=1,
+        seed=962,
+        replay=make_scenario_config().replay.model_copy(update={"random_seed": 962}),
+        benign_entity_count=40,
+        illicit_entity_count=16,
+    )
+    card = make_threat_card(
+        threat_id="reviewed-card-testing",
+        family="card_testing_cnp",
+        rails=[Rail.CARD],
+        default_config=config,
+    )
+    with TestClient(create_app(Settings.from_root(tmp_path))) as client:
+        assert client.put(
+            f"/api/v1/threats/{card.threat_id}", json=card.model_dump(mode="json")
+        ).status_code == 200
+        compiled = client.post(
+            "/api/v1/scenarios/compile",
+            json={"threat_id": card.threat_id, "config": config.model_dump(mode="json")},
+        ).json()
+        response = client.post(
+            "/api/v1/runs",
+            json={
+                "scenario_artifact_id": compiled["scenario_artifact_id"],
+                "policy": {
+                    "family": "synthetic_merchant_refund",
+                    "attacker_mode": "decision_only",
+                    "kind": "fixed",
+                    "query_budget": 1,
+                    "worker_timeout_ms": 2_000,
+                },
+            },
+        )
+
+    assert response.status_code == 409
 
 
 def test_run_accepts_only_a_compiled_id_and_typed_policy_then_is_gettable(
@@ -67,6 +118,7 @@ def test_run_accepts_only_a_compiled_id_and_typed_policy_then_is_gettable(
                 "scenario_artifact_id": compiled["scenario_artifact_id"],
                 "policy": {
                     "family": "app_scam_mule",
+                    "attacker_mode": "decision_only",
                     "kind": "fixed",
                     "query_budget": 1,
                     "worker_timeout_ms": 2_000,
@@ -76,10 +128,22 @@ def test_run_accepts_only_a_compiled_id_and_typed_policy_then_is_gettable(
         assert response.status_code == 201
         manifest = response.json()
         fetched = client.get(f"/api/v1/runs/{manifest['run_id']}")
+        internal = cast(FastAPI, client.app).state.run_runner.get(manifest["run_id"])
+        restricted_ref = internal.artifacts["restricted_validity"]
 
         assert fetched.status_code == 200
         assert fetched.json() == manifest
-        assert "restricted_validity" in manifest["artifacts"]
+        assert set(manifest["artifacts"]) == {
+            "events",
+            "feedback",
+            "policy",
+            "population",
+            "scenario",
+        }
+        assert restricted_ref.sha256 not in json.dumps(manifest, sort_keys=True)
+        assert restricted_ref.relative_path not in json.dumps(manifest, sort_keys=True)
+        assert "restricted_validity" not in str(manifest)
+        assert "restricted_evaluation" not in str(manifest)
         assert "reasons" not in str(manifest)
 
         rejected = client.post(
@@ -88,10 +152,25 @@ def test_run_accepts_only_a_compiled_id_and_typed_policy_then_is_gettable(
                 "scenario_artifact_id": compiled["scenario_artifact_id"],
                 "policy": {
                     "family": "app_scam_mule",
+                    "attacker_mode": "decision_only",
                     "kind": "fixed",
                     "query_budget": 1,
                     "worker_timeout_ms": 2_000,
                     "path": "/tmp/untrusted.py",
+                },
+            },
+        )
+        disclosure_escalation = client.post(
+            "/api/v1/runs",
+            json={
+                "scenario_artifact_id": compiled["scenario_artifact_id"],
+                "policy": {
+                    "family": "app_scam_mule",
+                    "attacker_mode": "decision_only",
+                    "kind": "fixed",
+                    "query_budget": 1,
+                    "worker_timeout_ms": 2_000,
+                    "expose_realized_value": True,
                 },
             },
         )
@@ -101,6 +180,7 @@ def test_run_accepts_only_a_compiled_id_and_typed_policy_then_is_gettable(
                 "scenario_artifact_id": compiled["scenario_artifact_id"],
                 "policy": {
                     "family": "card_testing_cnp",
+                    "attacker_mode": "decision_only",
                     "kind": "fixed",
                     "query_budget": 1,
                     "worker_timeout_ms": 2_000,
@@ -108,6 +188,7 @@ def test_run_accepts_only_a_compiled_id_and_typed_policy_then_is_gettable(
             },
         )
     assert rejected.status_code == 422
+    assert disclosure_escalation.status_code == 422
     assert mismatched.status_code == 409
     assert mismatched.json() == {
         "detail": {
@@ -126,6 +207,7 @@ def test_unknown_scenario_artifact_and_run_use_structured_errors(tmp_path: Path)
                 "scenario_artifact_id": "0" * 64,
                 "policy": {
                     "family": "app_scam_mule",
+                    "attacker_mode": "decision_only",
                     "kind": "fixed",
                     "query_budget": 1,
                     "worker_timeout_ms": 2_000,

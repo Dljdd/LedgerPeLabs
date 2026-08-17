@@ -25,7 +25,7 @@ output watchdogs, a hard deadline, and process-group termination.
    policy, evaluator object, template, label, or raw hidden reason.
 
 The final focused acceptance script reports three G1 production-rail invariants and six
-G2 checks. The final repository suite is `882 passed, 1 skipped`. The accepted Task 6
+G2 checks. After Fix Round 1 the final repository suite is `913 passed, 1 skipped`. The accepted Task 6
 v3.4 result remains unchanged and is used only as frozen evidence. No experiment,
 search, evaluator trial, cache preparation, seed, threshold, or policy tuning was run or
 modified by Task 7.
@@ -41,15 +41,16 @@ modified by Task 7.
 - `card_testing_cnp`; and
 - `synthetic_merchant_refund`.
 
-It uses Python's independent `random.Random`, hidden entity motifs, a separate causal
+It uses a locally constructed, domain-separated NumPy `Generator(PCG64)`, hidden entity
+motifs, a separate causal
 schedule, independent beta-distributed leaves, UUID5 identities, and no production
 generator or defender import. It returns only `tuple[PaymentEvent, ...]`, as required by
 the Task 7 ruling.
 
 `HiddenValidityOracle.evaluate(...)` returns a frozen model with exactly one field,
-`valid: bool`. Detailed stable reason codes and metrics exist only in
-`evaluate_restricted(..., run_complete=True)`. `RunRunner` calls that method only after
-policy execution and stores the result in a restricted artifact. The attacker worker
+`valid: bool`. Detailed stable reason codes and metrics exist only through a module-private
+completed-run interface. `RunRunner` calls that interface only after policy execution and
+stores the result in a restricted artifact. The attacker worker
 cannot import the package, does not receive its module, template, constraints, labels,
 audit records, digests, failures, or artifact references, and receives no validity bit
 during proposal generation.
@@ -77,8 +78,8 @@ while the fully independent hidden corpus remains evaluated without that label.
 
 `PolicyWorkerClient` accepts only `AttackerPolicyKind` values `fixed`, `random`,
 `adaptive`, and `cached_llm`. The public `AttackerPolicy` is closed and frozen and holds
-only family, policy kind, bounded query budget, bounded worker timeout, and the declared
-realized-value disclosure flag. Pydantic extra-field rejection prevents paths and
+only reviewed family, attacker mode, policy kind, bounded query budget, and bounded worker
+timeout. Feedback visibility comes only from the compiled scenario. Pydantic extra-field rejection prevents paths and
 callables from entering the route or runner.
 
 Each proposal launches the exact reviewed `policy_worker.py` through:
@@ -124,8 +125,9 @@ is platform-compatible, observes the actual resident set, is exercised against t
 worker, and has deterministic tests for both over-cap and unavailable-reader kill paths.
 
 This is a boundary for the four reviewed built-in policy selections, not an API for
-running arbitrary uploaded Python code. The cached-LLM selection in local Task 7
-orchestration is a deterministic zero-network fixture. The empirical cached-LLM claim is
+running arbitrary uploaded Python code. The cached-LLM selection in local Task 7 uses the
+real `LLMPlannerPolicy` against the exact pinned Task 6 replay cache with a transport that
+must never be called. The empirical cached-LLM claim is
 carried only by the accepted frozen Task 6 v3.4 raw evidence, not by a Task 7 rerun.
 
 ### Signed immutable execution lineage
@@ -142,22 +144,23 @@ Before any worker executes, `RunRunner` stores and signs an authorization receip
 - population;
 - provenance;
 - restricted evaluation input; and
+- independent restricted hidden-evaluation events; and
 - compiled scenario.
 
 After the run, it stores and signs a completion receipt over:
 
-- production/hidden evaluation events;
+- selected-winner production events;
 - public feedback history;
 - restricted production evaluation audit;
 - restricted validity report; and
 - summary.
 
 The completion receipt contains the authorization receipt's artifact digest. The final
-manifest contains exactly those ten input/output artifacts plus both receipts: twelve
+manifest contains six input artifacts, five output artifacts, and both receipts: thirteen
 immutable references. Its signed lineage digest includes the complete named artifact
 map and both receipt references.
 
-Verification requires the configured durable signer, exact twelve-name set, immutable
+Verification requires the configured durable signer, exact thirteen-name set, immutable
 artifact reads, both receipt signatures, exact input/output digest maps, authorization
 `previous=None`, completion-to-authorization chaining, identical receipt and manifest
 run IDs, manifest lineage digest, and pinned provenance. An authentically signed receipt
@@ -182,7 +185,8 @@ separately checks the historical Git object, mode, path, commit, and bytes.
 The Task 6 v3.4 result is pinned as:
 
 - path `docs/experiments/task6-v3.4-holdout-result.json`;
-- current mode `0600`, regular and non-symlink;
+- current source mode `0600` or fresh-checkout `0644`, regular, owned, non-symlink, and single-link;
+- private admitted execution mode `0600`;
 - historical Git mode `100644`, object type `blob`;
 - result commit `d6d3eecbfe2d871af8375e1455814cb5c48f2928`;
 - SHA-256 `f82981a987651a7f7ebb10a9011df063b2dc54a56181cae5b838e31de5e658db`.
@@ -197,13 +201,13 @@ commands replayed through `SimulationEngine` and the real public rail adapter wi
 conserved ledger. The runner enriches immutable events with evaluator-owned public roles,
 opening balances, and attack/control classification before independent validity.
 
-For agentic attacks, `CampaignBenchmark` performs the evaluator-owned Task 5 generation
-and fresh real `AgenticRailAdapter`/`TrustVerifier` replay for every proposal; its
-restricted audit freezes the production event/ledger digests and exact counts. Because
-the public Task 5 command API intentionally does not expose its evaluator-only verifier
-fixture, the manifest's independent validity corpus is then produced by
-`HiddenCampaignGenerator`. The summary records this source explicitly. No private Task 5
-engine state or evaluator fixture is accessed.
+For agentic attacks, Task 7 owns one deterministic public `TrustVerifier` configuration.
+Every proposed candidate is generated through public Task 5 interfaces and replayed
+through the real Task 4 agentic adapter under that configuration. The winning candidate
+is regenerated and replayed under the identical configuration; its evaluated event
+digest must equal the frozen production-event digest or the run fails closed. The
+independent `HiddenCampaignGenerator` corpus is stored separately for validity evaluation.
+No private Task 5 engine state or evaluator fixture is accessed.
 
 G1 separately proves the production matrix: 25 commands yield 23 fail-closed declined
 authorizations and two valid receipt-chain controls, with a conserved ledger. Task 5's
@@ -226,9 +230,9 @@ Compilation accepts a registered `threat_id` and closed `ScenarioConfig`, compil
 the existing public compiler, stores canonical immutable bytes, and returns only
 `scenario_artifact_id` and `scenario_id`. Run creation resolves and verifies the content
 address, reconstructs an exact `ScenarioBundle`, accepts a closed `AttackerPolicy`, and
-returns a typed signed `RunManifest`. Run retrieval returns the same reverified manifest.
-Restricted artifact references may appear in signed lineage, but no route returns their
-payloads or raw hidden reasons. Execution errors use a generic structured message and do
+returns a typed redacted `PublicRunManifest` backed by a reverified signed internal
+manifest. No route returns restricted references, their hashes/sizes, their payloads, or
+raw hidden reasons. Execution errors use a generic structured message and do
 not disclose local paths or internal provenance failures.
 
 Application lifespan owns one repository, artifact store, durable signer, and runner per
@@ -616,3 +620,516 @@ The hostile boundary intentionally executes only reviewed built-in policy kinds.
 not a general-purpose arbitrary-code sandbox and exposes no API for uploaded code. On
 Darwin/Linux it fails closed if the parent cannot enforce or observe the declared process
 limits. This narrower authority is the safe contract implemented by the typed API.
+
+## Fix Round 1 — review rejection closure (2026-08-18)
+
+This section supersedes every conflicting implementation statement or pre-fix count
+above it. All Critical, Important, Warning/leakage, and requested Minor findings from the
+Round 1 review were reproduced and addressed. No Task 6 experiment, search, evaluator
+trial, cache preparation, threshold, seed, defender, generator, or policy was executed or
+retuned.
+
+### Final architecture after Round 1
+
+- Feedback authority belongs only to `ScenarioBundle.feedback`. `AttackerPolicy` has no
+  disclosure switch. The worker wire carries the candidate and only declared public
+  action/reason/value fields; it carries no objective, model score, hidden validity,
+  detailed reason, evaluator digest, or evaluator artifact reference.
+- The worker remains a closed built-in-policy API. Resource limits are installed by the
+  child before package/numeric imports. The parent begins the wall deadline before spawn,
+  performs nonblocking stdin/stdout/stderr handling in one selector/watchdog loop, caps
+  request/output bytes and RSS, and kills the process group on every boundary failure.
+  Real `execv`, `fork`, `posix_spawn`, signal, native loader, socket, filesystem, hidden
+  import, and reflection attempts are exercised and denied.
+- Agentic evaluation and final production replay share one Task 7-owned deterministic
+  public `TrustVerifier` construction. The selected evaluation event digest must equal the
+  final frozen production event digest. The independent hidden corpus remains a separate
+  restricted input artifact.
+- Hidden generation uses only a locally constructed domain-separated NumPy generator.
+  Hidden lifecycle validation independently replays explicit accounts, opening balances,
+  fees, holds, frozen funds, chargeback accounts, and all declared card/A2A/agentic
+  terminal paths.
+- Artifact, signer, private evidence, and run-index access is rooted in stable no-follow
+  directory descriptors. Files are owned mode-0600 regular single-link objects; private
+  directories are owned mode-0700. Publication is file-fsync plus native atomic exclusive
+  no-replace rename plus directory-fsync.
+- A tracked Task 6 result may be a regular owned single-link source at current mode 0600
+  or a fresh-checkout mode 0644. Its historical Git mode and bytes are pinned separately,
+  and its execution copy is atomically admitted into private mode-0600 state.
+- Scenario compilation adds the validated `apar_run_binding_v1` envelope after the frozen
+  compiler returns. Standalone execution requires exact threat family, scenario attacker
+  mode, policy attacker mode, threat-card reference, and rail pairing.
+- The internal signed manifest retains every restricted reference. The public API returns
+  a separately typed allowlisted view containing only scenario, policy, population,
+  feedback, and production-event references plus the boolean validity result; no
+  restricted hash, size, path, signature, reason, or other low-entropy identifier crosses
+  the route.
+- G2 uses three matched adaptive steps and the real `LLMPlannerPolicy` over the exact
+  pinned Task 6 replay cache. Its transport raises if called. The one-command gate invokes
+  the exact Task 6 postcommit verification-only recomputation instead of trusting summary
+  fields.
+
+### Finding-to-test map
+
+| Review finding | Production closure | Regression evidence |
+| --- | --- | --- |
+| Critical 1 — golden feedback bypass | Removed caller disclosure authority; scenario-owned filtering in runner and wire | API extra-field rejection, golden and decision-only wire-shape tests |
+| Critical 2 — process escape | Audit/import denial for exec/fork/spawn/signal/native/network/filesystem plus closed built-ins | Real worker escape probe test |
+| Critical 3 — unbounded startup | No `preexec_fn`; deadline before spawn; child-installed limits; one nonblocking selector/watchdog | no-preexec, 2 MiB backpressure hang, spawn-error, deadline, RSS tests |
+| Critical 4 — agentic winner ignored | Same verifier/config for evaluation and final replay; exact selected/final event digest equality | fixed-versus-adaptive winner-change and separate-hidden-corpus test |
+| Important 1 — generator RNG | Domain-separated local NumPy `Generator(PCG64)` | literal first hidden amount and deterministic rerun test |
+| Important 2 — validity economics/lifecycles | Independent explicit account/fee ledger for every rail lifecycle | reversal/refund/chargeback/recovery/return/freeze, mutation, negative-gap tests |
+| Important 3 — atomic signer/index | 0600 temporary, fsync, native no-replace publication, directory fsync | concurrency, crash, partial, short-write, symlink, hardlink, owner/mode tests |
+| Important 4 — real G2 | Three-step matched histories; exact frozen Task 6 cache and verifier command | G2 history/parent/cache audit and one-command script |
+| Important 5 — tracked 0600 impossible | Accept verified 0600/0644 tracked source; admit private 0600 copy | fresh-checkout-mode private-admission test |
+| Important 6 — artifact/index root admission | Stable no-follow root descriptors; exact owner/mode/link checks | root symlink/path-swap/file-swap/owner/mode/link tests |
+| Important 7 — family pairing | API compile envelope plus standalone family/mode/card/rail equality | same-rail cross-family API rejection and attacker-mode standalone rejection |
+| Warning/leakage gap | Redacted `PublicRunManifest`; private completed-run detail interface | exact public allowlist and restricted identifier absence assertions |
+| Minor run ID | Full `run-[0-9a-f]{32}` match before lookup | non-hex same-length ID test |
+| Minor invalid event order | Oracle returns boolean false without log-domain exception | out-of-order/negative-gap test |
+
+### Strict TDD evidence by finding
+
+#### Critical 1 — feedback disclosure
+
+RED against the reviewed implementation:
+
+```text
+$ .venv/bin/python -m pytest \
+    tests/redteam/test_run_boundary.py::test_policy_selection_rejects_caller_controlled_feedback_disclosure \
+    tests/redteam/test_run_boundary.py::test_worker_history_contains_only_scenario_declared_feedback \
+    tests/api/test_runs.py::test_run_accepts_only_a_compiled_id_and_typed_policy_then_is_gettable -q
+FFF                                                                      [100%]
+3 failed in 5.48s
+```
+
+GREEN after removing policy disclosure authority and filtering both directions of the
+wire from the compiled feedback declaration:
+
+```text
+$ <same command>
+...                                                                      [100%]
+3 passed in 3.03s
+```
+
+The golden case explicitly proves `realized_value` is sent only when declared; the
+decision-only case contains only candidate and declared public feedback. The public API
+rejects both `expose_realized_value` and arbitrary path/callable fields.
+
+#### Critical 2 and Critical 3 — process and startup boundary
+
+The first real-escape/startup tests were RED:
+
+```text
+$ .venv/bin/python -m pytest \
+    tests/redteam/test_run_boundary.py::test_clean_policy_worker_blocks_real_process_and_native_escape_attempts \
+    tests/redteam/test_run_boundary.py::test_policy_worker_spawn_has_no_parent_preexec_hook \
+    tests/redteam/test_run_boundary.py::test_policy_worker_bounds_hung_startup_while_stdin_is_backpressured \
+    tests/redteam/test_run_boundary.py::test_policy_worker_converts_spawn_failure_to_fail_closed_error -q
+FFFF                                                                     [100%]
+4 failed in 0.54s
+```
+
+GREEN after child-side limit installation and the bounded selector/watchdog launch path:
+
+```text
+$ <same command>
+....                                                                     [100%]
+4 passed in 0.59s
+```
+
+The existing real deadline/RSS tests additionally prove process-group termination above
+805,306,368 resident bytes and termination when RSS observation is unavailable. A later
+full-suite run exposed only a test-wrapper runtime-cast defect (`1 failed, 798 passed,
+1 skipped`); the wrapper was corrected without production changes and the complete
+required integration suite then passed at 799/1.
+
+#### Critical 4 — selected agentic winner replay
+
+The winner-specific regression initially failed because the event artifact still named
+the independent hidden corpus. After production events were separated, a stronger digest
+test was RED until evaluation and final replay used the same deterministic verifier:
+
+```text
+$ .venv/bin/python -m pytest \
+    tests/redteam/test_run_boundary.py::test_agentic_final_artifact_replays_each_policy_winner_and_keeps_hidden_corpus_separate -q
+F                                                                        [100%]
+1 failed in 3.69s
+```
+
+The first exact-replay GREEN was:
+
+```text
+$ <same command>
+.                                                                        [100%]
+1 passed in 4.73s
+```
+
+Final strengthening uses action-only feedback so fixed and adaptive choose different
+winners, asserts their production event hashes differ, asserts each selected evaluation
+hash equals its frozen production hash, requires at least one approved production event,
+and asserts the independent hidden-corpus hash remains identical:
+
+```text
+$ <same command>
+.                                                                        [100%]
+1 passed in 4.50s
+```
+
+#### Important 1 — independent NumPy RNG
+
+The literal hand-derived stream assertion was RED against `random.Random`:
+
+```text
+$ .venv/bin/python -m pytest tests/redteam/test_hidden_validity.py \
+    -q -k 'numpy_stream or independent_hidden_families'
+F....                                                                    [100%]
+E AssertionError: expected first amount Decimal('88.25'), got Decimal('119.36')
+1 failed, 4 passed in 0.16s
+```
+
+GREEN after local SHA-256 domain separation into `numpy.random.PCG64`:
+
+```text
+$ <same command>
+.....                                                                    [100%]
+5 passed in 0.16s
+```
+
+No global RNG state is read or written.
+
+#### Important 2 and invalid-order Minor — lifecycle economics
+
+Initial explicit lifecycle/account/fee regressions were RED:
+
+```text
+$ .venv/bin/python -m pytest tests/redteam/test_hidden_validity.py -q \
+    -k 'requires_independent_fee or reversal or cover_refund or negative_gaps or mutations'
+FFFFF                                                                    [100%]
+5 failed in 0.19s
+```
+
+The first lifecycle implementation was GREEN at `5 passed in 0.16s`. A subsequent fee
+mutation test reproduced a missing economic-contract check (`1 failed in 0.16s`) and
+passed after binding fee/accounts across each payment (`1 passed in 0.33s`). Return-path
+coverage then reproduced one omitted A2A terminal path (`1 failed in 0.16s`). Final hidden
+validity coverage:
+
+```text
+$ .venv/bin/python -m pytest tests/redteam/test_hidden_validity.py -q
+..................                                                       [100%]
+18 passed in 0.56s
+```
+
+Impossible transitions, out-of-order events, and negative gaps add reason codes and
+return `valid=False`; they do not raise from the distance/log calculation.
+
+#### Important 3 and Important 6 — atomic private storage and root admission
+
+The new signer/index/artifact adversarial tests began with nine failures:
+
+```text
+$ .venv/bin/python -m pytest tests/redteam/test_run_boundary.py \
+    tests/storage/test_artifacts.py -q \
+    -k 'partial_key or short_low or symlink_parent or crash_safe or concurrent_publishers or symlink_or_permissive_artifact_root or stable_root_descriptor or owner_and_link or payload_swap'
+FFFFFFFFF                                                                [100%]
+9 failed in 0.37s
+```
+
+Initial component GREEN was seven artifact tests plus six signer/index tests. The first
+combined stress pass found one real hard-link publication race (`1 failed, 80 passed`).
+Replacing link/unlink publication with native `renameatx_np(RENAME_EXCL)` on Darwin and
+`renameat2(RENAME_NOREPLACE)` on Linux made the race-focused set GREEN:
+
+```text
+$ .venv/bin/python -m pytest tests/redteam/test_run_boundary.py \
+    tests/storage/test_artifacts.py -q -k 'concurrent or exclusive_rename'
+...                                                                      [100%]
+3 passed in 0.43s
+```
+
+Unsupported platforms and unsupported filesystems fail closed; there is no overwrite
+fallback. All reads use stable directory/file descriptors and reject symlink, wrong
+owner, wrong mode, unexpected hard link, metadata change, and non-regular object.
+
+#### Important 4 — real G2 and exact Task 6 verifier
+
+The multi-step assertions were RED against the one-step review baseline: observed
+generation history was `[0]`, so no adaptive parent/history change was exercised, and no
+authenticated frozen-cache source existed in the worker audit. The replacement uses a
+matched budget of three for fixed, random, adaptive, and cached LLM policies. The cached
+path constructs the production `LLMPlannerPolicy` with the exact pinned replay records,
+`require_cached_replay=True`, and a client whose transport raises if called.
+
+Focused frozen-cache GREEN:
+
+```text
+$ .venv/bin/python -m pytest \
+    tests/redteam/test_run_boundary.py::test_cached_worker_uses_the_real_cache_only_planner_with_zero_network \
+    tests/integration/test_g2_adaptation.py::test_g2_disposable_policies_use_matched_budgets_and_seeded_bytes -q
+..                                                                       [100%]
+2 passed in 12.12s
+```
+
+Every cached proposal records `cache_source=task6-v3-frozen-replay`, `cache_hit=True`,
+and `network_call_count=0`. `scripts/verify_g1_g2.py` now invokes the exact existing
+`run_task6_holdout.py --verify-postcommit` command with approved commit and SHA. The
+clean-HEAD gate result is recorded in the postcommit subsection below.
+
+#### Important 5 — tracked mode and private admission
+
+The fresh-checkout regression was RED because no private-admission helper existed:
+
+```text
+$ .venv/bin/python -m pytest \
+    tests/redteam/test_run_boundary.py::test_tracked_task6_evidence_is_atomically_admitted_to_private_state -q
+F                                                                        [100%]
+1 failed
+```
+
+GREEN covers both source modes and private publication:
+
+```text
+$ .venv/bin/python -m pytest tests/redteam/test_run_boundary.py -q \
+    -k 'tracked_task6_evidence or durable_signer_never_publishes'
+..                                                                       [100%]
+2 passed
+```
+
+The runner never chmods the tracked result. It verifies regular/non-symlink ownership,
+single-link state, bounded stable descriptor metadata, source mode 0600 or 0644, exact
+SHA, historical Git mode 100644, and historical bytes before reading the atomic private
+0600 copy.
+
+#### Important 7 — complete reviewed pairing
+
+Family-envelope and same-rail cross-family tests were RED before the compile extension:
+
+```text
+$ .venv/bin/python -m pytest \
+    tests/api/test_runs.py::test_compile_returns_a_verified_scenario_artifact_id \
+    tests/api/test_runs.py::test_run_rejects_same_rail_policy_from_a_different_reviewed_family -q
+FF                                                                       [100%]
+2 failed in 1.70s
+```
+
+GREEN after `apar_run_binding_v1` and runner validation:
+
+```text
+$ <same command>
+..                                                                       [100%]
+2 passed in 0.97s
+```
+
+A later standalone RED showed policy mode itself was not yet typed (`extra_forbidden` on
+`attacker_mode`). `AttackerPolicy.attacker_mode` is now required and execution requires
+binding mode == scenario mode == policy mode:
+
+```text
+$ .venv/bin/python -m pytest \
+    tests/redteam/test_run_boundary.py::test_standalone_runner_rejects_policy_attacker_mode_outside_reviewed_binding -q
+.                                                                        [100%]
+1 passed in 0.19s
+```
+
+The frozen G0 compiler implementation and hash were not changed.
+
+#### Warning/leakage gap — public response and restricted completion detail
+
+The original API regression was RED while a full internal manifest, including the
+restricted validity reference, was returned. The final test asserts an exact five-name
+public artifact allowlist and verifies the internal restricted SHA and relative path are
+absent from the entire serialized response. It also asserts no `restricted_validity`,
+`restricted_evaluation`, or `reasons` token is present. `evaluation_hidden.__init__`
+exports neither the restricted report nor a detailed evaluator. The caller-controlled
+`run_complete=True` switch no longer exists; only the runner imports the module-private
+completed-run function after proposal execution.
+
+```text
+$ .venv/bin/python -m pytest tests/api/test_runs.py -q
+....                                                                     [100%]
+4 passed
+```
+
+#### Full-regex run ID Minor
+
+The exact-length non-hex ID test was deliberately run against the prefix/length-only
+implementation and reached artifact lookup instead of rejecting the identifier:
+
+```text
+$ .venv/bin/python -m pytest \
+    tests/redteam/test_run_boundary.py::test_get_rejects_non_hex_run_ids_before_any_index_lookup -q
+F                                                                        [100%]
+E apar.runs.runner.RunExecutionError: stored run manifest is invalid
+1 failed in 0.25s
+```
+
+GREEN after the full regex:
+
+```text
+$ <same command>
+.                                                                        [100%]
+1 passed in 0.44s
+```
+
+#### Self-review compatibility defect — pre-existing `.apar` root
+
+The first full repository run found that G0 can initialize its general database parent at
+0755 before API startup. Keeping a key directly in that parent correctly failed closed,
+but broke existing API startup:
+
+```text
+$ .venv/bin/python -m pytest -q
+FF
+FAILED tests/integration/test_g0_contract_flow.py::test_golden_threat_is_available_through_real_api
+FAILED tests/integration/test_g0_contract_flow.py::test_one_command_g0_verification
+2 failed, 911 passed, 1 skipped in 145.74s
+```
+
+Signer and index state now live beneath a dedicated owned mode-0700
+`.apar/private-run-state` directory. The database root is neither chmodded nor trusted as
+private:
+
+```text
+$ .venv/bin/python -m pytest \
+    tests/integration/test_g0_contract_flow.py::test_golden_threat_is_available_through_real_api \
+    tests/integration/test_g0_contract_flow.py::test_one_command_g0_verification \
+    tests/api/test_runs.py -q
+......                                                                   [100%]
+6 passed in 6.47s
+```
+
+### Final focused and repository gates
+
+Final review-focused set:
+
+```text
+$ .venv/bin/python -m pytest tests/redteam/test_run_boundary.py \
+    tests/redteam/test_hidden_validity.py tests/storage/test_artifacts.py \
+    tests/api/test_runs.py tests/integration/test_g2_adaptation.py -q
+........................................................................ [ 86%]
+...........                                                              [100%]
+83 passed in 34.29s
+```
+
+Required integration set:
+
+```text
+$ .venv/bin/python -m pytest tests/simulator tests/trust tests/generators \
+    tests/redteam tests/integration/test_g1_simulation.py \
+    tests/integration/test_g2_adaptation.py -q
+799 passed, 1 skipped in 158.59s (0:02:38)
+```
+
+Full repository:
+
+```text
+$ .venv/bin/python -m pytest -q
+913 passed, 1 skipped in 147.53s (0:02:27)
+```
+
+Static and foundation gates:
+
+```text
+$ .venv/bin/ruff check src tests scripts
+All checks passed!
+
+$ .venv/bin/mypy --strict <18 exact Task 7 source/test targets>
+Success: no issues found in 18 source files
+
+$ .venv/bin/mypy src
+Success: no issues found in 53 source files
+
+$ .venv/bin/python scripts/verify_g0.py
+G0 PASS: 20 threat cards, contracts, registry, compiler, API, and artifact store
+```
+
+Hygiene and frozen isolation all exited zero with no diff output:
+
+```text
+$ git diff --check
+$ git diff --exit-code 7534c0e38eaff568f390784113a0dd5992f8d048 -- validation_spike
+$ git diff --exit-code 7534c0e38eaff568f390784113a0dd5992f8d048 -- \
+    docs/experiments/task6-v3.4-holdout-result.json \
+    docs/experiments/task6-v3.4-holdout-preregistration.json \
+    src/apar/redteam/policies.py src/apar/redteam/benchmark.py \
+    src/apar/generators/campaigns.py src/apar/generators/population.py \
+    src/apar/redteam/llm_policy.py src/apar/redteam/search.py \
+    src/apar/redteam/task6_experiment.py scripts/run_task6_holdout.py
+```
+
+Pinned current hashes:
+
+```text
+f82981a987651a7f7ebb10a9011df063b2dc54a56181cae5b838e31de5e658db  docs/experiments/task6-v3.4-holdout-result.json
+12bf24e081e97f3222bf1fc92fb1d441c36bba548184c6b503519590efc649a4  docs/experiments/task6-v3.4-holdout-preregistration.json
+c97ab7b263a493978cf901140a97f15874a34f8ff2ce54c84253e7baa998fb82  src/apar/redteam/policies.py
+7996fcf20c85547a861afcfeb9da132dad534ad30f7fe1a07618e90e2faef519  src/apar/redteam/benchmark.py
+670b4a3ec358f82d88f9655bd41d878fbee11d4841ff264655554bae31c3b31a  src/apar/generators/campaigns.py
+2e54862322980414098c17930ec95bd268372da8968a78384a5bd661bfdaa2e5  src/apar/generators/population.py
+8105a6788041f7d73b1afa571482f4b0ff3b15980f6c28769b701ab350936622  src/apar/redteam/llm_policy.py
+ee05348ab07a9852a68a3f6a477eeec7ad6837d94f187e6fbb97767220f60e89  src/apar/redteam/search.py
+a1367a8bb4310eeea2812a7d118ccb738ae1d9c32bfbc21c87413b1a869ce056  src/apar/redteam/task6_experiment.py
+1b137c2de0bec6eb95acf34172217113c825ab5be9322e694f9ec9e458427efc  docs/experiments/task6-v3-cached-llm-replay.json
+```
+
+Historical result mode remains `100644 blob` at approved commit
+`d6d3eecbfe2d871af8375e1455814cb5c48f2928`.
+
+### Files changed in Fix Round 1
+
+- `scripts/verify_g1_g2.py`
+- `src/apar/api/app.py`
+- `src/apar/api/routes/runs.py`
+- `src/apar/api/routes/scenarios.py`
+- `src/apar/evaluation_hidden/__init__.py`
+- `src/apar/evaluation_hidden/generator.py`
+- `src/apar/evaluation_hidden/validity.py`
+- `src/apar/runs/__init__.py`
+- `src/apar/runs/agentic_replay.py` (new)
+- `src/apar/runs/policy_worker.py`
+- `src/apar/runs/runner.py`
+- `src/apar/runs/wire.py`
+- `src/apar/storage/artifacts.py`
+- `tests/api/test_runs.py`
+- `tests/integration/test_g2_adaptation.py`
+- `tests/redteam/test_hidden_validity.py`
+- `tests/redteam/test_run_boundary.py`
+- `tests/storage/test_artifacts.py`
+- this report
+
+### Self-review and residual scope
+
+The complete diff was reviewed for hidden imports, worker request/response fields,
+retained objects, subprocess setup, selector termination, platform rename behavior,
+descriptor lifetime, source/private file modes, hard links, API response fields,
+manifest/receipt name sets, scenario/policy pairing, agentic event ownership, and Task 6
+frozen-path drift. The review itself found and fixed the concurrent hard-link publication
+race, the exact run-ID validation gap, the fixed/random agentic test case that selected an
+identical winner, the test-wrapper monkeypatch cast, and the pre-existing 0755 `.apar`
+compatibility defect.
+
+Residual boundary: native exclusive publication and RSS observation are implemented for
+Darwin and Linux. An unsupported platform or filesystem fails closed. The worker remains
+intentionally limited to the four reviewed built-in selections; it is not an arbitrary
+uploaded-code sandbox. The Task 6 result is accepted synthetic frozen evidence only and
+does not establish live-fraud effectiveness.
+
+### Fix Round 1 commits and clean-HEAD postcommit gates
+
+Implementation/report commit: `PENDING_FIX_ROUND_1_IMPLEMENTATION_COMMIT`
+
+Postcommit verification-report commit: `PENDING_FIX_ROUND_1_REPORT_COMMIT`
+
+The following outputs are populated only after the implementation commit, from a clean
+tracked HEAD:
+
+```text
+$ .venv/bin/python scripts/verify_g1_g2.py
+PENDING_CLEAN_HEAD_G1_G2_OUTPUT
+
+$ .venv/bin/python scripts/run_task6_holdout.py --verify-postcommit \
+    --approved-result-commit d6d3eecbfe2d871af8375e1455814cb5c48f2928 \
+    --approved-result-sha256 f82981a987651a7f7ebb10a9011df063b2dc54a56181cae5b838e31de5e658db
+PENDING_CLEAN_HEAD_TASK6_OUTPUT
+```

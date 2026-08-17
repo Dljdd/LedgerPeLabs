@@ -73,15 +73,16 @@ async def _http_error_handler(_: Request, error: Exception) -> JSONResponse:
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    run_state_root = app.state.settings.root / ".apar" / "private-run-state"
+    signer = RunSigningIdentity.load_or_create(
+        run_state_root / "run-signing-key.ed25519"
+    )
     app.state.repository = ThreatRepository(app.state.settings.database_path)
     app.state.artifact_store = ArtifactStore(app.state.settings.artifact_root)
-    signer = RunSigningIdentity.load_or_create(
-        app.state.settings.root / ".apar" / "run-signing-key.ed25519"
-    )
     app.state.run_runner = RunRunner(
         artifact_store=app.state.artifact_store,
         signer=signer,
-        run_index_root=app.state.settings.root / ".apar" / "runs",
+        run_index_root=run_state_root / "runs",
     )
     yield
 

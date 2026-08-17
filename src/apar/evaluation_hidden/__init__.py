@@ -4,12 +4,10 @@ from apar.evaluation_hidden.generator import HiddenCampaignGenerator
 from apar.evaluation_hidden.validity import (
     HiddenValidityOracle,
     HiddenValidityResult,
-    RestrictedValidityReport,
 )
 
 __all__ = [
     "HiddenCampaignGenerator",
     "HiddenValidityOracle",
     "HiddenValidityResult",
-    "RestrictedValidityReport",
 ]

@@ -8,6 +8,7 @@ from decimal import Decimal, InvalidOperation
 from typing import cast
 
 from apar.contracts.decisions import Action
+from apar.contracts.scenarios import FeedbackField
 from apar.redteam.policies import (
     AdaptiveParameter,
     AdaptiveVector,
@@ -232,33 +233,90 @@ def candidate_from_wire(
     return checked
 
 
-def history_to_wire(history: tuple[VisibleTrial, ...]) -> list[dict[str, object]]:
+_ACTION_FIELDS = frozenset(
+    {FeedbackField.APPROVE, FeedbackField.CHALLENGE, FeedbackField.DECLINE}
+)
+
+
+def _checked_feedback_fields(
+    feedback_fields: tuple[FeedbackField, ...],
+) -> frozenset[FeedbackField]:
+    if type(feedback_fields) is not tuple or not feedback_fields or any(
+        type(field) is not FeedbackField for field in feedback_fields
+    ):
+        raise WireContractError("feedback fields must be a non-empty exact tuple")
+    if len(set(feedback_fields)) != len(feedback_fields):
+        raise WireContractError("feedback fields must be unique")
+    return frozenset(feedback_fields)
+
+
+def feedback_fields_to_wire(
+    feedback_fields: tuple[FeedbackField, ...],
+) -> list[str]:
+    """Serialize the scenario-owned disclosure declaration for the worker."""
+    checked = _checked_feedback_fields(feedback_fields)
+    return sorted(field.value for field in checked)
+
+
+def feedback_fields_from_wire(value: object) -> tuple[FeedbackField, ...]:
+    """Reconstruct an exact, unique disclosure declaration from worker input."""
+    raw_fields = _list(value, label="feedback fields")
+    fields: list[FeedbackField] = []
+    for raw in raw_fields:
+        try:
+            field = FeedbackField(_text(raw, label="feedback field"))
+        except ValueError as error:
+            raise WireContractError("feedback field is undeclared") from error
+        fields.append(field)
+    checked = _checked_feedback_fields(tuple(fields))
+    return tuple(sorted(checked, key=lambda field: field.value))
+
+
+def _action_is_declared(fields: frozenset[FeedbackField]) -> bool:
+    return FeedbackField.ACTION in fields or fields >= _ACTION_FIELDS
+
+
+def history_to_wire(
+    history: tuple[VisibleTrial, ...],
+    *,
+    feedback_fields: tuple[FeedbackField, ...],
+) -> list[dict[str, object]]:
+    """Serialize only the feedback fields authorized by the compiled scenario."""
     checked = reconstruct_history(history)
-    return [
-        {
-            "candidate": candidate_to_wire(trial.candidate),
-            "feedback": {
-                "action": trial.feedback.action.value,
-                "realized_value": (
-                    None
-                    if trial.feedback.realized_value is None
-                    else str(trial.feedback.realized_value)
-                ),
-                "reason_family": trial.feedback.reason_family,
-            },
-            "objective_value": str(trial.objective_value),
-        }
-        for trial in checked
-    ]
+    declared = _checked_feedback_fields(feedback_fields)
+    wire_history: list[dict[str, object]] = []
+    for trial in checked:
+        feedback: dict[str, object] = {}
+        if _action_is_declared(declared):
+            feedback["action"] = trial.feedback.action.value
+        if FeedbackField.REASON_FAMILY in declared:
+            feedback["reason_family"] = trial.feedback.reason_family
+        if FeedbackField.REALIZED_VALUE in declared:
+            feedback["realized_value"] = (
+                None
+                if trial.feedback.realized_value is None
+                else str(trial.feedback.realized_value)
+            )
+        wire_history.append(
+            {"candidate": candidate_to_wire(trial.candidate), "feedback": feedback}
+        )
+    return wire_history
 
 
-def history_from_wire(value: object, bounds: ParameterBounds) -> tuple[VisibleTrial, ...]:
+def history_from_wire(
+    value: object,
+    bounds: ParameterBounds,
+    *,
+    feedback_fields: tuple[FeedbackField, ...],
+) -> tuple[VisibleTrial, ...]:
+    """Reconstruct policy history, filling undisclosed fields with fixed neutral values."""
+    declared = _checked_feedback_fields(feedback_fields)
     raw_trials = _list(value, label="visible history")
     trials: list[VisibleTrial] = []
     for raw_trial in raw_trials:
         trial = _object(
             raw_trial,
-            {"candidate", "feedback", "objective_value"},
+            {"candidate", "feedback"},
             label="visible trial",
         )
         candidate = candidate_from_wire(
@@ -266,16 +324,23 @@ def history_from_wire(value: object, bounds: ParameterBounds) -> tuple[VisibleTr
             history=tuple(trials),
             bounds=bounds,
         )
+        expected_feedback: set[str] = set()
+        if _action_is_declared(declared):
+            expected_feedback.add("action")
+        if FeedbackField.REASON_FAMILY in declared:
+            expected_feedback.add("reason_family")
+        if FeedbackField.REALIZED_VALUE in declared:
+            expected_feedback.add("realized_value")
         feedback_document = _object(
-            trial["feedback"],
-            {"action", "reason_family", "realized_value"},
-            label="visible feedback",
+            trial["feedback"], expected_feedback, label="visible feedback"
         )
-        try:
-            action = Action(_text(feedback_document["action"], label="feedback action"))
-        except ValueError as error:
-            raise WireContractError("feedback action is undeclared") from error
-        realized_raw = feedback_document["realized_value"]
+        action = Action.CHALLENGE
+        if "action" in feedback_document:
+            try:
+                action = Action(_text(feedback_document["action"], label="feedback action"))
+            except ValueError as error:
+                raise WireContractError("feedback action is undeclared") from error
+        realized_raw = feedback_document.get("realized_value")
         realized: Decimal | None
         if realized_raw is None:
             realized = None
@@ -287,24 +352,23 @@ def history_from_wire(value: object, bounds: ParameterBounds) -> tuple[VisibleTr
                 raise WireContractError("realized value is invalid") from error
             if str(realized) != realized_text:
                 raise WireContractError("realized value is not canonical")
-        objective_text = _text(trial["objective_value"], label="visible objective")
-        try:
-            objective = Decimal(objective_text)
-        except InvalidOperation as error:
-            raise WireContractError("visible objective is invalid") from error
-        if not objective.is_finite() or str(objective) != objective_text:
-            raise WireContractError("visible objective is not canonical")
+        reason = feedback_document.get("reason_family")
+        if reason is None:
+            reason = "approved" if action is Action.APPROVE else "other"
         trials.append(
             VisibleTrial(
                 candidate=candidate,
                 feedback=Feedback(
                     action=action,
-                    reason_family=_text(
-                        feedback_document["reason_family"], label="feedback reason"
-                    ),
+                    reason_family=_text(reason, label="feedback reason"),
                     realized_value=realized,
                 ),
-                objective_value=objective,
+                objective_value=(realized or Decimal(0))
+                - {
+                    Action.APPROVE: Decimal(0),
+                    Action.CHALLENGE: Decimal("0.25"),
+                    Action.DECLINE: Decimal(1),
+                }[action],
             )
         )
     return reconstruct_history(tuple(trials))
@@ -317,6 +381,8 @@ __all__ = [
     "candidate_from_wire",
     "candidate_to_wire",
     "canonical_json_bytes",
+    "feedback_fields_from_wire",
+    "feedback_fields_to_wire",
     "history_from_wire",
     "history_to_wire",
     "strict_json_loads",

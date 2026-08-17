@@ -12,11 +12,14 @@ if TYPE_CHECKING:
         PolicyWorkerBoundaryReport,
         PolicyWorkerClient,
         PolicyWorkerError,
+        PublicRunManifest,
         RunExecutionError,
         RunManifest,
         RunRunner,
         RunSigningIdentity,
+        ScenarioRunBinding,
         SignedRunReceipt,
+        bind_scenario_for_run,
     )
 
 __all__ = [
@@ -25,11 +28,14 @@ __all__ = [
     "PolicyWorkerBoundaryReport",
     "PolicyWorkerClient",
     "PolicyWorkerError",
+    "PublicRunManifest",
     "RunExecutionError",
     "RunManifest",
     "RunRunner",
     "RunSigningIdentity",
     "SignedRunReceipt",
+    "ScenarioRunBinding",
+    "bind_scenario_for_run",
 ]
 
 

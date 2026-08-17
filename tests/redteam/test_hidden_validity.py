@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import ast
+from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
+from apar.contracts.events import EventKind
 from apar.evaluation_hidden import HiddenCampaignGenerator, HiddenValidityOracle
 
 
@@ -38,6 +41,21 @@ def test_hidden_package_does_not_import_defender() -> None:
 def test_hidden_generator_does_not_import_main_generator() -> None:
     """Catch a circular hidden benchmark implemented with the public generator."""
     assert _scan_imports(Path("src/apar/evaluation_hidden"), prefix="apar.generators") == []
+
+
+def test_hidden_generator_uses_the_domain_separated_numpy_stream() -> None:
+    """Pin a hand-derived PCG64 leaf and schedule, independent of global RNG state."""
+    events = HiddenCampaignGenerator().generate(
+        "app_scam_mule", seed=260_816, count=8
+    )
+    source = Path("src/apar/evaluation_hidden/generator.py").read_text(encoding="utf-8")
+    imports = _scan_imports(Path("src/apar/evaluation_hidden"), prefix="random")
+
+    assert events[0].amount == Decimal("88.25")
+    assert events[0].event_time == datetime(2026, 8, 16, 0, 22, 9, tzinfo=UTC)
+    assert events[0].lineage["hidden_generator"] == "independent-numpy-v2"
+    assert imports == []
+    assert "np.random.Generator" in source
 
 
 @pytest.mark.parametrize(
@@ -107,6 +125,126 @@ def test_hidden_oracle_rejects_conflicting_opening_balance_evidence() -> None:
     )
 
     assert not HiddenValidityOracle().evaluate(tuple(changed)).valid
+
+
+@pytest.mark.parametrize(
+    "family",
+    ("app_scam_mule", "card_testing_cnp", "synthetic_merchant_refund"),
+)
+def test_hidden_oracle_requires_independent_fee_and_account_evidence(
+    family: str,
+) -> None:
+    """Catch principal-only conservation that ignores fees and ledger account roles."""
+    events = HiddenCampaignGenerator().generate(family, seed=41, count=8)
+    opening = events[0]
+    assert {
+        "fee_amount",
+        "payer_account",
+        "payee_account",
+        "fee_account",
+    } <= set(opening.rail_data)
+    assert {
+        "payer_opening_balance",
+        "payee_opening_balance",
+        "fee_opening_balance",
+    } <= set(opening.party_refs)
+
+    tampered = list(events)
+    tampered[0] = opening.model_copy(
+        update={"rail_data": {**opening.rail_data, "fee_amount": "-0.01"}}
+    )
+
+    assert HiddenValidityOracle().evaluate(tuple(tampered)).model_dump() == {
+        "valid": False
+    }
+
+
+def test_hidden_card_oracle_covers_reversal_and_rejects_impossible_transition() -> None:
+    """Pin authorization reversal and reject a reversal after clearing without raising."""
+    events = HiddenCampaignGenerator().generate("card_testing_cnp", seed=43, count=8)
+    assert EventKind.REVERSAL in {event.event_type for event in events}
+    assert HiddenValidityOracle().evaluate(events).valid
+
+    settlement_index = next(
+        index
+        for index, event in enumerate(events)
+        if event.event_type is EventKind.SETTLEMENT
+    )
+    changed = list(events)
+    changed[settlement_index] = changed[settlement_index].model_copy(
+        update={"event_type": EventKind.REVERSAL}
+    )
+
+    assert not HiddenValidityOracle().evaluate(tuple(changed)).valid
+
+
+def test_hidden_corpora_cover_refund_chargeback_recovery_return_and_freeze() -> None:
+    """Pin every fee-bearing terminal lifecycle used by the independent ledger."""
+    card_testing = HiddenCampaignGenerator().generate(
+        "card_testing_cnp", seed=44, count=8
+    )
+    refunds = HiddenCampaignGenerator().generate(
+        "synthetic_merchant_refund", seed=45, count=8
+    )
+    a2a = HiddenCampaignGenerator().generate("app_scam_mule", seed=46, count=8)
+    kinds = {event.event_type for event in (*card_testing, *refunds, *a2a)}
+
+    assert {
+        EventKind.REFUND,
+        EventKind.CHARGEBACK,
+        EventKind.RECOVERY,
+        EventKind.TRANSFER_RETURNED,
+        EventKind.FUNDS_FROZEN,
+    } <= kinds
+    assert all(
+        HiddenValidityOracle().evaluate(events).valid
+        for events in (card_testing, refunds, a2a)
+    )
+
+
+def test_hidden_oracle_returns_false_for_out_of_order_negative_gaps() -> None:
+    """Catch negative timing gaps reaching logarithms and escaping as exceptions."""
+    events = HiddenCampaignGenerator().generate("app_scam_mule", seed=47, count=8)
+
+    assert HiddenValidityOracle().evaluate(tuple(reversed(events))).model_dump() == {
+        "valid": False
+    }
+
+
+def test_hidden_oracle_rejects_mid_lifecycle_fee_or_account_mutations() -> None:
+    """Catch self-balancing but undeclared economics changing after authorization."""
+    events = HiddenCampaignGenerator().generate(
+        "synthetic_merchant_refund", seed=53, count=8
+    )
+    settlement_index = next(
+        index
+        for index, event in enumerate(events)
+        if event.event_type is EventKind.SETTLEMENT
+    )
+    settlement = events[settlement_index]
+    changed_fee = list(events)
+    changed_fee[settlement_index] = settlement.model_copy(
+        update={
+            "rail_data": {
+                **settlement.rail_data,
+                "fee_amount": str(
+                    Decimal(str(settlement.rail_data["fee_amount"])) + Decimal("0.01")
+                ),
+            }
+        }
+    )
+    changed_account = list(events)
+    changed_account[settlement_index] = settlement.model_copy(
+        update={
+            "rail_data": {
+                **settlement.rail_data,
+                "payee_account": "hidden:card:substituted-payee",
+            }
+        }
+    )
+
+    assert not HiddenValidityOracle().evaluate(tuple(changed_fee)).valid
+    assert not HiddenValidityOracle().evaluate(tuple(changed_account)).valid
 
 
 def test_hidden_generator_rejects_unbounded_inputs() -> None:

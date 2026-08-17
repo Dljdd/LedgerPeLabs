@@ -7,8 +7,10 @@ import binascii
 import contextlib
 import ctypes
 import hashlib
+import json
 import os
-import resource
+import re
+import secrets
 import selectors
 import signal
 import stat
@@ -16,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import Counter
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -33,8 +36,9 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from pydantic import Field, field_validator, model_validator
 
 from apar.contracts._validation import ExternalContract
-from apar.contracts.events import PaymentEvent, Rail
-from apar.contracts.scenarios import ScenarioBundle
+from apar.contracts.decisions import Action
+from apar.contracts.events import EventKind, PaymentEvent, Rail
+from apar.contracts.scenarios import AttackerMode, FeedbackField, ScenarioBundle
 from apar.redteam.policies import (
     PUBLIC_CAMPAIGN_FAMILIES,
     AttackCandidate,
@@ -45,6 +49,7 @@ from apar.runs.wire import (
     bounds_to_wire,
     candidate_from_wire,
     canonical_json_bytes,
+    feedback_fields_to_wire,
     history_to_wire,
     strict_json_loads,
 )
@@ -60,10 +65,20 @@ _REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 _TASK6_RESULT = "docs/experiments/task6-v3.4-holdout-result.json"
 _TASK6_RESULT_COMMIT = "d6d3eecbfe2d871af8375e1455814cb5c48f2928"
 _TASK6_RESULT_SHA256 = "f82981a987651a7f7ebb10a9011df063b2dc54a56181cae5b838e31de5e658db"
-_TASK6_CURRENT_MODE = 0o600
 _TASK6_HISTORICAL_MODE = "100644"
+_TASK6_PRIVATE_NAME = ".task6-v3.4-holdout-result.private"
+_TASK6_MAX_BYTES = 16 * 1024 * 1024
+_TASK6_LLM_CACHE = "docs/experiments/task6-v3-cached-llm-replay.json"
+_TASK6_LLM_CACHE_SHA256 = (
+    "1b137c2de0bec6eb95acf34172217113c825ab5be9322e694f9ec9e458427efc"
+)
 _RUN_INDEX_MAX_BYTES = 4_096
+_RUN_BINDING_EXTENSION = "apar_run_binding_v1"
 _PINNED_CURRENT_FILES = {
+    _TASK6_LLM_CACHE: (
+        _TASK6_LLM_CACHE_SHA256,
+        0o644,
+    ),
     "docs/experiments/task6-v3.4-holdout-preregistration.json": (
         "12bf24e081e97f3222bf1fc92fb1d441c36bba548184c6b503519590efc649a4",
         0o644,
@@ -170,26 +185,132 @@ def _strict_regular_file(path: Path, *, expected_mode: int, expected_sha256: str
     return raw
 
 
-def _read_run_index_file(path: Path) -> bytes:
-    """Read one index entry through the descriptor whose invariants were checked."""
+def _admit_private_evidence(
+    source: Path,
+    state_fd: int,
+    private_name: str,
+    expected_sha256: str,
+) -> int:
+    """Verify tracked bytes and atomically admit a private durable execution copy."""
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as error:
+        raise RunExecutionError("tracked evidence is not a regular non-symlink file") from error
+    try:
+        before = os.fstat(descriptor)
+        current_mode = stat.S_IMODE(before.st_mode)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or current_mode not in {0o600, 0o644}
+            or before.st_uid != os.geteuid()
+            or before.st_nlink != 1
+            or before.st_size > _TASK6_MAX_BYTES
+        ):
+            raise RunExecutionError("tracked evidence ownership or filesystem mode is invalid")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev != after.st_dev
+            or before.st_ino != after.st_ino
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+            or before.st_ctime_ns != after.st_ctime_ns
+            or stat.S_IMODE(after.st_mode) != current_mode
+            or after.st_uid != os.geteuid()
+            or after.st_nlink != 1
+        ):
+            raise RunExecutionError("tracked evidence changed while it was read")
+    finally:
+        os.close(descriptor)
+    if hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise RunExecutionError("tracked evidence bytes changed")
+    with contextlib.suppress(FileExistsError):
+        _atomic_publish_private_file(
+            state_fd,
+            private_name,
+            raw,
+            label="private admitted evidence",
+        )
+    private_raw = _read_private_file_at(
+        state_fd,
+        private_name,
+        label="private admitted evidence",
+        max_bytes=_TASK6_MAX_BYTES,
+    )
+    if private_raw != raw or hashlib.sha256(private_raw).hexdigest() != expected_sha256:
+        raise RunExecutionError("private admitted evidence does not match tracked bytes")
+    return current_mode
+
+
+def _validate_private_directory(descriptor: int, label: str) -> None:
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_nlink < 1
+    ):
+        raise ValueError(f"{label} must be an owned mode-0700 directory")
+
+
+def _open_private_directory(path: Path, label: str) -> int:
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as error:
+        raise ValueError(f"{label} must be a non-symlink private directory") from error
+    try:
+        _validate_private_directory(descriptor, label)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _read_private_file_at(
+    directory_fd: int,
+    name: str,
+    *,
+    label: str,
+    max_bytes: int,
+) -> bytes:
+    """Read one private file through a stable directory and file descriptor."""
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
     except FileNotFoundError:
         raise
     except OSError as error:
-        raise RunExecutionError("run index entry is not a regular mode-0600 file") from error
+        raise RunExecutionError(f"{label} is not a private regular file") from error
     try:
         before = os.fstat(descriptor)
+        if before.st_nlink != 1:
+            raise RunExecutionError(f"{label} has unexpected hard links")
         if (
             not stat.S_ISREG(before.st_mode)
             or stat.S_IMODE(before.st_mode) != 0o600
-            or before.st_size > _RUN_INDEX_MAX_BYTES
+            or before.st_uid != os.geteuid()
+            or before.st_size > max_bytes
         ):
-            raise RunExecutionError("run index entry is not a regular mode-0600 file")
-        raw = os.read(descriptor, _RUN_INDEX_MAX_BYTES + 1)
+            raise RunExecutionError(f"{label} is not a private regular file")
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
         after = os.fstat(descriptor)
         if (
-            len(raw) > _RUN_INDEX_MAX_BYTES
+            len(raw) > max_bytes
             or len(raw) != after.st_size
             or before.st_dev != after.st_dev
             or before.st_ino != after.st_ino
@@ -197,11 +318,60 @@ def _read_run_index_file(path: Path) -> bytes:
             or before.st_mtime_ns != after.st_mtime_ns
             or before.st_ctime_ns != after.st_ctime_ns
             or stat.S_IMODE(after.st_mode) != 0o600
+            or after.st_uid != os.geteuid()
+            or after.st_nlink != 1
         ):
-            raise RunExecutionError("run index entry changed while it was read")
+            raise RunExecutionError(f"{label} changed while it was read")
         return raw
     finally:
         os.close(descriptor)
+
+
+def _atomic_publish_private_file(
+    directory_fd: int,
+    name: str,
+    content: bytes,
+    *,
+    label: str,
+) -> None:
+    """Fsync a private temporary file then publish by exclusive same-dir rename."""
+    temporary = f".{name}.{secrets.token_hex(12)}.tmp"
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=directory_fd,
+    )
+    try:
+        try:
+            os.fchmod(descriptor, 0o600)
+            _write_all(descriptor, content)
+            os.fsync(descriptor)
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_nlink != 1
+            ):
+                raise RunExecutionError(f"new {label} has invalid ownership or mode")
+        finally:
+            os.close(descriptor)
+        ArtifactStore.publish_no_replace_at(directory_fd, temporary, name)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+
+
+def _read_run_index_file(directory_fd: int, name: str) -> bytes:
+    """Read one index entry through the descriptor whose invariants were checked."""
+    return _read_private_file_at(
+        directory_fd,
+        name,
+        label="run index entry",
+        max_bytes=_RUN_INDEX_MAX_BYTES,
+    )
 
 
 def _git(*arguments: str, binary: bool = False) -> bytes | str:
@@ -225,13 +395,22 @@ def _git(*arguments: str, binary: bool = False) -> bytes | str:
     return output
 
 
-def _provenance_document() -> dict[str, object]:
+def _provenance_document(private_state_fd: int | None) -> dict[str, object]:
     """Verify current regular-file modes and separately pin historical Git mode."""
+    if private_state_fd is None:
+        raise RunExecutionError("durable private state is required for Task 6 evidence")
     result_path = _REPOSITORY_ROOT / _TASK6_RESULT
-    result_raw = _strict_regular_file(
+    current_mode = _admit_private_evidence(
         result_path,
-        expected_mode=_TASK6_CURRENT_MODE,
-        expected_sha256=_TASK6_RESULT_SHA256,
+        private_state_fd,
+        _TASK6_PRIVATE_NAME,
+        _TASK6_RESULT_SHA256,
+    )
+    result_raw = _read_private_file_at(
+        private_state_fd,
+        _TASK6_PRIVATE_NAME,
+        label="private admitted Task 6 evidence",
+        max_bytes=_TASK6_MAX_BYTES,
     )
     current_files: dict[str, object] = {}
     for relative, (digest, mode) in sorted(_PINNED_CURRENT_FILES.items()):
@@ -279,12 +458,14 @@ def _provenance_document() -> dict[str, object]:
         },
         "python": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
         "task6_result": {
-            "current_filesystem_mode": format(_TASK6_CURRENT_MODE, "04o"),
+            "current_filesystem_mode": format(current_mode, "04o"),
             "current_regular_non_symlink": True,
             "historical_commit": _TASK6_RESULT_COMMIT,
             "historical_git_mode": _TASK6_HISTORICAL_MODE,
             "historical_object_type": "blob",
             "path": _TASK6_RESULT,
+            "private_admission_filesystem_mode": "0600",
+            "private_admission_regular_non_symlink": True,
             "sha256": _TASK6_RESULT_SHA256,
             "size_bytes": len(result_raw),
         },
@@ -337,10 +518,10 @@ class AttackerPolicy(ExternalContract):
 
     schema_version: str = "1.0.0"
     family: str
+    attacker_mode: AttackerMode
     kind: AttackerPolicyKind
     query_budget: int = Field(ge=1, le=64, strict=True)
     worker_timeout_ms: int = Field(ge=50, le=30_000, strict=True)
-    expose_realized_value: bool = False
 
     @field_validator("family", mode="before")
     @classmethod
@@ -349,41 +530,72 @@ class AttackerPolicy(ExternalContract):
             raise ValueError("policy family is unsupported")
         return value
 
-    @field_validator("expose_realized_value", mode="before")
+
+class ScenarioRunBinding(ExternalContract):
+    """API-added binding from reviewed threat evidence to one compiled run mode."""
+
+    schema_version: str = "1.0.0"
+    threat_family: str
+    attacker_mode: AttackerMode
+    threat_card_ref: str
+
+    @field_validator("threat_family", mode="before")
     @classmethod
-    def disclosure_is_exact(cls, value: object) -> object:
-        if type(value) is not bool:
-            raise TypeError("expose_realized_value must be an exact boolean")
+    def family_is_supported(cls, value: object) -> object:
+        if type(value) is not str or value not in PUBLIC_CAMPAIGN_FAMILIES:
+            raise ValueError("run binding threat family is unsupported")
         return value
+
+
+def bind_scenario_for_run(
+    bundle: ScenarioBundle,
+    *,
+    threat_family: str,
+) -> ScenarioBundle:
+    """Attach a validated reviewed-family envelope without changing compiler bytes."""
+    if type(bundle) is not ScenarioBundle:
+        raise TypeError("bundle must be an exact ScenarioBundle")
+    binding = ScenarioRunBinding(
+        threat_family=threat_family,
+        attacker_mode=bundle.attacker_mode,
+        threat_card_ref=bundle.threat_card_ref,
+    )
+    extensions = {
+        **bundle.extensions,
+        _RUN_BINDING_EXTENSION: binding.model_dump(mode="json", exclude={"schema_version"}),
+    }
+    return ScenarioBundle.model_validate(
+        bundle.model_copy(update={"extensions": extensions}).model_dump(
+            mode="json", round_trip=True
+        )
+    )
 
 
 class PolicyWorkerBoundaryReport(ExternalContract):
     """Boolean self-test results from a fresh disposable worker."""
 
     clean_start: bool
+    exec_blocked: bool
     filesystem_blocked: bool
+    fork_blocked: bool
     forbidden_import_blocked: bool
+    native_blocked: bool
+    process_signal_blocked: bool
     reflection_import_blocked: bool
     network_blocked: bool
+    spawn_blocked: bool
     hidden_modules_absent: bool
     input_hidden_fields_absent: bool
     orchestrator_modules_absent: bool
 
 
-def _set_limit(kind: int, maximum: int) -> None:
-    soft, hard = resource.getrlimit(kind)
-    bounded = maximum if hard == resource.RLIM_INFINITY else min(maximum, hard)
-    resource.setrlimit(kind, (bounded, bounded))
+class PolicyWorkerProposalAudit(ExternalContract):
+    """Non-sensitive proof of the selected built-in worker implementation."""
 
-
-def _limit_policy_child() -> None:
-    """Apply hard POSIX resource limits before the isolated interpreter starts."""
-    _set_limit(resource.RLIMIT_CORE, 0)
-    _set_limit(resource.RLIMIT_CPU, 3)
-    _set_limit(resource.RLIMIT_FSIZE, 1_048_576)
-    _set_limit(resource.RLIMIT_NOFILE, 64)
-    if hasattr(resource, "RLIMIT_NPROC"):
-        _set_limit(resource.RLIMIT_NPROC, 1)
+    policy_kind: AttackerPolicyKind
+    cache_hit: bool
+    cache_source: str | None
+    network_call_count: int = Field(ge=0, strict=True)
 
 
 class PolicyWorkerClient:
@@ -394,6 +606,31 @@ class PolicyWorkerClient:
         if resolved != _WORKER_PATH or resolved.is_symlink() or not resolved.is_file():
             raise ValueError("policy worker path is not the reviewed regular entry point")
         self._worker_path = resolved
+        self._proposal_audits: list[PolicyWorkerProposalAudit] = []
+        cache_raw = _strict_regular_file(
+            _REPOSITORY_ROOT / _TASK6_LLM_CACHE,
+            expected_mode=0o644,
+            expected_sha256=_TASK6_LLM_CACHE_SHA256,
+        )
+        try:
+            cache_artifact = json.loads(cache_raw)
+        except json.JSONDecodeError as error:
+            raise ValueError("pinned LLM replay cache is invalid") from error
+        if (
+            type(cache_artifact) is not dict
+            or set(cache_artifact)
+            != {
+                "budget",
+                "development_seed",
+                "record_counts",
+                "records",
+                "schema_version",
+            }
+            or cache_artifact.get("schema_version") != "1.0.0"
+            or type(cache_artifact.get("records")) is not dict
+        ):
+            raise ValueError("pinned LLM replay cache has an invalid schema")
+        self._llm_replay_cache = cast(dict[str, object], cache_artifact)["records"]
 
     def propose(
         self,
@@ -401,6 +638,7 @@ class PolicyWorkerClient:
         kind: AttackerPolicyKind,
         bounds: ParameterBounds,
         history: tuple[VisibleTrial, ...],
+        feedback_fields: tuple[FeedbackField, ...],
         seed: int,
         timeout_ms: int,
     ) -> AttackCandidate:
@@ -410,18 +648,39 @@ class PolicyWorkerClient:
             raise TypeError("worker seed must be an exact bounded integer")
         document = {
             "bounds": bounds_to_wire(bounds),
-            "history": history_to_wire(history),
+            "feedback_fields": feedback_fields_to_wire(feedback_fields),
+            "history": history_to_wire(history, feedback_fields=feedback_fields),
             "operation": "propose",
             "policy_kind": kind.value,
             "schema_version": "1.0.0",
             "seed": seed,
         }
+        if kind is AttackerPolicyKind.CACHED_LLM:
+            document["llm_replay_cache"] = self._llm_replay_cache
         response = self._invoke(document, timeout_ms=timeout_ms)
-        if type(response) is not dict or set(response) != {"candidate", "ok"}:
+        if type(response) is not dict or set(response) != {"audit", "candidate", "ok"}:
             raise PolicyWorkerError("policy worker response field set is invalid")
         if response["ok"] is not True:
             raise PolicyWorkerError("policy worker failed closed")
-        return candidate_from_wire(response["candidate"], history=history, bounds=bounds)
+        audit = PolicyWorkerProposalAudit.model_validate(response["audit"])
+        cached = kind is AttackerPolicyKind.CACHED_LLM
+        if (
+            audit.policy_kind is not kind
+            or audit.network_call_count != 0
+            or audit.cache_hit != cached
+            or audit.cache_source
+            != ("task6-v3-frozen-replay" if cached else None)
+        ):
+            raise PolicyWorkerError("policy worker implementation audit is invalid")
+        candidate = candidate_from_wire(response["candidate"], history=history, bounds=bounds)
+        self._proposal_audits.append(audit)
+        return candidate
+
+    def take_audit_records(self) -> tuple[PolicyWorkerProposalAudit, ...]:
+        """Return and clear proposal implementation audits owned by this client."""
+        records = tuple(self._proposal_audits)
+        self._proposal_audits.clear()
+        return records
 
     def probe(self, *, timeout_ms: int) -> PolicyWorkerBoundaryReport:
         response = self._invoke(
@@ -440,7 +699,27 @@ class PolicyWorkerClient:
             timeout_ms=timeout_ms,
         )
 
-    def _invoke(self, document: dict[str, object], *, timeout_ms: int) -> dict[str, object]:
+    def probe_startup_hang(self, *, timeout_ms: int, request_bytes: int) -> None:
+        """Exercise a reviewed child that intentionally never reads its bounded request."""
+        if type(request_bytes) is not int or not 1 <= request_bytes <= 8 * 1024 * 1024:
+            raise ValueError("startup probe request size is invalid")
+        self._invoke(
+            {
+                "operation": "probe",
+                "padding": "x" * max(0, request_bytes - 40),
+                "schema_version": "1.0.0",
+            },
+            timeout_ms=timeout_ms,
+            worker_argument="startup-hang-probe",
+        )
+
+    def _invoke(
+        self,
+        document: dict[str, object],
+        *,
+        timeout_ms: int,
+        worker_argument: str | None = None,
+    ) -> dict[str, object]:
         if type(timeout_ms) is not int or not 50 <= timeout_ms <= 30_000:
             raise ValueError("worker timeout must be an exact integer in [50, 30000]")
         request = canonical_json_bytes(document)
@@ -451,22 +730,35 @@ class PolicyWorkerClient:
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONHASHSEED": "0",
         }
+        if worker_argument not in {None, "startup-hang-probe"}:
+            raise ValueError("worker argument is not reviewed")
+        deadline = time.monotonic() + timeout_ms / 1000
+        command = [sys.executable, "-I", str(self._worker_path)]
+        if worker_argument is not None:
+            command.append(worker_argument)
         with tempfile.TemporaryDirectory(prefix="apar-policy-worker-") as worker_directory:
-            process = subprocess.Popen(
-                [sys.executable, "-I", str(self._worker_path)],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                cwd=worker_directory,
-                env=environment,
-                close_fds=True,
-                start_new_session=True,
-                preexec_fn=_limit_policy_child,
-            )
+            try:
+                process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    cwd=worker_directory,
+                    env=environment,
+                    close_fds=True,
+                    start_new_session=True,
+                )
+            except OSError as error:
+                raise PolicyWorkerError("policy worker could not start") from error
+            if time.monotonic() >= deadline:
+                self._kill_group(process)
+                raise PolicyWorkerError(
+                    "policy worker deadline exceeded during startup and process killed"
+                )
             stdout, stderr = self._collect_bounded(
                 process,
                 request=request,
-                timeout_ms=timeout_ms,
+                deadline=deadline,
             )
         if process.returncode != 0:
             raise PolicyWorkerError("policy worker failed closed")
@@ -484,66 +776,86 @@ class PolicyWorkerClient:
     def _kill_group(process: subprocess.Popen[bytes]) -> None:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(process.pid, signal.SIGKILL)
-        process.wait()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            process.wait(timeout=1)
 
     def _collect_bounded(
         self,
         process: subprocess.Popen[bytes],
         *,
         request: bytes,
-        timeout_ms: int,
+        deadline: float,
     ) -> tuple[bytes, bytes]:
         """Bound deadline, resident memory, and pipe bytes while the child executes."""
         assert process.stdin is not None
         assert process.stdout is not None
         assert process.stderr is not None
-        process.stdin.write(request)
-        process.stdin.close()
         output = bytearray()
         errors = bytearray()
+        request_offset = 0
         selector = selectors.DefaultSelector()
+        os.set_blocking(process.stdin.fileno(), False)
+        selector.register(process.stdin, selectors.EVENT_WRITE, data="stdin")
         for stream, label in ((process.stdout, "stdout"), (process.stderr, "stderr")):
             os.set_blocking(stream.fileno(), False)
             selector.register(stream, selectors.EVENT_READ, data=label)
-        deadline = time.monotonic() + timeout_ms / 1000
         next_memory_check = 0.0
-        while selector.get_map() or process.poll() is None:
-            now = time.monotonic()
-            if now >= deadline:
-                self._kill_group(process)
-                selector.close()
-                raise PolicyWorkerError("policy worker deadline exceeded and process killed")
-            if now >= next_memory_check and process.poll() is None:
-                next_memory_check = now + 0.05
-                resident = _resident_bytes(process.pid)
-                if resident is None and process.poll() is None:
+        try:
+            while selector.get_map() or process.poll() is None:
+                now = time.monotonic()
+                if now >= deadline:
                     self._kill_group(process)
-                    selector.close()
-                    raise PolicyWorkerError(
-                        "policy worker memory watchdog unavailable; process killed"
-                    )
-                if resident is not None and resident > 805_306_368:
-                    self._kill_group(process)
-                    selector.close()
-                    raise PolicyWorkerError(
-                        "policy worker resident-memory limit exceeded and process killed"
-                    )
-            for key, _ in selector.select(timeout=min(0.05, deadline - now)):
-                selected_stream = cast(BinaryIO, key.fileobj)
-                chunk = os.read(selected_stream.fileno(), 65_536)
-                if not chunk:
-                    selector.unregister(key.fileobj)
-                    continue
-                target = output if key.data == "stdout" else errors
-                target.extend(chunk)
-                if len(output) + len(errors) > 1_048_576:
-                    self._kill_group(process)
-                    selector.close()
-                    raise PolicyWorkerError(
-                        "policy worker output limit exceeded and process killed"
-                    )
-        selector.close()
-        process.wait()
+                    raise PolicyWorkerError("policy worker deadline exceeded and process killed")
+                if now >= next_memory_check and process.poll() is None:
+                    next_memory_check = now + 0.05
+                    resident = _resident_bytes(process.pid)
+                    if resident is None and process.poll() is None:
+                        self._kill_group(process)
+                        raise PolicyWorkerError(
+                            "policy worker memory watchdog unavailable; process killed"
+                        )
+                    if resident is not None and resident > 805_306_368:
+                        self._kill_group(process)
+                        raise PolicyWorkerError(
+                            "policy worker resident-memory limit exceeded and process killed"
+                        )
+                for key, _ in selector.select(timeout=min(0.05, deadline - now)):
+                    selected_stream = cast(BinaryIO, key.fileobj)
+                    if key.data == "stdin":
+                        try:
+                            written = os.write(
+                                selected_stream.fileno(),
+                                request[request_offset : request_offset + 65_536],
+                            )
+                        except (BlockingIOError, BrokenPipeError):
+                            written = 0
+                        request_offset += written
+                        if request_offset == len(request) or process.poll() is not None:
+                            selector.unregister(key.fileobj)
+                            selected_stream.close()
+                        continue
+                    chunk = os.read(selected_stream.fileno(), 65_536)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        selected_stream.close()
+                        continue
+                    target = output if key.data == "stdout" else errors
+                    target.extend(chunk)
+                    if len(output) + len(errors) > 1_048_576:
+                        self._kill_group(process)
+                        raise PolicyWorkerError(
+                            "policy worker output limit exceeded and process killed"
+                        )
+        finally:
+            selector.close()
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if not stream.closed:
+                    stream.close()
+        process.wait(timeout=1)
         return bytes(output), bytes(errors)
 
 
@@ -587,44 +899,34 @@ class RunSigningIdentity:
             raise TypeError("signing key path must be an exact Path")
         path = Path(path)
         parent = path.parent
-        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if parent.is_symlink() or not parent.is_dir():
-            raise ValueError("signing key parent must be a regular directory")
+        parent_fd = _open_private_directory(parent, "signing key parent")
         try:
-            descriptor = os.open(
-                path,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                0o600,
-            )
-        except FileExistsError:
-            descriptor = -1
-        if descriptor >= 0:
-            key = Ed25519PrivateKey.generate()
-            raw = _private_key_bytes(key)
             try:
-                _write_all(descriptor, raw)
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
-            directory = os.open(parent, os.O_RDONLY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
-        try:
-            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-        except OSError as error:
-            raise ValueError("signing key is not a regular non-symlink file") from error
-        try:
-            metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600:
-                raise ValueError("signing key must be a mode-0600 regular file")
-            chunks: list[bytes] = []
-            while chunk := os.read(descriptor, 64):
-                chunks.append(chunk)
-            raw = b"".join(chunks)
+                raw = _read_private_file_at(
+                    parent_fd,
+                    path.name,
+                    label="signing key",
+                    max_bytes=32,
+                )
+            except FileNotFoundError:
+                generated = _private_key_bytes(Ed25519PrivateKey.generate())
+                with contextlib.suppress(FileExistsError):
+                    _atomic_publish_private_file(
+                        parent_fd,
+                        path.name,
+                        generated,
+                        label="signing key",
+                    )
+                raw = _read_private_file_at(
+                    parent_fd,
+                    path.name,
+                    label="signing key",
+                    max_bytes=32,
+                )
+        except RunExecutionError as error:
+            raise ValueError(str(error)) from error
         finally:
-            os.close(descriptor)
+            os.close(parent_fd)
         return cls.from_private_bytes(raw)
 
     def sign(self, document: object) -> str:
@@ -745,6 +1047,21 @@ class RunManifest(ExternalContract):
         }
 
 
+class PublicRunManifest(ExternalContract):
+    """Redacted API view with no identifier derived from evaluator-only artifacts."""
+
+    schema_version: str = "1.0.0"
+    run_id: str
+    scenario_id: str
+    policy_kind: AttackerPolicyKind
+    completed_at: datetime
+    artifacts: dict[str, ArtifactRef]
+    signer_key_id: str
+    public_key_base64: str
+    authenticated: bool
+    valid: bool
+
+
 class RunRunner:
     """Freeze inputs, isolate policy proposals, execute real rails, and sign outputs."""
 
@@ -763,16 +1080,34 @@ class RunRunner:
         if run_index_root is not None and not isinstance(run_index_root, Path):
             raise TypeError("run_index_root must be a Path or None")
         self._run_index_root = None if run_index_root is None else Path(run_index_root)
+        self._run_index_fd: int | None = None
         self._memory_index: dict[str, ArtifactRef] = {}
         if self._run_index_root is not None:
-            self._run_index_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-            if self._run_index_root.is_symlink() or not self._run_index_root.is_dir():
-                raise ValueError("run index root must be a regular directory")
+            self._run_index_fd = _open_private_directory(
+                self._run_index_root, "run index root"
+            )
 
     def execute(self, bundle: ScenarioBundle, policy: AttackerPolicy) -> RunManifest:
         """Execute one deterministic evaluator-owned run around disposable policies."""
         checked_bundle = self._validated_bundle(bundle)
         checked_policy = self._validated_policy(policy)
+        try:
+            binding = ScenarioRunBinding.model_validate(
+                checked_bundle.extensions[_RUN_BINDING_EXTENSION]
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise RunExecutionError(
+                "compiled scenario run binding is missing or invalid"
+            ) from error
+        if (
+            binding.threat_family != checked_policy.family
+            or binding.attacker_mode is not checked_bundle.attacker_mode
+            or binding.attacker_mode is not checked_policy.attacker_mode
+            or binding.threat_card_ref != checked_bundle.threat_card_ref
+        ):
+            raise RunExecutionError(
+                "policy family or attacker mode does not match reviewed scenario binding"
+            )
         if checked_policy.query_budget > checked_bundle.query_budget:
             raise RunExecutionError("policy query budget exceeds the compiled scenario")
         expected_rail = {
@@ -796,14 +1131,20 @@ class RunRunner:
             hidden_template=template,
             defender=default_defender_rules(),
             disclosure_profile=DisclosureProfile(
-                profile_id=(
-                    "run-decision-value-v1"
-                    if checked_policy.expose_realized_value
-                    else "run-decision-only-v1"
+                profile_id="run-compiled-feedback-v1",
+                expose_realized_value=(
+                    FeedbackField.REALIZED_VALUE in checked_bundle.feedback
                 ),
-                expose_realized_value=checked_policy.expose_realized_value,
             ),
             generator_seed=checked_bundle.seed,
+        )
+
+        from apar.evaluation_hidden import HiddenCampaignGenerator
+
+        hidden_events = HiddenCampaignGenerator().generate(
+            checked_policy.family,
+            seed=checked_bundle.seed,
+            count=25 if checked_policy.family == "agentic_intent_abuse" else 10,
         )
 
         inputs = {
@@ -811,7 +1152,9 @@ class RunRunner:
             "population": self.artifact_store.put_bytes(
                 population.canonical_bytes(), "application/vnd.apar.population+json"
             ),
-            "provenance": self.artifact_store.put_json(_provenance_document()),
+            "provenance": self.artifact_store.put_json(
+                _provenance_document(self._run_index_fd)
+            ),
             "restricted_evaluation_input": self.artifact_store.put_json(
                 {
                     "bounds": bounds_to_wire(benchmark.public_bounds),
@@ -819,6 +1162,10 @@ class RunRunner:
                     "hidden_template": _campaign_template_document(template),
                     "restriction": "evaluator_only",
                 }
+            ),
+            "restricted_hidden_evaluation_events": self.artifact_store.put_bytes(
+                _event_bytes(hidden_events),
+                "application/vnd.apar.restricted-hidden-events+json",
             ),
             "scenario": self.artifact_store.put_json(checked_bundle),
         }
@@ -847,13 +1194,24 @@ class RunRunner:
         history, observations = self._search(
             worker=worker,
             benchmark=benchmark,
+            bundle=checked_bundle,
+            population=population,
             policy=checked_policy,
+            feedback_fields=tuple(checked_bundle.feedback),
             run_id=run_id,
         )
+        worker_audits = worker.take_audit_records()
+        if len(worker_audits) != checked_policy.query_budget:
+            raise RunExecutionError("policy worker audit count differs from proposal budget")
         winner = min(
             history,
             key=lambda trial: (-trial.objective_value, trial.candidate.candidate_id),
         ).candidate
+        selected_observation = next(
+            observation
+            for trial, observation in zip(history, observations, strict=True)
+            if trial.candidate.candidate_id == winner.candidate_id
+        )
         events, event_source = self._final_events(
             bundle=checked_bundle,
             policy=checked_policy,
@@ -861,12 +1219,22 @@ class RunRunner:
             benchmark=benchmark,
             winner=winner,
         )
+        event_sha256 = hashlib.sha256(_event_bytes(events)).hexdigest()
+        if (
+            checked_bundle.rail is Rail.AGENTIC
+            and selected_observation.event_digest != event_sha256
+        ):
+            raise RunExecutionError(
+                "agentic winner replay differs from its selected evaluation outcome"
+            )
 
         from apar.evaluation_hidden import HiddenValidityOracle
 
         oracle = HiddenValidityOracle()
-        public_validity = oracle.evaluate(events)
-        restricted_validity = oracle.evaluate_restricted(events, run_complete=True)
+        public_validity = oracle.evaluate(hidden_events)
+        from apar.evaluation_hidden.validity import _evaluate_completed_run
+
+        restricted_validity = _evaluate_completed_run(hidden_events)
         if public_validity.valid != restricted_validity.valid:
             raise RunExecutionError("hidden validity views disagree")
         outputs = {
@@ -875,7 +1243,9 @@ class RunRunner:
             ),
             "feedback": self.artifact_store.put_json(
                 {
-                    "history": history_to_wire(history),
+                    "history": history_to_wire(
+                        history, feedback_fields=tuple(checked_bundle.feedback)
+                    ),
                     "logical_time_used": len(history),
                     "proposal_budget": checked_policy.query_budget,
                     "proposals_used": len(history),
@@ -887,6 +1257,9 @@ class RunRunner:
                 {
                     "observations": [observation.document() for observation in observations],
                     "policy_worker_boundary": boundary_report.model_dump(mode="json"),
+                    "policy_worker_proposals": [
+                        audit.model_dump(mode="json") for audit in worker_audits
+                    ],
                     "restriction": "evaluator_only",
                 }
             ),
@@ -911,8 +1284,13 @@ class RunRunner:
                         }
                     ),
                     "policy_kind": checked_policy.kind.value,
+                    "production_approved_event_count": sum(
+                        event.event_type is EventKind.AUTHORIZATION for event in events
+                    ),
+                    "production_event_sha256": event_sha256,
                     "proposals_used": len(history),
                     "run_id": run_id,
+                    "selected_evaluation_event_sha256": selected_observation.event_digest,
                 }
             ),
         }
@@ -962,6 +1340,34 @@ class RunRunner:
         self._publish_index(run_id, manifest_ref)
         return manifest
 
+    def public_view(self, manifest: RunManifest) -> PublicRunManifest:
+        """Return an authenticated redaction without restricted hashes or signatures."""
+        if type(manifest) is not RunManifest or not self.verify_run(manifest):
+            raise RunExecutionError("run cannot be exposed before authenticated verification")
+        public_names = frozenset({"events", "feedback", "policy", "population", "scenario"})
+        try:
+            summary = strict_json_loads(self.artifact_store.read(manifest.artifacts["summary"]))
+        except (KeyError, ValueError) as error:
+            raise RunExecutionError("run summary is unavailable") from error
+        if (
+            type(summary) is not dict
+            or type(summary.get("hidden_valid")) is not bool
+        ):
+            raise RunExecutionError("run summary validity is invalid")
+        hidden_valid = summary["hidden_valid"]
+        assert type(hidden_valid) is bool
+        return PublicRunManifest(
+            run_id=manifest.run_id,
+            scenario_id=manifest.scenario_id,
+            policy_kind=manifest.policy_kind,
+            completed_at=manifest.completed_at,
+            artifacts={name: manifest.artifacts[name] for name in sorted(public_names)},
+            signer_key_id=manifest.signer_key_id,
+            public_key_base64=manifest.public_key_base64,
+            authenticated=True,
+            valid=hidden_valid,
+        )
+
     def verify_manifest(self, manifest: RunManifest) -> bool:
         if type(manifest) is not RunManifest:
             return False
@@ -986,6 +1392,7 @@ class RunRunner:
                 "population",
                 "provenance",
                 "restricted_evaluation_input",
+                "restricted_hidden_evaluation_events",
                 "scenario",
             }
             output_names = {
@@ -1027,7 +1434,7 @@ class RunRunner:
             if not self._verify_receipt(authorization) or not self._verify_receipt(completion):
                 return False
             stored_provenance = strict_json_loads(payloads["provenance"])
-            current_provenance = _provenance_document()
+            current_provenance = _provenance_document(self._run_index_fd)
             if type(stored_provenance) is not dict:
                 return False
             stored = cast(dict[str, object], stored_provenance)
@@ -1041,16 +1448,17 @@ class RunRunner:
             return False
 
     def get(self, run_id: str) -> RunManifest:
-        if type(run_id) is not str or not run_id.startswith("run-") or len(run_id) != 36:
+        if type(run_id) is not str or re.fullmatch(r"run-[0-9a-f]{32}", run_id) is None:
             raise KeyError("run does not exist")
         reference: ArtifactRef | None
         if self._run_index_root is None:
             reference = self._memory_index.get(run_id)
         else:
             reference = None
-            path = self._run_index_root / f"{run_id}.json"
+            if self._run_index_fd is None:
+                raise RunExecutionError("run index descriptor is unavailable")
             try:
-                raw = _read_run_index_file(path)
+                raw = _read_run_index_file(self._run_index_fd, f"{run_id}.json")
             except FileNotFoundError as error:
                 raise KeyError("run does not exist") from error
             try:
@@ -1125,9 +1533,11 @@ class RunRunner:
                 )
             ),
             seed=bundle.seed,
-            payment_count=25 if agentic else 10,
-            target_illicit_rate=Decimal("0.92") if agentic else Decimal("0.70"),
-            class_rate_tolerance=Decimal("0.01"),
+            payment_count=26 if agentic else 10,
+            target_illicit_rate=(
+                Decimal(23) / Decimal(26) if agentic else Decimal("0.70")
+            ),
+            class_rate_tolerance=Decimal("0.05") if agentic else Decimal("0.01"),
             target_value_total=Decimal("500.00"),
             value_tolerance=Decimal("0.01"),
             min_amount=Decimal("10.00"),
@@ -1136,10 +1546,10 @@ class RunRunner:
             duration_hours=min(bundle.duration_hours, 12),
             query_budget=policy.query_budget,
             min_delay_seconds=1,
-            max_delay_seconds=60,
+            max_delay_seconds=300,
             expected_motif=motifs[policy.family],
-            cash_out_delay_seconds=60,
-            agentic_attack_mix=Decimal("0.92"),
+            cash_out_delay_seconds=300,
+            agentic_attack_mix=(Decimal(23) / Decimal(26)),
         )
 
     @staticmethod
@@ -1147,14 +1557,18 @@ class RunRunner:
         *,
         worker: PolicyWorkerClient,
         benchmark: object,
+        bundle: ScenarioBundle,
+        population: object,
         policy: AttackerPolicy,
+        feedback_fields: tuple[FeedbackField, ...],
         run_id: str,
     ) -> tuple[tuple[VisibleTrial, ...], tuple[BenchmarkObservation, ...]]:
-        from apar.redteam.benchmark import CampaignBenchmark
+        from apar.generators import Population, campaign_bytes
+        from apar.redteam.benchmark import BenchmarkObservation, CampaignBenchmark
         from apar.redteam.policies import Feedback, VisibleTrial, visible_objective
 
-        if type(benchmark) is not CampaignBenchmark:
-            raise TypeError("benchmark must be exact")
+        if type(benchmark) is not CampaignBenchmark or type(population) is not Population:
+            raise TypeError("benchmark and population must be exact")
         history: list[VisibleTrial] = []
         observations: list[BenchmarkObservation] = []
         for generation in range(policy.query_budget):
@@ -1166,14 +1580,105 @@ class RunRunner:
                 kind=policy.kind,
                 bounds=benchmark.public_bounds,
                 history=tuple(history),
+                feedback_fields=feedback_fields,
                 seed=seed,
                 timeout_ms=policy.worker_timeout_ms,
             )
-            returned, observation = benchmark.evaluate_with_observation(candidate)
+            if policy.family == "agentic_intent_abuse":
+                from apar.runs.agentic_replay import replay_agentic_candidate
+
+                replay = replay_agentic_candidate(
+                    bundle=bundle,
+                    population=population,
+                    params=benchmark.compose(candidate),
+                    seed=bundle.seed,
+                )
+                realized = sum(
+                    (
+                        event.amount
+                        for event in replay.events
+                        if event.event_type is EventKind.AUTHORIZATION
+                    ),
+                    Decimal("0.00"),
+                )
+                decision = (
+                    Action.APPROVE if replay.approved_event_count else Action.DECLINE
+                )
+                returned = Feedback(
+                    action=decision,
+                    reason_family="approved" if decision is Action.APPROVE else "integrity",
+                    realized_value=realized,
+                )
+                ledger_document = [
+                    {
+                        "credit": {
+                            str(account): str(amount)
+                            for account, amount in sorted(entry.credit.items(), key=str)
+                        },
+                        "currency": entry.currency,
+                        "debit": {
+                            str(account): str(amount)
+                            for account, amount in sorted(entry.debit.items(), key=str)
+                        },
+                        "entry_id": entry.entry_id,
+                    }
+                    for entry in replay.entries
+                ]
+                observation = BenchmarkObservation(
+                    family=policy.family,
+                    candidate_id=candidate.candidate_id,
+                    candidate_document_digest=_digest_document(
+                        candidate.model_dump(mode="json", round_trip=True)
+                    ),
+                    artifact_digest=replay.command_sha256,
+                    command_count=len(replay.commands),
+                    command_type_counts=tuple(
+                        sorted(Counter(command.name for command in replay.commands).items())
+                    ),
+                    event_digest=replay.event_sha256,
+                    event_count=len(replay.events),
+                    event_type_counts=tuple(
+                        sorted(
+                            Counter(event.event_type.value for event in replay.events).items()
+                        )
+                    ),
+                    ledger_digest=_digest_document(ledger_document),
+                    ledger_entry_count=len(replay.entries),
+                    feature_values=(),
+                    fresh_replay_succeeded=True,
+                    ledger_conserved=True,
+                    matched_rule=None,
+                    decision_action=decision,
+                    decision_reason_family=returned.reason_family,
+                    role_bound_value_components=(),
+                    realized_settled_illicit_value=realized,
+                    feedback_realized_value=returned.realized_value,
+                )
+                if hashlib.sha256(campaign_bytes(replay.commands)).hexdigest() != (
+                    replay.command_sha256
+                ):
+                    raise RunExecutionError("agentic command replay digest changed")
+            else:
+                returned, observation = benchmark.evaluate_with_observation(candidate)
+            action_declared = FeedbackField.ACTION in feedback_fields or {
+                FeedbackField.APPROVE,
+                FeedbackField.CHALLENGE,
+                FeedbackField.DECLINE,
+            } <= set(feedback_fields)
+            action = returned.action if action_declared else Action.CHALLENGE
+            reason = (
+                returned.reason_family
+                if FeedbackField.REASON_FAMILY in feedback_fields
+                else ("approved" if action is Action.APPROVE else "other")
+            )
             feedback = Feedback(
-                action=returned.action,
-                reason_family=returned.reason_family,
-                realized_value=(returned.realized_value if policy.expose_realized_value else None),
+                action=action,
+                reason_family=reason,
+                realized_value=(
+                    returned.realized_value
+                    if FeedbackField.REALIZED_VALUE in feedback_fields
+                    else None
+                ),
             )
             history.append(
                 VisibleTrial(
@@ -1204,18 +1709,17 @@ class RunRunner:
 
         if type(population) is not Population or type(benchmark) is not CampaignBenchmark:
             raise TypeError("final replay requires exact evaluator inputs")
-        if policy.family == "agentic_intent_abuse":
-            from apar.evaluation_hidden import HiddenCampaignGenerator
-
-            return (
-                HiddenCampaignGenerator().generate(
-                    policy.family,
-                    seed=bundle.seed,
-                    count=25,
-                ),
-                "independent_hidden_evaluation_corpus_after_production_trial_replay",
-            )
         params = benchmark.compose(winner)
+        if bundle.rail is Rail.AGENTIC:
+            from apar.runs.agentic_replay import replay_agentic_candidate
+
+            replay = replay_agentic_candidate(
+                bundle=bundle,
+                population=population,
+                params=params,
+                seed=bundle.seed,
+            )
+            return replay.events, "task5_winner_commands_task4_agentic_replay"
         commands = CampaignGenerator(seed=bundle.seed).generate(
             policy.family,
             population,
@@ -1248,20 +1752,60 @@ class RunRunner:
         raw_events = engine.run()
         engine.ledger.assert_conserved()
         entities = {entity.entity_id: entity for entity in population.entities}
-        balance_by_entity = {
-            account.owner_entity_id: account.opening_balance for account in population.accounts
-        }
+        opening_balances = dict(population.opening_balances)
+        economic_by_payment: dict[str, dict[str, str]] = {}
+        account_fields = (
+            ("payer", "payee", "fee", "frozen")
+            if bundle.rail is Rail.A2A
+            else ("payer", "payee", "fee", "hold", "chargeback")
+        )
+        for command in commands:
+            payload = command.payload
+            if "amount" not in payload:
+                continue
+            payment_id = cast(str, payload["payment_id"])
+            evidence = {
+                "fee_amount": str(cast(Decimal, payload["fee"])),
+                **{
+                    f"{role}_account": cast(str, payload[f"{role}_account"])
+                    for role in account_fields
+                },
+            }
+            if any(
+                evidence[f"{role}_account"] not in opening_balances
+                for role in account_fields
+            ):
+                raise RunExecutionError("production replay account evidence is incomplete")
+            economic_by_payment[payment_id] = evidence
         enriched: list[PaymentEvent] = []
         for event in raw_events:
             actor = entities[event.actor_id]
             counterparty = entities[event.counterparty_id]
+            payment_id = cast(str, event.rail_data["payment_id"])
+            try:
+                economic = economic_by_payment[payment_id]
+            except KeyError as error:
+                raise RunExecutionError(
+                    "production event lacks its opening command economics"
+                ) from error
             party_refs = {
                 **event.party_refs,
-                "actor_opening_balance": str(balance_by_entity[event.actor_id]),
+                "actor_opening_balance": str(
+                    opening_balances[economic["payer_account"]]
+                ),
                 "actor_role": actor.role,
-                "counterparty_opening_balance": str(balance_by_entity[event.counterparty_id]),
+                "counterparty_opening_balance": str(
+                    opening_balances[economic["payee_account"]]
+                ),
                 "counterparty_role": counterparty.role,
+                **{
+                    f"{role}_opening_balance": str(
+                        opening_balances[economic[f"{role}_account"]]
+                    )
+                    for role in account_fields
+                },
             }
+            rail_data = {**event.rail_data, **economic}
             lineage = {
                 **event.lineage,
                 "campaign_role": (
@@ -1271,7 +1815,11 @@ class RunRunner:
             enriched.append(
                 PaymentEvent.model_validate(
                     event.model_copy(
-                        update={"lineage": lineage, "party_refs": party_refs}
+                        update={
+                            "lineage": lineage,
+                            "party_refs": party_refs,
+                            "rail_data": rail_data,
+                        }
                     ).model_dump(mode="json", round_trip=True)
                 )
             )
@@ -1348,46 +1896,49 @@ class RunRunner:
         }
 
     def _publish_index(self, run_id: str, manifest_ref: ArtifactRef) -> None:
-        self._memory_index[run_id] = manifest_ref
         if self._run_index_root is None:
+            self._memory_index[run_id] = manifest_ref
             return
-        path = self._run_index_root / f"{run_id}.json"
+        if self._run_index_fd is None:
+            raise RunExecutionError("run index descriptor is unavailable")
+        name = f"{run_id}.json"
         raw = canonical_json_bytes(asdict(manifest_ref))
         try:
-            descriptor = os.open(
-                path,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                0o600,
+            _atomic_publish_private_file(
+                self._run_index_fd,
+                name,
+                raw,
+                label="run index entry",
             )
         except FileExistsError:
             try:
-                existing = _read_run_index_file(path)
+                existing = _read_run_index_file(self._run_index_fd, name)
             except FileNotFoundError as error:
                 raise RunExecutionError("append-only run index collision") from error
             if existing != raw:
                 raise RunExecutionError("append-only run index collision") from None
-            return
-        try:
-            _write_all(descriptor, raw)
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        directory = os.open(
-            self._run_index_root,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-        )
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        self._memory_index[run_id] = manifest_ref
+
+    def close(self) -> None:
+        """Release the stable append-only index descriptor."""
+        if self._run_index_fd is not None:
+            os.close(self._run_index_fd)
+            self._run_index_fd = None
+
+    def __del__(self) -> None:
+        with contextlib.suppress(OSError):
+            self.close()
 
 
 __all__ = [
     "AttackerPolicy",
     "AttackerPolicyKind",
+    "ScenarioRunBinding",
+    "bind_scenario_for_run",
     "PolicyWorkerBoundaryReport",
     "PolicyWorkerClient",
     "PolicyWorkerError",
+    "PublicRunManifest",
     "RunExecutionError",
     "RunManifest",
     "RunRunner",

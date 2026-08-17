@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import errno
 import hashlib
 import json
 import os
-import shutil
+import secrets
 import stat
 import sys
-import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import cast
@@ -38,10 +38,21 @@ class ArtifactStore:
     """Persist payloads once under their SHA-256 digest."""
 
     def __init__(self, root: Path) -> None:
-        self._root = root.resolve()
-        self._root.mkdir(parents=True, exist_ok=True)
-        if not self._root.is_dir():
-            raise ValueError(f"artifact root is not a directory: {self._root}")
+        self._root = Path(root)
+        self._root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            root_fd = os.open(
+                self._root,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+        except OSError as error:
+            raise ValueError("artifact root must be a non-symlink directory") from error
+        try:
+            self._validate_directory_descriptor(root_fd, "root")
+        except BaseException:
+            os.close(root_fd)
+            raise
+        self._root_fd = root_fd
 
     def put_bytes(self, payload: bytes, media_type: str) -> ArtifactRef:
         """Store bytes atomically, returning their immutable content reference."""
@@ -60,24 +71,31 @@ class ArtifactStore:
             size_bytes=len(payload),
             relative_path=self._relative_payload_path(digest),
         )
-        temporary_dir = Path(tempfile.mkdtemp(prefix=f".{digest}.", dir=self._root))
+        root_fd = self._open_root_directory()
+        temporary_name = self._create_temporary_directory(root_fd, digest)
         try:
-            self._write_durable_file(temporary_dir / _PAYLOAD_FILENAME, payload)
-            self._write_durable_file(temporary_dir / _MANIFEST_FILENAME, self._manifest_bytes(ref))
-            self._fsync_directory(temporary_dir)
+            temporary_fd = self._open_directory_at(root_fd, temporary_name, digest)
+            try:
+                self._write_durable_file_at(temporary_fd, _PAYLOAD_FILENAME, payload)
+                self._write_durable_file_at(
+                    temporary_fd, _MANIFEST_FILENAME, self._manifest_bytes(ref)
+                )
+                os.fsync(temporary_fd)
+            finally:
+                os.close(temporary_fd)
 
             try:
-                self._publish_no_replace(temporary_dir.name, digest)
+                self._publish_no_replace(temporary_name, digest)
             except FileExistsError:
                 existing = self._load_if_present(digest)
                 if existing is None:
                     raise ValueError(f"concurrent artifact disappeared: {digest}") from None
                 return self._reuse_verified_artifact(digest, payload, existing)
-            self._fsync_directory(self._root)
+            os.fsync(root_fd)
             return ref
         finally:
-            if temporary_dir.exists():
-                shutil.rmtree(temporary_dir)
+            self._remove_temporary_directory(root_fd, temporary_name)
+            os.close(root_fd)
 
     def put_json(self, payload: BaseModel | dict[str, object]) -> ArtifactRef:
         """Canonicalize a validated model or JSON object before immutable storage."""
@@ -232,9 +250,28 @@ class ArtifactStore:
         """Atomically rename a completed temporary directory only when destination is absent."""
         root_fd = self._open_root_directory()
         try:
-            self._rename_directory_no_replace(root_fd, source_name, destination_name)
+            self.publish_no_replace_at(root_fd, source_name, destination_name)
         finally:
             os.close(root_fd)
+
+    @staticmethod
+    def publish_no_replace_at(
+        root_fd: int, source_name: str, destination_name: str
+    ) -> None:
+        """Publish one same-directory entry atomically without replacing a winner."""
+        if (
+            type(root_fd) is not int
+            or type(source_name) is not str
+            or not source_name
+            or "/" in source_name
+            or type(destination_name) is not str
+            or not destination_name
+            or "/" in destination_name
+        ):
+            raise ValueError("exclusive publication names are invalid")
+        ArtifactStore._rename_directory_no_replace(
+            root_fd, source_name, destination_name
+        )
 
     @staticmethod
     def _rename_directory_no_replace(root_fd: int, source_name: str, destination_name: str) -> None:
@@ -317,7 +354,16 @@ class ArtifactStore:
         raise OSError(error_number, os.strerror(error_number), destination_name)
 
     def _open_root_directory(self) -> int:
-        return self._open_directory_at(None, self._root, "root")
+        try:
+            descriptor = os.dup(self._root_fd)
+        except OSError as error:
+            raise ValueError("artifact root descriptor is unavailable") from error
+        try:
+            self._validate_directory_descriptor(descriptor, "root")
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
 
     @staticmethod
     def _open_directory_at(parent_fd: int | None, name: str | Path, label: str) -> int:
@@ -332,12 +378,24 @@ class ArtifactStore:
         except OSError as error:
             raise ValueError(f"artifact directory is invalid: {label}") from error
         try:
-            if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
-                raise ValueError(f"artifact directory is invalid: {label}")
+            ArtifactStore._validate_directory_descriptor(descriptor, label)
             return descriptor
         except BaseException:
             os.close(descriptor)
             raise
+
+    @staticmethod
+    def _validate_directory_descriptor(descriptor: int, label: str) -> None:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink < 1
+        ):
+            if label == "root":
+                raise ValueError("artifact root must be an owned mode-0700 directory")
+            raise ValueError(f"artifact directory is invalid: {label}")
 
     @staticmethod
     def _read_regular_file_at(directory_fd: int, name: str, digest: str) -> bytes:
@@ -346,7 +404,13 @@ class ArtifactStore:
         except OSError as error:
             raise ValueError(f"artifact file is invalid: {digest}/{name}") from error
         try:
-            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_nlink != 1
+            ):
                 raise ValueError(f"artifact file is invalid: {digest}/{name}")
             chunks: list[bytes] = []
             while chunk := os.read(descriptor, 1024 * 1024):
@@ -356,16 +420,74 @@ class ArtifactStore:
             os.close(descriptor)
 
     @staticmethod
-    def _write_durable_file(path: Path, content: bytes) -> None:
-        with path.open("wb") as file:
-            file.write(content)
-            file.flush()
-            os.fsync(file.fileno())
-
-    @staticmethod
-    def _fsync_directory(path: Path) -> None:
-        descriptor = os.open(path, os.O_RDONLY)
+    def _write_durable_file_at(directory_fd: int, name: str, content: bytes) -> None:
+        descriptor = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
+        )
         try:
+            os.fchmod(descriptor, 0o600)
+            offset = 0
+            while offset < len(content):
+                written = os.write(descriptor, content[offset:])
+                if written <= 0:
+                    raise OSError("artifact write made no progress")
+                offset += written
             os.fsync(descriptor)
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_nlink != 1
+            ):
+                raise ValueError("new artifact file has invalid ownership or mode")
         finally:
             os.close(descriptor)
+
+    @staticmethod
+    def _create_temporary_directory(root_fd: int, digest: str) -> str:
+        for _ in range(100):
+            name = f".{digest}.{secrets.token_hex(12)}.tmp"
+            try:
+                os.mkdir(name, 0o700, dir_fd=root_fd)
+            except FileExistsError:
+                continue
+            os.chmod(name, 0o700, dir_fd=root_fd, follow_symlinks=False)
+            descriptor = ArtifactStore._open_directory_at(root_fd, name, digest)
+            try:
+                os.fchmod(descriptor, 0o700)
+                ArtifactStore._validate_directory_descriptor(descriptor, digest)
+            finally:
+                os.close(descriptor)
+            return name
+        raise RuntimeError("could not allocate an artifact staging directory")
+
+    @staticmethod
+    def _remove_temporary_directory(root_fd: int, name: str) -> None:
+        try:
+            directory_fd = ArtifactStore._open_directory_at(root_fd, name, name)
+        except (FileNotFoundError, ValueError):
+            return
+        try:
+            for entry in os.listdir(directory_fd):
+                if entry in {_PAYLOAD_FILENAME, _MANIFEST_FILENAME}:
+                    with contextlib.suppress(OSError):
+                        os.unlink(entry, dir_fd=directory_fd)
+        finally:
+            os.close(directory_fd)
+        with contextlib.suppress(OSError):
+            os.rmdir(name, dir_fd=root_fd)
+
+    def close(self) -> None:
+        """Release the stable root descriptor; subsequent operations fail closed."""
+        descriptor = getattr(self, "_root_fd", -1)
+        if descriptor >= 0:
+            os.close(descriptor)
+            self._root_fd = -1
+
+    def __del__(self) -> None:
+        with contextlib.suppress(OSError):
+            self.close()

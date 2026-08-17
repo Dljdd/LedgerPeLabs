@@ -10,6 +10,7 @@ from apar.compiler import CompilerError, compile_scenario
 from apar.contracts._validation import ExternalContract
 from apar.contracts.scenarios import ScenarioConfig
 from apar.registry.repository import ThreatRepository
+from apar.runs import bind_scenario_for_run
 from apar.storage.artifacts import ArtifactStore
 
 THREAT_NOT_FOUND: Final = "THREAT_NOT_FOUND"
@@ -52,7 +53,9 @@ def compile_scenario_artifact(
     if card is None:
         raise ApiError(404, THREAT_NOT_FOUND, "threat card not found")
     try:
-        bundle = compile_scenario(card, request.config)
+        bundle = bind_scenario_for_run(
+            compile_scenario(card, request.config), threat_family=card.family
+        )
     except CompilerError as error:
         raise ApiError(422, error.code, str(error)) from None
     reference = store.put_json(bundle)

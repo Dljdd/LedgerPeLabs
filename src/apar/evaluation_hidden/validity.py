@@ -94,17 +94,6 @@ class HiddenValidityOracle:
         """Return one bit and deliberately discard all hidden rejection details."""
         return HiddenValidityResult(valid=self._report(events).valid)
 
-    def evaluate_restricted(
-        self,
-        events: tuple[PaymentEvent, ...],
-        *,
-        run_complete: bool,
-    ) -> RestrictedValidityReport:
-        """Return detailed reasons only for a completed evaluator-owned run."""
-        if type(run_complete) is not bool or not run_complete:
-            raise PermissionError("restricted validity is available only after run completion")
-        return self._report(events)
-
     def _report(self, events: tuple[PaymentEvent, ...]) -> RestrictedValidityReport:
         try:
             checked = _owned_events(events)
@@ -160,6 +149,7 @@ class HiddenValidityOracle:
     ) -> None:
         legal_card_prefixes = (
             (EventKind.AUTHORIZATION_DECLINED,),
+            (EventKind.AUTHORIZATION, EventKind.REVERSAL),
             (EventKind.AUTHORIZATION, EventKind.CLEARING, EventKind.SETTLEMENT),
             (
                 EventKind.AUTHORIZATION,
@@ -263,49 +253,145 @@ class HiddenValidityOracle:
         return value
 
     def _check_balances(self, events: tuple[PaymentEvent, ...], reasons: set[str]) -> None:
+        """Replay independently declared rail account effects, including fees."""
         balances: dict[str, Decimal] = {}
         declared_openings: dict[str, Decimal] = {}
-        outstanding: dict[str, Decimal] = {}
-        reversed_principal: set[str] = set()
-        for event in events:
-            actor_opening = self._opening(event, "actor_opening_balance")
-            counterparty_opening = self._opening(event, "counterparty_opening_balance")
-            if actor_opening is None or counterparty_opening is None:
-                reasons.add("BALANCE_EVIDENCE_MISSING")
-                continue
-            for entity_id, opening in (
-                (event.actor_id, actor_opening),
-                (event.counterparty_id, counterparty_opening),
+        economic_contracts: dict[
+            str, tuple[Rail, Decimal, str, Decimal, tuple[tuple[str, str], ...]]
+        ] = {}
+
+        def money(raw: object) -> Decimal | None:
+            if type(raw) is not str:
+                return None
+            try:
+                value = Decimal(raw)
+            except InvalidOperation:
+                return None
+            if (
+                not value.is_finite()
+                or value < 0
+                or value != value.quantize(Decimal("0.01"))
+                or str(value) != raw
             ):
-                if (
-                    entity_id in declared_openings
-                    and declared_openings[entity_id] != opening
-                ):
-                    reasons.add("BALANCE_EVIDENCE_INCONSISTENT")
-                declared_openings.setdefault(entity_id, opening)
-            balances.setdefault(event.actor_id, actor_opening)
-            balances.setdefault(event.counterparty_id, counterparty_opening)
+                return None
+            return value
+
+        def account(event: PaymentEvent, name: str) -> str | None:
+            value = event.rail_data.get(name)
+            return value if type(value) is str and value else None
+
+        def register(event: PaymentEvent, role: str, account_id: str) -> bool:
+            opening = money(event.party_refs.get(f"{role}_opening_balance"))
+            if opening is None:
+                reasons.add("BALANCE_EVIDENCE_MISSING")
+                return False
+            identity_role = {"payer": "actor", "payee": "counterparty"}.get(role)
+            if identity_role is not None and money(
+                event.party_refs.get(f"{identity_role}_opening_balance")
+            ) != opening:
+                reasons.add("BALANCE_EVIDENCE_INCONSISTENT")
+                return False
+            prior = declared_openings.get(account_id)
+            if prior is not None and prior != opening:
+                reasons.add("BALANCE_EVIDENCE_INCONSISTENT")
+                return False
+            declared_openings.setdefault(account_id, opening)
+            balances.setdefault(account_id, opening)
+            return True
+
+        def transfer(debits: dict[str, Decimal], credits: dict[str, Decimal]) -> None:
+            if sum(debits.values(), Decimal(0)) != sum(credits.values(), Decimal(0)):
+                reasons.add("VALUE_CONSERVATION_FAILED")
+                return
+            if any(balances[source] < value for source, value in debits.items()):
+                reasons.add("BALANCE_INFEASIBLE")
+                return
+            for source, value in debits.items():
+                balances[source] -= value
+            for destination, value in credits.items():
+                balances[destination] += value
+
+        for event in events:
+            role_names = ["payer", "payee", "fee"]
+            if event.rail is Rail.CARD:
+                role_names.extend(("hold", "chargeback"))
+            elif event.rail is Rail.A2A:
+                role_names.append("frozen")
+            accounts = {role: account(event, f"{role}_account") for role in role_names}
+            if any(value is None for value in accounts.values()) or len(
+                set(accounts.values())
+            ) != len(accounts):
+                reasons.add("ACCOUNT_EVIDENCE_INVALID")
+                continue
+            checked_accounts = {
+                role: value for role, value in accounts.items() if value is not None
+            }
+            if not all(register(event, role, value) for role, value in checked_accounts.items()):
+                continue
+            fee = money(event.rail_data.get("fee_amount"))
+            if fee is None or (event.rail is Rail.CARD and fee > event.amount):
+                reasons.add("FEE_EVIDENCE_INVALID")
+                continue
             payment_id = _payment_id(event)
             if payment_id is None:
                 continue
-            positive = event.event_type in _POSITIVE or (
-                event.rail is Rail.AGENTIC and event.event_type is EventKind.AUTHORIZATION
+            contract = (
+                event.rail,
+                event.amount,
+                event.currency,
+                fee,
+                tuple(sorted(checked_accounts.items())),
             )
-            if positive:
-                if balances[event.actor_id] < event.amount:
-                    reasons.add("BALANCE_INFEASIBLE")
-                    continue
-                balances[event.actor_id] -= event.amount
-                balances[event.counterparty_id] += event.amount
-                outstanding[payment_id] = event.amount
-            elif event.event_type in _NEGATIVE and payment_id not in reversed_principal:
-                amount = outstanding.get(payment_id, Decimal("0.00"))
-                if amount != event.amount or balances[event.counterparty_id] < amount:
-                    reasons.add("VALUE_CONSERVATION_FAILED")
-                    continue
-                balances[event.counterparty_id] -= amount
-                balances[event.actor_id] += amount
-                reversed_principal.add(payment_id)
+            previous_contract = economic_contracts.get(payment_id)
+            if previous_contract is not None and previous_contract != contract:
+                reasons.add("ECONOMIC_EVIDENCE_INCONSISTENT")
+                continue
+            economic_contracts.setdefault(payment_id, contract)
+            payer = checked_accounts["payer"]
+            payee = checked_accounts["payee"]
+            fee_account = checked_accounts["fee"]
+            if event.rail is Rail.CARD:
+                hold = checked_accounts["hold"]
+                chargeback = checked_accounts["chargeback"]
+                if event.event_type is EventKind.AUTHORIZATION:
+                    transfer({payer: event.amount}, {hold: event.amount})
+                elif event.event_type is EventKind.REVERSAL:
+                    transfer({hold: event.amount}, {payer: event.amount})
+                elif event.event_type is EventKind.SETTLEMENT:
+                    transfer(
+                        {hold: event.amount},
+                        {payee: event.amount - fee, fee_account: fee},
+                    )
+                elif event.event_type is EventKind.REFUND:
+                    transfer(
+                        {payee: event.amount - fee, fee_account: fee},
+                        {payer: event.amount},
+                    )
+                elif event.event_type is EventKind.CHARGEBACK:
+                    transfer(
+                        {payee: event.amount - fee, fee_account: fee},
+                        {chargeback: event.amount},
+                    )
+                elif event.event_type is EventKind.RECOVERY:
+                    transfer({chargeback: event.amount}, {payer: event.amount})
+            elif event.rail is Rail.A2A:
+                frozen = checked_accounts["frozen"]
+                if event.event_type is EventKind.TRANSFER_POSTED:
+                    transfer(
+                        {payer: event.amount + fee},
+                        {payee: event.amount, fee_account: fee},
+                    )
+                elif event.event_type is EventKind.TRANSFER_RETURNED:
+                    transfer({payee: event.amount}, {payer: event.amount})
+                elif event.event_type is EventKind.FUNDS_FROZEN:
+                    transfer({payee: event.amount}, {frozen: event.amount})
+                elif event.event_type is EventKind.RECOVERY:
+                    transfer({frozen: event.amount}, {payer: event.amount})
+            elif event.event_type is EventKind.AUTHORIZATION:
+                if fee != 0:
+                    reasons.add("FEE_EVIDENCE_INVALID")
+                else:
+                    transfer({payer: event.amount}, {payee: event.amount})
         if any(balance < 0 for balance in balances.values()):
             reasons.add("BALANCE_INFEASIBLE")
 
@@ -325,7 +411,8 @@ class HiddenValidityOracle:
             for event in events
         ):
             reasons.add("PARAMETER_OUT_OF_BOUNDS")
-        if events[-1].event_time - events[0].event_time > timedelta(hours=72):
+        times = tuple(event.event_time for event in events)
+        if max(times) - min(times) > timedelta(hours=72):
             reasons.add("PARAMETER_OUT_OF_BOUNDS")
 
     @staticmethod
@@ -356,14 +443,19 @@ class HiddenValidityOracle:
     @staticmethod
     def _benign_distance(events: tuple[PaymentEvent, ...]) -> Decimal:
         openings = tuple(
-            event
-            for event in events
-            if event.event_type
-            in {
-                EventKind.AUTHORIZATION,
-                EventKind.AUTHORIZATION_DECLINED,
-                EventKind.TRANSFER_INITIATED,
-            }
+            sorted(
+                (
+                    event
+                    for event in events
+                    if event.event_type
+                    in {
+                        EventKind.AUTHORIZATION,
+                        EventKind.AUTHORIZATION_DECLINED,
+                        EventKind.TRANSFER_INITIATED,
+                    }
+                ),
+                key=lambda event: (event.event_time, event.event_id),
+            )
         )
         if not openings:
             return Decimal("9.999")
@@ -385,6 +477,13 @@ class HiddenValidityOracle:
         return Decimal(str((amount_component + gap_component + diversity_component) / 3)).quantize(
             Decimal("0.001")
         )
+
+
+def _evaluate_completed_run(
+    events: tuple[PaymentEvent, ...],
+) -> RestrictedValidityReport:
+    """Evaluator-private detailed view, called only after runner-owned completion."""
+    return HiddenValidityOracle()._report(events)
 
 
 __all__ = ["HiddenValidityOracle", "HiddenValidityResult", "RestrictedValidityReport"]
