@@ -228,11 +228,7 @@ def test_external_app_evaluator_rejects_terminal_and_dependency_drift() -> None:
 
 def test_agentic_baseline_matrix_cannot_be_removed_by_adaptive_selection() -> None:
     population = PopulationGenerator(seed=12).generate(_bundle(12))
-    params = _params(
-        "agentic_intent_abuse",
-        seed=12,
-        agentic_mutations=("amount",),
-    )
+    params = _params("agentic_intent_abuse", seed=12)
 
     evaluator = _CampaignEvaluator(seed=12)
     commands, audit = evaluator.generate(
@@ -275,6 +271,13 @@ def test_agentic_baseline_matrix_cannot_be_removed_by_adaptive_selection() -> No
     }
     assert audit.valid_control_count >= 2
 
+    with pytest.raises(GenerationConstraintError):
+        evaluator.generate(
+            "agentic_intent_abuse",
+            population,
+            replace(params, agentic_mutations=("amount",)),
+        )
+
     for impossible in (
         _params("agentic_intent_abuse", payment_count=24),
         _params(
@@ -313,8 +316,6 @@ def test_deep_motifs_require_terminals_and_zero_rate_testing_rejects() -> None:
 @pytest.mark.parametrize(
     "family",
     [
-        "app_scam_mule",
-        "card_testing_cnp",
         "synthetic_merchant_refund",
         "agentic_intent_abuse",
     ],

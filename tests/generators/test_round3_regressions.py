@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import cast
 
@@ -19,6 +19,7 @@ from apar.generators.campaigns import (
     CampaignParams,
     GenerationConstraintError,
     _CampaignEvaluator,
+    campaign_bytes,
     motif_signature,
 )
 from apar.generators.population import PopulationGenerator
@@ -374,3 +375,249 @@ def test_adaptive_clipping_and_contradictory_regions_reject() -> None:
                 population,
                 replace(app, cash_out_delay_seconds=delay),
             )
+
+
+def test_card_testing_requires_a_strictly_separated_delay_region() -> None:
+    population = PopulationGenerator(seed=37).generate(_bundle(37))
+    evaluator = _CampaignEvaluator(seed=37)
+    base = _params("card_testing_cnp", seed=37)
+
+    for maximum in (1, 2):
+        with pytest.raises(GenerationConstraintError) as caught:
+            evaluator.generate(
+                "card_testing_cnp",
+                population,
+                replace(
+                    base,
+                    min_delay_seconds=1,
+                    max_delay_seconds=maximum,
+                ),
+            )
+        assert caught.value.code == "GENERATION_CONSTRAINT_UNSATISFIED"
+        assert caught.value.attempts == 100
+
+    params = replace(base, min_delay_seconds=1, max_delay_seconds=3)
+    commands, audit = evaluator.generate("card_testing_cnp", population, params)
+    entity_roles = {entity.entity_id: entity.role for entity in population.entities}
+    delays = tuple(
+        int(
+            (
+                timestamp
+                - (population.generated_at if index == 0 else audit.schedule[index - 1])
+            ).total_seconds()
+        )
+        for index, timestamp in enumerate(audit.schedule)
+    )
+    probe_delays = tuple(
+        delays[index]
+        for index, command in enumerate(commands)
+        if command.name == "card.decline"
+        and entity_roles[cast(str, command.payload["actor_id"])] == "attacker"
+    )
+    illicit_success_ids = {
+        cast(str, command.payload["payment_id"])
+        for command in commands
+        if command.name == "card.authorize"
+        and entity_roles[cast(str, command.payload["actor_id"])] == "attacker"
+    }
+    success_delays = tuple(
+        delays[index]
+        for index, command in enumerate(commands)
+        if cast(str, command.payload["payment_id"]) in illicit_success_ids
+    )
+
+    assert probe_delays
+    assert success_delays
+    assert min(probe_delays) > max(success_delays)
+    assert min(probe_delays) >= 2
+    assert max(success_delays) <= 1
+
+
+@pytest.mark.parametrize("family", ["app_scam_mule", "synthetic_merchant_refund"])
+@pytest.mark.parametrize("probability", [Decimal("0.01"), Decimal("0.10")])
+def test_noncanonical_recovery_probabilities_reject(
+    family: str,
+    probability: Decimal,
+) -> None:
+    population = PopulationGenerator(seed=38).generate(_bundle(38))
+    with pytest.raises(GenerationConstraintError) as caught:
+        _CampaignEvaluator(seed=38).generate(
+            family,
+            population,
+            replace(
+                _params(family, seed=38),
+                recovery_probability=probability,
+            ),
+        )
+    assert caught.value.code == "GENERATION_CONSTRAINT_UNSATISFIED"
+    assert caught.value.attempts == 100
+
+
+def test_canonical_recovery_levels_realize_distinct_exact_counts() -> None:
+    population = PopulationGenerator(seed=39).generate(_bundle(39))
+
+    app = _params("app_scam_mule", seed=39)
+    app_one, _ = _CampaignEvaluator(seed=39).generate(
+        "app_scam_mule",
+        population,
+        replace(app, recovery_probability=Decimal("0.25")),
+    )
+    app_two, _ = _CampaignEvaluator(seed=39).generate(
+        "app_scam_mule",
+        population,
+        replace(app, recovery_probability=Decimal("1")),
+    )
+    assert sum(command.name == "a2a.recover" for command in app_one) == 1
+    assert sum(command.name == "a2a.recover" for command in app_two) == 2
+    assert campaign_bytes(app_one) != campaign_bytes(app_two)
+    with pytest.raises(GenerationConstraintError):
+        _CampaignEvaluator(seed=39).generate(
+            "app_scam_mule",
+            population,
+            replace(app, recovery_probability=Decimal("0.50")),
+        )
+
+    synthetic = _params("synthetic_merchant_refund", seed=39)
+    synthetic_two, _ = _CampaignEvaluator(seed=39).generate(
+        "synthetic_merchant_refund",
+        population,
+        replace(synthetic, recovery_probability=Decimal("0.25")),
+    )
+    synthetic_three, _ = _CampaignEvaluator(seed=39).generate(
+        "synthetic_merchant_refund",
+        population,
+        replace(
+            synthetic,
+            recovery_probability=Decimal("0.428571428571428571"),
+        ),
+    )
+    assert sum(command.name == "card.recover" for command in synthetic_two) == 2
+    assert sum(command.name == "card.recover" for command in synthetic_three) == 3
+    assert campaign_bytes(synthetic_two) != campaign_bytes(synthetic_three)
+    with pytest.raises(GenerationConstraintError):
+        _CampaignEvaluator(seed=39).generate(
+            "synthetic_merchant_refund",
+            population,
+            replace(synthetic, recovery_probability=Decimal("0.30")),
+        )
+
+
+def test_staged_cash_out_delay_is_an_exact_external_schedule_witness() -> None:
+    population = PopulationGenerator(seed=40).generate(_bundle(40))
+    base = _params(
+        "app_scam_mule",
+        seed=40,
+        cash_out_strategy="staged",
+        min_delay_seconds=1,
+        max_delay_seconds=300,
+    )
+    evaluator = _CampaignEvaluator(seed=40)
+    commands_two, audit_two = evaluator.generate(
+        "app_scam_mule",
+        population,
+        replace(base, cash_out_delay_seconds=2),
+    )
+    commands_three, audit_three = evaluator.generate(
+        "app_scam_mule",
+        population,
+        replace(base, cash_out_delay_seconds=3),
+    )
+
+    entity_roles = {entity.entity_id: entity.role for entity in population.entities}
+
+    def cash_positions(commands: tuple[Command, ...]) -> tuple[int, ...]:
+        return tuple(
+            index
+            for index, command in enumerate(commands)
+            if command.name == "a2a.initiate"
+            and entity_roles[cast(str, command.payload["actor_id"])] == "mule"
+            and entity_roles[cast(str, command.payload["counterparty_id"])] == "attacker"
+        )
+
+    two_positions = cash_positions(commands_two)
+    three_positions = cash_positions(commands_three)
+    assert len(two_positions) >= 2
+    assert len(three_positions) >= 2
+
+    def delay(schedule: tuple[datetime, ...], index: int) -> int:
+        timestamp = schedule[index]
+        prior = population.generated_at if index == 0 else schedule[index - 1]
+        return int((timestamp - prior).total_seconds())
+
+    assert delay(audit_two.schedule, two_positions[0]) == 1
+    assert delay(audit_two.schedule, two_positions[-1]) == 2
+    assert delay(audit_three.schedule, three_positions[0]) == 1
+    assert delay(audit_three.schedule, three_positions[-1]) == 3
+    assert audit_two.schedule != audit_three.schedule
+
+    last_cash = three_positions[-1]
+    mutated_schedule = tuple(
+        timestamp if index < last_cash else timestamp - timedelta(seconds=1)
+        for index, timestamp in enumerate(audit_three.schedule)
+    )
+    with pytest.raises(GenerationConstraintError):
+        evaluator.validate(
+            "app_scam_mule",
+            commands_three,
+            population,
+            replace(base, cash_out_delay_seconds=3),
+            schedule=mutated_schedule,
+        )
+
+
+@pytest.mark.parametrize(
+    ("family", "updates"),
+    [
+        (
+            "card_testing_cnp",
+            {"merchant_concentration": Decimal("0.700000000000000001")},
+        ),
+        (
+            "card_testing_cnp",
+            {"merchant_concentration": Decimal("0.10")},
+        ),
+        (
+            "card_testing_cnp",
+            {"device_reuse_rate": Decimal("0.600000000000000001")},
+        ),
+        (
+            "app_scam_mule",
+            {"cash_out_fraction": Decimal("0.300000000000000001")},
+        ),
+        (
+            "agentic_intent_abuse",
+            {"agentic_attack_mix": Decimal("0.920000000000000001")},
+        ),
+        (
+            "agentic_intent_abuse",
+            {"agentic_mutations": ("amount",)},
+        ),
+    ],
+)
+def test_other_adaptive_aliases_reject_instead_of_becoming_no_ops(
+    family: str,
+    updates: dict[str, object],
+) -> None:
+    population = PopulationGenerator(seed=41).generate(_bundle(41))
+    with pytest.raises(GenerationConstraintError) as caught:
+        _CampaignEvaluator(seed=41).generate(
+            family,
+            population,
+            _params(family, seed=41, **updates),
+        )
+    assert caught.value.code == "GENERATION_CONSTRAINT_UNSATISFIED"
+    assert caught.value.attempts == 100
+
+
+def test_cash_out_strategies_cannot_share_the_minimum_delay_schedule() -> None:
+    population = PopulationGenerator(seed=42).generate(_bundle(42))
+    params = _params(
+        "app_scam_mule",
+        seed=42,
+        min_delay_seconds=1,
+        max_delay_seconds=300,
+        cash_out_delay_seconds=1,
+        cash_out_strategy="delayed",
+    )
+    with pytest.raises(GenerationConstraintError):
+        _CampaignEvaluator(seed=42).generate("app_scam_mule", population, params)

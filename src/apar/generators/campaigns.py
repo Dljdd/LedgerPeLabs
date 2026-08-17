@@ -8,7 +8,7 @@ from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from decimal import ROUND_CEILING, ROUND_HALF_EVEN, Decimal, DecimalException
+from decimal import ROUND_HALF_EVEN, Decimal, DecimalException, localcontext
 from types import MappingProxyType
 from typing import cast
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -72,6 +72,8 @@ _MOTIFS: Mapping[str, str] = MappingProxyType(
     }
 )
 _CENT = Decimal("0.01")
+_PROBABILITY_QUANTUM = Decimal("0.000000000000000001")
+_COMPATIBLE_RECOVERY_PROBABILITY = Decimal("0.25")
 _AGENTIC_MUTATIONS = (
     "identity",
     "signature",
@@ -167,6 +169,166 @@ def _decimal_unit(label: str, value: object) -> Decimal:
     if not number.is_finite() or number < 0 or number > 1:
         raise ValueError(f"{label} must be between zero and one")
     return number
+
+
+def _canonical_recovery_probability(recovery_count: int, eligible_count: int) -> Decimal:
+    """Return one stable public probability for one discrete recovery count."""
+    compatible_count = int(
+        Decimal(eligible_count) * _COMPATIBLE_RECOVERY_PROBABILITY
+    )
+    if Decimal(eligible_count) * _COMPATIBLE_RECOVERY_PROBABILITY > compatible_count:
+        compatible_count += 1
+    if recovery_count == compatible_count:
+        return _COMPATIBLE_RECOVERY_PROBABILITY
+    with localcontext() as context:
+        context.prec = 50
+        return (Decimal(recovery_count) / Decimal(eligible_count)).quantize(
+            _PROBABILITY_QUANTUM,
+            rounding=ROUND_HALF_EVEN,
+        )
+
+
+def _recovery_count(
+    probability: Decimal,
+    eligible_count: int,
+    *,
+    require_unrecovered: bool,
+) -> int:
+    """Decode a canonical discrete probability without ceiling aliases."""
+    maximum = eligible_count - 1 if require_unrecovered else eligible_count
+    if eligible_count <= 0 or maximum <= 0:
+        raise ValueError("recovery motif has no eligible discrete level")
+    for recovery_count in range(1, maximum + 1):
+        if probability == _canonical_recovery_probability(
+            recovery_count,
+            eligible_count,
+        ):
+            return recovery_count
+    raise ValueError("recovery_probability is not canonical for the eligible count")
+
+
+def _card_delay_regions(minimum: int, maximum: int) -> tuple[int, int]:
+    """Derive disjoint probe and success regions or fail closed."""
+    span = maximum - minimum
+    probe_floor = minimum + (span * 2) // 3
+    success_ceiling = minimum + span // 4
+    if probe_floor <= success_ceiling:
+        raise ValueError("card-testing delay regions are not strictly separated")
+    return probe_floor, success_ceiling
+
+
+def _ratio(numerator: int, denominator: int, *, precision: int = 18) -> Decimal:
+    if denominator <= 0:
+        raise ValueError("discrete adaptive denominator must be positive")
+    with localcontext() as context:
+        context.prec = max(precision + 8, 36)
+        quantum = Decimal(1).scaleb(-precision)
+        return (Decimal(numerator) / Decimal(denominator)).quantize(
+            quantum,
+            rounding=ROUND_HALF_EVEN,
+        )
+
+
+def _merchant_target_count(concentration: Decimal, available: int) -> int:
+    if available <= 0:
+        raise ValueError("merchant concentration has no eligible merchants")
+    compatible = max(
+        1,
+        int(
+            (
+                Decimal(available) * (Decimal(1) - Decimal("0.70"))
+            ).to_integral_value(rounding=ROUND_HALF_EVEN)
+        ),
+    )
+    for count in range(1, available + 1):
+        if count == compatible:
+            candidate = Decimal("0.70")
+        elif count == 1:
+            candidate = Decimal(1)
+        elif count == available:
+            candidate = Decimal(0)
+        else:
+            candidate = Decimal(1) - _ratio(count, available)
+        if concentration == candidate:
+            return count
+    raise ValueError("merchant_concentration is not canonical for the population")
+
+
+def _card_actor_span(reuse_rate: Decimal, available: int) -> int:
+    if available < 2:
+        raise ValueError("device reuse requires at least two eligible actors")
+    compatible = max(
+        2,
+        min(
+            available,
+            int(
+                (
+                    Decimal(2)
+                    + Decimal(available - 2) * (Decimal(1) - Decimal("0.60"))
+                ).to_integral_value(rounding=ROUND_HALF_EVEN)
+            ),
+        ),
+    )
+    for count in range(2, available + 1):
+        if count == compatible:
+            candidate = Decimal("0.60")
+        elif count == 2:
+            candidate = Decimal(1)
+        elif count == available:
+            candidate = Decimal(0)
+        else:
+            candidate = _ratio(available - count, available - 2)
+        if reuse_rate == candidate:
+            return count
+    raise ValueError("device_reuse_rate is not canonical for the population")
+
+
+def _cash_out_target(fraction: Decimal, total: Decimal) -> Decimal:
+    cash_target = (total * fraction).quantize(_CENT, rounding=ROUND_HALF_EVEN)
+    compatible_target = (total * Decimal("0.30")).quantize(
+        _CENT,
+        rounding=ROUND_HALF_EVEN,
+    )
+    if cash_target == compatible_target:
+        candidate = Decimal("0.30")
+    else:
+        total_cents = int(total / _CENT)
+        candidate = _ratio(int(cash_target / _CENT), total_cents)
+    if fraction != candidate:
+        raise ValueError("cash_out_fraction is not canonical for the realized cents")
+    return cash_target
+
+
+def _agentic_attack_count(attack_mix: Decimal, payment_count: int) -> int:
+    for count in range(23, payment_count - 1):
+        with localcontext() as context:
+            context.prec = 28
+            candidate = Decimal(count) / Decimal(payment_count)
+        if attack_mix == candidate:
+            return count
+    raise ValueError("agentic_attack_mix is not canonical for the payment count")
+
+
+def _agentic_extras(
+    mutations: tuple[str, ...],
+    additional_attacks: int,
+) -> tuple[str, ...]:
+    if additional_attacks == 0:
+        if mutations != _AGENTIC_MUTATIONS:
+            raise ValueError("agentic mutation selection has no adaptive slot")
+        return ()
+    if mutations != _AGENTIC_MUTATIONS and len(mutations) > additional_attacks:
+        raise ValueError("agentic mutation selection contains unused values")
+    extras = tuple(
+        mutations[index % len(mutations)] for index in range(additional_attacks)
+    )
+    default_extras = tuple(
+        _AGENTIC_MUTATIONS[index % len(_AGENTIC_MUTATIONS)]
+        for index in range(additional_attacks)
+    )
+    if mutations != _AGENTIC_MUTATIONS and extras == default_extras:
+        raise ValueError("agentic mutation selection aliases the default")
+    return extras
 
 
 class CampaignParameterError(ValueError):
@@ -732,8 +894,9 @@ class CampaignGenerator:
         plans: list[_PaymentPlan] = []
         agentic_kinds: tuple[str, ...] = ()
         if family == "agentic_intent_abuse":
-            desired_attacks = round(
-                Decimal(params.payment_count) * params.agentic_attack_mix
+            desired_attacks = _agentic_attack_count(
+                params.agentic_attack_mix,
+                params.payment_count,
             )
             if (
                 params.payment_count < 25
@@ -754,9 +917,9 @@ class CampaignGenerator:
                 "auth_replay",
             )
             additional_attacks = desired_attacks - 23
-            extras = tuple(
-                params.agentic_mutations[index % len(params.agentic_mutations)]
-                for index in range(additional_attacks)
+            extras = _agentic_extras(
+                params.agentic_mutations,
+                additional_attacks,
             )
             controls = ("valid_control",) * (
                 params.payment_count - len(mandatory) - len(extras)
@@ -771,9 +934,10 @@ class CampaignGenerator:
                 selected_mules = mules[: params.mule_count]
                 layer_count = params.mule_layers
                 fanout_count = params.mule_fanout
-                recovered_count = int(
-                    (Decimal(fanout_count) * params.recovery_probability)
-                    .to_integral_value(rounding=ROUND_CEILING)
+                recovered_count = _recovery_count(
+                    params.recovery_probability,
+                    fanout_count,
+                    require_unrecovered=False,
                 )
                 incoming_count = attack_count - layer_count - fanout_count
                 if (
@@ -812,24 +976,14 @@ class CampaignGenerator:
                         raise ValueError("card-testing requires at least one probe retry")
                     if params.retry_intensity > illicit_count - 1:
                         raise ValueError("retry intensity exceeds eligible probes")
-                    actor_span = max(
-                        2,
-                        min(
-                            len(attackers),
-                            round(
-                                2
-                                + (len(attackers) - 2)
-                                * float(1 - params.device_reuse_rate)
-                            ),
-                        ),
+                    actor_span = _card_actor_span(
+                        params.device_reuse_rate,
+                        min(len(attackers), illicit_count),
                     )
                     actor = attackers[index % actor_span]
-                    concentrated = max(
-                        1,
-                        round(
-                            len(merchants)
-                            * float(1 - params.merchant_concentration)
-                        ),
+                    concentrated = _merchant_target_count(
+                        params.merchant_concentration,
+                        min(len(merchants), illicit_count),
                     )
                     counterparty = merchants[index % concentrated]
                     decline_count = params.retry_intensity
@@ -854,11 +1008,10 @@ class CampaignGenerator:
                     synthetic_merchants[0] if illicit else merchants[index % len(merchants)]
                 )
                 if illicit:
-                    recovered_count = int(
-                        (
-                            Decimal(illicit_count)
-                            * params.recovery_probability
-                        ).to_integral_value(rounding=ROUND_CEILING)
+                    recovered_count = _recovery_count(
+                        params.recovery_probability,
+                        illicit_count,
+                        require_unrecovered=True,
                     )
                     if recovered_count == 0 or recovered_count >= illicit_count:
                         raise ValueError(
@@ -929,6 +1082,30 @@ class CampaignGenerator:
     ) -> tuple[datetime, ...]:
         schedule: list[datetime] = []
         current = population.generated_at
+        card_delay_regions = (
+            _card_delay_regions(
+                params.min_delay_seconds,
+                params.max_delay_seconds,
+            )
+            if family == "card_testing_cnp"
+            else None
+        )
+        cash_payment_ids = tuple(
+            plan.payment_id
+            for plan in plans
+            if plan.actor.role == "mule" and plan.counterparty.role == "attacker"
+        )
+        if family == "app_scam_mule" and params.cash_out_strategy == "staged":
+            if len(cash_payment_ids) < 2:
+                raise ValueError("staged cash-out requires at least two payments")
+            if params.cash_out_delay_seconds <= params.min_delay_seconds:
+                raise ValueError("staged cash-out requires a distinct delay witness")
+        if (
+            family == "app_scam_mule"
+            and params.cash_out_strategy == "delayed"
+            and params.cash_out_delay_seconds <= params.min_delay_seconds
+        ):
+            raise ValueError("delayed cash-out requires a distinct delay witness")
         horizon = min(
             population.horizon_end,
             population.generated_at + timedelta(hours=params.duration_hours),
@@ -938,14 +1115,12 @@ class CampaignGenerator:
                 delay_low = params.min_delay_seconds
                 delay_high = params.max_delay_seconds
                 if family == "card_testing_cnp":
-                    span = params.max_delay_seconds - params.min_delay_seconds
+                    assert card_delay_regions is not None
+                    probe_floor, success_ceiling = card_delay_regions
                     if plan.stages[0] == "decline":
-                        delay_low = params.min_delay_seconds + (span * 2) // 3
+                        delay_low = probe_floor
                     else:
-                        delay_high = min(
-                            params.max_delay_seconds,
-                            params.min_delay_seconds + span // 4,
-                        )
+                        delay_high = success_ceiling
                 if (
                     family == "app_scam_mule"
                     and stage_index == 0
@@ -969,8 +1144,15 @@ class CampaignGenerator:
                         delay_low = params.cash_out_delay_seconds
                         delay_high = params.cash_out_delay_seconds
                     else:
-                        delay_low = params.min_delay_seconds
-                        delay_high = params.cash_out_delay_seconds
+                        if plan.payment_id == cash_payment_ids[0]:
+                            delay_low = params.min_delay_seconds
+                            delay_high = params.min_delay_seconds
+                        elif plan.payment_id == cash_payment_ids[-1]:
+                            delay_low = params.cash_out_delay_seconds
+                            delay_high = params.cash_out_delay_seconds
+                        else:
+                            delay_low = params.min_delay_seconds
+                            delay_high = params.cash_out_delay_seconds
                 delay = int(
                     self._rng.integers(
                         delay_low,
@@ -1044,9 +1226,9 @@ class CampaignGenerator:
         )
         if not cash_indices or not layer_indices or not inbound_indices:
             raise ValueError("APP topology requires cash-out and funding payments")
-        cash_target = (params.target_value_total * params.cash_out_fraction).quantize(
-            _CENT,
-            rounding=ROUND_HALF_EVEN,
+        cash_target = _cash_out_target(
+            params.cash_out_fraction,
+            params.target_value_total,
         )
         if not (
             params.min_amount * len(cash_indices)
@@ -1511,6 +1693,15 @@ class CampaignGenerator:
             raise ValueError("schedule must contain one timestamp per command")
         if params.expected_motif != _MOTIFS[family]:
             raise ValueError("declared motif does not match the selected family")
+        if family == "agentic_intent_abuse":
+            desired_attacks = _agentic_attack_count(
+                params.agentic_attack_mix,
+                params.payment_count,
+            )
+            _agentic_extras(
+                params.agentic_mutations,
+                desired_attacks - 23,
+            )
         expected_command_type: type[Command]
         if family == "app_scam_mule":
             expected_command_type = A2ACommand
@@ -1848,16 +2039,9 @@ class CampaignGenerator:
             available_attackers = sum(
                 entity.role == "attacker" for entity in population.entities
             )
-            expected_actor_span = max(
-                2,
-                min(
-                    available_attackers,
-                    round(
-                        2
-                        + (available_attackers - 2)
-                        * float(1 - params.device_reuse_rate)
-                    ),
-                ),
+            expected_actor_span = _card_actor_span(
+                params.device_reuse_rate,
+                min(available_attackers, sum(class_labels)),
             )
             illicit_commands = tuple(
                 command
@@ -1875,11 +2059,9 @@ class CampaignGenerator:
                 and entity.account_id is not None
                 for entity in population.entities
             )
-            concentrated = max(
-                1,
-                round(
-                    merchant_count * float(1 - params.merchant_concentration)
-                ),
+            concentrated = _merchant_target_count(
+                params.merchant_concentration,
+                min(merchant_count, sum(class_labels)),
             )
             if len(
                 {command.payload["payee_account"] for command in illicit_commands}
@@ -1908,34 +2090,53 @@ class CampaignGenerator:
             }
             if not probe_actor_ids & attack_success_ids:
                 raise ValueError("probe and escalation accounts lack causal reuse")
-            span = params.max_delay_seconds - params.min_delay_seconds
-            probe_delay_floor = params.min_delay_seconds + (span * 2) // 3
-            success_delay_ceiling = params.min_delay_seconds + span // 4
+            probe_delay_floor, success_delay_ceiling = _card_delay_regions(
+                params.min_delay_seconds,
+                params.max_delay_seconds,
+            )
             command_positions = {
                 id(command): index for index, command in enumerate(commands)
             }
+            probe_delays: list[int] = []
             for command in opening_commands[:decline_count]:
                 index = command_positions[id(command)]
                 prior_timestamp = (
                     population.generated_at if index == 0 else schedule[index - 1]
                 )
-                if int((schedule[index] - prior_timestamp).total_seconds()) < probe_delay_floor:
+                probe_delay = int(
+                    (schedule[index] - prior_timestamp).total_seconds()
+                )
+                probe_delays.append(probe_delay)
+                if probe_delay < probe_delay_floor:
                     raise ValueError("card probe delay is outside its temporal region")
             success_payment_ids = {
                 cast(str, command.payload["payment_id"])
-                for command in opening_commands[decline_count:]
+                for command, label in zip(
+                    opening_commands[decline_count:],
+                    class_labels[decline_count:],
+                    strict=True,
+                )
+                if label
             }
+            success_delays: list[int] = []
             for index, command in enumerate(commands):
                 if cast(str, command.payload["payment_id"]) not in success_payment_ids:
                     continue
                 prior_timestamp = (
                     population.generated_at if index == 0 else schedule[index - 1]
                 )
-                if (
-                    int((schedule[index] - prior_timestamp).total_seconds())
-                    > success_delay_ceiling
-                ):
+                success_delay = int(
+                    (schedule[index] - prior_timestamp).total_seconds()
+                )
+                success_delays.append(success_delay)
+                if success_delay > success_delay_ceiling:
                     raise ValueError("card success burst exceeds its temporal region")
+            if (
+                not probe_delays
+                or not success_delays
+                or min(probe_delays) <= max(success_delays)
+            ):
+                raise ValueError("card probe delays do not exceed the success burst")
         if abs(rate - params.target_illicit_rate) > params.class_rate_tolerance:
             raise ValueError("class rate constraint not satisfied")
         if (
@@ -1979,9 +2180,10 @@ class CampaignGenerator:
             )
             if len(cash_commands) != params.mule_fanout:
                 raise ValueError("APP topology does not use the declared fan-out")
-            expected_recoveries = int(
-                (Decimal(params.mule_fanout) * params.recovery_probability)
-                .to_integral_value(rounding=ROUND_CEILING)
+            expected_recoveries = _recovery_count(
+                params.recovery_probability,
+                params.mule_fanout,
+                require_unrecovered=False,
             )
             actual_recoveries = sum(
                 "recover" in histories[cast(str, command.payload["payment_id"])]
@@ -1993,9 +2195,10 @@ class CampaignGenerator:
                 (cast(Decimal, command.payload["amount"]) for command in cash_commands),
                 Decimal("0.00"),
             )
-            expected_cash = (
-                params.target_value_total * params.cash_out_fraction
-            ).quantize(_CENT, rounding=ROUND_HALF_EVEN)
+            expected_cash = _cash_out_target(
+                params.cash_out_fraction,
+                params.target_value_total,
+            )
             if cash_total != expected_cash:
                 raise ValueError("APP cash-out fraction differs from concrete flow")
             dependency_ids = {dependency.payment_id for dependency in dependencies}
@@ -2006,18 +2209,29 @@ class CampaignGenerator:
             }
             if not mule_outflow_ids <= dependency_ids:
                 raise ValueError("APP mule outflow lacks a prior concrete funding dependency")
-            for index, (command, timestamp) in enumerate(
-                zip(commands, schedule, strict=True)
+            cash_positions = tuple(
+                index
+                for index, command in enumerate(commands)
+                if command.name == "a2a.initiate"
+                and entity_by_id[cast(str, command.payload["actor_id"])].role
+                == "mule"
+                and entity_by_id[
+                    cast(str, command.payload["counterparty_id"])
+                ].role
+                == "attacker"
+            )
+            if params.cash_out_strategy == "staged" and (
+                len(cash_positions) < 2
+                or params.cash_out_delay_seconds <= params.min_delay_seconds
             ):
-                if command.name != "a2a.initiate":
-                    continue
-                actor_id = cast(str, command.payload["actor_id"])
-                counterparty_id = cast(str, command.payload["counterparty_id"])
-                if not (
-                    entity_by_id[actor_id].role == "mule"
-                    and entity_by_id[counterparty_id].role == "attacker"
-                ):
-                    continue
+                raise ValueError("APP staged delay parameter is incompatible")
+            if (
+                params.cash_out_strategy == "delayed"
+                and params.cash_out_delay_seconds <= params.min_delay_seconds
+            ):
+                raise ValueError("APP delayed delay parameter is incompatible")
+            for cash_order, index in enumerate(cash_positions):
+                timestamp = schedule[index]
                 prior_timestamp = (
                     population.generated_at if index == 0 else schedule[index - 1]
                 )
@@ -2042,11 +2256,24 @@ class CampaignGenerator:
                     and delay_seconds > params.cash_out_delay_seconds
                 ):
                     raise ValueError("APP staged cash-out timing drifted")
+                if (
+                    params.cash_out_strategy == "staged"
+                    and cash_order == 0
+                    and delay_seconds != params.min_delay_seconds
+                ):
+                    raise ValueError("APP staged cash-out lacks its opening witness")
+                if (
+                    params.cash_out_strategy == "staged"
+                    and cash_order == len(cash_positions) - 1
+                    and delay_seconds != params.cash_out_delay_seconds
+                ):
+                    raise ValueError("APP staged cash-out lacks its delay witness")
         elif family == "synthetic_merchant_refund":
             illicit_count = sum(class_labels)
-            expected_recoveries = int(
-                (Decimal(illicit_count) * params.recovery_probability)
-                .to_integral_value(rounding=ROUND_CEILING)
+            expected_recoveries = _recovery_count(
+                params.recovery_probability,
+                illicit_count,
+                require_unrecovered=True,
             )
             actual_recoveries = sum(command.name == "card.recover" for command in commands)
             if (

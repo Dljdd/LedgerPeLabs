@@ -263,12 +263,15 @@ def test_adaptive_dimensions_change_concrete_family_behavior() -> None:
     low_recovery, _ = _CampaignEvaluator(seed=61).generate(
         "synthetic_merchant_refund",
         population,
-        replace(merchant_params, recovery_probability=Decimal("0.15")),
+        replace(merchant_params, recovery_probability=Decimal("0.25")),
     )
     high_recovery, _ = _CampaignEvaluator(seed=61).generate(
         "synthetic_merchant_refund",
         population,
-        replace(merchant_params, recovery_probability=Decimal("0.80")),
+        replace(
+            merchant_params,
+            recovery_probability=Decimal("0.857142857142857143"),
+        ),
     )
     assert sum(command.name == "card.recover" for command in low_recovery) == 2
     assert sum(command.name == "card.recover" for command in high_recovery) == 6
