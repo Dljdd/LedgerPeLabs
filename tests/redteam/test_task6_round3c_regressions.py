@@ -334,12 +334,8 @@ def test_v32_behavior_manifest_covers_every_tracked_executable_input() -> None:
     entries = freeze["behavior_manifest"]["entries"]
     tracked = set(holdout_runner._tracked_paths(head))
     expected = (
-        {path for path in tracked if path.startswith("src/") and path.endswith(".py")}
-        | {
-            path
-            for path in tracked
-            if path.startswith("scripts/") and path.endswith(".py")
-        }
+        {path for path in tracked if path.startswith("src/")}
+        | {path for path in tracked if path.startswith("scripts/")}
         | {path for path in tracked if path.startswith("fixtures/")}
         | {
             "pyproject.toml",
@@ -349,6 +345,8 @@ def test_v32_behavior_manifest_covers_every_tracked_executable_input() -> None:
     )
     if "docs/experiments/task6-v3.1-cancellation.json" in tracked:
         expected.add("docs/experiments/task6-v3.1-cancellation.json")
+    if "docs/experiments/task6-v3.2-cancellation.json" in tracked:
+        expected.add("docs/experiments/task6-v3.2-cancellation.json")
 
     assert set(entries) == expected
     assert "scripts/run_task6_holdout.py" in entries

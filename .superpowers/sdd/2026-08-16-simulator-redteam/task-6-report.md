@@ -565,3 +565,67 @@ and policy provenance, cancellation records, and result absence. Only the explic
 
 No v3.2 confirmatory search was invoked, and reserved seeds
 `(503, 607, 709, 811, 907, 1009, 1103, 1201)` remain untouched.
+
+## Fix round 3 Phase D: canceled v3.2 and external approval anchor
+
+Independent review canceled the `239617e` v3.2 preregistration before execution. The
+canonical `task6-v3.2-cancellation.json` preserves its exact source commit,
+preregistration commit and byte digest, the absent result, the uninvoked execution path,
+and the untouched reserved seeds. V3.3 keeps the same policy, seeds, budgets, metrics,
+thresholds, negative control, no-network rule, descriptive uncertainty, and one-attempt
+stopping rule; this phase changes only the freeze and approval integrity boundary.
+
+Confirmatory execution now requires two values supplied by an out-of-band controller or
+reviewer: an exact approved freeze commit and the exact SHA-256 of the v3.3
+preregistration bytes. The runner requires current `HEAD` to equal that commit, not merely
+descend from it, and checks the artifact bytes immediately before execution. Verify-only
+can validate an explicit pair or print the values awaiting approval; execute mode cannot
+self-select them. The result, if a separately authorized controller later creates it,
+records both approved values. This is a trusted-controller authorization anchor, not
+durable authenticity against a malicious caller that supplies its own values. Task 7
+still owns signed approval, process isolation, and an append-only execution receipt.
+
+The experiment protocol is now reconstructed from source constants and compared against
+an exact canonical preregistration schema before any evaluator or policy capability is
+created. The frozen fields include every seed and proposal/query/logical/wall cap, all
+policy versions, both target metrics and thresholds, the negative-control definition,
+the zero-network contract, fairness, uncertainty, maximum attempt, stopping rule, and
+approval boundary. Extra fields, scalar subclasses, changed types, and changed values
+reject.
+
+The source freeze records the exact behavior-affecting Git path set with each path's mode,
+object type, blob object ID, and content SHA-256. It includes all tracked `src/`, `scripts/`,
+fixtures, root package/environment configuration and locks, cached replay/cancellation
+inputs, customization modules, and `.pth` inputs. Execution compares the source and exact
+approved-HEAD sets and entries, then independently validates the filesystem. Added or
+deleted behavior files, mode/type changes, Git or filesystem symlinks, submodules, changed
+bytes, unexpected `sitecustomize`/`usercustomize`, and loaded external customization
+modules reject before search.
+
+Phase D again uses two commits. The source commit contains this code, cancellation,
+regressions, and report, but intentionally no v3.3 preregistration or result. A subsequent
+preregistration-only commit binds that exact source tree and manifest. No Phase D path
+constructs or executes confirmatory search while producing either freeze commit.
+
+## Fix round 3 Phase D source-stage verification
+
+- Initial approval/protocol/manifest regressions: `26 failed, 1 passed` before
+  implementation; two additional customization escape reproductions and the absent-
+  preregistration execute reproduction were also captured RED.
+- Phase D approval, protocol, cancellation, manifest, customization, and source tests:
+  `30 passed`.
+- Round-three regression suites: `69 passed`.
+- Complete Task 6 red-team suite: `169 passed`.
+- Simulator/trust/generator/red-team/G0-flow integration: `698 passed`.
+- Full repository pytest: `797 passed`.
+- Ruff over `src`, `tests`, and `scripts`: PASS.
+- Strict mypy over seven Task 6 source/runner files: PASS.
+- Project mypy over 44 source files: PASS.
+- G0 verifier: PASS for 20 threat cards and reviewed contract flow.
+- Direct v3.3 source-only invocation without `PYTHONPATH`: PASS.
+- V3, v3.1, v3.2, and v3.3 result absence plus v3.3 preregistration absence: PASS.
+- `git diff --check`: PASS.
+- `validation_spike/`: unchanged from `239617e`.
+
+No v3.3 confirmatory search was invoked, and reserved seeds
+`(503, 607, 709, 811, 907, 1009, 1103, 1201)` remain untouched.

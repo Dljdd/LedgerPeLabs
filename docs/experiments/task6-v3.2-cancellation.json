@@ -1,0 +1,22 @@
+{
+  "schema_version": "1.0.0",
+  "status": "cancelled_before_execution",
+  "cancelled_source_commit": "4ed9f6acabcdaeaa2e6c4a58ed150ffb2f87b7f6",
+  "cancelled_preregistration_commit": "239617e70563c9af3566b821cdaeb82df48cf1c7",
+  "cancelled_preregistration_path": "docs/experiments/task6-v3.2-holdout-preregistration.json",
+  "cancelled_preregistration_sha256": "4eade7ac071df843b53f9bb3797b6924a99f16a6efa2598309a4456415bb340c",
+  "cancelled_result_path": "docs/experiments/task6-v3.2-holdout-result.json",
+  "result_created": false,
+  "confirmatory_execution_invoked": false,
+  "seeds_used": false,
+  "seeds_remain_eligible_for_v3_3": [503, 607, 709, 811, 907, 1009, 1103, 1201],
+  "review_findings": [
+    "Execution accepted a clean descendant without an exact out-of-band approved freeze commit and preregistration byte digest.",
+    "The preregistration schema did not independently freeze and reconstruct every experiment protocol field.",
+    "The behavior manifest omitted Git mode, object type, object identity, symlink rejection, and exact execution-HEAD path-set comparison."
+  ],
+  "replacement_preregistration_path": "docs/experiments/task6-v3.3-holdout-preregistration.json",
+  "replacement_result_path": "docs/experiments/task6-v3.3-holdout-result.json",
+  "seed_reuse_basis": "The v3.2 execute path was never invoked, its result path remains absent, and none of the reserved seeds entered search or evaluation.",
+  "approval_boundary": "V3.3 requires an out-of-band controller or reviewer to approve the exact freeze commit and preregistration byte digest; Task 7 will sign that authorization durably."
+}
