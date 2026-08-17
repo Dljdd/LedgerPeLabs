@@ -13,6 +13,8 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from apar import __version__
 from apar.config import Settings
 from apar.registry.repository import ThreatRepository
+from apar.runs import RunRunner, RunSigningIdentity
+from apar.storage.artifacts import ArtifactStore
 
 RESOURCE_NOT_FOUND: Final = "RESOURCE_NOT_FOUND"
 VALIDATION_FAILED: Final = "VALIDATION_FAILED"
@@ -72,6 +74,15 @@ async def _http_error_handler(_: Request, error: Exception) -> JSONResponse:
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.repository = ThreatRepository(app.state.settings.database_path)
+    app.state.artifact_store = ArtifactStore(app.state.settings.artifact_root)
+    signer = RunSigningIdentity.load_or_create(
+        app.state.settings.root / ".apar" / "run-signing-key.ed25519"
+    )
+    app.state.run_runner = RunRunner(
+        artifact_store=app.state.artifact_store,
+        signer=signer,
+        run_index_root=app.state.settings.root / ".apar" / "runs",
+    )
     yield
 
 
@@ -79,6 +90,8 @@ def create_app(settings: Settings) -> FastAPI:
     """Build an unbound local API application for the supplied settings."""
     from apar.api.routes.health import router as health_router
     from apar.api.routes.registry import router as registry_router
+    from apar.api.routes.runs import router as runs_router
+    from apar.api.routes.scenarios import router as scenarios_router
 
     app = FastAPI(
         title="APAR API",
@@ -93,4 +106,6 @@ def create_app(settings: Settings) -> FastAPI:
     app.add_exception_handler(StarletteHTTPException, _http_error_handler)
     app.include_router(health_router)
     app.include_router(registry_router)
+    app.include_router(scenarios_router)
+    app.include_router(runs_router)
     return app

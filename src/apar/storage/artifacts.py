@@ -103,6 +103,14 @@ class ArtifactStore:
             raise ValueError("artifact reference does not match stored manifest")
         return payload
 
+    def resolve(self, digest: str) -> ArtifactRef:
+        """Resolve one content address only after verifying its payload and manifest."""
+        try:
+            ref, _ = self._load_verified(digest)
+        except FileNotFoundError as error:
+            raise ValueError(f"artifact does not exist: {digest}") from error
+        return ref
+
     def _load_if_present(self, digest: str) -> tuple[ArtifactRef, bytes] | None:
         try:
             return self._load_verified(digest)

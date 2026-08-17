@@ -130,6 +130,17 @@ def test_existing_digest_cannot_be_overwritten(tmp_path: Path) -> None:
     assert len(list((tmp_path / ref.sha256).iterdir())) == 2
 
 
+def test_resolve_returns_only_a_verified_content_address(tmp_path: Path) -> None:
+    """Catches API artifact IDs bypassing manifest and payload verification."""
+    store = ArtifactStore(tmp_path)
+    ref = store.put_json({"scenario_id": "scenario-1"})
+
+    assert store.resolve(ref.sha256) == ref
+
+    with pytest.raises(ValueError, match="does not exist"):
+        store.resolve("0" * 64)
+
+
 def test_existing_digest_with_corrupt_manifest_is_rejected(tmp_path: Path) -> None:
     """Catches accepting a digest directory whose metadata was modified after creation."""
     store = ArtifactStore(tmp_path)

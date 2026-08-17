@@ -21,6 +21,9 @@ def test_openapi_exposes_only_the_foundation_api_paths(tmp_path) -> None:
     assert response.status_code == 200
     assert set(response.json()["paths"]) == {
         "/api/v1/health",
+        "/api/v1/runs",
+        "/api/v1/runs/{run_id}",
+        "/api/v1/scenarios/compile",
         "/api/v1/threats",
         "/api/v1/threats/{threat_id}",
     }
