@@ -1,4 +1,4 @@
-"""Public contracts and bounded non-LLM policy behavior."""
+"""Sanitized public contracts, feasible bounds, and non-LLM policy behavior."""
 
 from __future__ import annotations
 
@@ -10,11 +10,15 @@ import pytest
 from pydantic import ValidationError
 
 from apar.contracts.decisions import Action
-from apar.generators import CampaignParameterError
+from apar.generators import Population
 from apar.redteam import (
     PUBLIC_REASON_FAMILIES,
+    AdaptiveParameter,
     AdaptiveTournamentPolicy,
+    AdaptiveVector,
     AttackCandidate,
+    CandidateContractError,
+    DisclosureProfile,
     DomainKind,
     Feedback,
     FixedPolicy,
@@ -23,7 +27,24 @@ from apar.redteam import (
     RandomPolicy,
     VisibleTrial,
 )
-from tests.redteam.conftest import campaign_params
+from apar.redteam.benchmark import CampaignBenchmark, default_defender_rules
+from tests.redteam.conftest import campaign_benchmark, campaign_params
+
+
+def _trial(candidate: AttackCandidate, feedback: Feedback) -> VisibleTrial:
+    penalty = {
+        Action.APPROVE: Decimal(0),
+        Action.CHALLENGE: Decimal("-0.25"),
+        Action.DECLINE: Decimal("-1"),
+    }[feedback.action]
+    objective = (
+        feedback.realized_value if feedback.realized_value is not None else Decimal(0)
+    ) + penalty
+    return VisibleTrial(
+        candidate=candidate,
+        feedback=feedback,
+        objective_value=objective,
+    )
 
 
 def test_feedback_contract_is_exact_closed_and_immutable() -> None:
@@ -43,15 +64,21 @@ def test_feedback_contract_is_exact_closed_and_immutable() -> None:
             }
         )
     with pytest.raises(ValidationError):
-        Feedback(action=Action.APPROVE, reason_family="hidden_rule_42", realized_value=None)
+        Feedback(
+            action=Action.APPROVE,
+            reason_family="hidden_rule_42",
+            realized_value=None,
+        )
     with pytest.raises(ValidationError):
         feedback.reason_family = "other"  # type: ignore[misc]
     assert "invalid_candidate" in PUBLIC_REASON_FAMILIES
 
 
-def test_visible_trial_objective_cannot_smuggle_a_score() -> None:
+def test_visible_trial_objective_cannot_smuggle_a_score(card_bounds) -> None:  # type: ignore[no-untyped-def]
     candidate = AttackCandidate(
-        params=campaign_params(), parent_id=None, generation=0
+        params=card_bounds.defaults,
+        parent_id=None,
+        generation=0,
     )
     feedback = Feedback(
         action=Action.APPROVE,
@@ -64,11 +91,6 @@ def test_visible_trial_objective_cannot_smuggle_a_score() -> None:
             feedback=feedback,
             objective_value=Decimal("0.987"),
         )
-    assert set(VisibleTrial.model_fields) == {
-        "candidate",
-        "feedback",
-        "objective_value",
-    }
 
 
 @pytest.mark.parametrize(
@@ -84,52 +106,51 @@ def test_feedback_money_rejects_noncanonical_numeric_attacks(value: Decimal) -> 
         )
 
 
-def test_candidate_has_stable_canonical_identity() -> None:
-    params = campaign_params()
-    first = AttackCandidate(params=params, parent_id=None, generation=0)
-    second = AttackCandidate(params=params, parent_id=None, generation=0)
-    changed = AttackCandidate(
-        params=replace(params, retry_intensity=3),
-        parent_id=None,
-        generation=0,
+def test_candidate_identity_contains_only_sanitized_adaptive_vector(card_bounds) -> None:  # type: ignore[no-untyped-def]
+    first = AttackCandidate(params=card_bounds.defaults, parent_id=None, generation=0)
+    changed_vector = next(
+        vector
+        for vector in card_bounds.feasible_vectors
+        if vector.fingerprint != card_bounds.defaults.fingerprint
     )
-    assert first.candidate_id == second.candidate_id
-    assert first.fingerprint == second.fingerprint
-    assert changed.candidate_id != first.candidate_id
+    changed = AttackCandidate(params=changed_vector, parent_id=None, generation=0)
+    assert first.params.names == card_bounds.names
+    assert "campaign_id" not in repr(first)
+    assert "expected_motif" not in repr(first)
+    assert "seed=" not in repr(first)
     assert changed.fingerprint != first.fingerprint
-    assert len(first.candidate_id) == len(first.fingerprint) == 64
+    assert changed.candidate_id != first.candidate_id
 
 
-def test_parameter_bounds_declare_only_family_adaptive_fields(card_bounds: ParameterBounds) -> None:
-    assert card_bounds.names == (
-        "device_reuse_rate",
-        "merchant_concentration",
-        "retry_intensity",
-    )
-    assert "model_score" not in card_bounds.schema_document()
-    assert "campaign_id" not in card_bounds.schema_document()
-    assert {domain.kind.value for domain in card_bounds.domains} == {
-        "discrete",
-        "linear",
+def test_parameter_bounds_have_no_hidden_template_and_are_integrity_sealed(card_bounds) -> None:  # type: ignore[no-untyped-def]
+    assert set(ParameterBounds.model_fields) == {
+        "family",
+        "defaults",
+        "domains",
+        "feasible_vectors",
     }
-    with pytest.raises(CampaignParameterError, match="non-adaptive"):
-        card_bounds.with_updates(card_bounds.template, {"target_value_total": Decimal("600")})
+    schema = repr(card_bounds.schema_document())
+    for forbidden in (
+        "campaign_id",
+        "expected_motif",
+        "target_value_total",
+        "seed",
+        "model_score",
+    ):
+        assert forbidden not in schema
+    injected = card_bounds.model_copy(update={"hidden_template": object()})
+    with pytest.raises(CandidateContractError, match="field set"):
+        injected.assert_pristine()
 
 
-def test_bounds_reject_subclasses_and_nonfinite_values(card_bounds: ParameterBounds) -> None:
+def test_vector_and_domain_reject_subclasses_nonfinite_and_no_op_aliases() -> None:
     class EvilInt(int):
         pass
 
-    with pytest.raises(CampaignParameterError):
-        card_bounds.with_updates(card_bounds.template, {"retry_intensity": EvilInt(2)})
-    with pytest.raises(CampaignParameterError):
-        card_bounds.with_updates(
-            card_bounds.template,
-            {"merchant_concentration": Decimal("NaN")},
-        )
-
-
-def test_parameter_domain_rejects_numerically_equal_no_op_aliases() -> None:
+    with pytest.raises((TypeError, ValidationError)):
+        AdaptiveParameter(name="retry_intensity", value=EvilInt(2))
+    with pytest.raises(ValidationError):
+        AdaptiveParameter(name="merchant_concentration", value=Decimal("NaN"))
     with pytest.raises(ValidationError, match="aliases"):
         ParameterDomain(
             name="merchant_concentration",
@@ -138,30 +159,36 @@ def test_parameter_domain_rejects_numerically_equal_no_op_aliases() -> None:
         )
 
 
-def test_fixed_random_and_adaptive_are_deterministic_and_do_not_touch_global_rng(
-    card_bounds: ParameterBounds,
-) -> None:
+def test_fixed_random_and_adaptive_are_deterministic_and_keep_global_rng(card_bounds) -> None:  # type: ignore[no-untyped-def]
     state_before = np.random.get_state()
     fixed = FixedPolicy().propose((), card_bounds, np.random.default_rng(7))
     random_first = RandomPolicy().propose((), card_bounds, np.random.default_rng(7))
     random_second = RandomPolicy().propose((), card_bounds, np.random.default_rng(7))
-    feedback = Feedback(
-        action=Action.DECLINE,
-        reason_family="velocity",
-        realized_value=None,
+    history = (
+        _trial(
+            fixed,
+            Feedback(
+                action=Action.DECLINE,
+                reason_family="velocity",
+                realized_value=None,
+            ),
+        ),
     )
-    trial = VisibleTrial(candidate=fixed, feedback=feedback, objective_value=Decimal("-1"))
     adaptive_first = AdaptiveTournamentPolicy().propose(
-        (trial,), card_bounds, np.random.default_rng(9)
+        history,
+        card_bounds,
+        np.random.default_rng(9),
     )
     adaptive_second = AdaptiveTournamentPolicy().propose(
-        (trial,), card_bounds, np.random.default_rng(9)
+        history,
+        card_bounds,
+        np.random.default_rng(9),
     )
     state_after = np.random.get_state()
-
-    assert fixed.params == card_bounds.template
+    assert fixed.params == card_bounds.defaults
     assert random_first == random_second
     assert adaptive_first == adaptive_second
+    assert adaptive_first.parent_id == fixed.candidate_id
     assert 1 <= card_bounds.changed_field_count(fixed.params, adaptive_first.params) <= 3
     assert all(
         (left == right).all() if hasattr(left, "all") else left == right
@@ -169,101 +196,115 @@ def test_fixed_random_and_adaptive_are_deterministic_and_do_not_touch_global_rng
     )
 
 
-def test_adaptive_selection_is_invariant_to_history_order(
-    card_bounds: ParameterBounds,
-) -> None:
+def test_adaptive_selection_is_invariant_to_history_order(card_bounds) -> None:  # type: ignore[no-untyped-def]
+    history: tuple[VisibleTrial, ...] = ()
     rng = np.random.default_rng(31)
-    candidates = tuple(RandomPolicy().propose((), card_bounds, rng) for _ in range(4))
-    trials = tuple(
-        VisibleTrial(
-            candidate=candidate,
-            feedback=Feedback(
-                action=Action.APPROVE,
-                reason_family="approved",
-                realized_value=Decimal(f"{index}.00"),
+    for index in range(5):
+        candidate = RandomPolicy().propose(history, card_bounds, rng)
+        history += (
+            _trial(
+                candidate,
+                Feedback(
+                    action=Action.APPROVE,
+                    reason_family="approved",
+                    realized_value=Decimal(f"{index}.00"),
+                ),
             ),
-            objective_value=Decimal(index),
         )
-        for index, candidate in enumerate(candidates)
-    )
     first = AdaptiveTournamentPolicy().propose(
-        trials, card_bounds, np.random.default_rng(42)
+        history,
+        card_bounds,
+        np.random.default_rng(42),
     )
     second = AdaptiveTournamentPolicy().propose(
-        tuple(reversed(trials)), card_bounds, np.random.default_rng(42)
+        tuple(reversed(history)),
+        card_bounds,
+        np.random.default_rng(42),
     )
     assert first == second
 
 
 @pytest.mark.parametrize(
     "family",
-    ["app_scam_mule", "card_testing_cnp", "synthetic_merchant_refund"],
+    [
+        "app_scam_mule",
+        "card_testing_cnp",
+        "synthetic_merchant_refund",
+        "agentic_intent_abuse",
+    ],
 )
-def test_random_and_adaptive_emit_only_canonical_family_candidates(family: str) -> None:
-    bounds = ParameterBounds.for_campaign(family, campaign_params(family))
-    history: tuple[VisibleTrial, ...] = ()
-    for generation in range(16):
-        candidate = RandomPolicy().propose(history, bounds, np.random.default_rng(generation))
-        bounds.validate_params(candidate.params)
-        feedback = Feedback(
-            action=Action.APPROVE,
-            reason_family="approved",
-            realized_value=None,
-        )
-        history += (
-            VisibleTrial(
-                candidate=candidate,
-                feedback=feedback,
-                objective_value=Decimal(0),
-            ),
-        )
-        adaptive = AdaptiveTournamentPolicy().propose(
-            history, bounds, np.random.default_rng(generation + 100)
-        )
-        bounds.validate_params(adaptive.params)
-        parent = next(
-            trial.candidate
-            for trial in history
-            if trial.candidate.candidate_id == adaptive.parent_id
-        )
-        assert 1 <= bounds.changed_field_count(parent.params, adaptive.params) <= 3
+def test_every_advertised_value_is_in_a_preflighted_task5_vector(
+    family: str,
+    benchmark_population: Population,
+) -> None:
+    benchmark = campaign_benchmark(family, benchmark_population)
+    bounds = benchmark.public_bounds
+    for domain in bounds.domains:
+        for value in domain.values:
+            vector = next(
+                candidate
+                for candidate in bounds.feasible_vectors
+                if type(candidate.get(domain.name)) is type(value)
+                and candidate.get(domain.name) == value
+            )
+            feedback, observation = benchmark.evaluate_with_observation(
+                AttackCandidate(params=vector, parent_id=None, generation=0)
+            )
+            assert feedback.reason_family != "invalid_candidate"
+            assert observation.fresh_replay_succeeded is True
+            assert observation.ledger_conserved is True
 
 
-def test_larger_agentic_matrix_exposes_only_real_mutation_slots() -> None:
+def test_non_feasible_constraint_interaction_rejects_before_evaluator(
+    benchmark_population: Population,
+) -> None:
+    benchmark = campaign_benchmark("app_scam_mule", benchmark_population)
+    bounds = benchmark.public_bounds
+    values = {entry.name: entry.value for entry in bounds.defaults.entries}
+    values["cash_out_strategy"] = "burst"
+    values["cash_out_delay_seconds"] = max(
+        value for value in bounds.domain("cash_out_delay_seconds").values if type(value) is int
+    )
+    incompatible = AdaptiveVector.from_mapping(values)
+    with pytest.raises(CandidateContractError, match="feasible"):
+        bounds.validate_vector(incompatible)
+
+
+def test_minimum_agentic_matrix_omits_fixed_slots_and_larger_matrix_exposes_real_slot(
+    benchmark_population: Population,
+) -> None:
+    minimum = campaign_benchmark("agentic_intent_abuse", benchmark_population).public_bounds
+    assert minimum.names == ()
+    assert len(minimum.feasible_vectors) == 1
+
     base = campaign_params("agentic_intent_abuse")
     with localcontext() as context:
         context.prec = 28
         rate = Decimal(24) / Decimal(26)
-    params = replace(
+    larger_template = replace(
         base,
         payment_count=26,
         target_illicit_rate=rate,
         agentic_attack_mix=rate,
     )
-    bounds = ParameterBounds.for_campaign("agentic_intent_abuse", params)
-    mutation_domain = bounds.domain("agentic_mutations")
-    assert bounds.has_non_no_op_mutation is True
-    assert len(mutation_domain.values) > 1
-    history: tuple[VisibleTrial, ...] = ()
-    for seed in range(12):
-        candidate = RandomPolicy().propose(history, bounds, np.random.default_rng(seed))
-        bounds.validate_params(candidate.params)
-        assert candidate.params.agentic_mutations != ("identity",)
-        trial = VisibleTrial(
-            candidate=candidate,
-            feedback=Feedback(
-                action=Action.DECLINE,
-                reason_family="integrity",
-                realized_value=None,
-            ),
-            objective_value=Decimal("-1"),
-        )
-        history += (trial,)
-    adaptive = AdaptiveTournamentPolicy().propose(
-        history, bounds, np.random.default_rng(30)
-    )
-    parent = next(
-        trial.candidate for trial in history if trial.candidate.candidate_id == adaptive.parent_id
-    )
-    assert 1 <= bounds.changed_field_count(parent.params, adaptive.params) <= 3
-    bounds.validate_params(adaptive.params)
+    larger = CampaignBenchmark(
+        family="agentic_intent_abuse",
+        population=benchmark_population,
+        hidden_template=larger_template,
+        defender=default_defender_rules(),
+        disclosure_profile=DisclosureProfile(
+            profile_id="artifact-decision-only-v1",
+            expose_realized_value=False,
+        ),
+        generator_seed=960,
+    ).public_bounds
+    assert larger.has_non_no_op_mutation is True
+    assert larger.names == ("agentic_mutations",)
+
+
+def test_policy_cannot_retain_mutable_aliases(card_bounds) -> None:  # type: ignore[no-untyped-def]
+    original_digest = card_bounds.bounds_digest
+    serialized = card_bounds.document()
+    serialized["family"] = "app_scam_mule"
+    assert card_bounds.family == "card_testing_cnp"
+    assert card_bounds.bounds_digest == original_digest

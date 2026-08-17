@@ -2,9 +2,13 @@
 
 from apar.redteam.llm_policy import LLMAuditRecord, LLMClient, LLMPlannerPolicy
 from apar.redteam.policies import (
+    PUBLIC_CAMPAIGN_FAMILIES,
     PUBLIC_REASON_FAMILIES,
+    AdaptiveParameter,
     AdaptiveTournamentPolicy,
+    AdaptiveVector,
     AttackCandidate,
+    CandidateContractError,
     DomainKind,
     Feedback,
     FixedPolicy,
@@ -19,6 +23,8 @@ from apar.redteam.search import (
     AdaptiveSearch,
     CapabilityDeltaReport,
     CapabilityPreregistration,
+    DisclosureProfile,
+    EvaluationContract,
     FamilyCapabilityMetrics,
     FamilyThreshold,
     PolicyMetrics,
@@ -28,13 +34,19 @@ from apar.redteam.search import (
 )
 
 __all__ = [
+    "PUBLIC_CAMPAIGN_FAMILIES",
     "PUBLIC_REASON_FAMILIES",
+    "AdaptiveParameter",
     "AdaptiveSearch",
     "AdaptiveTournamentPolicy",
+    "AdaptiveVector",
     "AttackCandidate",
+    "CandidateContractError",
     "CapabilityDeltaReport",
     "CapabilityPreregistration",
+    "DisclosureProfile",
     "DomainKind",
+    "EvaluationContract",
     "FamilyCapabilityMetrics",
     "FamilyThreshold",
     "Feedback",
