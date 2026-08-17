@@ -5,7 +5,6 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -38,6 +37,10 @@ def _digest(document: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def _entry(*, mode: str = "100644", content: str = "b") -> dict[str, str]:
     return {
         "git_mode": mode,
@@ -67,7 +70,10 @@ def test_v32_is_canonically_cancelled_without_its_result() -> None:
     assert not V32_RESULT.exists()
     assert V33_RESULT.exists()
     assert V33_REJECTION.exists()
-    assert not V34_RESULT.exists()
+    assert V34_RESULT.exists()
+    assert _sha256(V34_RESULT) == (
+        "f82981a987651a7f7ebb10a9011df063b2dc54a56181cae5b838e31de5e658db"
+    )
 
 
 def test_execute_parser_requires_both_external_approval_values() -> None:
@@ -298,27 +304,14 @@ def test_unapproved_loaded_python_customization_module_rejects(
         validate({}, root=tmp_path / "repository")
 
 
-def test_verify_only_handles_v34_freeze_without_search() -> None:
-    environment = dict(os.environ)
-    environment.pop("PYTHONPATH", None)
-    completed = subprocess.run(
-        [sys.executable, str(ROOT / "scripts/run_task6_holdout.py"), "--verify-only"],
-        cwd=ROOT,
-        env=environment,
-        check=False,
-        capture_output=True,
-        text=True,
+def test_portable_postcommit_verifier_handles_v34_without_search() -> None:
+    document, summary = holdout_runner._verify_published_result_portably(
+        expected_freeze_commit="52e8d795c9c2bc40fda1d40178cce50e33349b20"
     )
 
-    assert completed.returncode == 0, completed.stderr
-    if V34_PREREGISTRATION.exists():
-        assert "awaiting external approval" in completed.stdout
-        assert "--approved-freeze-commit" in completed.stdout
-        assert "--approved-prereg-sha256" in completed.stdout
-    else:
-        assert "source stage" in completed.stdout
-    assert "no holdout trial executed" in completed.stdout
-    assert not V34_RESULT.exists()
+    assert document["summary"] == summary
+    assert summary["confirmatory_valid"] is True
+    assert summary["supported_family_count"] == 2
 
 
 def test_execute_refuses_when_v34_preregistration_is_absent() -> None:
@@ -345,16 +338,23 @@ def test_execute_refuses_when_v34_preregistration_is_absent() -> None:
     assert not V34_RESULT.exists()
 
 
-def test_v34_preregistration_is_absent_until_separate_freeze_commit() -> None:
+def test_v34_preregistration_and_result_are_preserved_after_separate_commits() -> None:
     if not V34_PREREGISTRATION.exists():
         assert not V34_RESULT.exists()
         return
     artifact = json.loads(V34_PREREGISTRATION.read_text(encoding="utf-8"))
-    validate = getattr(holdout_runner, "_validate_preregistration_schema", None)
+    validate = getattr(
+        holdout_runner,
+        "_validate_portable_preregistration_schema",
+        None,
+    )
     assert callable(validate)
 
     validate(artifact)
     assert artifact["status"] == "final_v3_4_frozen_before_evidence_replication"
     assert artifact["protocol"] == holdout_runner._expected_protocol()
     assert artifact["source_freeze"]["source_commit"] != holdout_runner._head_commit()
-    assert not V34_RESULT.exists()
+    assert V34_RESULT.exists()
+    assert _sha256(V34_RESULT) == (
+        "f82981a987651a7f7ebb10a9011df063b2dc54a56181cae5b838e31de5e658db"
+    )

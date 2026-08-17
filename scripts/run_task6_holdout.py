@@ -58,6 +58,7 @@ from apar.redteam.task6_verifier import (  # noqa: E402
     build_search_cell_document,
     canonical_digest,
     canonical_json_bytes,
+    derive_artifact_scoped_provenance,
     strict_json_loads,
     verify_result_bundle,
 )
@@ -689,6 +690,19 @@ def _head_commit() -> str:
     return cast(str, _git_output(["rev-parse", "HEAD"])).strip()
 
 
+def _commit_is_ancestor(ancestor: str, descendant: str) -> bool:
+    completed = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode not in {0, 1}:
+        raise RuntimeError("unable to validate approved result ancestry")
+    return completed.returncode == 0
+
+
 def _require_clean_worktree() -> None:
     status = cast(str, _git_output(["status", "--porcelain"])).strip()
     if status:
@@ -728,8 +742,9 @@ def _validate_postcommit_chronology(
     expected_path = "docs/experiments/task6-v3.4-holdout-result.json"
     if approved_artifacts != {expected_path: result_sha}:
         raise RuntimeError("approved result artifact path or SHA-256 differs")
-    if _head_commit() != result_commit:
-        raise RuntimeError("HEAD is not the exact approved result commit")
+    current_head = _head_commit()
+    if not _commit_is_ancestor(result_commit, current_head):
+        raise RuntimeError("approved result commit is not an ancestor of HEAD")
     parents = cast(
         str,
         _git_output(["rev-list", "--parents", "-n", "1", result_commit]),
@@ -763,6 +778,11 @@ def _validate_postcommit_chronology(
     )
     if _sha256_bytes(content) != result_sha:
         raise RuntimeError("approved result artifact SHA-256 differs from its committed blob")
+    if RESULT_PATH.is_symlink() or not RESULT_PATH.is_file():
+        raise RuntimeError("current approved result artifact is not one regular file")
+    current = RESULT_PATH.read_bytes()
+    if len(current) != len(content) or _sha256_bytes(current) != result_sha:
+        raise RuntimeError("current approved result artifact size or SHA-256 differs")
 
 
 def _verify_source_freeze(
@@ -1154,7 +1174,11 @@ def _build_preregistration_document(source_commit: str) -> dict[str, object]:
     }
 
 
-def _validate_preregistration_schema(artifact: object) -> dict[str, Any]:
+def _validate_preregistration_schema(
+    artifact: object,
+    *,
+    verify_current_bindings: bool = True,
+) -> dict[str, Any]:
     _assert_exact_json(artifact, path="preregistration")
     document = _require_exact_fields(
         "v3.4 preregistration",
@@ -1178,10 +1202,19 @@ def _validate_preregistration_schema(artifact: object) -> dict[str, Any]:
     )
     if document["schema_version"] != "1.0.0":
         raise RuntimeError("v3.4 preregistration schema version changed")
-    if document["status"] != _SOURCE_STATUS or document["purpose"] != _PURPOSE:
-        raise RuntimeError("v3.4 preregistration status or purpose changed")
-    _validate_protocol(document["protocol"])
-    if document["predecessor_evidence"] != _predecessor_evidence_document():
+    if verify_current_bindings:
+        if document["status"] != _SOURCE_STATUS or document["purpose"] != _PURPOSE:
+            raise RuntimeError("v3.4 preregistration status or purpose changed")
+        _validate_protocol(document["protocol"])
+    elif (
+        type(document["status"]) is not str
+        or type(document["purpose"]) is not str
+        or type(document["protocol"]) is not dict
+    ):
+        raise RuntimeError("historical v3.4 status, purpose, or protocol is malformed")
+    if verify_current_bindings and document[
+        "predecessor_evidence"
+    ] != _predecessor_evidence_document():
         raise RuntimeError("v3.4 predecessor evidence binding changed")
     behavior = _require_exact_fields(
         "v3.4 behavior equivalence",
@@ -1200,15 +1233,38 @@ def _validate_preregistration_schema(artifact: object) -> dict[str, Any]:
             }
         ),
     )
-    if behavior != _behavior_equivalence_document() or behavior["equivalent"] is not True:
+    if behavior["equivalent"] is not True:
         raise RuntimeError("v3.4 behavior equivalence to v3.3 is not exact")
+    if verify_current_bindings:
+        if behavior != _behavior_equivalence_document():
+            raise RuntimeError("v3.4 behavior equivalence to v3.3 is not exact")
+    elif (
+        type(behavior["baseline_commit"]) is not str
+        or behavior["proposal_implementation_sha256"]
+        != behavior["v3_3_proposal_implementation_sha256"]
+        or behavior["generator_implementation_sha256"]
+        != behavior["v3_3_generator_implementation_sha256"]
+        or behavior["defender_ast_sha256"]
+        != behavior["v3_3_defender_ast_sha256"]
+    ):
+        raise RuntimeError("historical v3.4 behavior-equivalence evidence differs")
+    if not verify_current_bindings:
+        _exact_hex(
+            "historical v3.3 baseline commit",
+            behavior["baseline_commit"],
+            length=40,
+        )
 
     policies = _require_exact_fields(
         "v3.4 policy bindings",
         document["policy_bindings"],
         frozenset({"fixed", "random", "adaptive", "cached_llm"}),
     )
-    expected_versions = cast(dict[str, str], _expected_protocol()["policies"])
+    expected_versions = (
+        cast(dict[str, str], _expected_protocol()["policies"])
+        if verify_current_bindings
+        else None
+    )
     for name, raw_binding in policies.items():
         binding = _require_exact_fields(
             f"v3.4 policy binding {name}",
@@ -1222,8 +1278,13 @@ def _validate_preregistration_schema(artifact: object) -> dict[str, Any]:
                 }
             ),
         )
-        if binding["version"] != expected_versions[name]:
+        if (
+            expected_versions is not None
+            and binding["version"] != expected_versions[name]
+        ):
             raise RuntimeError("v3.4 policy version binding changed")
+        if type(binding["version"]) is not str or not binding["version"]:
+            raise RuntimeError("v3.4 policy version binding is malformed")
         if binding["capability_id_scope"] != (
             "process_local_nonportable_not_preregistered"
         ):
@@ -1289,11 +1350,73 @@ def _validate_preregistration_schema(artifact: object) -> dict[str, Any]:
         ) or contract.get("defender_digest") != defender["defender_digest"]:
             raise RuntimeError("v3.4 context defender provenance differs")
 
-    cache_artifact = _load_exact_json(CACHE_PATH)
-    if document["cached_replay"] != _cached_replay_document(cache_artifact):
-        raise RuntimeError("v3.4 cached replay configuration or digest changed")
-    if document["result_publication"] != _result_publication_document():
-        raise RuntimeError("v3.4 result publication/verifier binding changed")
+    if verify_current_bindings:
+        cache_artifact = _load_exact_json(CACHE_PATH)
+        if document["cached_replay"] != _cached_replay_document(cache_artifact):
+            raise RuntimeError("v3.4 cached replay configuration or digest changed")
+    else:
+        cached = _require_exact_fields(
+            "historical v3.4 cached replay",
+            document["cached_replay"],
+            frozenset(
+                {
+                    "path",
+                    "file_sha256",
+                    "canonical_digest",
+                    "schema_version",
+                    "preparation_seed",
+                    "preparation_budget",
+                    "record_counts",
+                    "record_count",
+                    "records_digest",
+                    "provider",
+                    "model_id",
+                    "policy_version",
+                    "require_cached_replay",
+                    "network_calls_allowed",
+                }
+            ),
+        )
+        for name in ("file_sha256", "canonical_digest", "records_digest"):
+            _exact_hex(f"historical cache {name}", cached[name], length=64)
+    if verify_current_bindings:
+        if document["result_publication"] != _result_publication_document():
+            raise RuntimeError("v3.4 result publication/verifier binding changed")
+    else:
+        publication = _require_exact_fields(
+            "historical v3.4 result publication",
+            document["result_publication"],
+            frozenset(
+                {
+                    "approved_artifact_paths",
+                    "canonical_json_required",
+                    "atomic_exclusive_no_replace",
+                    "directory_eio_reports_published_recovery_state",
+                    "postexecution_mode",
+                    "postcommit_mode",
+                    "verifier_path",
+                    "verifier_sha256",
+                    "verifier_calls_policy_search",
+                    "verification_input",
+                    "deterministic_evaluator_replay_predeclared",
+                    "process_local_issuance_seals_portable",
+                }
+            ),
+        )
+        if (
+            publication["approved_artifact_paths"]
+            != ["docs/experiments/task6-v3.4-holdout-result.json"]
+            or publication["verifier_path"] != "src/apar/redteam/task6_verifier.py"
+            or publication["verifier_calls_policy_search"] is not False
+            or publication["verification_input"] != "complete_raw_cells_not_summary"
+            or publication["process_local_issuance_seals_portable"] is not False
+        ):
+            raise RuntimeError("historical v3.4 result publication binding changed")
+        _exact_hex(
+            "historical v3.4 verifier SHA-256",
+            publication["verifier_sha256"],
+            length=64,
+        )
     source = _require_exact_fields(
         "v3.4 source freeze",
         document["source_freeze"],
@@ -1305,6 +1428,130 @@ def _validate_preregistration_schema(artifact: object) -> dict[str, Any]:
     _exact_hex("source tree", source["git_tree"], length=40)
     _validate_manifest_document(source["behavior_manifest"])
     return document
+
+
+def _validate_portable_preregistration_schema(artifact: object) -> dict[str, Any]:
+    """Validate frozen bytes while retaining the historical verifier binding."""
+    return _validate_preregistration_schema(
+        artifact,
+        verify_current_bindings=False,
+    )
+
+
+def _git_regular_blob(commit: str, path: str) -> bytes:
+    record = _git_tree_records(commit).get(path)
+    if record is None or record["git_mode"] != "100644" or record["object_type"] != "blob":
+        raise RuntimeError(f"historical artifact is not one regular blob: {path}")
+    return cast(
+        bytes,
+        _git_output(["cat-file", "blob", record["git_object_id"]], text=False),
+    )
+
+
+def _validate_historical_preregistration(
+    artifact: dict[str, Any],
+    *,
+    raw: bytes,
+    preregistration_commit: str,
+    approved_sha256: str,
+) -> None:
+    preregistration_path = (
+        "docs/experiments/task6-v3.4-holdout-preregistration.json"
+    )
+    source = cast(dict[str, object], artifact["source_freeze"])
+    source_commit = _exact_hex(
+        "historical source commit", source["source_commit"], length=40
+    )
+    preregistration_commit = _exact_hex(
+        "historical preregistration commit", preregistration_commit, length=40
+    )
+    approved_sha256 = _exact_hex(
+        "historical preregistration SHA-256", approved_sha256, length=64
+    )
+    if PREREGISTRATION_PATH.is_symlink() or not PREREGISTRATION_PATH.is_file():
+        raise RuntimeError("current preregistration artifact is not one regular file")
+    if _sha256_bytes(raw) != approved_sha256:
+        raise RuntimeError("current preregistration SHA-256 differs from approval")
+    committed = _git_regular_blob(preregistration_commit, preregistration_path)
+    if len(committed) != len(raw) or _sha256_bytes(committed) != approved_sha256:
+        raise RuntimeError("historical preregistration size or SHA-256 differs")
+    parents = cast(
+        str,
+        _git_output(
+            ["rev-list", "--parents", "-n", "1", preregistration_commit]
+        ),
+    ).strip().split()
+    if parents != [preregistration_commit, source_commit]:
+        raise RuntimeError("preregistration commit is not directly based on its source freeze")
+    changed = cast(
+        bytes,
+        _git_output(
+            [
+                "diff-tree",
+                "--no-commit-id",
+                "--name-status",
+                "-r",
+                "-z",
+                preregistration_commit,
+            ],
+            text=False,
+        ),
+    )
+    if changed != b"A\0" + preregistration_path.encode("utf-8") + b"\0":
+        raise RuntimeError("preregistration commit is not an exact artifact-only freeze")
+    observed_tree = cast(
+        str,
+        _git_output(["rev-parse", f"{source_commit}^{{tree}}"]),
+    ).strip()
+    if observed_tree != source["git_tree"]:
+        raise RuntimeError("historical source tree differs from preregistration")
+    observed_manifest = _behavior_manifest_document(source_commit)
+    if observed_manifest != source["behavior_manifest"]:
+        raise RuntimeError("historical behavior manifest differs from preregistration")
+    entries = _validate_manifest_document(source["behavior_manifest"])
+    verifier_path = cast(str, artifact["result_publication"]["verifier_path"])
+    if (
+        verifier_path not in entries
+        or entries[verifier_path]["content_sha256"]
+        != artifact["result_publication"]["verifier_sha256"]
+    ):
+        raise RuntimeError("historical raw verifier differs from preregistration")
+
+
+def _load_frozen_cache_records(artifact: dict[str, Any]) -> dict[str, object]:
+    cached = cast(dict[str, object], artifact["cached_replay"])
+    source = cast(dict[str, object], artifact["source_freeze"])
+    source_commit = cast(str, source["source_commit"])
+    path = cast(str, cached["path"])
+    raw = _git_regular_blob(source_commit, path)
+    if _sha256_bytes(raw) != cached["file_sha256"]:
+        raise RuntimeError("historical cached-replay file SHA-256 differs")
+    loaded = strict_json_loads(raw, require_canonical=False)
+    if type(loaded) is not dict:
+        raise RuntimeError("historical cached replay is not one exact object")
+    cache_artifact = cast(dict[str, Any], loaded)
+    records = cache_artifact.get("records")
+    if type(records) is not dict:
+        raise RuntimeError("historical cached replay records are not an exact object")
+    observed = {
+        "path": path,
+        "file_sha256": _sha256_bytes(raw),
+        "canonical_digest": _canonical_digest(cache_artifact),
+        "schema_version": cache_artifact.get("schema_version"),
+        "preparation_seed": cache_artifact.get("development_seed"),
+        "preparation_budget": cache_artifact.get("budget"),
+        "record_counts": cache_artifact.get("record_counts"),
+        "record_count": len(records),
+        "records_digest": _canonical_digest(records),
+        "provider": "fixture",
+        "model_id": "cached-default-v1",
+        "policy_version": "1.0.0",
+        "require_cached_replay": True,
+        "network_calls_allowed": 0,
+    }
+    if observed != cached:
+        raise RuntimeError("historical cached-replay stable provenance differs")
+    return cast(dict[str, object], records)
 
 
 def _runtime() -> tuple[
@@ -1735,41 +1982,56 @@ def _execute(
     return document
 
 
-def _verify_published_result(
+def _verify_published_result_portably(
     *,
-    artifact: dict[str, Any],
-    authority: SearchAuthority,
-    evaluators: dict[str, EvaluatorCapability],
-    negative_evaluator: EvaluatorCapability,
-    policies: dict[str, PolicyCapability],
     expected_freeze_commit: str,
 ) -> tuple[dict[str, object], dict[str, object]]:
-    if not RESULT_PATH.is_file() or RESULT_PATH.is_symlink():
-        raise RuntimeError("v3.4 result must be one exact regular file")
-    raw = RESULT_PATH.read_bytes()
-    loaded = strict_json_loads(raw, require_canonical=True)
-    if type(loaded) is not dict:
-        raise RuntimeError("v3.4 result must contain one exact JSON object")
-    document = cast(dict[str, object], loaded)
-    expected_contexts = _runtime_verification_contexts(
-        artifact,
-        evaluators,
-        negative_evaluator,
+    """Verify frozen raw evidence without issuing any live process capability."""
+    expected_freeze_commit = _exact_hex(
+        "portable expected freeze commit", expected_freeze_commit, length=40
     )
-    policy_bindings: dict[str, object] = {
-        name: authority.policy_binding(capability).model_dump(mode="json")
-        for name, capability in policies.items()
-    }
-    cache_records = cast(dict[str, object], _load_exact_json(CACHE_PATH)["records"])
-    expected_approval: dict[str, str] = {
+    if RESULT_PATH.is_symlink() or not RESULT_PATH.is_file():
+        raise RuntimeError("v3.4 result must be one exact regular file")
+    result_raw = RESULT_PATH.read_bytes()
+    loaded_result = strict_json_loads(result_raw, require_canonical=True)
+    if type(loaded_result) is not dict:
+        raise RuntimeError("v3.4 result must contain one exact JSON object")
+    document = cast(dict[str, object], loaded_result)
+    if PREREGISTRATION_PATH.is_symlink() or not PREREGISTRATION_PATH.is_file():
+        raise RuntimeError("v3.4 preregistration must be one exact regular file")
+    preregistration_raw = PREREGISTRATION_PATH.read_bytes()
+    loaded_preregistration = strict_json_loads(
+        preregistration_raw,
+        require_canonical=True,
+    )
+    artifact = _validate_portable_preregistration_schema(loaded_preregistration)
+    preregistration_sha = _sha256_bytes(preregistration_raw)
+    if (
+        document.get("preregistration_commit") != expected_freeze_commit
+        or document.get("preregistration_file_sha256") != preregistration_sha
+    ):
+        raise RuntimeError("v3.4 result differs from its approved preregistration")
+    _validate_historical_preregistration(
+        artifact,
+        raw=preregistration_raw,
+        preregistration_commit=expected_freeze_commit,
+        approved_sha256=preregistration_sha,
+    )
+    cache_records = _load_frozen_cache_records(artifact)
+    contexts, policies = derive_artifact_scoped_provenance(
+        document,
+        preregistered_contexts=artifact["evidence_contexts"],
+        preregistered_policy_bindings=artifact["policy_bindings"],
+    )
+    expected_approval = {
         "approved_freeze_commit": expected_freeze_commit,
-        "approved_prereg_sha256": _sha256_file(PREREGISTRATION_PATH),
+        "approved_prereg_sha256": preregistration_sha,
     }
     summary = verify_result_bundle(
         document,
-        expected_protocol=_expected_protocol(),
-        expected_contexts=expected_contexts,
-        expected_policy_bindings=policy_bindings,
+        expected_protocol=artifact["protocol"],
+        expected_contexts=contexts,
+        expected_policy_bindings=policies,
         expected_llm_cache=cache_records,
         expected_external_approval=expected_approval,
         expected_preregistration_canonical_digest=canonical_digest(artifact),
@@ -1878,32 +2140,7 @@ def main() -> None:
             ),
         )
         _validate_postexecution_worktree_status(status)
-        (
-            artifact,
-            experiment,
-            authority,
-            _group,
-            evaluators,
-            negative_evaluator,
-            policies,
-            _cached_policy,
-            _no_network,
-        ) = _runtime()
-        _verify_frozen_bindings(
-            artifact,
-            experiment,
-            authority,
-            evaluators,
-            negative_evaluator,
-            policies,
-            require_clean=False,
-        )
-        _document, summary = _verify_published_result(
-            artifact=artifact,
-            authority=authority,
-            evaluators=evaluators,
-            negative_evaluator=negative_evaluator,
-            policies=policies,
+        _document, summary = _verify_published_result_portably(
             expected_freeze_commit=_head_commit(),
         )
         print(
@@ -1930,31 +2167,7 @@ def main() -> None:
                 "docs/experiments/task6-v3.4-holdout-result.json": approved_result_sha
             },
         )
-        (
-            artifact,
-            experiment,
-            authority,
-            _group,
-            evaluators,
-            negative_evaluator,
-            policies,
-            _cached_policy,
-            _no_network,
-        ) = _runtime()
-        _verify_frozen_bindings(
-            artifact,
-            experiment,
-            authority,
-            evaluators,
-            negative_evaluator,
-            policies,
-        )
-        _document, summary = _verify_published_result(
-            artifact=artifact,
-            authority=authority,
-            evaluators=evaluators,
-            negative_evaluator=negative_evaluator,
-            policies=policies,
+        _document, summary = _verify_published_result_portably(
             expected_freeze_commit=preregistration_commit,
         )
         print(

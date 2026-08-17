@@ -306,7 +306,7 @@ def test_v31_is_canonically_cancelled_without_execution_or_result() -> None:
     assert not V32_RESULT.exists()
 
 
-def test_v32_source_only_verification_is_direct_and_executes_no_search() -> None:
+def test_v32_source_only_mode_closes_after_v34_result_publication() -> None:
     environment = dict(os.environ)
     environment.pop("PYTHONPATH", None)
     completed = subprocess.run(
@@ -322,9 +322,8 @@ def test_v32_source_only_verification_is_direct_and_executes_no_search() -> None
         text=True,
     )
 
-    assert completed.returncode == 0, completed.stderr
-    assert "v3.2 source" in completed.stdout
-    assert "no holdout trial executed" in completed.stdout
+    assert completed.returncode != 0
+    assert "result must remain absent" in completed.stderr
     assert not V32_RESULT.exists()
 
 

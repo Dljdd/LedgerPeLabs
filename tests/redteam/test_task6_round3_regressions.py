@@ -5,15 +5,13 @@ from __future__ import annotations
 import ast
 import inspect
 import json
-import os
-import subprocess
-import sys
 from pathlib import Path
 from types import MethodType
 
 import numpy as np
 import pytest
 
+import scripts.run_task6_holdout as holdout_runner
 from apar.contracts.decisions import Action
 from apar.redteam import (
     AdaptiveSearch,
@@ -220,21 +218,12 @@ def test_v3_policy_ast_contains_no_family_or_task5_specific_strategy() -> None:
     assert AdaptiveTournamentPolicy.policy_version == "3.0.0"
 
 
-def test_v31_runner_is_directly_reproducible_and_verify_only_executes_no_trial() -> None:
-    environment = dict(os.environ)
-    environment.pop("PYTHONPATH", None)
-    completed = subprocess.run(
-        [sys.executable, str(ROOT / "scripts/run_task6_holdout.py"), "--verify-only"],
-        cwd=ROOT,
-        env=environment,
-        check=False,
-        capture_output=True,
-        text=True,
+def test_v31_lineage_is_preserved_while_v34_verifies_without_a_new_trial() -> None:
+    _document, summary = holdout_runner._verify_published_result_portably(
+        expected_freeze_commit="52e8d795c9c2bc40fda1d40178cce50e33349b20"
     )
 
-    assert completed.returncode == 0, completed.stderr
-    assert "v3.1" in completed.stdout
-    assert "no holdout trial executed" in completed.stdout
+    assert summary["confirmatory_valid"] is True
     assert not V3_RESULT.exists()
 
 

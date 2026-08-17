@@ -99,7 +99,10 @@ def test_v34_protocol_is_instrumentation_only_evidence_replication() -> None:
         "lossless": True,
     }
     assert "no further Task 6 confirmatory attempt" in protocol["stopping_rule"]
-    assert not V34_RESULT.exists()
+    assert V34_RESULT.exists()
+    assert _sha256(V34_RESULT) == (
+        "f82981a987651a7f7ebb10a9011df063b2dc54a56181cae5b838e31de5e658db"
+    )
 
 
 def test_policy_and_defender_behavior_equivalence_is_bound_to_v33() -> None:
@@ -187,8 +190,11 @@ def test_evaluator_trace_is_lossless_and_does_not_change_feedback() -> None:
     assert take_traces() == ()
 
 
-def test_v34_result_stays_absent_while_source_or_preregistration_is_prepared() -> None:
-    assert not V34_RESULT.exists()
+def test_v34_result_is_preserved_after_source_and_preregistration_commits() -> None:
+    assert V34_RESULT.exists()
+    assert _sha256(V34_RESULT) == (
+        "f82981a987651a7f7ebb10a9011df063b2dc54a56181cae5b838e31de5e658db"
+    )
     if V34_PREREGISTRATION.exists():
         artifact = json.loads(V34_PREREGISTRATION.read_text(encoding="utf-8"))
         assert artifact["protocol"] == holdout_runner._expected_protocol()
@@ -692,6 +698,7 @@ def test_postexecution_mode_allows_exact_untracked_result_and_nothing_else() -> 
 
 
 def test_postcommit_chronology_requires_exact_prereg_parent_path_mode_and_sha(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     validate = getattr(holdout_runner, "_validate_postcommit_chronology", None)
@@ -701,6 +708,8 @@ def test_postcommit_chronology_requires_exact_prereg_parent_path_mode_and_sha(
     result_sha = "f" * 64
     result_path = "docs/experiments/task6-v3.4-holdout-result.json"
     approved = {result_path: result_sha}
+    local_result = tmp_path / "task6-v3.4-holdout-result.json"
+    local_result.write_bytes(b"result-bytes")
 
     def git_output(arguments: list[str], *, text: bool = True) -> str | bytes:
         if arguments == ["rev-parse", "HEAD"]:
@@ -721,6 +730,12 @@ def test_postcommit_chronology_requires_exact_prereg_parent_path_mode_and_sha(
         raise AssertionError(arguments)
 
     monkeypatch.setattr(holdout_runner, "_git_output", git_output)
+    monkeypatch.setattr(holdout_runner, "RESULT_PATH", local_result)
+    monkeypatch.setattr(
+        holdout_runner,
+        "_commit_is_ancestor",
+        lambda ancestor, descendant: ancestor == descendant == result_commit,
+    )
     monkeypatch.setattr(
         holdout_runner,
         "_git_tree_records",
@@ -839,7 +854,10 @@ def test_v34_preregistration_builder_freezes_instrumentation_and_full_contexts(
         "result_commit_parent_is_exact_preregistration_commit"
     )
     assert publication["verifier_calls_policy_search"] is False
-    assert not V34_RESULT.exists()
+    assert V34_RESULT.exists()
+    assert _sha256(V34_RESULT) == (
+        "f82981a987651a7f7ebb10a9011df063b2dc54a56181cae5b838e31de5e658db"
+    )
 
     tampered = deepcopy(artifact)
     tampered["behavior_equivalence"]["equivalent"] = False

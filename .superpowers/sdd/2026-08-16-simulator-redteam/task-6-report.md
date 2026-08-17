@@ -629,3 +629,107 @@ constructs or executes confirmatory search while producing either freeze commit.
 
 No v3.3 confirmatory search was invoked, and reserved seeds
 `(503, 607, 709, 811, 907, 1009, 1103, 1201)` remain untouched.
+
+## Final evidence chronology and adjudication
+
+The earliest Task 6 benchmark was invalidated because its synthetic outcome was circular:
+the benchmark effectively measured a value supplied by the candidate rather than an
+independently replayed payment outcome. Fix round 1 replaced it with Task 5 generation,
+fresh rail/ledger replay, a policy-independent defender, and role-bound value accounting.
+The later v2 confirmatory artifact remains valid historical evidence but met only one of
+the two preregistered family criteria (`supported_family_count = 1`); it is not evidence
+that the final two-family criterion was met.
+
+The v3.3 aggregate artifact at
+`docs/experiments/task6-v3.3-holdout-result.json` remains preserved byte-for-byte. It is
+**rejected / unverifiable** because it did not retain the raw trials, evaluation traces,
+and individual cached-LLM audits needed to reconstruct its aggregates. Its reported
+summary is historical output, not accepted capability evidence.
+
+V3.4 was a separately frozen, instrumentation-only replication of the unchanged v3.3
+policy, defender, generators, seeds, budgets, metrics, and stopping rule. It added the
+lossless raw evidence missing from v3.3; it did not retune the algorithm after v3.3. The
+preregistered source/preregistration commit is
+`52e8d795c9c2bc40fda1d40178cce50e33349b20`, whose exact parent is the frozen source
+commit. Independent post-execution adjudication approved the v3.4 result committed as the
+single regular result file by `d6d3eecbfe2d871af8375e1455814cb5c48f2928` (exact parent
+`52e8d795c9c2bc40fda1d40178cce50e33349b20`), with raw artifact SHA-256
+`f82981a987651a7f7ebb10a9011df063b2dc54a56181cae5b838e31de5e658db`.
+
+## Accepted v3.4 result
+
+The approved raw artifact contains 88 cells, 2,112 trials, 2,112 corresponding evaluator
+traces, and 384 cached-LLM audit attempts. All 384 cache attempts succeeded, network calls
+were zero, configured and actual proposal/query/logical budgets matched, no cell exhausted
+its deadline, and total wall-time overrun was zero.
+
+| Family and preregistered primary outcome | Random | Adaptive | Observed delta | Supported |
+| --- | ---: | ---: | ---: | --- |
+| APP scam/mule, role-bound net settled value rate | `8840.00` | `18000.00` | `+1.036199095022624434389140271` | yes |
+| Card testing CNP, valid yield | `0.1197916666666666666666666667` | `0.3125` | `+0.1927083333333333333333333333` | yes |
+
+All eight APP per-seed deltas and all eight card per-seed deltas are positive. The derived
+`supported_family_count` is 2 and the two-family criterion is met. The minimum-agentic
+negative control has an observed valid-yield delta of exactly zero, remains unsupported,
+and is excluded from the supported-family count. The exact paired sign-resampling
+reference intervals are descriptive checks only; both intervals cross zero. They are not
+statistical proof and are not an additional post-hoc acceptance gate.
+
+These findings are bounded to this exact frozen synthetic replay benchmark. They do not
+establish live-fraud effectiveness, production generalization, or causal performance on
+real Mastercard traffic.
+
+## Fix round 5: portable post-execution wrapper
+
+The approved result bytes were sound, but the original post-execution wrapper attempted
+to reconstruct fresh process-local capability IDs and HMAC issuance seals. Those values
+are explicitly nonportable in the preregistration, so a fresh process could not reproduce
+the original identities. The wrapper defect was fixed after the run without changing the
+v3.4 result, preregistration, policy, defender, evaluator, or generator bytes.
+
+Portable verification now obtains stable code, callable, version, bounds, contract,
+template, background, population, evaluator, defender, disclosure, cache, source-tree,
+and publication provenance from the preregistration and its historical Git blobs. It
+derives only the explicitly nonportable evaluator/policy capability IDs from the frozen
+raw cells, after enforcing one authority and run-group, one distinct evaluator ID for
+each target/control context, one distinct policy ID for each policy, unique result/cell
+IDs, exact public/embedded agreement, and exact stable preregistered provenance. The
+existing raw verifier then reconstructs the aggregate result from all raw cells.
+
+Postcommit verification accepts a later clean code `HEAD` only when the approved result
+commit is an ancestor, its exact parent is the preregistration commit, that commit adds
+exactly one regular result blob, and both the committed and working-tree result bytes have
+the approved mode, size, and SHA-256. Recomputed nested public digests cannot bypass this
+artifact approval check. The execution/search path remains AST-identical to approved
+result `HEAD` `d6d3eec`; no confirmatory search or evaluator trial was rerun during this
+wrapper repair.
+
+Round 5 began with focused RED reproductions for missing artifact-scoped provenance,
+fresh-process capability reconstruction, descendant-HEAD chronology, ID relabel/reuse and
+authority/run-group splits, embedded/public mismatch, same-kind and cross-kind duplicate
+identities, recomputed
+stable-field digests, and changed process-local seals. The focused suite is GREEN with 29
+tests, including byte/hash equality against the frozen Git source and manifest for every
+declared proposal algorithm, generator, and evaluator dependency.
+
+Task 7 still owns signed durable approval and execution receipts, an independently hidden
+oracle, append-only evidence storage, and a killable process/network/resource sandbox.
+Those properties are not claimed by this Task 6 repair.
+
+## Fix round 5 verification
+
+- Focused portable-wrapper and tamper regressions: `29 passed`.
+- Complete Task 6 red-team suite: `216 passed, 1 skipped`; the skip is an intentionally
+  inapplicable pre-preregistration source-stage test after the result was published.
+- Full repository pytest: `844 passed, 1 skipped`.
+- Ruff over `src`, `tests`, and `scripts`: PASS.
+- Strict mypy over the changed verifier and runner: PASS.
+- Project mypy over 43 source files: PASS.
+- G0 verifier: PASS for 20 threat cards and reviewed contract flow.
+- Frozen result/preregistration/policy/defender/generator SHA and byte-equivalence checks:
+  PASS.
+- `git diff --check`: PASS.
+- `validation_spike/`: unchanged from approved result `d6d3eec`.
+
+No confirmatory experiment, reserved-seed search, or evaluator replay was invoked by this
+repair. The tests verify already-frozen raw bytes and ordinary development fixtures only.

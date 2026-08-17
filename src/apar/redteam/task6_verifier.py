@@ -1404,6 +1404,313 @@ _SUMMARY_FIELDS = frozenset(
 _TARGET_POLICY_ORDER = ("fixed", "random", "adaptive", "cached_llm")
 
 
+def derive_artifact_scoped_provenance(
+    value: object,
+    *,
+    preregistered_contexts: object,
+    preregistered_policy_bindings: object,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Rehydrate nonportable capability IDs from one frozen raw artifact."""
+    _assert_exact_json(value, path="artifact-scoped result")
+    _assert_exact_json(
+        preregistered_contexts,
+        path="artifact-scoped preregistered contexts",
+    )
+    _assert_exact_json(
+        preregistered_policy_bindings,
+        path="artifact-scoped preregistered policies",
+    )
+    bundle = _exact_dict(value, _BUNDLE_FIELDS, label="result bundle")
+    bundle_core = {key: bundle[key] for key in bundle if key != "bundle_digest"}
+    if bundle["bundle_digest"] != canonical_digest(bundle_core):
+        _fail("artifact result bundle digest differs")
+    evidence = _exact_dict(bundle["evidence"], _EVIDENCE_FIELDS, label="raw evidence")
+    cells = _exact_list(evidence["cells"], label="raw evidence cells")
+    if evidence["evidence_digest"] != canonical_digest(cells):
+        _fail("artifact raw-evidence digest differs")
+    contexts = _exact_dict(
+        preregistered_contexts,
+        frozenset({"targets", "negative_control"}),
+        label="preregistered evidence contexts",
+    )
+    if type(contexts["targets"]) is not dict or any(
+        type(family) is not str for family in cast(dict[object, object], contexts["targets"])
+    ):
+        _fail("preregistered target contexts must be an exact string-keyed object")
+    target_contexts = cast(dict[str, object], contexts["targets"])
+    negative_stable = _exact_dict(
+        contexts["negative_control"],
+        frozenset(
+            {
+                "public_bounds",
+                "evaluation_contract",
+                "evaluator_code_digest",
+                "defender",
+            }
+        ),
+        label="preregistered negative-control context",
+    )
+    negative_contract = cast(dict[str, object], negative_stable["evaluation_contract"])
+    negative_family = _exact_text(
+        negative_contract.get("family"),
+        label="preregistered negative-control family",
+    )
+    expected_evaluator_contexts = {
+        *(('target', family) for family in target_contexts),
+        ("negative_control", negative_family),
+    }
+    preregistered_policies = _exact_dict(
+        preregistered_policy_bindings,
+        frozenset(_TARGET_POLICY_ORDER),
+        label="preregistered policy bindings",
+    )
+    evaluator_id_sets: dict[tuple[str, str], set[str]] = {
+        key: set() for key in expected_evaluator_contexts
+    }
+    policy_id_sets: dict[str, set[str]] = {
+        name: set() for name in _TARGET_POLICY_ORDER
+    }
+    authority_ids: set[str] = set()
+    run_group_ids: set[str] = set()
+    artifact_ids: set[str] = set()
+    for raw_cell in cells:
+        cell = _exact_dict(raw_cell, _CELL_FIELDS, label="raw evidence cell")
+        cell_core = {key: cell[key] for key in cell if key != "cell_digest"}
+        if cell["cell_digest"] != canonical_digest(cell_core):
+            _fail("artifact cell digest differs")
+        cell_kind = _exact_text(cell["cell_kind"], label="artifact cell kind")
+        family = _exact_text(cell["family"], label="artifact cell family")
+        policy_name = _exact_text(cell["policy_name"], label="artifact cell policy")
+        seed = _exact_int(cell["seed"], label="artifact cell seed")
+        context_key = (cell_kind, family)
+        if context_key not in evaluator_id_sets or policy_name not in policy_id_sets:
+            _fail("artifact cell provenance is outside preregistered contexts")
+        raw_stable_context = (
+            target_contexts[family]
+            if cell_kind == "target"
+            else negative_stable
+        )
+        stable_context = _exact_dict(
+            raw_stable_context,
+            frozenset(
+                {
+                    "public_bounds",
+                    "evaluation_contract",
+                    "evaluator_code_digest",
+                    "defender",
+                }
+            ),
+            label="preregistered evidence context",
+        )
+        stable_policy = _exact_dict(
+            preregistered_policies[policy_name],
+            frozenset(
+                {
+                    "version",
+                    "code_digest",
+                    "callable_digest",
+                    "capability_id_scope",
+                }
+            ),
+            label="preregistered policy binding",
+        )
+        if stable_policy["capability_id_scope"] != (
+            "process_local_nonportable_not_preregistered"
+        ):
+            _fail("preregistered policy capability scope is not explicitly nonportable")
+        public_context = _exact_dict(
+            cell["public_context"],
+            frozenset(
+                {
+                    "public_bounds",
+                    "evaluation_contract",
+                    "evaluator_binding",
+                    "policy_binding",
+                    "defender",
+                }
+            ),
+            label="artifact public context",
+        )
+        evaluator_binding = _exact_dict(
+            public_context["evaluator_binding"],
+            frozenset({"capability_id", "code_digest"}),
+            label="artifact evaluator binding",
+        )
+        policy_binding = _exact_dict(
+            public_context["policy_binding"],
+            frozenset(
+                {"name", "version", "capability_id", "code_digest", "callable_digest"}
+            ),
+            label="artifact policy binding",
+        )
+        search = _exact_dict(
+            cell["search_result"],
+            frozenset(
+                {
+                    "document",
+                    "canonical_document_digest",
+                    "process_local_issuance_seal",
+                    "seal_scope",
+                }
+            ),
+            label="artifact search result",
+        )
+        document = _exact_dict(
+            search["document"],
+            _SEARCH_RESULT_FIELDS,
+            label="artifact SearchResult",
+        )
+        if search["canonical_document_digest"] != canonical_digest(document):
+            _fail("artifact SearchResult canonical digest differs")
+        _exact_hex(
+            search["process_local_issuance_seal"],
+            label="artifact process-local issuance seal",
+        )
+        if search["seal_scope"] != "process_local_nonportable_hmac":
+            _fail("artifact issuance seal is not explicitly process-local")
+        evaluator_id = _exact_hex(
+            evaluator_binding["capability_id"],
+            label="artifact evaluator capability ID",
+        )
+        policy_id = _exact_hex(
+            policy_binding["capability_id"],
+            label="artifact policy capability ID",
+        )
+        authority_id = _exact_hex(
+            document["authority_id"],
+            label="artifact authority ID",
+        )
+        run_group_id = _exact_hex(
+            document["run_group_id"],
+            label="artifact run-group ID",
+        )
+        result_id = _exact_hex(
+            document["result_id"],
+            label="artifact result ID",
+        )
+        cell_id = _exact_hex(cell["cell_id"], label="artifact cell ID")
+        if (
+            public_context["public_bounds"] != stable_context["public_bounds"]
+            or public_context["evaluation_contract"]
+            != stable_context["evaluation_contract"]
+            or public_context["defender"] != stable_context["defender"]
+            or evaluator_binding["code_digest"]
+            != stable_context["evaluator_code_digest"]
+        ):
+            _fail("artifact evaluator or contract provenance differs from preregistration")
+        if (
+            policy_binding["version"] != stable_policy["version"]
+            or policy_binding["code_digest"] != stable_policy["code_digest"]
+            or policy_binding["callable_digest"] != stable_policy["callable_digest"]
+        ):
+            _fail("artifact policy provenance differs from preregistration")
+        public_contract = cast(
+            dict[str, object], public_context["evaluation_contract"]
+        )
+        disclosure = cast(dict[str, object], public_contract["disclosure_profile"])
+        if (
+            document["family"] != family
+            or document["seed"] != seed
+            or document["policy_name"] != policy_name
+            or policy_binding["name"] != policy_name
+            or document["evaluator_capability_id"] != evaluator_id
+            or document["policy_capability_id"] != policy_id
+            or document["evaluator_code_digest"] != evaluator_binding["code_digest"]
+            or document["policy_version"] != policy_binding["version"]
+            or document["policy_code_digest"] != policy_binding["code_digest"]
+            or document["policy_callable_digest"] != policy_binding["callable_digest"]
+            or document["bounds_digest"] != public_contract["bounds_digest"]
+            or document["hidden_template_digest"]
+            != public_contract["hidden_template_digest"]
+            or document["background_digest"] != public_contract["background_digest"]
+            or document["population_digest"] != public_contract["population_digest"]
+            or document["evaluator_digest"] != public_contract["evaluator_digest"]
+            or document["defender_digest"] != public_contract["defender_digest"]
+            or document["disclosure_profile_digest"] != disclosure["profile_digest"]
+            or document["evaluation_contract_digest"]
+            != public_contract["contract_digest"]
+        ):
+            _fail("artifact embedded and public provenance differs")
+        evaluator_id_sets[context_key].add(evaluator_id)
+        policy_id_sets[policy_name].add(policy_id)
+        authority_ids.add(authority_id)
+        run_group_ids.add(run_group_id)
+        if (
+            result_id == cell_id
+            or result_id in artifact_ids
+            or cell_id in artifact_ids
+        ):
+            _fail("artifact result or cell identity is not unique")
+        artifact_ids.update((result_id, cell_id))
+
+    if len(authority_ids) != 1 or len(run_group_ids) != 1:
+        _fail("artifact authority or run-group identity is not unique")
+    if any(len(ids) != 1 for ids in evaluator_id_sets.values()):
+        _fail("artifact evaluator capability identity differs within one context")
+    evaluator_ids = {
+        key: next(iter(ids)) for key, ids in evaluator_id_sets.items()
+    }
+    if len(set(evaluator_ids.values())) != len(evaluator_ids):
+        _fail("artifact evaluator capability identities are reused across contexts")
+    if any(len(ids) != 1 for ids in policy_id_sets.values()):
+        _fail("artifact policy capability identity differs within one policy")
+    policy_ids = {name: next(iter(ids)) for name, ids in policy_id_sets.items()}
+    if len(set(policy_ids.values())) != len(policy_ids):
+        _fail("artifact policy capability identities are reused across policies")
+
+    def context_document(
+        preregistered: object,
+        *,
+        key: tuple[str, str],
+    ) -> dict[str, object]:
+        stable = _exact_dict(
+            preregistered,
+            frozenset(
+                {
+                    "public_bounds",
+                    "evaluation_contract",
+                    "evaluator_code_digest",
+                    "defender",
+                }
+            ),
+            label="preregistered evidence context",
+        )
+        return {
+            "public_bounds": stable["public_bounds"],
+            "evaluation_contract": stable["evaluation_contract"],
+            "evaluator_binding": {
+                "capability_id": evaluator_ids[key],
+                "code_digest": stable["evaluator_code_digest"],
+            },
+            "defender": stable["defender"],
+        }
+
+    expected_contexts: dict[str, object] = {
+        "targets": {
+            family: context_document(
+                preregistered,
+                key=("target", family),
+            )
+            for family, preregistered in target_contexts.items()
+        },
+        "negative_control": context_document(
+            negative_stable,
+            key=("negative_control", negative_family),
+        ),
+    }
+    expected_policies: dict[str, object] = {}
+    for name, raw_stable in preregistered_policies.items():
+        stable = cast(dict[str, object], raw_stable)
+        expected_policies[name] = {
+            "name": name,
+            "version": stable["version"],
+            "capability_id": policy_ids[name],
+            "code_digest": stable["code_digest"],
+            "callable_digest": stable["callable_digest"],
+        }
+    return expected_contexts, expected_policies
+
+
 def _protocol_parts(
     value: object,
 ) -> tuple[
@@ -2049,6 +2356,7 @@ __all__ = [
     "build_search_cell_document",
     "canonical_digest",
     "canonical_json_bytes",
+    "derive_artifact_scoped_provenance",
     "strict_json_loads",
     "verify_result_bundle",
     "verify_search_cell",
