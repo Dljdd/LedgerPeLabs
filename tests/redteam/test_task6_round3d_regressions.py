@@ -20,6 +20,9 @@ V32_CANCELLATION = ROOT / "docs/experiments/task6-v3.2-cancellation.json"
 V32_RESULT = ROOT / "docs/experiments/task6-v3.2-holdout-result.json"
 V33_PREREGISTRATION = ROOT / "docs/experiments/task6-v3.3-holdout-preregistration.json"
 V33_RESULT = ROOT / "docs/experiments/task6-v3.3-holdout-result.json"
+V33_REJECTION = ROOT / "docs/experiments/task6-v3.3-postexecution-rejection.json"
+V34_PREREGISTRATION = ROOT / "docs/experiments/task6-v3.4-holdout-preregistration.json"
+V34_RESULT = ROOT / "docs/experiments/task6-v3.4-holdout-result.json"
 SOURCE_COMMIT = "4ed9f6acabcdaeaa2e6c4a58ed150ffb2f87b7f6"
 V32_FREEZE_COMMIT = "239617e70563c9af3566b821cdaeb82df48cf1c7"
 
@@ -48,7 +51,7 @@ def _manifest(entries: dict[str, dict[str, str]]) -> dict[str, object]:
     return {"entries": entries, "digest": _digest(entries)}
 
 
-def test_v32_is_canonically_cancelled_without_execution_or_result() -> None:
+def test_v32_is_canonically_cancelled_without_its_result() -> None:
     assert V32_CANCELLATION.exists()
     cancellation = json.loads(V32_CANCELLATION.read_text(encoding="utf-8"))
 
@@ -62,7 +65,9 @@ def test_v32_is_canonically_cancelled_without_execution_or_result() -> None:
         "docs/experiments/task6-v3.3-holdout-preregistration.json"
     )
     assert not V32_RESULT.exists()
-    assert not V33_RESULT.exists()
+    assert V33_RESULT.exists()
+    assert V33_REJECTION.exists()
+    assert not V34_RESULT.exists()
 
 
 def test_execute_parser_requires_both_external_approval_values() -> None:
@@ -293,7 +298,7 @@ def test_unapproved_loaded_python_customization_module_rejects(
         validate({}, root=tmp_path / "repository")
 
 
-def test_verify_only_prints_external_values_awaiting_approval_without_search() -> None:
+def test_verify_only_handles_v34_freeze_without_search() -> None:
     environment = dict(os.environ)
     environment.pop("PYTHONPATH", None)
     completed = subprocess.run(
@@ -306,15 +311,18 @@ def test_verify_only_prints_external_values_awaiting_approval_without_search() -
     )
 
     assert completed.returncode == 0, completed.stderr
-    assert "awaiting external approval" in completed.stdout
-    assert "--approved-freeze-commit" in completed.stdout
-    assert "--approved-prereg-sha256" in completed.stdout
+    if V34_PREREGISTRATION.exists():
+        assert "awaiting external approval" in completed.stdout
+        assert "--approved-freeze-commit" in completed.stdout
+        assert "--approved-prereg-sha256" in completed.stdout
+    else:
+        assert "source stage" in completed.stdout
     assert "no holdout trial executed" in completed.stdout
-    assert not V33_RESULT.exists()
+    assert not V34_RESULT.exists()
 
 
-def test_execute_refuses_when_v33_preregistration_is_absent() -> None:
-    if V33_PREREGISTRATION.exists():
+def test_execute_refuses_when_v34_preregistration_is_absent() -> None:
+    if V34_PREREGISTRATION.exists():
         pytest.skip("source-stage missing-preregistration regression")
     completed = subprocess.run(
         [
@@ -334,19 +342,19 @@ def test_execute_refuses_when_v33_preregistration_is_absent() -> None:
 
     assert completed.returncode != 0
     assert "preregistration" in completed.stderr
-    assert not V33_RESULT.exists()
+    assert not V34_RESULT.exists()
 
 
-def test_v33_preregistration_is_absent_until_separate_freeze_commit() -> None:
-    if not V33_PREREGISTRATION.exists():
-        assert not V33_RESULT.exists()
+def test_v34_preregistration_is_absent_until_separate_freeze_commit() -> None:
+    if not V34_PREREGISTRATION.exists():
+        assert not V34_RESULT.exists()
         return
-    artifact = json.loads(V33_PREREGISTRATION.read_text(encoding="utf-8"))
+    artifact = json.loads(V34_PREREGISTRATION.read_text(encoding="utf-8"))
     validate = getattr(holdout_runner, "_validate_preregistration_schema", None)
     assert callable(validate)
 
     validate(artifact)
-    assert artifact["status"] == "final_v3_3_frozen_before_confirmatory_execution"
+    assert artifact["status"] == "final_v3_4_frozen_before_evidence_replication"
     assert artifact["protocol"] == holdout_runner._expected_protocol()
     assert artifact["source_freeze"]["source_commit"] != holdout_runner._head_commit()
-    assert not V33_RESULT.exists()
+    assert not V34_RESULT.exists()

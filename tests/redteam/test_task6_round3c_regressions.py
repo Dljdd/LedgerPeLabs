@@ -347,6 +347,13 @@ def test_v32_behavior_manifest_covers_every_tracked_executable_input() -> None:
         expected.add("docs/experiments/task6-v3.1-cancellation.json")
     if "docs/experiments/task6-v3.2-cancellation.json" in tracked:
         expected.add("docs/experiments/task6-v3.2-cancellation.json")
+    for path in (
+        "docs/experiments/task6-v3.3-holdout-preregistration.json",
+        "docs/experiments/task6-v3.3-holdout-result.json",
+        "docs/experiments/task6-v3.3-postexecution-rejection.json",
+    ):
+        if path in tracked:
+            expected.add(path)
 
     assert set(entries) == expected
     assert "scripts/run_task6_holdout.py" in entries

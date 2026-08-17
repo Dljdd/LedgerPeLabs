@@ -1,13 +1,15 @@
-"""Verify or explicitly execute the frozen Task 6 v3.3 confirmatory experiment.
+"""Prepare, verify, or explicitly execute Task 6 v3.4 evidence replication.
 
-The local result-file check is an accidental-rerun guard, not cryptographic exactly-once
-enforcement. Durable append-only execution receipts and cross-process verification remain
-a Task 7 responsibility. The historical v2 runner is preserved at commit ``10bb4c4``.
+V3.4 changes instrumentation and evidence persistence only. Proposal algorithms, frozen
+defender behavior, primary metrics, and thresholds remain those used by v3.3. The v3.3
+artifact is preserved but canonically rejected because it omitted independently auditable
+raw evidence.
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import errno
 import hashlib
 import importlib.metadata
@@ -45,33 +47,82 @@ from apar.redteam import (  # noqa: E402
     RunGroupCapability,
     SearchAuthority,
     SearchResult,
-    capability_delta_report,
 )
+from apar.redteam.benchmark import CampaignBenchmark, default_defender_rules  # noqa: E402
 from apar.redteam.task6_experiment import (  # noqa: E402
     Task6Experiment,
     build_task6_experiment,
 )
+from apar.redteam.task6_verifier import (  # noqa: E402
+    build_result_bundle_document,
+    build_search_cell_document,
+    canonical_digest,
+    canonical_json_bytes,
+    strict_json_loads,
+    verify_result_bundle,
+)
 
-PREREGISTRATION_PATH = ROOT / "docs/experiments/task6-v3.3-holdout-preregistration.json"
+PREREGISTRATION_PATH = ROOT / "docs/experiments/task6-v3.4-holdout-preregistration.json"
 CACHE_PATH = ROOT / "docs/experiments/task6-v3-cached-llm-replay.json"
 CANCELLATION_PATH = ROOT / "docs/experiments/task6-v3-cancellation.json"
-CANCELLED_RESULT_PATH = ROOT / "docs/experiments/task6-v3-holdout-result.json"
 V31_CANCELLATION_PATH = ROOT / "docs/experiments/task6-v3.1-cancellation.json"
 V31_RESULT_PATH = ROOT / "docs/experiments/task6-v3.1-holdout-result.json"
 V32_CANCELLATION_PATH = ROOT / "docs/experiments/task6-v3.2-cancellation.json"
 V32_RESULT_PATH = ROOT / "docs/experiments/task6-v3.2-holdout-result.json"
-RESULT_PATH = ROOT / "docs/experiments/task6-v3.3-holdout-result.json"
+V33_PREREGISTRATION_PATH = ROOT / "docs/experiments/task6-v3.3-holdout-preregistration.json"
+V33_RESULT_PATH = ROOT / "docs/experiments/task6-v3.3-holdout-result.json"
+V33_REJECTION_PATH = ROOT / "docs/experiments/task6-v3.3-postexecution-rejection.json"
+RESULT_PATH = ROOT / "docs/experiments/task6-v3.4-holdout-result.json"
 _LOCK_FILES = ("uv.lock", "poetry.lock", "Pipfile.lock", "requirements.lock")
 _HEX = frozenset("0123456789abcdef")
-_SOURCE_STATUS = "final_v3_3_frozen_before_confirmatory_execution"
+_SOURCE_STATUS = "final_v3_4_frozen_before_evidence_replication"
 _PURPOSE = (
-    "Maximum one final confirmatory evaluation of the unchanged family-agnostic "
-    "finite-lattice frontier/UCB policy under an externally approved exact freeze."
+    "One instrumentation-only evidence replication of the unchanged v3.3 "
+    "family-agnostic finite-lattice frontier/UCB policy."
 )
 _STOPPING_RULE = (
-    "If v3.3 fails either preregistered target threshold or its confirmatory validity "
-    "hard gate, no further confirmatory holdout will be opened; later work is "
-    "exploratory or Task 7 evaluation."
+    "If v3.4 fails either preregistered target threshold or its evidence-validity hard "
+    "gate, no further Task 6 confirmatory attempt will be opened; later work is "
+    "exploratory or belongs to Task 7 evaluation."
+)
+_V33_BASELINE_COMMIT = "c513f263536330e7104c8b6eb1c0e5da4ccba0b4"
+_V33_RESULT_SHA256 = "78cfa7a8352b41c2f4ca34b67cde939d2e9ffdefd8f8f3f91ccb24ee1e05d7fd"
+_V33_PROPOSAL_SHA256 = {
+    "src/apar/redteam/llm_policy.py": (
+        "8105a6788041f7d73b1afa571482f4b0ff3b15980f6c28769b701ab350936622"
+    ),
+    "src/apar/redteam/policies.py": (
+        "c97ab7b263a493978cf901140a97f15874a34f8ff2ce54c84253e7baa998fb82"
+    ),
+    "src/apar/redteam/search.py": (
+        "ee05348ab07a9852a68a3f6a477eeec7ad6837d94f187e6fbb97767220f60e89"
+    ),
+}
+_V33_GENERATOR_SHA256 = {
+    "src/apar/generators/__init__.py": (
+        "c4b3cdb979f1ec154cd6d55b40317495f024be7e09f7d9b6f7a93101b99d2886"
+    ),
+    "src/apar/generators/campaigns.py": (
+        "670b4a3ec358f82d88f9655bd41d878fbee11d4841ff264655554bae31c3b31a"
+    ),
+    "src/apar/generators/population.py": (
+        "2e54862322980414098c17930ec95bd268372da8968a78384a5bd661bfdaa2e5"
+    ),
+    "src/apar/redteam/task6_experiment.py": (
+        "a1367a8bb4310eeea2812a7d118ccb738ae1d9c32bfbc21c87413b1a869ce056"
+    ),
+}
+_V33_DEFENDER_AST_SHA256 = (
+    "e38ceaeea1c859f4281d415072d5a52476d2ce5f1390626c93ce8842ff2b5c19"
+)
+_DEFENDER_AST_NAMES = frozenset(
+    {
+        "DefenderRule",
+        "DefenderRuleSet",
+        "default_defender_rules",
+        "_observable_features",
+        "role_bound_settled_value",
+    }
 )
 _EXECUTION_BOUNDARY = {
     "local_approval_is_durable_authenticity": False,
@@ -168,8 +219,10 @@ def _expected_protocol() -> dict[str, object]:
     """Return the source-bound experiment protocol, independent of artifact input."""
     return {
         "protocol_version": "1.0.0",
-        "experiment_id": "task6-v3.3-confirmatory",
-        "seeds": [503, 607, 709, 811, 907, 1009, 1103, 1201],
+        "experiment_id": "task6-v3.4-evidence-replication",
+        "replication_kind": "instrumentation_only_evidence_replication",
+        "algorithm_retuned_after_v3_3": False,
+        "seeds": [2601, 2707, 2801, 2903, 3001, 3109, 3203, 3301],
         "budgets": {
             "proposal": 24,
             "query": 24,
@@ -209,6 +262,14 @@ def _expected_protocol() -> dict[str, object]:
             "allowed_calls": 0,
             "cached_llm_required": True,
         },
+        "evidence_limits": {
+            "expected_cell_count": 88,
+            "trials_per_complete_cell": 24,
+            "maximum_total_trials": 2112,
+            "maximum_cached_llm_attempts": 384,
+            "maximum_bundle_bytes": 33_554_432,
+            "lossless": True,
+        },
         "uncertainty": {
             "method": "exact_paired_sign_resampling_reference_interval",
             "reported_values": [
@@ -227,6 +288,49 @@ def _expected_protocol() -> dict[str, object]:
         },
         "stopping_rule": _STOPPING_RULE,
         "approval_boundary": dict(_EXECUTION_BOUNDARY),
+    }
+
+
+def _defender_ast_digest(path: Path) -> str:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    selected = [
+        node
+        for node in tree.body
+        if getattr(node, "name", None) in _DEFENDER_AST_NAMES
+    ]
+    if {getattr(node, "name", None) for node in selected} != set(_DEFENDER_AST_NAMES):
+        raise RuntimeError("frozen defender AST selection is incomplete")
+    rendered = "\n".join(
+        ast.dump(node, include_attributes=False) for node in selected
+    ).encode("utf-8")
+    return _sha256_bytes(rendered)
+
+
+def _behavior_equivalence_document() -> dict[str, object]:
+    proposal_hashes = {
+        path: _sha256_file(ROOT / path) for path in sorted(_V33_PROPOSAL_SHA256)
+    }
+    generator_hashes = {
+        path: _sha256_file(ROOT / path) for path in sorted(_V33_GENERATOR_SHA256)
+    }
+    defender_ast = _defender_ast_digest(ROOT / "src/apar/redteam/benchmark.py")
+    equivalent = (
+        proposal_hashes == _V33_PROPOSAL_SHA256
+        and generator_hashes == _V33_GENERATOR_SHA256
+        and defender_ast == _V33_DEFENDER_AST_SHA256
+    )
+    return {
+        "baseline_commit": _V33_BASELINE_COMMIT,
+        "proposal_implementation_sha256": proposal_hashes,
+        "v3_3_proposal_implementation_sha256": dict(_V33_PROPOSAL_SHA256),
+        "generator_implementation_sha256": generator_hashes,
+        "v3_3_generator_implementation_sha256": dict(_V33_GENERATOR_SHA256),
+        "defender_ast_sha256": defender_ast,
+        "v3_3_defender_ast_sha256": _V33_DEFENDER_AST_SHA256,
+        "defender_rules": [
+            rule.document() for rule in default_defender_rules().rules
+        ],
+        "equivalent": equivalent,
     }
 
 
@@ -398,6 +502,9 @@ def _is_behavior_affecting_path(path: str) -> bool:
             "docs/experiments/task6-v3-cancellation.json",
             "docs/experiments/task6-v3.1-cancellation.json",
             "docs/experiments/task6-v3.2-cancellation.json",
+            "docs/experiments/task6-v3.3-holdout-preregistration.json",
+            "docs/experiments/task6-v3.3-holdout-result.json",
+            "docs/experiments/task6-v3.3-postexecution-rejection.json",
         }
     )
 
@@ -585,12 +692,86 @@ def _head_commit() -> str:
 def _require_clean_worktree() -> None:
     status = cast(str, _git_output(["status", "--porcelain"])).strip()
     if status:
-        raise RuntimeError("v3.3 verification requires a clean Git worktree")
+        raise RuntimeError("v3.4 freeze verification requires a clean Git worktree")
 
 
-def _verify_source_freeze(artifact: dict[str, Any]) -> None:
+def _validate_postexecution_worktree_status(raw_status: bytes) -> None:
+    """Permit exactly the newly published untracked v3.4 result, and nothing else."""
+    if type(raw_status) is not bytes:
+        raise TypeError("post-execution Git status must be exact bytes")
+    expected = (
+        b"?? docs/experiments/task6-v3.4-holdout-result.json\0"
+    )
+    if raw_status != expected:
+        raise RuntimeError(
+            "post-execution worktree must contain exactly the untracked v3.4 result"
+        )
+
+
+def _validate_postcommit_chronology(
+    *,
+    approved_result_commit: object,
+    approved_result_sha256: object,
+    preregistration_commit: object,
+    approved_artifacts: object,
+) -> None:
+    """Bind one result-only commit to its exact preregistration parent and blob."""
+    result_commit = _exact_hex(
+        "approved result commit", approved_result_commit, length=40
+    )
+    result_sha = _exact_hex(
+        "approved result SHA-256", approved_result_sha256, length=64
+    )
+    prereg_commit = _exact_hex(
+        "preregistration commit", preregistration_commit, length=40
+    )
+    expected_path = "docs/experiments/task6-v3.4-holdout-result.json"
+    if approved_artifacts != {expected_path: result_sha}:
+        raise RuntimeError("approved result artifact path or SHA-256 differs")
+    if _head_commit() != result_commit:
+        raise RuntimeError("HEAD is not the exact approved result commit")
+    parents = cast(
+        str,
+        _git_output(["rev-list", "--parents", "-n", "1", result_commit]),
+    ).strip().split()
+    if parents != [result_commit, prereg_commit]:
+        raise RuntimeError(
+            "result commit chronology requires the exact preregistration commit as its only parent"
+        )
+    changed = cast(
+        bytes,
+        _git_output(
+            [
+                "diff-tree",
+                "--no-commit-id",
+                "--name-status",
+                "-r",
+                "-z",
+                result_commit,
+            ],
+            text=False,
+        ),
+    )
+    if changed != b"A\0" + expected_path.encode("utf-8") + b"\0":
+        raise RuntimeError("result commit changed paths differ from the approved artifact")
+    record = _git_tree_records(result_commit).get(expected_path)
+    if record is None or record["git_mode"] != "100644" or record["object_type"] != "blob":
+        raise RuntimeError("approved result artifact is not one regular non-executable blob")
+    content = cast(
+        bytes,
+        _git_output(["cat-file", "blob", record["git_object_id"]], text=False),
+    )
+    if _sha256_bytes(content) != result_sha:
+        raise RuntimeError("approved result artifact SHA-256 differs from its committed blob")
+
+
+def _verify_source_freeze(
+    artifact: dict[str, Any],
+    *,
+    require_clean: bool = True,
+) -> None:
     source = _require_exact_fields(
-        "v3.3 source freeze",
+        "v3.4 source freeze",
         artifact.get("source_freeze"),
         frozenset(
             {"source_commit", "git_tree", "behavior_manifest", "lock_file", "environment"}
@@ -598,7 +779,7 @@ def _verify_source_freeze(artifact: dict[str, Any]) -> None:
     )
     source_commit = source.get("source_commit")
     checked_source_commit = _exact_hex(
-        "v3.3 source commit", source_commit, length=40
+        "v3.4 source commit", source_commit, length=40
     )
     ancestor = subprocess.run(
         ["git", "merge-base", "--is-ancestor", checked_source_commit, "HEAD"],
@@ -608,16 +789,17 @@ def _verify_source_freeze(artifact: dict[str, Any]) -> None:
         text=True,
     )
     if ancestor.returncode != 0:
-        raise RuntimeError("v3.3 source commit is not an ancestor of this checkout")
+        raise RuntimeError("v3.4 source commit is not an ancestor of this checkout")
     observed = _source_freeze_document(checked_source_commit)
     if observed != source:
-        raise RuntimeError("v3.3 source tree, manifest, or environment binding changed")
+        raise RuntimeError("v3.4 source tree, manifest, or environment binding changed")
     execution_manifest = _behavior_manifest_document(_head_commit())
     _validate_matching_manifests(source["behavior_manifest"], execution_manifest)
     source_entries = _validate_manifest_document(source["behavior_manifest"])
     _validate_filesystem_behavior_paths(source_entries)
     _validate_python_customization_modules(source_entries)
-    _require_clean_worktree()
+    if require_clean:
+        _require_clean_worktree()
 
 
 def _verify_cancelled_predecessors() -> None:
@@ -630,18 +812,45 @@ def _verify_cancelled_predecessors() -> None:
         raise RuntimeError("v3.1 cancellation record is not canonical")
     if v32.get("status") != "cancelled_before_execution":
         raise RuntimeError("v3.2 cancellation record is not canonical")
-    if (
-        CANCELLED_RESULT_PATH.exists()
-        or V31_RESULT_PATH.exists()
-        or V32_RESULT_PATH.exists()
-    ):
+    if V31_RESULT_PATH.exists() or V32_RESULT_PATH.exists():
         raise RuntimeError("a cancelled confirmatory result must remain absent")
+    rejection = _load_exact_json(V33_REJECTION_PATH)
+    expected_rejection = {
+        "schema_version": "1.0.0",
+        "status": "rejected_unverifiable",
+        "result_commit": _V33_BASELINE_COMMIT,
+        "result_path": "docs/experiments/task6-v3.3-holdout-result.json",
+        "result_sha256": _V33_RESULT_SHA256,
+        "result_preserved_byte_for_byte": True,
+        "reviewer_reason": (
+            "The result omits raw SearchResult documents, evaluator-owned per-trial "
+            "execution traces, and individual cached-LLM audit attempts, so its "
+            "aggregate capability claims cannot be independently reconstructed."
+        ),
+        "rejected_claims": [
+            "adaptive_claim",
+            "confirmatory_valid",
+            "criterion_met",
+            "supported_family_count",
+        ],
+        "replacement_preregistration_path": (
+            "docs/experiments/task6-v3.4-holdout-preregistration.json"
+        ),
+        "replacement_result_path": "docs/experiments/task6-v3.4-holdout-result.json",
+        "replacement_kind": "instrumentation_only_evidence_replication",
+    }
+    if rejection != expected_rejection:
+        raise RuntimeError("v3.3 post-execution rejection record is not canonical")
+    if not V33_RESULT_PATH.is_file() or V33_RESULT_PATH.is_symlink():
+        raise RuntimeError("the preserved v3.3 result must be an exact regular file")
+    if _sha256_file(V33_RESULT_PATH) != _V33_RESULT_SHA256:
+        raise RuntimeError("the preserved v3.3 result bytes changed")
 
 
 def _require_recording_preconditions() -> None:
     _require_clean_worktree()
     if RESULT_PATH.exists():
-        raise RuntimeError("local v3.3 result exists; refusing an accidental rerun")
+        raise RuntimeError("local v3.4 result exists; refusing an accidental rerun")
 
 
 def _validate_external_approval(
@@ -683,140 +892,79 @@ _PROVENANCE_FIELDS = frozenset(
 )
 
 
-def _validate_preregistration_schema(artifact: object) -> dict[str, Any]:
-    _assert_exact_json(artifact, path="preregistration")
-    document = _require_exact_fields(
-        "v3.3 preregistration",
-        artifact,
-        frozenset(
-            {
-                "schema_version",
-                "status",
-                "purpose",
-                "source_freeze",
-                "cancellation_record",
-                "protocol",
-                "policy_bindings",
-                "frozen_benchmark",
-                "families",
-                "negative_control_provenance",
-                "cached_replay",
-            }
-        ),
-    )
-    if document["schema_version"] != "1.0.0":
-        raise RuntimeError("v3.3 preregistration schema version changed")
-    if document["status"] != _SOURCE_STATUS or document["purpose"] != _PURPOSE:
-        raise RuntimeError("v3.3 preregistration status or purpose changed")
-    _validate_protocol(document["protocol"])
-    cancellation = _require_exact_fields(
-        "v3.3 cancellation binding",
-        document["cancellation_record"],
-        frozenset(
-            {
-                "v3_path",
-                "v3_sha256",
-                "v3_1_path",
-                "v3_1_sha256",
-                "v3_2_path",
-                "v3_2_sha256",
-                "cancelled_results_absent",
-                "reserved_seeds_unused",
-            }
-        ),
-    )
-    if cancellation["cancelled_results_absent"] is not True or cancellation[
-        "reserved_seeds_unused"
-    ] is not True:
-        raise RuntimeError("v3.3 cancellation state is not exact")
-    expected_cancellation_paths = {
-        "v3_path": "docs/experiments/task6-v3-cancellation.json",
-        "v3_1_path": "docs/experiments/task6-v3.1-cancellation.json",
-        "v3_2_path": "docs/experiments/task6-v3.2-cancellation.json",
+def _contract_document(evaluator: EvaluatorCapability) -> dict[str, object]:
+    contract = evaluator.evaluation_contract
+    return {
+        "family": contract.family,
+        "bounds_digest": contract.bounds_digest,
+        "hidden_template_digest": contract.hidden_template_digest,
+        "background_digest": contract.background_digest,
+        "population_digest": contract.population_digest,
+        "evaluator_digest": contract.evaluator_digest,
+        "defender_digest": contract.defender_digest,
+        "disclosure_profile": {
+            "profile_id": contract.disclosure_profile.profile_id,
+            "expose_realized_value": contract.disclosure_profile.expose_realized_value,
+            "profile_digest": contract.disclosure_profile_digest,
+        },
+        "contract_digest": contract.contract_digest,
     }
-    for field, expected in expected_cancellation_paths.items():
-        if cancellation[field] != expected:
-            raise RuntimeError("v3.3 cancellation path binding changed")
-    for field in ("v3_sha256", "v3_1_sha256", "v3_2_sha256"):
-        _exact_hex(field, cancellation[field], length=64)
 
-    policies = _require_exact_fields(
-        "v3.3 policy bindings",
-        document["policy_bindings"],
-        frozenset({"fixed", "random", "adaptive", "cached_llm"}),
-    )
-    expected_versions = cast(dict[str, str], _expected_protocol()["policies"])
-    for name, raw_binding in policies.items():
-        binding = _require_exact_fields(
-            f"v3.3 policy binding {name}",
-            raw_binding,
-            frozenset({"version", "code_digest", "callable_digest"}),
-        )
-        if binding["version"] != expected_versions[name]:
-            raise RuntimeError("v3.3 policy version binding changed")
-        _exact_hex("policy code digest", binding["code_digest"], length=64)
-        _exact_hex("policy callable digest", binding["callable_digest"], length=64)
 
-    benchmark = _require_exact_fields(
-        "v3.3 benchmark binding",
-        document["frozen_benchmark"],
-        frozenset(
-            {"population_digest", "defender_digest", "disclosure_profile_digest"}
+def _preregistered_evidence_context(
+    benchmark: CampaignBenchmark,
+    evaluator: EvaluatorCapability,
+) -> dict[str, object]:
+    defender = default_defender_rules()
+    return {
+        "public_bounds": benchmark.public_bounds.document(),
+        "evaluation_contract": _contract_document(evaluator),
+        "evaluator_code_digest": evaluator.evaluator_code_digest,
+        "defender": {
+            "version": defender.version,
+            "rules": [rule.document() for rule in defender.rules],
+            "defender_digest": defender.defender_digest,
+        },
+    }
+
+
+def _runtime_evidence_context(
+    preregistered: dict[str, object],
+    evaluator: EvaluatorCapability,
+) -> dict[str, object]:
+    if preregistered.get("evaluator_code_digest") != evaluator.evaluator_code_digest:
+        raise RuntimeError("runtime evaluator code differs from preregistered context")
+    return {
+        "public_bounds": preregistered["public_bounds"],
+        "evaluation_contract": preregistered["evaluation_contract"],
+        "evaluator_binding": {
+            "capability_id": evaluator.capability_id,
+            "code_digest": evaluator.evaluator_code_digest,
+        },
+        "defender": preregistered["defender"],
+    }
+
+
+def _runtime_verification_contexts(
+    artifact: dict[str, Any],
+    evaluators: dict[str, EvaluatorCapability],
+    negative_evaluator: EvaluatorCapability,
+) -> dict[str, object]:
+    preregistered = artifact["evidence_contexts"]
+    return {
+        "targets": {
+            family: _runtime_evidence_context(
+                preregistered["targets"][family], evaluators[family]
+            )
+            for family in sorted(evaluators)
+        },
+        "negative_control": _runtime_evidence_context(
+            preregistered["negative_control"], negative_evaluator
         ),
-    )
-    for value in benchmark.values():
-        _exact_hex("benchmark digest", value, length=64)
-
-    families = _require_exact_fields(
-        "v3.3 family bindings",
-        document["families"],
-        frozenset({"app_scam_mule", "card_testing_cnp"}),
-    )
-    for family, raw_family in families.items():
-        family_document = _require_exact_fields(
-            f"v3.3 family binding {family}",
-            raw_family,
-            frozenset({"provenance"}),
-        )
-        provenance = _require_exact_fields(
-            f"v3.3 family provenance {family}",
-            family_document["provenance"],
-            _PROVENANCE_FIELDS,
-        )
-        for value in provenance.values():
-            _exact_hex("family provenance digest", value, length=64)
-    negative = _require_exact_fields(
-        "v3.3 negative-control binding",
-        document["negative_control_provenance"],
-        frozenset({"provenance"}),
-    )
-    negative_provenance = _require_exact_fields(
-        "v3.3 negative-control provenance",
-        negative["provenance"],
-        _PROVENANCE_FIELDS,
-    )
-    for value in negative_provenance.values():
-        _exact_hex("negative-control provenance digest", value, length=64)
-
-    cache = _require_exact_fields(
-        "v3.3 cached replay binding",
-        document["cached_replay"],
-        frozenset(
-            {"path", "file_sha256", "preparation_seed", "preparation_budget"}
-        ),
-    )
-    if (
-        cache["path"] != "docs/experiments/task6-v3-cached-llm-replay.json"
-        or cache["preparation_seed"] != 4
-        or cache["preparation_budget"] != 24
-    ):
-        raise RuntimeError("v3.3 cached replay protocol changed")
-    _exact_hex("cached replay digest", cache["file_sha256"], length=64)
-    return document
+    }
 
 
-def _runtime() -> tuple[
-    dict[str, Any],
+def _bootstrap_runtime() -> tuple[
     Task6Experiment,
     SearchAuthority,
     RunGroupCapability,
@@ -825,18 +973,15 @@ def _runtime() -> tuple[
     dict[str, PolicyCapability],
     LLMPlannerPolicy,
     _NoNetworkClient,
+    dict[str, Any],
 ]:
-    artifact = _validate_preregistration_schema(_load_exact_json(PREREGISTRATION_PATH))
     cache_artifact = _load_exact_json(CACHE_PATH)
-    if _sha256_file(CACHE_PATH) != artifact["cached_replay"]["file_sha256"]:
-        raise RuntimeError("v3.3 cached replay artifact digest changed")
     protocol = _expected_protocol()
-    if cache_artifact["development_seed"] in cast(list[int], protocol["seeds"]):
-        raise RuntimeError("cache preparation seed overlaps the v3.3 holdout")
-
+    if cache_artifact.get("development_seed") in cast(list[int], protocol["seeds"]):
+        raise RuntimeError("cache preparation seed overlaps the v3.4 replication")
     experiment = build_task6_experiment(ROOT)
     authority = SearchAuthority()
-    run_group = authority.issue_run_group("task6-v3.3-confirmatory")
+    group = authority.issue_run_group("task6-v3.4-evidence-replication")
     evaluators = {
         family: benchmark.issue_evaluator_capability(authority)
         for family, benchmark in experiment.benchmarks.items()
@@ -860,6 +1005,334 @@ def _runtime() -> tuple[
         for name, policy in policy_objects.items()
     }
     return (
+        experiment,
+        authority,
+        group,
+        evaluators,
+        negative_evaluator,
+        policies,
+        cached_policy,
+        no_network,
+        cache_artifact,
+    )
+
+
+def _predecessor_evidence_document() -> dict[str, object]:
+    return {
+        "cancelled_before_execution": {
+            "v3": {
+                "path": "docs/experiments/task6-v3-cancellation.json",
+                "sha256": _sha256_file(CANCELLATION_PATH),
+            },
+            "v3_1": {
+                "path": "docs/experiments/task6-v3.1-cancellation.json",
+                "sha256": _sha256_file(V31_CANCELLATION_PATH),
+            },
+            "v3_2": {
+                "path": "docs/experiments/task6-v3.2-cancellation.json",
+                "sha256": _sha256_file(V32_CANCELLATION_PATH),
+            },
+            "cancelled_results_absent": True,
+            "reserved_seeds_unused": True,
+        },
+        "v3_3_preregistration": {
+            "path": "docs/experiments/task6-v3.3-holdout-preregistration.json",
+            "sha256": _sha256_file(V33_PREREGISTRATION_PATH),
+        },
+        "v3_3_result": {
+            "path": "docs/experiments/task6-v3.3-holdout-result.json",
+            "commit": _V33_BASELINE_COMMIT,
+            "sha256": _V33_RESULT_SHA256,
+            "status": "preserved_but_rejected_unverifiable",
+        },
+        "v3_3_rejection": {
+            "path": "docs/experiments/task6-v3.3-postexecution-rejection.json",
+            "sha256": _sha256_file(V33_REJECTION_PATH),
+        },
+    }
+
+
+def _cached_replay_document(cache_artifact: dict[str, Any]) -> dict[str, object]:
+    records = cache_artifact.get("records")
+    if type(records) is not dict:
+        raise RuntimeError("cached replay records are not an exact object")
+    return {
+        "path": "docs/experiments/task6-v3-cached-llm-replay.json",
+        "file_sha256": _sha256_file(CACHE_PATH),
+        "canonical_digest": _canonical_digest(cache_artifact),
+        "schema_version": cache_artifact.get("schema_version"),
+        "preparation_seed": cache_artifact.get("development_seed"),
+        "preparation_budget": cache_artifact.get("budget"),
+        "record_counts": cache_artifact.get("record_counts"),
+        "record_count": len(records),
+        "records_digest": _canonical_digest(records),
+        "provider": "fixture",
+        "model_id": "cached-default-v1",
+        "policy_version": "1.0.0",
+        "require_cached_replay": True,
+        "network_calls_allowed": 0,
+    }
+
+
+def _result_publication_document() -> dict[str, object]:
+    verifier_path = "src/apar/redteam/task6_verifier.py"
+    result_path = "docs/experiments/task6-v3.4-holdout-result.json"
+    return {
+        "approved_artifact_paths": [result_path],
+        "canonical_json_required": True,
+        "atomic_exclusive_no_replace": True,
+        "directory_eio_reports_published_recovery_state": True,
+        "postexecution_mode": "exactly_one_untracked_result_and_no_other_change",
+        "postcommit_mode": "result_commit_parent_is_exact_preregistration_commit",
+        "verifier_path": verifier_path,
+        "verifier_sha256": _sha256_file(ROOT / verifier_path),
+        "verifier_calls_policy_search": False,
+        "verification_input": "complete_raw_cells_not_summary",
+        "deterministic_evaluator_replay_predeclared": False,
+        "process_local_issuance_seals_portable": False,
+    }
+
+
+def _build_preregistration_document(source_commit: str) -> dict[str, object]:
+    """Create the preregistration only; this path never invokes policy search."""
+    _exact_hex("source commit", source_commit, length=40)
+    (
+        experiment,
+        authority,
+        _group,
+        evaluators,
+        negative_evaluator,
+        policies,
+        _cached_policy,
+        no_network,
+        cache_artifact,
+    ) = _bootstrap_runtime()
+    if no_network.calls != 0:
+        raise RuntimeError("preregistration construction attempted network transport")
+    policy_bindings = {}
+    for name, capability in policies.items():
+        binding = authority.policy_binding(capability)
+        policy_bindings[name] = {
+            "version": binding.version,
+            "code_digest": binding.code_digest,
+            "callable_digest": binding.callable_digest,
+            "capability_id_scope": "process_local_nonportable_not_preregistered",
+        }
+    target_contexts = {
+        family: _preregistered_evidence_context(
+            experiment.benchmarks[family], evaluators[family]
+        )
+        for family in sorted(evaluators)
+    }
+    negative_context = _preregistered_evidence_context(
+        experiment.negative_control, negative_evaluator
+    )
+    behavior = _behavior_equivalence_document()
+    if behavior["equivalent"] is not True:
+        raise RuntimeError("v3.4 behavior is not equivalent to the frozen v3.3 behavior")
+    return {
+        "schema_version": "1.0.0",
+        "status": _SOURCE_STATUS,
+        "purpose": _PURPOSE,
+        "source_freeze": _source_freeze_document(source_commit),
+        "predecessor_evidence": _predecessor_evidence_document(),
+        "behavior_equivalence": behavior,
+        "protocol": _expected_protocol(),
+        "policy_bindings": policy_bindings,
+        "frozen_benchmark": {
+            "population_digest": experiment.population_digest,
+            "defender_digest": default_defender_rules().defender_digest,
+            "evaluator_instrumentation": "lossless_per_trial_trace_v1",
+            "generator_semantics_changed_after_v3_3": False,
+        },
+        "evidence_contexts": {
+            "targets": target_contexts,
+            "negative_control": negative_context,
+        },
+        "cached_replay": _cached_replay_document(cache_artifact),
+        "result_publication": _result_publication_document(),
+    }
+
+
+def _validate_preregistration_schema(artifact: object) -> dict[str, Any]:
+    _assert_exact_json(artifact, path="preregistration")
+    document = _require_exact_fields(
+        "v3.4 preregistration",
+        artifact,
+        frozenset(
+            {
+                "schema_version",
+                "status",
+                "purpose",
+                "source_freeze",
+                "predecessor_evidence",
+                "behavior_equivalence",
+                "protocol",
+                "policy_bindings",
+                "frozen_benchmark",
+                "evidence_contexts",
+                "cached_replay",
+                "result_publication",
+            }
+        ),
+    )
+    if document["schema_version"] != "1.0.0":
+        raise RuntimeError("v3.4 preregistration schema version changed")
+    if document["status"] != _SOURCE_STATUS or document["purpose"] != _PURPOSE:
+        raise RuntimeError("v3.4 preregistration status or purpose changed")
+    _validate_protocol(document["protocol"])
+    if document["predecessor_evidence"] != _predecessor_evidence_document():
+        raise RuntimeError("v3.4 predecessor evidence binding changed")
+    behavior = _require_exact_fields(
+        "v3.4 behavior equivalence",
+        document["behavior_equivalence"],
+        frozenset(
+            {
+                "baseline_commit",
+                "proposal_implementation_sha256",
+                "v3_3_proposal_implementation_sha256",
+                "generator_implementation_sha256",
+                "v3_3_generator_implementation_sha256",
+                "defender_ast_sha256",
+                "v3_3_defender_ast_sha256",
+                "defender_rules",
+                "equivalent",
+            }
+        ),
+    )
+    if behavior != _behavior_equivalence_document() or behavior["equivalent"] is not True:
+        raise RuntimeError("v3.4 behavior equivalence to v3.3 is not exact")
+
+    policies = _require_exact_fields(
+        "v3.4 policy bindings",
+        document["policy_bindings"],
+        frozenset({"fixed", "random", "adaptive", "cached_llm"}),
+    )
+    expected_versions = cast(dict[str, str], _expected_protocol()["policies"])
+    for name, raw_binding in policies.items():
+        binding = _require_exact_fields(
+            f"v3.4 policy binding {name}",
+            raw_binding,
+            frozenset(
+                {
+                    "version",
+                    "code_digest",
+                    "callable_digest",
+                    "capability_id_scope",
+                }
+            ),
+        )
+        if binding["version"] != expected_versions[name]:
+            raise RuntimeError("v3.4 policy version binding changed")
+        if binding["capability_id_scope"] != (
+            "process_local_nonportable_not_preregistered"
+        ):
+            raise RuntimeError("v3.4 policy capability scope changed")
+        _exact_hex("policy code digest", binding["code_digest"], length=64)
+        _exact_hex("policy callable digest", binding["callable_digest"], length=64)
+
+    benchmark = _require_exact_fields(
+        "v3.4 benchmark binding",
+        document["frozen_benchmark"],
+        frozenset(
+            {
+                "population_digest",
+                "defender_digest",
+                "evaluator_instrumentation",
+                "generator_semantics_changed_after_v3_3",
+            }
+        ),
+    )
+    _exact_hex("population digest", benchmark["population_digest"], length=64)
+    _exact_hex("defender digest", benchmark["defender_digest"], length=64)
+    if (
+        benchmark["evaluator_instrumentation"] != "lossless_per_trial_trace_v1"
+        or benchmark["generator_semantics_changed_after_v3_3"] is not False
+    ):
+        raise RuntimeError("v3.4 instrumentation or generator-equivalence binding changed")
+    contexts = _require_exact_fields(
+        "v3.4 evidence contexts",
+        document["evidence_contexts"],
+        frozenset({"targets", "negative_control"}),
+    )
+    targets = _require_exact_fields(
+        "v3.4 target contexts",
+        contexts["targets"],
+        frozenset({"app_scam_mule", "card_testing_cnp"}),
+    )
+    all_contexts = [*targets.values(), contexts["negative_control"]]
+    for raw_context in all_contexts:
+        context = _require_exact_fields(
+            "v3.4 evidence context",
+            raw_context,
+            frozenset(
+                {
+                    "public_bounds",
+                    "evaluation_contract",
+                    "evaluator_code_digest",
+                    "defender",
+                }
+            ),
+        )
+        _exact_hex("evaluator code digest", context["evaluator_code_digest"], length=64)
+        bounds = cast(dict[str, object], context["public_bounds"])
+        contract = cast(dict[str, object], context["evaluation_contract"])
+        defender = _require_exact_fields(
+            "v3.4 context defender",
+            context["defender"],
+            frozenset({"version", "rules", "defender_digest"}),
+        )
+        if contract.get("bounds_digest") != _canonical_digest(bounds):
+            raise RuntimeError("v3.4 context bounds digest differs")
+        if defender["defender_digest"] != _canonical_digest(
+            {"version": defender["version"], "rules": defender["rules"]}
+        ) or contract.get("defender_digest") != defender["defender_digest"]:
+            raise RuntimeError("v3.4 context defender provenance differs")
+
+    cache_artifact = _load_exact_json(CACHE_PATH)
+    if document["cached_replay"] != _cached_replay_document(cache_artifact):
+        raise RuntimeError("v3.4 cached replay configuration or digest changed")
+    if document["result_publication"] != _result_publication_document():
+        raise RuntimeError("v3.4 result publication/verifier binding changed")
+    source = _require_exact_fields(
+        "v3.4 source freeze",
+        document["source_freeze"],
+        frozenset(
+            {"source_commit", "git_tree", "behavior_manifest", "lock_file", "environment"}
+        ),
+    )
+    _exact_hex("source commit", source["source_commit"], length=40)
+    _exact_hex("source tree", source["git_tree"], length=40)
+    _validate_manifest_document(source["behavior_manifest"])
+    return document
+
+
+def _runtime() -> tuple[
+    dict[str, Any],
+    Task6Experiment,
+    SearchAuthority,
+    RunGroupCapability,
+    dict[str, EvaluatorCapability],
+    EvaluatorCapability,
+    dict[str, PolicyCapability],
+    LLMPlannerPolicy,
+    _NoNetworkClient,
+]:
+    artifact = _validate_preregistration_schema(
+        strict_json_loads(PREREGISTRATION_PATH.read_bytes(), require_canonical=True)
+    )
+    (
+        experiment,
+        authority,
+        run_group,
+        evaluators,
+        negative_evaluator,
+        policies,
+        cached_policy,
+        no_network,
+        _cache_artifact,
+    ) = _bootstrap_runtime()
+    return (
         artifact,
         experiment,
         authority,
@@ -879,65 +1352,43 @@ def _verify_frozen_bindings(
     evaluators: dict[str, EvaluatorCapability],
     negative_evaluator: EvaluatorCapability,
     policies: dict[str, PolicyCapability],
+    *,
+    require_clean: bool = True,
 ) -> None:
     _validate_preregistration_schema(artifact)
     _verify_cancelled_predecessors()
-    _verify_source_freeze(artifact)
+    _verify_source_freeze(artifact, require_clean=require_clean)
     if experiment.population_digest != artifact["frozen_benchmark"]["population_digest"]:
-        raise RuntimeError("frozen v3.3 population changed")
-    cancellation = artifact["cancellation_record"]
-    cancellation_files = {
-        "v3_sha256": CANCELLATION_PATH,
-        "v3_1_sha256": V31_CANCELLATION_PATH,
-        "v3_2_sha256": V32_CANCELLATION_PATH,
-    }
-    if any(
-        _sha256_file(path) != cancellation[field]
-        for field, path in cancellation_files.items()
+        raise RuntimeError("frozen v3.4 population changed")
+    if artifact["frozen_benchmark"]["defender_digest"] != (
+        default_defender_rules().defender_digest
     ):
-        raise RuntimeError("frozen v3.3 cancellation record digest changed")
+        raise RuntimeError("frozen v3.4 defender changed")
     for name, expected in artifact["policy_bindings"].items():
         policy = authority.policy_binding(policies[name])
         observed = {
             "version": policy.version,
             "code_digest": policy.code_digest,
             "callable_digest": policy.callable_digest,
+            "capability_id_scope": "process_local_nonportable_not_preregistered",
         }
         if observed != expected:
             raise RuntimeError(
-                f"frozen v3.3 policy binding changed: {name}; "
+                f"frozen v3.4 policy binding changed: {name}; "
                 f"expected={expected!r}; observed={observed!r}"
             )
-    for family, expected in artifact["families"].items():
-        evaluator = evaluators[family]
-        contract = evaluator.evaluation_contract
-        observed = {
-            "evaluator_code_digest": evaluator.evaluator_code_digest,
-            "contract_digest": contract.contract_digest,
-            "bounds_digest": contract.bounds_digest,
-            "hidden_template_digest": contract.hidden_template_digest,
-            "background_digest": contract.background_digest,
-            "population_digest": contract.population_digest,
-            "evaluator_digest": contract.evaluator_digest,
-            "defender_digest": contract.defender_digest,
-            "disclosure_profile_digest": contract.disclosure_profile_digest,
-        }
-        if observed != expected["provenance"]:
-            raise RuntimeError(f"frozen v3.3 evaluator provenance changed: {family}")
-    negative_contract = negative_evaluator.evaluation_contract
-    negative_observed = {
-        "evaluator_code_digest": negative_evaluator.evaluator_code_digest,
-        "contract_digest": negative_contract.contract_digest,
-        "bounds_digest": negative_contract.bounds_digest,
-        "hidden_template_digest": negative_contract.hidden_template_digest,
-        "background_digest": negative_contract.background_digest,
-        "population_digest": negative_contract.population_digest,
-        "evaluator_digest": negative_contract.evaluator_digest,
-        "defender_digest": negative_contract.defender_digest,
-        "disclosure_profile_digest": negative_contract.disclosure_profile_digest,
-    }
-    if negative_observed != artifact["negative_control_provenance"]["provenance"]:
-        raise RuntimeError("frozen v3.3 negative-control provenance changed")
+    target_contexts = artifact["evidence_contexts"]["targets"]
+    for family, evaluator in evaluators.items():
+        observed_context = _preregistered_evidence_context(
+            experiment.benchmarks[family], evaluator
+        )
+        if observed_context != target_contexts[family]:
+            raise RuntimeError(f"frozen v3.4 evaluator context changed: {family}")
+    negative_observed = _preregistered_evidence_context(
+        experiment.negative_control, negative_evaluator
+    )
+    if negative_observed != artifact["evidence_contexts"]["negative_control"]:
+        raise RuntimeError("frozen v3.4 negative-control context changed")
 
 
 def _valid_yield(results: tuple[SearchResult, ...]) -> Decimal:
@@ -1149,6 +1600,7 @@ def _descriptive_uncertainty(
 
 def _execute(
     artifact: dict[str, Any],
+    experiment: Task6Experiment,
     authority: SearchAuthority,
     group: RunGroupCapability,
     evaluators: dict[str, EvaluatorCapability],
@@ -1165,6 +1617,8 @@ def _execute(
     if not (budget == budgets["query"] == budgets["logical_time"]):
         raise RuntimeError("source-bound discrete budgets do not match")
     wall_budget = budgets["wall_time_ms"]
+    # Keep the authority-level preregistration checks from v3.3, but raw evidence and
+    # independent verification below are the only basis for exported claims.
     metrics = cast(dict[str, dict[str, object]], protocol["metrics"])
     thresholds = tuple(
         FamilyThreshold(
@@ -1177,7 +1631,7 @@ def _execute(
         )
         for family, details in sorted(metrics.items())
     )
-    issued_preregistration = authority.issue_preregistration(
+    authority.issue_preregistration(
         run_group=group,
         seeds=seeds,
         budget=budget,
@@ -1185,10 +1639,19 @@ def _execute(
         thresholds=thresholds,
         policies=tuple(policies[name] for name in sorted(policies)),
     )
-    results = {
-        family: {
-            name: tuple(
-                AdaptiveSearch(
+    if cached_policy.take_audit_records():
+        raise RuntimeError("cached LLM audit buffer was not empty before execution")
+    for benchmark in (*experiment.benchmarks.values(), experiment.negative_control):
+        if benchmark.take_evaluation_traces():
+            raise RuntimeError("evaluator trace buffer was not empty before execution")
+
+    cells: list[dict[str, object]] = []
+    defender = default_defender_rules()
+    for family in sorted(evaluators):
+        benchmark = experiment.benchmarks[family]
+        for name in ("fixed", "random", "adaptive", "cached_llm"):
+            for seed in seeds:
+                result = AdaptiveSearch(
                     evaluator_capability=evaluators[family],
                     policy_capability=policies[name],
                     run_group=group,
@@ -1197,107 +1660,121 @@ def _execute(
                     budget=budget,
                     wall_time_budget_ms=wall_budget,
                 )
-                for seed in seeds
+                audits = (
+                    cached_policy.take_audit_records() if name == "cached_llm" else ()
+                )
+                cells.append(
+                    build_search_cell_document(
+                        cell_kind="target",
+                        result=result,
+                        public_bounds=benchmark.public_bounds,
+                        evaluation_contract=benchmark.evaluation_contract,
+                        policy_binding=authority.policy_binding(policies[name]),
+                        defender=defender,
+                        evaluation_traces=benchmark.take_evaluation_traces(),
+                        llm_audit_records=audits,
+                    )
+                )
+    negative_benchmark = experiment.negative_control
+    for name in ("fixed", "random", "adaptive"):
+        for seed in seeds:
+            result = AdaptiveSearch(
+                evaluator_capability=negative_evaluator,
+                policy_capability=policies[name],
+                run_group=group,
+            ).search(
+                seed=seed,
+                budget=budget,
+                wall_time_budget_ms=wall_budget,
             )
-            for name in ("fixed", "random", "adaptive", "cached_llm")
-        }
-        for family in sorted(evaluators)
+            cells.append(
+                build_search_cell_document(
+                    cell_kind="negative_control",
+                    result=result,
+                    public_bounds=negative_benchmark.public_bounds,
+                    evaluation_contract=negative_benchmark.evaluation_contract,
+                    policy_binding=authority.policy_binding(policies[name]),
+                    defender=defender,
+                    evaluation_traces=negative_benchmark.take_evaluation_traces(),
+                    llm_audit_records=(),
+                )
+            )
+    if cached_policy.take_audit_records():
+        raise RuntimeError("cached LLM audit buffer contains unbound attempts")
+    if no_network.calls != 0:
+        raise RuntimeError("v3.4 cached planner attempted network transport")
+    expected_contexts = _runtime_verification_contexts(
+        artifact,
+        evaluators,
+        negative_evaluator,
+    )
+    policy_bindings: dict[str, object] = {
+        name: authority.policy_binding(capability).model_dump(mode="json")
+        for name, capability in policies.items()
     }
-    report = capability_delta_report(
-        issued_preregistration,
-        results,
-        authority=authority,
+    cache_records = cast(dict[str, object], _load_exact_json(CACHE_PATH)["records"])
+    document = build_result_bundle_document(
+        protocol=protocol,
+        cells=cells,
+        expected_contexts=expected_contexts,
+        expected_policy_bindings=policy_bindings,
+        expected_llm_cache=cache_records,
+        external_approval=external_approval,
+        preregistration_canonical_digest=canonical_digest(artifact),
+        network_call_count=no_network.calls,
     )
-    audit = cached_policy.take_audit_records()
-    if no_network.calls != 0 or len(audit) != 2 * len(seeds) * budget:
-        raise RuntimeError("v3.3 cached LLM zero-network audit is incomplete")
-    if any(record.call_status != "cache_success" for record in audit):
-        raise RuntimeError("v3.3 cached LLM contains a replay miss")
-    negative_control = _run_negative_control(
-        authority=authority,
-        run_group=group,
-        evaluator=negative_evaluator,
-        policies=policies,
-        seeds=seeds,
-        budget=budget,
-        wall_time_budget_ms=wall_budget,
+    verify_result_bundle(
+        document,
+        expected_protocol=protocol,
+        expected_contexts=expected_contexts,
+        expected_policy_bindings=policy_bindings,
+        expected_llm_cache=cache_records,
+        expected_external_approval=external_approval,
+        expected_preregistration_canonical_digest=canonical_digest(artifact),
     )
-    target_cells_bound = (
-        {metric.family for metric in report.family_metrics}
-        == set(artifact["families"])
-        and set(results) == set(artifact["families"])
-        and all(
-            set(cells) == {"fixed", "random", "adaptive", "cached_llm"}
-            and all(len(runs) == len(seeds) for runs in cells.values())
-            for cells in results.values()
-        )
-    )
-    confirmatory_claim = _confirmatory_gate(
-        target_cells_bound=target_cells_bound,
-        target_matched_budgets=report.matched_budgets,
-        target_network_call_count=no_network.calls,
-        target_supported_family_count=report.supported_family_count,
-        target_adaptive_claim=report.adaptive_claim,
-        negative_control=negative_control,
-    )
+    return document
 
-    return {
-        "schema_version": "1.0.0",
-        "external_approval": external_approval,
-        "preregistration_commit": external_approval["approved_freeze_commit"],
-        "preregistration_file_sha256": _sha256_file(PREREGISTRATION_PATH),
-        "preregistration_canonical_digest": _canonical_digest(artifact),
-        "protocol": protocol,
-        "matched_budgets": report.matched_budgets,
-        **confirmatory_claim,
-        "negative_control": negative_control,
-        "families": {
-            metric.family: {
-                "primary_outcome": metric.primary_outcome.value,
-                "minimum_delta": str(metric.minimum_delta),
-                "observed_delta": str(metric.observed_delta),
-                "supported": metric.supported
-                and bool(confirmatory_claim["confirmatory_valid"]),
-                "fixed": _metrics_document(metric.fixed),
-                "random": _metrics_document(metric.random),
-                "adaptive": _metrics_document(metric.adaptive),
-                "cached_llm": _metrics_document(metric.cached_llm),
-                "uncertainty": _descriptive_uncertainty(
-                    results[metric.family]["adaptive"],
-                    results[metric.family]["random"],
-                    metric.primary_outcome,
-                ),
-            }
-            for metric in report.family_metrics
-        },
-        "cached_llm_audit": {
-            "attempt_count": len(audit),
-            "cache_success_count": sum(
-                record.call_status == "cache_success" for record in audit
-            ),
-            "network_call_count": no_network.calls,
-            "audit_digest": _canonical_digest(
-                [record.model_dump(mode="json") for record in audit]
-            ),
-        },
-        "result_bindings": {
-            family: {
-                name: [
-                    {
-                        "seed": result.seed,
-                        "result_id": result.result_id,
-                        "result_seal": result.result_seal,
-                        "canonical_document_digest": _canonical_digest(
-                            result.canonical_document()
-                        ),
-                    }
-                    for result in runs
-                ]
-                for name, runs in cells.items()
-            }
-            for family, cells in results.items()
-        },
+
+def _verify_published_result(
+    *,
+    artifact: dict[str, Any],
+    authority: SearchAuthority,
+    evaluators: dict[str, EvaluatorCapability],
+    negative_evaluator: EvaluatorCapability,
+    policies: dict[str, PolicyCapability],
+    expected_freeze_commit: str,
+) -> tuple[dict[str, object], dict[str, object]]:
+    if not RESULT_PATH.is_file() or RESULT_PATH.is_symlink():
+        raise RuntimeError("v3.4 result must be one exact regular file")
+    raw = RESULT_PATH.read_bytes()
+    loaded = strict_json_loads(raw, require_canonical=True)
+    if type(loaded) is not dict:
+        raise RuntimeError("v3.4 result must contain one exact JSON object")
+    document = cast(dict[str, object], loaded)
+    expected_contexts = _runtime_verification_contexts(
+        artifact,
+        evaluators,
+        negative_evaluator,
+    )
+    policy_bindings: dict[str, object] = {
+        name: authority.policy_binding(capability).model_dump(mode="json")
+        for name, capability in policies.items()
     }
+    cache_records = cast(dict[str, object], _load_exact_json(CACHE_PATH)["records"])
+    expected_approval: dict[str, str] = {
+        "approved_freeze_commit": expected_freeze_commit,
+        "approved_prereg_sha256": _sha256_file(PREREGISTRATION_PATH),
+    }
+    summary = verify_result_bundle(
+        document,
+        expected_protocol=_expected_protocol(),
+        expected_contexts=expected_contexts,
+        expected_policy_bindings=policy_bindings,
+        expected_llm_cache=cache_records,
+        expected_external_approval=expected_approval,
+        expected_preregistration_canonical_digest=canonical_digest(artifact),
+    )
+    return document, summary
 
 
 def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
@@ -1305,9 +1782,14 @@ def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--verify-only", action="store_true")
     mode.add_argument("--verify-source-only", action="store_true")
+    mode.add_argument("--prepare-preregistration", action="store_true")
     mode.add_argument("--execute-confirmatory", action="store_true")
+    mode.add_argument("--verify-postexecution", action="store_true")
+    mode.add_argument("--verify-postcommit", action="store_true")
     parser.add_argument("--approved-freeze-commit")
     parser.add_argument("--approved-prereg-sha256")
+    parser.add_argument("--approved-result-commit")
+    parser.add_argument("--approved-result-sha256")
     args = parser.parse_args(arguments)
     supplied_commit = args.approved_freeze_commit is not None
     supplied_preregistration = args.approved_prereg_sha256 is not None
@@ -1318,25 +1800,169 @@ def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
             "execute-confirmatory requires --approved-freeze-commit and "
             "--approved-prereg-sha256"
         )
-    if args.verify_source_only and supplied_commit:
-        parser.error("source-only verification does not accept freeze approval")
+    supplied_result_commit = args.approved_result_commit is not None
+    supplied_result_sha = args.approved_result_sha256 is not None
+    if supplied_result_commit != supplied_result_sha:
+        parser.error("both approved result values must be supplied together")
+    if args.verify_postcommit and not supplied_result_commit:
+        parser.error(
+            "verify-postcommit requires --approved-result-commit and "
+            "--approved-result-sha256"
+        )
+    if supplied_result_commit and not args.verify_postcommit:
+        parser.error("approved result values are accepted only by verify-postcommit")
+    if (args.verify_source_only or args.prepare_preregistration) and supplied_commit:
+        parser.error("source preparation/verification does not accept freeze approval")
+    if (args.verify_postexecution or args.verify_postcommit) and supplied_commit:
+        parser.error("post-execution verification derives approval from the result")
     return args
 
 
 def main() -> None:
     args = _parse_args()
     if args.execute_confirmatory and not PREREGISTRATION_PATH.exists():
-        raise RuntimeError("v3.3 preregistration is absent; execution is forbidden")
-    if args.verify_source_only or not PREREGISTRATION_PATH.exists():
+        raise RuntimeError("v3.4 preregistration is absent; execution is forbidden")
+    if args.prepare_preregistration:
+        _require_clean_worktree()
         _verify_cancelled_predecessors()
-        if RESULT_PATH.exists():
-            raise RuntimeError("v3.3 result must remain absent before preregistration")
+        if PREREGISTRATION_PATH.exists() or RESULT_PATH.exists():
+            raise RuntimeError(
+                "v3.4 preregistration/result must be absent before one-time preparation"
+            )
+        source_commit = _head_commit()
+        document = _build_preregistration_document(source_commit)
+        _validate_preregistration_schema(document)
+        payload = canonical_json_bytes(document)
+        _atomic_publish_result(PREREGISTRATION_PATH, payload)
         print(
-            "v3.1 cancelled; v3.2 source is cancelled; verified Task 6 v3.3 source stage; "
-            "awaiting external approval values --approved-freeze-commit and "
-            "--approved-prereg-sha256; no holdout trial executed"
+            "prepared Task 6 v3.4 preregistration only; "
+            f"source_commit={source_commit}; sha256={_sha256_bytes(payload)}; "
+            "no holdout trial executed"
         )
         return
+    if args.verify_source_only:
+        _verify_cancelled_predecessors()
+        if RESULT_PATH.exists():
+            raise RuntimeError("v3.4 result must remain absent during source verification")
+        behavior = _behavior_equivalence_document()
+        if behavior["equivalent"] is not True:
+            raise RuntimeError("v3.4 proposal or defender behavior differs from v3.3")
+        print(
+            "v3.2 source lineage retained; v3.3 result preserved and rejected; "
+            "verified Task 6 v3.4 source stage; "
+            "no holdout trial executed"
+        )
+        return
+    if not PREREGISTRATION_PATH.exists():
+        if args.verify_postexecution or args.verify_postcommit:
+            raise RuntimeError("v3.4 preregistration is absent; post verification is impossible")
+        _verify_cancelled_predecessors()
+        if RESULT_PATH.exists():
+            raise RuntimeError("v3.4 result must remain absent before preregistration")
+        behavior = _behavior_equivalence_document()
+        if behavior["equivalent"] is not True:
+            raise RuntimeError("v3.4 proposal or defender behavior differs from v3.3")
+        print(
+            "v3.1/v3.2 cancelled lineage retained; v3.3 result preserved and rejected; "
+            "verified Task 6 v3.4 source stage; "
+            "no holdout trial executed"
+        )
+        return
+
+    if args.verify_postexecution:
+        status = cast(
+            bytes,
+            _git_output(
+                ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+                text=False,
+            ),
+        )
+        _validate_postexecution_worktree_status(status)
+        (
+            artifact,
+            experiment,
+            authority,
+            _group,
+            evaluators,
+            negative_evaluator,
+            policies,
+            _cached_policy,
+            _no_network,
+        ) = _runtime()
+        _verify_frozen_bindings(
+            artifact,
+            experiment,
+            authority,
+            evaluators,
+            negative_evaluator,
+            policies,
+            require_clean=False,
+        )
+        _document, summary = _verify_published_result(
+            artifact=artifact,
+            authority=authority,
+            evaluators=evaluators,
+            negative_evaluator=negative_evaluator,
+            policies=policies,
+            expected_freeze_commit=_head_commit(),
+        )
+        print(
+            "verified exact untracked Task 6 v3.4 raw-evidence result before commit; "
+            f"confirmatory_valid={summary['confirmatory_valid']}"
+        )
+        return
+
+    if args.verify_postcommit:
+        _require_clean_worktree()
+        loaded = strict_json_loads(RESULT_PATH.read_bytes(), require_canonical=True)
+        if type(loaded) is not dict:
+            raise RuntimeError("v3.4 result must contain an exact object")
+        raw_result = cast(dict[str, object], loaded)
+        preregistration_commit = cast(str, raw_result["preregistration_commit"])
+        approved_result_sha = _exact_hex(
+            "approved result SHA-256", args.approved_result_sha256, length=64
+        )
+        _validate_postcommit_chronology(
+            approved_result_commit=args.approved_result_commit,
+            approved_result_sha256=approved_result_sha,
+            preregistration_commit=preregistration_commit,
+            approved_artifacts={
+                "docs/experiments/task6-v3.4-holdout-result.json": approved_result_sha
+            },
+        )
+        (
+            artifact,
+            experiment,
+            authority,
+            _group,
+            evaluators,
+            negative_evaluator,
+            policies,
+            _cached_policy,
+            _no_network,
+        ) = _runtime()
+        _verify_frozen_bindings(
+            artifact,
+            experiment,
+            authority,
+            evaluators,
+            negative_evaluator,
+            policies,
+        )
+        _document, summary = _verify_published_result(
+            artifact=artifact,
+            authority=authority,
+            evaluators=evaluators,
+            negative_evaluator=negative_evaluator,
+            policies=policies,
+            expected_freeze_commit=preregistration_commit,
+        )
+        print(
+            "verified Task 6 v3.4 result-only commit chronology and raw evidence; "
+            f"confirmatory_valid={summary['confirmatory_valid']}"
+        )
+        return
+
     external_approval: dict[str, str] | None = None
     if args.approved_freeze_commit is not None:
         external_approval = _validate_external_approval(
@@ -1364,10 +1990,11 @@ def main() -> None:
     )
     if args.verify_only:
         if RESULT_PATH.exists():
-            raise RuntimeError("v3.3 result must be absent during freeze verification")
+            raise RuntimeError("v3.4 result must be absent during freeze verification")
         if external_approval is None:
             print(
-                "v3.1 and v3.2 cancelled; verified frozen Task 6 v3.3 bindings; "
+                "v3.1/v3.2 cancelled; v3.3 rejected; verified frozen Task 6 v3.4 "
+                "bindings; "
                 "awaiting external approval: "
                 f"--approved-freeze-commit {_head_commit()} "
                 f"--approved-prereg-sha256 {_sha256_file(PREREGISTRATION_PATH)}; "
@@ -1375,7 +2002,8 @@ def main() -> None:
             )
         else:
             print(
-                "v3.1 and v3.2 cancelled; verified frozen Task 6 v3.3 bindings and "
+                "v3.1/v3.2 cancelled; v3.3 rejected; verified frozen Task 6 v3.4 "
+                "bindings and "
                 "supplied external approval; no holdout trial executed"
             )
         return
@@ -1389,6 +2017,7 @@ def main() -> None:
     )
     document = _execute(
         artifact,
+        experiment,
         authority,
         group,
         evaluators,
@@ -1400,10 +2029,11 @@ def main() -> None:
     )
     _atomic_publish_result(
         RESULT_PATH,
-        (json.dumps(document, sort_keys=True, indent=2) + "\n").encode("utf-8"),
+        canonical_json_bytes(document),
     )
-    print(json.dumps(document["families"], sort_keys=True, indent=2))
-    print(f"supported_family_count={document['supported_family_count']}")
+    summary = cast(dict[str, object], document["summary"])
+    print(json.dumps(summary["families"], sort_keys=True, indent=2))
+    print(f"supported_family_count={summary['supported_family_count']}")
 
 
 if __name__ == "__main__":

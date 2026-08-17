@@ -11,6 +11,7 @@ import hashlib
 import inspect
 import itertools
 import json
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from decimal import ROUND_HALF_EVEN, Decimal, localcontext
@@ -509,14 +510,158 @@ def default_defender_rules() -> DefenderRuleSet:
 
 @dataclass(frozen=True, slots=True)
 class BenchmarkObservation:
-    """Evaluator-only audit of artifact-derived features and executed value."""
+    """Evaluator-owned lossless audit trace for one candidate evaluation."""
 
+    family: str
+    candidate_id: str
+    candidate_document_digest: str
     artifact_digest: str
+    command_count: int
+    command_type_counts: tuple[tuple[str, int], ...]
     event_digest: str
+    event_count: int
+    event_type_counts: tuple[tuple[str, int], ...]
+    ledger_digest: str
+    ledger_entry_count: int
     feature_values: tuple[tuple[str, Decimal], ...]
     fresh_replay_succeeded: bool
     ledger_conserved: bool
+    matched_rule: DefenderRule | None
+    decision_action: Action
+    decision_reason_family: str
+    role_bound_value_components: tuple[tuple[str, Decimal, Decimal, Decimal], ...]
     realized_settled_illicit_value: Decimal
+    feedback_realized_value: Decimal | None
+
+    def document(self) -> dict[str, object]:
+        """Return the exact canonical public evidence record for this evaluation."""
+        return {
+            "family": self.family,
+            "candidate_id": self.candidate_id,
+            "candidate_document_digest": self.candidate_document_digest,
+            "command_digest": self.artifact_digest,
+            "command_count": self.command_count,
+            "command_type_counts": [
+                {"name": name, "count": count}
+                for name, count in self.command_type_counts
+            ],
+            "event_digest": self.event_digest,
+            "event_count": self.event_count,
+            "event_type_counts": [
+                {"event_type": event_type, "count": count}
+                for event_type, count in self.event_type_counts
+            ],
+            "ledger_digest": self.ledger_digest,
+            "ledger_entry_count": self.ledger_entry_count,
+            "fresh_replay_succeeded": self.fresh_replay_succeeded,
+            "ledger_conserved": self.ledger_conserved,
+            "derived_feature_vector": [
+                {"name": name, "value": str(value)}
+                for name, value in self.feature_values
+            ],
+            "matched_defender_rule": (
+                None if self.matched_rule is None else self.matched_rule.document()
+            ),
+            "decision": {
+                "action": self.decision_action.value,
+                "reason_family": self.decision_reason_family,
+            },
+            "role_bound_value_components": [
+                {
+                    "payment_id": payment_id,
+                    "positive_value": str(positive),
+                    "removed_value": str(removed),
+                    "outstanding_value": str(outstanding),
+                    "outstanding_minor_units": int(outstanding * 100),
+                }
+                for payment_id, positive, removed, outstanding in (
+                    self.role_bound_value_components
+                )
+            ],
+            "executed_role_bound_value": str(self.realized_settled_illicit_value),
+            "feedback_realized_value": (
+                None
+                if self.feedback_realized_value is None
+                else str(self.feedback_realized_value)
+            ),
+        }
+
+
+def _ledger_digest(entries: tuple[LedgerEntry, ...]) -> str:
+    document = [
+        {
+            "entry_id": entry.entry_id,
+            "currency": entry.currency,
+            "debit": {
+                account: str(amount) for account, amount in sorted(entry.debit.items())
+            },
+            "credit": {
+                account: str(amount) for account, amount in sorted(entry.credit.items())
+            },
+        }
+        for entry in entries
+    ]
+    return _digest(document)
+
+
+def _matched_rule(
+    defender: DefenderRuleSet,
+    family: str,
+    features: Mapping[str, Decimal],
+) -> DefenderRule | None:
+    triggered = tuple(
+        rule
+        for rule in defender.rules
+        if rule.family == family
+        and rule.feature in features
+        and features[rule.feature] >= rule.threshold
+    )
+    if not triggered:
+        return None
+    return min(
+        triggered,
+        key=lambda rule: (-_SEVERITY[rule.action], rule.reason_family, rule.feature),
+    )
+
+
+def _role_bound_value_components(
+    events: tuple[PaymentEvent, ...],
+    illicit_entity_ids: frozenset[str],
+) -> tuple[tuple[str, Decimal, Decimal, Decimal], ...]:
+    positive = {EventKind.SETTLEMENT, EventKind.TRANSFER_POSTED}
+    negative = {
+        EventKind.RECOVERY,
+        EventKind.CHARGEBACK,
+        EventKind.TRANSFER_RETURNED,
+        EventKind.REFUND,
+    }
+    values: dict[str, tuple[Decimal, Decimal, Decimal]] = {}
+    for event in events:
+        if not {event.actor_id, event.counterparty_id} & illicit_entity_ids:
+            continue
+        raw_payment_id = event.rail_data.get("payment_id", event.trace_id)
+        if type(raw_payment_id) is not str:
+            continue
+        positive_value, removed_value, outstanding = values.get(
+            raw_payment_id,
+            (Decimal(0), Decimal(0), Decimal(0)),
+        )
+        if event.event_type in positive:
+            positive_value += event.amount
+            outstanding += event.amount
+        elif event.event_type in negative:
+            applied = min(outstanding, event.amount)
+            removed_value += applied
+            outstanding -= applied
+        values[raw_payment_id] = (
+            _money(positive_value),
+            _money(removed_value),
+            _money(outstanding),
+        )
+    return tuple(
+        (payment_id, positive_value, removed_value, outstanding)
+        for payment_id, (positive_value, removed_value, outstanding) in sorted(values.items())
+    )
 
 
 def _fresh_replay(
@@ -655,6 +800,7 @@ class CampaignBenchmark:
         "_generator_seed",
         "_population",
         "_template",
+        "_evaluation_traces",
         "evaluation_contract",
         "public_bounds",
     )
@@ -707,6 +853,7 @@ class CampaignBenchmark:
         self._template = hidden_template
         self._defender = defender
         self._generator_seed = generator_seed
+        self._evaluation_traces: list[BenchmarkObservation] = []
         self.public_bounds = public_bounds
         self.evaluation_contract = EvaluationContract(
             family=family,
@@ -732,6 +879,8 @@ class CampaignBenchmark:
         candidate: AttackCandidate,
     ) -> tuple[Feedback, BenchmarkObservation]:
         params = self.compose(candidate)
+        checked_candidate = reconstruct_candidate(candidate)
+        candidate_document = checked_candidate.model_dump(mode="json", round_trip=True)
         try:
             commands, evidence = _CampaignEvaluator(seed=self._generator_seed).generate(
                 self._family,
@@ -751,20 +900,36 @@ class CampaignBenchmark:
                 realized_value=None,
             )
             observation = BenchmarkObservation(
+                family=self._family,
+                candidate_id=checked_candidate.candidate_id,
+                candidate_document_digest=_digest(candidate_document),
                 artifact_digest="0" * 64,
+                command_count=0,
+                command_type_counts=(),
                 event_digest="0" * 64,
+                event_count=0,
+                event_type_counts=(),
+                ledger_digest="0" * 64,
+                ledger_entry_count=0,
                 feature_values=(),
                 fresh_replay_succeeded=False,
                 ledger_conserved=False,
+                matched_rule=None,
+                decision_action=feedback.action,
+                decision_reason_family=feedback.reason_family,
+                role_bound_value_components=(),
                 realized_settled_illicit_value=Decimal("0.00"),
+                feedback_realized_value=feedback.realized_value,
             )
             return feedback, observation
         features = _observable_features(commands, evidence)
         action, reason = self._defender.decide(self._family, features)
+        matched_rule = _matched_rule(self._defender, self._family, features)
         illicit_entities = frozenset(
             entity.entity_id for entity in self._population.entities if entity.illicit
         )
         executed_value = role_bound_settled_value(events, illicit_entities)
+        value_components = _role_bound_value_components(events, illicit_entities)
         realized = executed_value if action is Action.APPROVE else Decimal("0.00")
         feedback = Feedback(
             action=action,
@@ -773,18 +938,43 @@ class CampaignBenchmark:
         )
         event_document = [event.model_dump(mode="json", round_trip=True) for event in events]
         observation = BenchmarkObservation(
+            family=self._family,
+            candidate_id=checked_candidate.candidate_id,
+            candidate_document_digest=_digest(candidate_document),
             artifact_digest=hashlib.sha256(campaign_bytes(commands)).hexdigest(),
+            command_count=len(commands),
+            command_type_counts=tuple(
+                sorted(Counter(command.name for command in commands).items())
+            ),
             event_digest=_digest(event_document),
+            event_count=len(events),
+            event_type_counts=tuple(
+                sorted(Counter(event.event_type.value for event in events).items())
+            ),
+            ledger_digest=_ledger_digest(_entries),
+            ledger_entry_count=len(_entries),
             feature_values=tuple(sorted(features.items())),
             fresh_replay_succeeded=True,
             ledger_conserved=True,
+            matched_rule=matched_rule,
+            decision_action=feedback.action,
+            decision_reason_family=feedback.reason_family,
+            role_bound_value_components=value_components,
             realized_settled_illicit_value=executed_value,
+            feedback_realized_value=feedback.realized_value,
         )
         return feedback, observation
 
     def evaluate(self, candidate: AttackCandidate) -> Feedback:
-        feedback, _observation = self.evaluate_with_observation(candidate)
+        feedback, observation = self.evaluate_with_observation(candidate)
+        self._evaluation_traces.append(observation)
         return feedback
+
+    def take_evaluation_traces(self) -> tuple[BenchmarkObservation, ...]:
+        """Drain evaluator-owned traces without exposing them to policy code."""
+        traces = tuple(self._evaluation_traces)
+        self._evaluation_traces.clear()
+        return traces
 
     def issue_evaluator_capability(
         self,
