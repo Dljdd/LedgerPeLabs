@@ -28,6 +28,7 @@ from apar.redteam import (
     ParameterDomain,
     PolicyMetrics,
     RandomPolicy,
+    SearchAuthority,
     SearchResult,
     VisibleTrial,
 )
@@ -77,6 +78,42 @@ def _evaluation_contract(bounds: ParameterBounds):  # type: ignore[no-untyped-de
             profile_id="decision-only-hidden-value-v1",
             expose_realized_value=False,
         ),
+    )
+
+
+class _RegisteredEvaluator:
+    def __init__(self, callback) -> None:  # type: ignore[no-untyped-def]
+        self.callback = callback
+
+    def evaluate(self, candidate: AttackCandidate) -> Feedback:
+        return self.callback(candidate)  # type: ignore[no-any-return]
+
+
+def _authorized_search(
+    policy,
+    bounds: ParameterBounds,
+    evaluate,
+    clock,
+) -> AdaptiveSearch:  # type: ignore[no-untyped-def]
+    authority = SearchAuthority()
+    owner = _RegisteredEvaluator(evaluate)
+    evaluator = authority.register_evaluator(
+        owner=owner,
+        bounds=bounds,
+        evaluation_contract=_evaluation_contract(bounds),
+        evaluate=owner.evaluate,
+        dependency_digest="9" * 64,
+    )
+    policy_capability = authority.register_policy(
+        policy,
+        name=policy.policy_name,
+        version=policy.policy_version,
+    )
+    return AdaptiveSearch(
+        evaluator_capability=evaluator,
+        policy_capability=policy_capability,
+        run_group=authority.issue_run_group("round1-test"),
+        clock_ns=clock,
     )
 
 
@@ -217,7 +254,9 @@ def test_adaptive_tournament_does_not_force_global_best_into_every_sample(card_b
 def test_search_requires_bound_disclosure_contract_and_provenance() -> None:
     signature = inspect.signature(AdaptiveSearch.__init__)
     assert "disclose_realized_value" not in signature.parameters
-    assert "evaluation_contract" in signature.parameters
+    assert "evaluation_contract" not in signature.parameters
+    assert "evaluator_capability" in signature.parameters
+    assert "policy_capability" in signature.parameters
     required = {
         "family",
         "bounds_digest",
@@ -231,6 +270,9 @@ def test_search_requires_bound_disclosure_contract_and_provenance() -> None:
         "wall_time_budget_ms",
         "wall_time_elapsed_ms",
         "wall_time_exhausted",
+        "evaluator_code_digest",
+        "policy_code_digest",
+        "result_seal",
     }
     assert required <= set(SearchResult.model_fields)
 
@@ -358,12 +400,11 @@ def test_deadline_stops_after_slow_evaluation_without_further_calls() -> None:
             realized_value=Decimal("10.00"),
         )
 
-    result = AdaptiveSearch(
-        policy=FixedPolicy(),
-        bounds=bounds,
-        evaluation_contract=_evaluation_contract(bounds),
-        clock_ns=clock,
-    ).search(seed=1, budget=4, wall_time_budget_ms=5, evaluate=evaluate)
+    result = _authorized_search(FixedPolicy(), bounds, evaluate, clock).search(
+        seed=1,
+        budget=4,
+        wall_time_budget_ms=5,
+    )
     assert calls == 1
     assert result.proposals_used == result.queries_used == 1
     assert result.wall_time_exhausted is True
@@ -397,12 +438,11 @@ def test_deadline_after_slow_policy_prevents_evaluator_call() -> None:
         calls += 1
         return _decline()
 
-    result = AdaptiveSearch(
-        policy=SlowPolicy(),
-        bounds=bounds,
-        evaluation_contract=_evaluation_contract(bounds),
-        clock_ns=clock,
-    ).search(seed=1, budget=4, wall_time_budget_ms=5, evaluate=evaluate)
+    result = _authorized_search(SlowPolicy(), bounds, evaluate, clock).search(
+        seed=1,
+        budget=4,
+        wall_time_budget_ms=5,
+    )
     assert calls == 0
     assert result.proposals_used == result.queries_used == 0
     assert result.wall_time_exhausted is True
@@ -412,8 +452,12 @@ def test_search_rejects_model_copy_injection_before_policy_execution() -> None:
     bounds = _tiny_bounds()
     injected = bounds.model_copy(update={"hidden_template": object()})
     with pytest.raises((TypeError, ValueError), match="field set|integrity|exact"):
-        AdaptiveSearch(
-            policy=FixedPolicy(),
+        authority = SearchAuthority()
+        owner = _RegisteredEvaluator(_decline)
+        authority.register_evaluator(
+            owner=owner,
             bounds=injected,
             evaluation_contract=_evaluation_contract(bounds),
+            evaluate=owner.evaluate,
+            dependency_digest="9" * 64,
         )

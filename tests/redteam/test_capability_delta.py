@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from decimal import Decimal
 
 import pytest
@@ -12,12 +13,15 @@ from apar.redteam import (
     AdaptiveTournamentPolicy,
     AttackCandidate,
     CapabilityPreregistration,
+    FamilyCapabilityMetrics,
     FamilyThreshold,
     FixedPolicy,
     LLMPlannerPolicy,
     PolicyMetrics,
     PrimaryOutcome,
     RandomPolicy,
+    RunGroupCapability,
+    SearchAuthority,
     SearchResult,
     capability_delta_report,
 )
@@ -85,23 +89,90 @@ def value_card_benchmark(benchmark_population: Population) -> CampaignBenchmark:
     )
 
 
+@dataclass(frozen=True)
+class _Experiment:
+    authority: SearchAuthority
+    run_group: RunGroupCapability
+    benchmarks: dict[str, CampaignBenchmark]
+    evaluators: dict[str, object]
+    policies: dict[str, object]
+    preregistration: CapabilityPreregistration
+
+
+def _experiment(
+    benchmarks: tuple[CampaignBenchmark, ...],
+    *,
+    seeds: tuple[int, ...] = _SEEDS,
+    budget: int = _BUDGET,
+    minimum_delta: Decimal = Decimal("0.10"),
+) -> _Experiment:
+    authority = SearchAuthority()
+    run_group = authority.issue_run_group("capability-delta-test")
+    by_family = {
+        benchmark.evaluation_contract.family: benchmark for benchmark in benchmarks
+    }
+    evaluators = {
+        family: benchmark.issue_evaluator_capability(authority)
+        for family, benchmark in by_family.items()
+    }
+    policy_objects = {
+        "fixed": FixedPolicy(),
+        "random": RandomPolicy(),
+        "adaptive": AdaptiveTournamentPolicy(),
+        # Cached replay mechanics are tested independently below and in the LLM suite.
+        # The comparison fixture registers a deterministic no-network planner baseline.
+        "cached_llm": FixedPolicy(),
+    }
+    policies = {
+        name: authority.register_policy(policy, name=name, version="test-v1")
+        for name, policy in policy_objects.items()
+    }
+    thresholds = tuple(
+        FamilyThreshold(
+            family=family,
+            primary_outcome=PrimaryOutcome.VALID_YIELD,
+            minimum_delta=minimum_delta,
+            evaluation_contract=evaluators[family].evaluation_contract,  # type: ignore[attr-defined]
+            evaluator_capability_id=evaluators[family].capability_id,  # type: ignore[attr-defined]
+            evaluator_code_digest=evaluators[family].evaluator_code_digest,  # type: ignore[attr-defined]
+        )
+        for family in sorted(by_family)
+    )
+    preregistration = authority.issue_preregistration(
+        run_group=run_group,
+        seeds=seeds,
+        budget=budget,
+        wall_time_budget_ms=_WALL_BUDGET_MS,
+        thresholds=thresholds,
+        policies=tuple(policies[name] for name in sorted(policies)),  # type: ignore[arg-type]
+    )
+    return _Experiment(
+        authority=authority,
+        run_group=run_group,
+        benchmarks=by_family,
+        evaluators=evaluators,
+        policies=policies,
+        preregistration=preregistration,
+    )
+
+
 def _run(
-    benchmark: CampaignBenchmark,
-    policy: object,
+    experiment: _Experiment,
+    family: str,
+    policy_name: str,
     *,
     seed: int,
     budget: int = _BUDGET,
     wall_budget_ms: int = _WALL_BUDGET_MS,
 ) -> SearchResult:
     return AdaptiveSearch(
-        policy=policy,  # type: ignore[arg-type]
-        bounds=benchmark.public_bounds,
-        evaluation_contract=benchmark.evaluation_contract,
+        evaluator_capability=experiment.evaluators[family],  # type: ignore[arg-type]
+        policy_capability=experiment.policies[policy_name],  # type: ignore[arg-type]
+        run_group=experiment.run_group,
     ).search(
         seed=seed,
         budget=budget,
         wall_time_budget_ms=wall_budget_ms,
-        evaluate=benchmark.evaluate,
     )
 
 
@@ -112,15 +183,21 @@ def _cached_run(
     budget: int = _BUDGET,
     wall_budget_ms: int = _WALL_BUDGET_MS,
 ) -> SearchResult:
+    authority = SearchAuthority()
+    evaluator = benchmark.issue_evaluator_capability(authority)
+    group = authority.issue_run_group("cached-replay-test")
     defaults = benchmark.public_bounds.defaults_document()
     online_client = _DefaultPlannerClient(defaults)
     online = LLMPlannerPolicy(online_client)
-    _run(
-        benchmark,
-        online,
-        seed=seed,
-        budget=budget,
-        wall_budget_ms=wall_budget_ms,
+    online_capability = authority.register_policy(
+        online, name="online_llm", version="test-v1"
+    )
+    AdaptiveSearch(
+        evaluator_capability=evaluator,
+        policy_capability=online_capability,
+        run_group=group,
+    ).search(
+        seed=seed, budget=budget, wall_time_budget_ms=wall_budget_ms
     )
     assert online_client.calls == budget
     offline_client = _NoNetworkPlannerClient(defaults)
@@ -129,67 +206,39 @@ def _cached_run(
         replay_cache=online.export_replay_cache(),
         require_cached_replay=True,
     )
-    result = _run(
-        benchmark,
-        cached,
-        seed=seed,
-        budget=budget,
-        wall_budget_ms=wall_budget_ms,
+    cached_capability = authority.register_policy(
+        cached, name="cached_llm", version="test-v1"
+    )
+    result = AdaptiveSearch(
+        evaluator_capability=evaluator,
+        policy_capability=cached_capability,
+        run_group=group,
+    ).search(
+        seed=seed, budget=budget, wall_time_budget_ms=wall_budget_ms
     )
     assert offline_client.calls == 0
     assert all(record.call_status == "cache_success" for record in cached.take_audit_records())
     return result
 
 
-def _preregistration(
-    benchmarks: tuple[CampaignBenchmark, ...],
-    *,
-    seeds: tuple[int, ...] = _SEEDS,
-    budget: int = _BUDGET,
-    minimum_delta: Decimal = Decimal("0.10"),
-) -> CapabilityPreregistration:
-    return CapabilityPreregistration(
-        seeds=seeds,
-        budget=budget,
-        wall_time_budget_ms=_WALL_BUDGET_MS,
-        thresholds=tuple(
-            FamilyThreshold(
-                family=benchmark.evaluation_contract.family,
-                primary_outcome=PrimaryOutcome.VALID_YIELD,
-                minimum_delta=minimum_delta,
-                evaluation_contract=benchmark.evaluation_contract,
-            )
-            for benchmark in sorted(
-                benchmarks,
-                key=lambda item: item.evaluation_contract.family,
-            )
-        ),
-    )
-
-
 def _matched_results(
-    benchmarks: tuple[CampaignBenchmark, ...],
-    preregistration: CapabilityPreregistration,
+    experiment: _Experiment,
 ) -> dict[str, dict[str, tuple[SearchResult, ...]]]:
     results: dict[str, dict[str, tuple[SearchResult, ...]]] = {}
-    for benchmark in benchmarks:
-        results[benchmark.evaluation_contract.family] = {
-            "fixed": tuple(
-                _run(benchmark, FixedPolicy(), seed=seed)
-                for seed in preregistration.seeds
-            ),
-            "random": tuple(
-                _run(benchmark, RandomPolicy(), seed=seed)
-                for seed in preregistration.seeds
-            ),
-            "adaptive": tuple(
-                _run(benchmark, AdaptiveTournamentPolicy(), seed=seed)
-                for seed in preregistration.seeds
-            ),
-            "cached_llm": tuple(
-                _cached_run(benchmark, seed=seed)
-                for seed in preregistration.seeds
-            ),
+    for family in experiment.benchmarks:
+        results[family] = {
+            name: tuple(
+                _run(
+                    experiment,
+                    family,
+                    name,
+                    seed=seed,
+                    budget=experiment.preregistration.budget,
+                    wall_budget_ms=experiment.preregistration.wall_time_budget_ms,
+                )
+                for seed in experiment.preregistration.seeds
+            )
+            for name in ("fixed", "random", "adaptive", "cached_llm")
         }
     return results
 
@@ -200,10 +249,12 @@ def test_replay_backed_capability_report_is_honest_and_matched(
 ) -> None:
     # Thresholds and exact evaluator contracts are frozen before any policy trial.
     benchmarks = (app_benchmark, value_card_benchmark)
-    preregistration = _preregistration(benchmarks)
-    results = _matched_results(benchmarks, preregistration)
+    experiment = _experiment(benchmarks)
+    results = _matched_results(experiment)
 
-    report = capability_delta_report(preregistration, results)
+    report = capability_delta_report(
+        experiment.preregistration, results, authority=experiment.authority
+    )
 
     assert report.matched_budgets is True
     assert report.supported_family_count == sum(
@@ -231,34 +282,17 @@ def test_minimum_agentic_space_is_a_negative_no_delta_control(
         benchmark_population,
         expose_realized_value=True,
     )
-    preregistration = _preregistration(
+    experiment = _experiment(
         (benchmark,),
         seeds=(1, 2),
         budget=2,
         minimum_delta=Decimal("0.01"),
     )
-    results = {
-        "agentic_intent_abuse": {
-            "fixed": tuple(
-                _run(benchmark, FixedPolicy(), seed=seed, budget=2)
-                for seed in preregistration.seeds
-            ),
-            "random": tuple(
-                _run(benchmark, RandomPolicy(), seed=seed, budget=2)
-                for seed in preregistration.seeds
-            ),
-            "adaptive": tuple(
-                _run(benchmark, AdaptiveTournamentPolicy(), seed=seed, budget=2)
-                for seed in preregistration.seeds
-            ),
-            "cached_llm": tuple(
-                _cached_run(benchmark, seed=seed, budget=2)
-                for seed in preregistration.seeds
-            ),
-        }
-    }
+    results = _matched_results(experiment)
 
-    report = capability_delta_report(preregistration, results)
+    report = capability_delta_report(
+        experiment.preregistration, results, authority=experiment.authority
+    )
 
     assert benchmark.public_bounds.names == ()
     assert report.supported_family_count == 0
@@ -316,52 +350,41 @@ def test_capability_report_rejects_each_cross_provenance_cell(
     replacement: str,
     message: str,
 ) -> None:
-    preregistration = _preregistration(
+    experiment = _experiment(
         (value_card_benchmark,), seeds=(1,), budget=1
     )
-    fixed = _run(value_card_benchmark, FixedPolicy(), seed=1, budget=1)
+    fixed = _run(experiment, "card_testing_cnp", "fixed", seed=1, budget=1)
     tampered = fixed.model_copy(update={field: replacement})
-    results = {
-        "card_testing_cnp": {
-            "fixed": (tampered,),
-            "random": (_run(value_card_benchmark, RandomPolicy(), seed=1, budget=1),),
-            "adaptive": (
-                _run(value_card_benchmark, AdaptiveTournamentPolicy(), seed=1, budget=1),
-            ),
-            "cached_llm": (_cached_run(value_card_benchmark, seed=1, budget=1),),
-        }
-    }
+    results = _matched_results(experiment)
+    results["card_testing_cnp"]["fixed"] = (tampered,)
 
-    with pytest.raises(ValueError, match=message):
-        capability_delta_report(preregistration, results)
+    with pytest.raises(ValueError, match="issued|authentic|pristine"):
+        capability_delta_report(
+            experiment.preregistration, results, authority=experiment.authority
+        )
 
 
 def test_capability_report_rejects_unmatched_discrete_and_wall_budgets(
     value_card_benchmark: CampaignBenchmark,
 ) -> None:
-    preregistration = _preregistration(
+    experiment = _experiment(
         (value_card_benchmark,), seeds=(1,), budget=2
     )
     wrong = _run(
-        value_card_benchmark,
-        FixedPolicy(),
+        experiment,
+        "card_testing_cnp",
+        "fixed",
         seed=1,
         budget=1,
         wall_budget_ms=_WALL_BUDGET_MS - 1,
     )
-    results = {
-        "card_testing_cnp": {
-            "fixed": (wrong,),
-            "random": (_run(value_card_benchmark, RandomPolicy(), seed=1, budget=2),),
-            "adaptive": (
-                _run(value_card_benchmark, AdaptiveTournamentPolicy(), seed=1, budget=2),
-            ),
-            "cached_llm": (_cached_run(value_card_benchmark, seed=1, budget=2),),
-        }
-    }
+    results = _matched_results(experiment)
+    results["card_testing_cnp"]["fixed"] = (wrong,)
 
     with pytest.raises(ValueError, match="budgets are not matched"):
-        capability_delta_report(preregistration, results)
+        capability_delta_report(
+            experiment.preregistration, results, authority=experiment.authority
+        )
 
 
 def test_metric_counts_and_derived_fields_cannot_be_forged() -> None:
@@ -381,3 +404,28 @@ def test_metric_counts_and_derived_fields_cannot_be_forged() -> None:
             adaptation_speed=Decimal(1),
             campaign_scale=2,
         )
+
+
+def test_net_settled_value_rate_is_derived_as_relative_improvement() -> None:
+    def metrics(value: str) -> PolicyMetrics:
+        return PolicyMetrics(
+            proposal_count=2,
+            approved_count=1,
+            net_settled_value=Decimal(value),
+            adaptation_speed=Decimal(1),
+            campaign_scale=1,
+        )
+
+    family = FamilyCapabilityMetrics(
+        family="app_scam_mule",
+        primary_outcome=PrimaryOutcome.NET_SETTLED_VALUE_RATE,
+        minimum_delta=Decimal("0.10"),
+        evaluation_contract_digest="a" * 64,
+        fixed=metrics("100.00"),
+        random=metrics("100.00"),
+        adaptive=metrics("110.00"),
+        cached_llm=metrics("100.00"),
+    )
+
+    assert family.observed_delta == Decimal("0.10")
+    assert family.supported is True

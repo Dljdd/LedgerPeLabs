@@ -1,0 +1,715 @@
+{
+  "budget": 16,
+  "development_seed": 4,
+  "record_counts": {
+    "app_scam_mule": 16,
+    "card_testing_cnp": 16
+  },
+  "records": {
+    "10d3c1643c4ced9e5aadb4c0ff2cb767e66c0780e7ed0c4164839715e13e6a4f": {
+      "model_id": "cached-default-v1",
+      "policy_version": "1.0.0",
+      "provider": "fixture",
+      "response_digest": "b4b52857d90b4c63b97050bce61cf867ffd6c2f78d63856d4dc4c4294ae8db2d",
+      "schema_digest": "1f58a78c0e695d919702312e06074cb43d3fadbae3e337221bf14c032618cdbc",
+      "transport": {
+        "input_tokens": 1,
+        "latency_ms": 1,
+        "output": {
+          "generation": 1,
+          "params": {
+            "cash_out_delay_seconds": 300,
+            "cash_out_fraction": "0.30",
+            "cash_out_strategy": "staged",
+            "mule_fanout": 2,
+            "recovery_probability": "0.25"
+          },
+          "parent_id": "a43d754089386218cb4e3c4c6cb0258e1821a501ce36ed776e29505aefa8b655"
+        },
+        "output_tokens": 1
+      }
+    },
+    "130824797bcc66f71aaa6a4c9aa09d62d13339efc13791faea565b406eeddd5e": {
+      "model_id": "cached-default-v1",
+      "policy_version": "1.0.0",
+      "provider": "fixture",
+      "response_digest": "8360feadba2cfd7af83c2d156fd9bd5f1844658e1f22f31849050dba25a89bbf",
+      "schema_digest": "1f58a78c0e695d919702312e06074cb43d3fadbae3e337221bf14c032618cdbc",
+      "transport": {
+        "input_tokens": 1,
+        "latency_ms": 1,
+        "output": {
+          "generation": 0,
+          "params": {
+            "cash_out_delay_seconds": 300,
+            "cash_out_fraction": "0.30",
+            "cash_out_strategy": "staged",
+            "mule_fanout": 2,
+            "recovery_probability": "0.25"
+          },
+          "parent_id": null
+        },
+        "output_tokens": 1
+      }
+    },
+    "1a2b021d5bbe2e48e4247d9c8aa9e76e7ccbe48d4e2137df8244e1540ecab616": {
+      "model_id": "cached-default-v1",
+      "policy_version": "1.0.0",
+      "provider": "fixture",
+      "response_digest": "f90f3b4b2f7269ade6b1c081fa80112a961b518da73f5f2e1d15b73d9d7e44c7",
+      "schema_digest": "1f58a78c0e695d919702312e06074cb43d3fadbae3e337221bf14c032618cdbc",
+      "transport": {
+        "input_tokens": 1,
+        "latency_ms": 1,
+        "output": {
+          "generation": 15,
+          "params": {
+            "cash_out_delay_seconds": 300,
+            "cash_out_fraction": "0.30",
+            "cash_out_strategy": "staged",
+            "mule_fanout": 2,
+            "recovery_probability": "0.25"
+          },
+          "parent_id": "c45b9387b7c566f98405d19c52a0757e7f6d3de3f8d4d75ab90029fd42c9223d"
+        },
+        "output_tokens": 1
+      }
+    },
+    "1bc5c1cdbaffdfc8ef78909e14bb1cc0fbc33e117e9f4220335b4e93eb4b5ddd": {
+      "model_id": "cached-default-v1",
+      "policy_version": "1.0.0",
+      "provider": "fixture",
+      "response_digest": "5f8b8e8bdf77af4559988a010230593a24ce935dc118367753fc316156941190",
+      "schema_digest": "1f58a78c0e695d919702312e06074cb43d3fadbae3e337221bf14c032618cdbc",
+      "transport": {
+        "input_tokens": 1,
+        "latency_ms": 1,
+        "output": {
+          "generation": 12,
+          "params": {
+            "cash_out_delay_seconds": 300,
+            "cash_out_fraction": "0.30",
+            "cash_out_strategy": "staged",
+            "mule_fanout": 2,
+            "recovery_probability": "0.25"
+          },
+          "parent_id": "eaad29f28a6eba195e7622cf234029be011b0b355680a3ddb0b60e52ef29d097"
+        },
+        "output_tokens": 1
+      }
+    },
+    "29aa6302fcb8ee65610c7a73f82073a401150c71838f4d4a8e7e5f63ed1cfd6b": {
+      "model_id": "cached-default-v1",
+      "policy_version": "1.0.0",
+      "provider": "fixture",
+      "response_digest": "9e85a082c2a5145f5af321ecd9ee0f14970e3ab58a5d3adc7ce16b990787c90b",
+      "schema_digest": "b4db8584e407ca3e0f450906c63d5d9898f4cbf04fcf9c9ac87891eb1197fa2f",
+      "transport": {
+        "input_tokens": 1,
+        "latency_ms": 1,
+        "output": {
+          "generation": 10,
+          "params": {
+            "device_reuse_rate": "0.60",
+            "merchant_concentration": "0.70",
+            "retry_intensity": 2
+          },
+          "parent_id": "4c14dcd700494b18ea23ce180bc2b4cf10e5ba151030166cbcdd4e815db49607"
+        },
+        "output_tokens": 1
+      }
+    },
+    "2e893b31361739524e00541722927290f847e9ce73cfc300fd769943663d9b5a": {
+      "model_id": "cached-default-v1",
+      "policy_version": "1.0.0",
+      "provider": "fixture",
+      "response_digest": "b0a315843c8d899b7b9679d45b7361bd97d05d93f010a979a435c2c5c32d6bc7",
+      "schema_digest": "b4db8584e407ca3e0f450906c63d5d9898f4cbf04fcf9c9ac87891eb1197fa2f",
+      "transport": {
+        "input_tokens": 1,
+        "latency_ms": 1,
+        "output": {
+          "generation": 15,
+          "params": {
+            "device_reuse_rate": "0.60",
+            "merchant_concentration": "0.70",
+            "retry_intensity": 2
+          },
+          "parent_id": "f592f4bd749354d178dc0e7db869c42009915576ca57232277643aa8719acdac"
+        },
+        "output_tokens": 1
+      }
+    },
+    "3baaae97ddbce6bd7f06ce0071362736371acc7a1b001c812fb03d4a7cf57e84": {
+      "model_id": "cached-default-v1",
+      "policy_version": "1.0.0",
+      "provider": "fixture",
+      "response_digest": "3c96dfc96c7378033953eb876682e7b6b8f55c776a983a221ff8485460b2b5cd",
+      "schema_digest": "b4db8584e407ca3e0f450906c63d5d9898f4cbf04fcf9c9ac87891eb1197fa2f",
+      "transport": {
+        "input_tokens": 1,
+        "latency_ms": 1,
+        "output": {
+          "generation": 8,
+          "params": {
+            "device_reuse_rate": "0.60",
+            "merchant_concentration": "0.70",
+            "retry_intensity": 2
+          },
+          "parent_id": "c76b3a3c5c0204fdba91c8701fc3b08c8d2058b0e9873c5048845746bb11ddbd"
+        },
+        "output_tokens": 1
+      }
+    },
+    "435f1e315944ede09ba7a9eaf3e4d5c3a911a62ce85f82afa47a0a4d97c5569b": {
+      "model_id": "cached-default-v1",
+      "policy_version": "1.0.0",
+      "provider": "fixture",
+      "response_digest": "7983ae9ca49a1df14a31f5fb8368f2a9dcc0586897391f87c9950ae3b3930b87",
+      "schema_digest": "1f58a78c0e695d919702312e06074cb43d3fadbae3e337221bf14c032618cdbc",
+      "transport": {
+        "input_tokens": 1,
+        "latency_ms": 1,
+        "output": {
+          "generation": 9,
+          "params": {
+            "cash_out_delay_seconds": 300,
+            "cash_out_fraction": "0.30",
+            "cash_out_strategy": "staged",
+            "mule_fanout": 2,
+            "recovery_probability": "0.25"
+          },
+          "parent_id": "5934a2618213cc2ae028c45e74c2b3d7d188c7e14742ecd849952b0ac05b147c"
+        },
+        "output_tokens": 1
+      }
+    },
+    "45cc5b55a67f97b166c91725045a511878632d9b0bb6959eff7dc0814170174f": {
+      "model_id": "cached-default-v1",
+      "policy_version": "1.0.0",
+      "provider": "fixture",
+      "response_digest": "e071cd2b6d5218ac2111c0354e82c73c584fcd071fabe72d67b02183e09c41bc",
+      "schema_digest": "b4db8584e407ca3e0f450906c63d5d9898f4cbf04fcf9c9ac87891eb1197fa2f",
+      "transport": {
+        "input_tokens": 1,
+        "latency_ms": 1,
+        "output": {
+          "generation": 1,
+          "params": {
+            "device_reuse_rate": "0.60",
+            "merchant_concentration": "0.70",
+            "retry_intensity": 2
+          },
+          "parent_id": "8b627802b432e508e18252fa81f082bef508f8788bf6987b79700ac123392985"
+        },
+        "output_tokens": 1
+      }
+    },
+    "5393d1ddaaab0e7b326528604ee1c9f2863c4b62c02d6f3c3b67f96adfc4b5b3": {
+      "model_id": "cached-default-v1",
+      "policy_version": "1.0.0",
+      "provider": "fixture",
+      "response_digest": "3df0971ed39f8d54956b282b596124a0244a60838b66e61547287b87ed89ad98",
+      "schema_digest": "1f58a78c0e695d919702312e06074cb43d3fadbae3e337221bf14c032618cdbc",
+      "transport": {
+        "input_tokens": 1,
+        "latency_ms": 1,
+        "output": {
+          "generation": 6,
+          "params": {
+            "cash_out_delay_seconds": 300,
+            "cash_out_fraction": "0.30",
+            "cash_out_strategy": "staged",
+            "mule_fanout": 2,
+            "recovery_probability": "0.25"
+          },
+          "parent_id": "b15026f4d52204d57a32a68028b429129ebdfe2644dcab6440deb54cc73cf0fc"
+        },
+        "output_tokens": 1
+      }
+    },
+    "55ee4f56b9d96680f607770d8c4a398ffc4ae7fe6406ca985238d012cd0ff5c7": {
+      "model_id": "cached-default-v1",
+      "policy_version": "1.0.0",
+      "provider": "fixture",
+      "response_digest": "7f04df712c1e8ca050aecfdf76f2d5e5cf04f407b26df0f55b13fb419897eda8",
+      "schema_digest": "b4db8584e407ca3e0f450906c63d5d9898f4cbf04fcf9c9ac87891eb1197fa2f",
+      "transport": {
+        "input_tokens": 1,
+        "latency_ms": 1,
+        "output": {
+          "generation": 7,
+          "params": {
+            "device_reuse_rate": "0.60",
+            "merchant_concentration": "0.70",
+            "retry_intensity": 2
+          },
+          "parent_id": "ba042e468827cebdcbcda8aeb8afe7493b64c643ecb5a78432ab92e0013fd5ad"
+        },
+        "output_tokens": 1
+      }
+    },
+    "5cdf578a675e27b840b3500affb6c78c15cd233ec165cddde08d8f8ac57f453f": {
+      "model_id": "cached-default-v1",
+      "policy_version": "1.0.0",
+      "provider": "fixture",
+      "response_digest": "bfa7426219ae9cf9b1ac033e88a0ec1022c761f5e07e86d67f9109f1f9131290",
+      "schema_digest": "b4db8584e407ca3e0f450906c63d5d9898f4cbf04fcf9c9ac87891eb1197fa2f",
+      "transport": {
+        "input_tokens": 1,
+        "latency_ms": 1,
+        "output": {
+          "generation": 11,
+          "params": {
+            "device_reuse_rate": "0.60",
+            "merchant_concentration": "0.70",
+            "retry_intensity": 2
+          },
+          "parent_id": "6bf4b0fb11a371d20d16816ffe25d349f865c66d4050dbb55bac70eb36c9bb0d"
+        },
+        "output_tokens": 1
+      }
+    },
+    "628b6e37aed209801ee5edc181106dcf42c1aa6be23599c1861ebb15c03f9008": {
+      "model_id": "cached-default-v1",
+      "policy_version": "1.0.0",
+      "provider": "fixture",
+      "response_digest": "4b5fb897fe784d72cb4ab4b14937803d00cf6f9c8d179e38f9dbc1888e73c43d",
+      "schema_digest": "b4db8584e407ca3e0f450906c63d5d9898f4cbf04fcf9c9ac87891eb1197fa2f",
+      "transport": {
+        "input_tokens": 1,
+        "latency_ms": 1,
+        "output": {
+          "generation": 0,
+          "params": {
+            "device_reuse_rate": "0.60",
+            "merchant_concentration": "0.70",
+            "retry_intensity": 2
+          },
+          "parent_id": null
+        },
+        "output_tokens": 1
+      }
+    },
+    "6f0fa8b9dd14e4be0c0c08e438ce8ca9aa4f015350427efb59dc61380838407d": {
+      "model_id": "cached-default-v1",
+      "policy_version": "1.0.0",
+      "provider": "fixture",
+      "response_digest": "8541dda69336a3cc76b7d81b3bce4066a5eabda3e769fc771154d3e5f5d9c1c1",
+      "schema_digest": "b4db8584e407ca3e0f450906c63d5d9898f4cbf04fcf9c9ac87891eb1197fa2f",
+      "transport": {
+        "input_tokens": 1,
+        "latency_ms": 1,
+        "output": {
+          "generation": 2,
+          "params": {
+            "device_reuse_rate": "0.60",
+            "merchant_concentration": "0.70",
+            "retry_intensity": 2
+          },
+          "parent_id": "d0a980d06ecef339f88e192b88295719d1bcd48d88d8bc2ac018b8c0bf6fe857"
+        },
+        "output_tokens": 1
+      }
+    },
+    "748a6be3fcefd0d1e317820fa5d723e42af15a31987fe33b3554b173fc02a7a4": {
+      "model_id": "cached-default-v1",
+      "policy_version": "1.0.0",
+      "provider": "fixture",
+      "response_digest": "56323dbac93d353e066364facda99c2700d035058377ed5139ac336a28aed3bc",
+      "schema_digest": "b4db8584e407ca3e0f450906c63d5d9898f4cbf04fcf9c9ac87891eb1197fa2f",
+      "transport": {
+        "input_tokens": 1,
+        "latency_ms": 1,
+        "output": {
+          "generation": 9,
+          "params": {
+            "device_reuse_rate": "0.60",
+            "merchant_concentration": "0.70",
+            "retry_intensity": 2
+          },
+          "parent_id": "0840ffa3bf52ef12d5c64d5b387039f2afafe13dfb884e958188d57819ef5352"
+        },
+        "output_tokens": 1
+      }
+    },
+    "8f36768187b5e6d5a5b042ae73a79d0f9dbd1146212d479768f93216806cd845": {
+      "model_id": "cached-default-v1",
+      "policy_version": "1.0.0",
+      "provider": "fixture",
+      "response_digest": "c09723ecf0e0a21e07ee41b5f9afe4770abaf14907926d597a7e6c6e32e91f7e",
+      "schema_digest": "1f58a78c0e695d919702312e06074cb43d3fadbae3e337221bf14c032618cdbc",
+      "transport": {
+        "input_tokens": 1,
+        "latency_ms": 1,
+        "output": {
+          "generation": 13,
+          "params": {
+            "cash_out_delay_seconds": 300,
+            "cash_out_fraction": "0.30",
+            "cash_out_strategy": "staged",
+            "mule_fanout": 2,
+            "recovery_probability": "0.25"
+          },
+          "parent_id": "447fce7b55a9f2b81a4c9febba8a7a7c8206785dfd199d88daf2a497439a0b34"
+        },
+        "output_tokens": 1
+      }
+    },
+    "9d81b8cc1fccd4aea4654d5c0326c300cc9856a3925e7600dfec3cb5cb9acea2": {
+      "model_id": "cached-default-v1",
+      "policy_version": "1.0.0",
+      "provider": "fixture",
+      "response_digest": "7f90357979d38b4806ba3c4882721b2d419175da7272002364cb0c20f02baf25",
+      "schema_digest": "1f58a78c0e695d919702312e06074cb43d3fadbae3e337221bf14c032618cdbc",
+      "transport": {
+        "input_tokens": 1,
+        "latency_ms": 1,
+        "output": {
+          "generation": 14,
+          "params": {
+            "cash_out_delay_seconds": 300,
+            "cash_out_fraction": "0.30",
+            "cash_out_strategy": "staged",
+            "mule_fanout": 2,
+            "recovery_probability": "0.25"
+          },
+          "parent_id": "0448ea74db52c282b63efd9de98d96b35fa1347eedd83eb29bafb8d411b0ad67"
+        },
+        "output_tokens": 1
+      }
+    },
+    "9e1cef850ba37dc530af339a92d9fb2c0e7c1ae5cdd8d3ac4503ef156154ed34": {
+      "model_id": "cached-default-v1",
+      "policy_version": "1.0.0",
+      "provider": "fixture",
+      "response_digest": "ca39201c34044922c3224c61958483c6b6d699675d133bf96d033c409bef1434",
+      "schema_digest": "b4db8584e407ca3e0f450906c63d5d9898f4cbf04fcf9c9ac87891eb1197fa2f",
+      "transport": {
+        "input_tokens": 1,
+        "latency_ms": 1,
+        "output": {
+          "generation": 4,
+          "params": {
+            "device_reuse_rate": "0.60",
+            "merchant_concentration": "0.70",
+            "retry_intensity": 2
+          },
+          "parent_id": "dc0df7befabd37888c08c8881378b5690e80dcd2dd0c8986c9765f7bd9d6f24e"
+        },
+        "output_tokens": 1
+      }
+    },
+    "a6d82e984df9cceac9b329444c70b0cca0ebabd798ca380a1b572867cf5399ec": {
+      "model_id": "cached-default-v1",
+      "policy_version": "1.0.0",
+      "provider": "fixture",
+      "response_digest": "ebb47b531cb87cd1b443c68a0193ed360b7afa5b4f3e3a507ccfd92df78af2f4",
+      "schema_digest": "1f58a78c0e695d919702312e06074cb43d3fadbae3e337221bf14c032618cdbc",
+      "transport": {
+        "input_tokens": 1,
+        "latency_ms": 1,
+        "output": {
+          "generation": 4,
+          "params": {
+            "cash_out_delay_seconds": 300,
+            "cash_out_fraction": "0.30",
+            "cash_out_strategy": "staged",
+            "mule_fanout": 2,
+            "recovery_probability": "0.25"
+          },
+          "parent_id": "fedc413e45f9743ab351418313ff1c28c5fb34f367458531d3a3637eccece479"
+        },
+        "output_tokens": 1
+      }
+    },
+    "a8284184961d7de6e720ae068ca6fb4e40b592480eb859301e2d0346342ec266": {
+      "model_id": "cached-default-v1",
+      "policy_version": "1.0.0",
+      "provider": "fixture",
+      "response_digest": "a38e863bd75ee31eaf0946a352833934d943ec6512baaa802609eda78d563af3",
+      "schema_digest": "b4db8584e407ca3e0f450906c63d5d9898f4cbf04fcf9c9ac87891eb1197fa2f",
+      "transport": {
+        "input_tokens": 1,
+        "latency_ms": 1,
+        "output": {
+          "generation": 14,
+          "params": {
+            "device_reuse_rate": "0.60",
+            "merchant_concentration": "0.70",
+            "retry_intensity": 2
+          },
+          "parent_id": "dc0231d0b8b047fa5db9bbcb97683c7793fbb2fd26c3030fb493d40d3b568946"
+        },
+        "output_tokens": 1
+      }
+    },
+    "b36d284c58c21eae72d9df48d525a32ac8ab906b3477c61c2b3f57dafceccbdd": {
+      "model_id": "cached-default-v1",
+      "policy_version": "1.0.0",
+      "provider": "fixture",
+      "response_digest": "0a71f1c92d5d2849c6c83e2a93a2301de57bb6cb967fb270b4c5bde99872f4e0",
+      "schema_digest": "b4db8584e407ca3e0f450906c63d5d9898f4cbf04fcf9c9ac87891eb1197fa2f",
+      "transport": {
+        "input_tokens": 1,
+        "latency_ms": 1,
+        "output": {
+          "generation": 12,
+          "params": {
+            "device_reuse_rate": "0.60",
+            "merchant_concentration": "0.70",
+            "retry_intensity": 2
+          },
+          "parent_id": "ac5c366a03f996d1717a36052a017d9ce88e3f29dffbfa89ef52e9a76e98e2cb"
+        },
+        "output_tokens": 1
+      }
+    },
+    "bb861e652bf40e816f4b910592ea673dc559760799ce16022027b078021acd82": {
+      "model_id": "cached-default-v1",
+      "policy_version": "1.0.0",
+      "provider": "fixture",
+      "response_digest": "9630b1bf3efa23a7fb29cd1eba567db83d1e2b954156f27895b5d4387ba4fb49",
+      "schema_digest": "b4db8584e407ca3e0f450906c63d5d9898f4cbf04fcf9c9ac87891eb1197fa2f",
+      "transport": {
+        "input_tokens": 1,
+        "latency_ms": 1,
+        "output": {
+          "generation": 6,
+          "params": {
+            "device_reuse_rate": "0.60",
+            "merchant_concentration": "0.70",
+            "retry_intensity": 2
+          },
+          "parent_id": "7b46c95607b0035bfcc40b145ace6a4e411701a20fed55ca1ef462a4fa93442f"
+        },
+        "output_tokens": 1
+      }
+    },
+    "c7024c3df1d6f4ac8f56ea7247a3f3134173922e94d9147226803f24afb4a07f": {
+      "model_id": "cached-default-v1",
+      "policy_version": "1.0.0",
+      "provider": "fixture",
+      "response_digest": "5449a7535834657a5d30e2cf328f250512d97609840fd6ffdab6ae7da324c8ee",
+      "schema_digest": "b4db8584e407ca3e0f450906c63d5d9898f4cbf04fcf9c9ac87891eb1197fa2f",
+      "transport": {
+        "input_tokens": 1,
+        "latency_ms": 1,
+        "output": {
+          "generation": 5,
+          "params": {
+            "device_reuse_rate": "0.60",
+            "merchant_concentration": "0.70",
+            "retry_intensity": 2
+          },
+          "parent_id": "69da4321fc669d6e4575440c8388e933c8881a2ee58d35af068aa983ac8a7a7d"
+        },
+        "output_tokens": 1
+      }
+    },
+    "c706cd5c1e764621f94f2e4d6b2f613edea6af9ff546edf3b2a102b808690e06": {
+      "model_id": "cached-default-v1",
+      "policy_version": "1.0.0",
+      "provider": "fixture",
+      "response_digest": "e566d8d722a38c0b25bcb5857f8061fd84c18135922541a41a01b13ad5cb0afb",
+      "schema_digest": "b4db8584e407ca3e0f450906c63d5d9898f4cbf04fcf9c9ac87891eb1197fa2f",
+      "transport": {
+        "input_tokens": 1,
+        "latency_ms": 1,
+        "output": {
+          "generation": 3,
+          "params": {
+            "device_reuse_rate": "0.60",
+            "merchant_concentration": "0.70",
+            "retry_intensity": 2
+          },
+          "parent_id": "2708d0b95057debabfc13ff966cf568deb0275aa36de12b3ab0b0736b036ea7e"
+        },
+        "output_tokens": 1
+      }
+    },
+    "cb9c096422fa70fe77d7fe1165652bb4a26165a11bca1c78034de0aa1c3b965d": {
+      "model_id": "cached-default-v1",
+      "policy_version": "1.0.0",
+      "provider": "fixture",
+      "response_digest": "12a8e4fc08a05d302ad88ccc135ec769eac872bd1fdb608b0c8ccb4700afb238",
+      "schema_digest": "1f58a78c0e695d919702312e06074cb43d3fadbae3e337221bf14c032618cdbc",
+      "transport": {
+        "input_tokens": 1,
+        "latency_ms": 1,
+        "output": {
+          "generation": 2,
+          "params": {
+            "cash_out_delay_seconds": 300,
+            "cash_out_fraction": "0.30",
+            "cash_out_strategy": "staged",
+            "mule_fanout": 2,
+            "recovery_probability": "0.25"
+          },
+          "parent_id": "2377539978315c181cfcaa6f2c3e79fd978aad4772ca3bb3d24028ca969cd179"
+        },
+        "output_tokens": 1
+      }
+    },
+    "d177dcab1db33f12aeb7814678b4931e717eb4b69c562e1b5240eeaff604b119": {
+      "model_id": "cached-default-v1",
+      "policy_version": "1.0.0",
+      "provider": "fixture",
+      "response_digest": "1b56659b1b46a366052cbd1ea7ea0f5fefbb7629513bf16e9105ad68856ff09d",
+      "schema_digest": "1f58a78c0e695d919702312e06074cb43d3fadbae3e337221bf14c032618cdbc",
+      "transport": {
+        "input_tokens": 1,
+        "latency_ms": 1,
+        "output": {
+          "generation": 8,
+          "params": {
+            "cash_out_delay_seconds": 300,
+            "cash_out_fraction": "0.30",
+            "cash_out_strategy": "staged",
+            "mule_fanout": 2,
+            "recovery_probability": "0.25"
+          },
+          "parent_id": "231222db389e5a34430e6be6c9c4dd6dbe8078aa0684578a0dad84968346d336"
+        },
+        "output_tokens": 1
+      }
+    },
+    "d1c956a9818f7344124b5f68ef98f097d31c0cbe9f9e6e66957d215437651b1b": {
+      "model_id": "cached-default-v1",
+      "policy_version": "1.0.0",
+      "provider": "fixture",
+      "response_digest": "4994f505804452b8ff6f7a382250b38763252a2cf37ec1335df0ac618bb7bb97",
+      "schema_digest": "1f58a78c0e695d919702312e06074cb43d3fadbae3e337221bf14c032618cdbc",
+      "transport": {
+        "input_tokens": 1,
+        "latency_ms": 1,
+        "output": {
+          "generation": 11,
+          "params": {
+            "cash_out_delay_seconds": 300,
+            "cash_out_fraction": "0.30",
+            "cash_out_strategy": "staged",
+            "mule_fanout": 2,
+            "recovery_probability": "0.25"
+          },
+          "parent_id": "71c4997287cd7d80a9ddd38155b97f8e4146ae1117a19965aa95157472cadac2"
+        },
+        "output_tokens": 1
+      }
+    },
+    "da77c7097287d39608da12aa47156f7e15901d6cd897ce577ad0383b77a03fe9": {
+      "model_id": "cached-default-v1",
+      "policy_version": "1.0.0",
+      "provider": "fixture",
+      "response_digest": "99ffe3369890197ac4682777e9dd98f1cf9a117e7cbacea0e0cf33b659d60449",
+      "schema_digest": "b4db8584e407ca3e0f450906c63d5d9898f4cbf04fcf9c9ac87891eb1197fa2f",
+      "transport": {
+        "input_tokens": 1,
+        "latency_ms": 1,
+        "output": {
+          "generation": 13,
+          "params": {
+            "device_reuse_rate": "0.60",
+            "merchant_concentration": "0.70",
+            "retry_intensity": 2
+          },
+          "parent_id": "183f76096f01d1edea0ed1106aff0b9ac8dc6b3ae8eb5f7e58d6811a24be9225"
+        },
+        "output_tokens": 1
+      }
+    },
+    "ddfdd90187094dafc1f9cabfcbca69d3b8573dee3f812d71a760d1071851cd9a": {
+      "model_id": "cached-default-v1",
+      "policy_version": "1.0.0",
+      "provider": "fixture",
+      "response_digest": "070106f867134e39033be3627e0dcfad80f776543856a37fd00eb9cd0ed36f6d",
+      "schema_digest": "1f58a78c0e695d919702312e06074cb43d3fadbae3e337221bf14c032618cdbc",
+      "transport": {
+        "input_tokens": 1,
+        "latency_ms": 1,
+        "output": {
+          "generation": 10,
+          "params": {
+            "cash_out_delay_seconds": 300,
+            "cash_out_fraction": "0.30",
+            "cash_out_strategy": "staged",
+            "mule_fanout": 2,
+            "recovery_probability": "0.25"
+          },
+          "parent_id": "75468d7a09cf09d30775e0380ab9b69386d69c4a15518b7b6262a381c6290254"
+        },
+        "output_tokens": 1
+      }
+    },
+    "dedab6ecfa66d5a4cd024912fb0b1c040d6e6e37a575df3f33bc9ff60b5f9b71": {
+      "model_id": "cached-default-v1",
+      "policy_version": "1.0.0",
+      "provider": "fixture",
+      "response_digest": "e2e41fd370acb98c40e242c48245c71c76b3fe922cd15ad7c73ade25a14c3f62",
+      "schema_digest": "1f58a78c0e695d919702312e06074cb43d3fadbae3e337221bf14c032618cdbc",
+      "transport": {
+        "input_tokens": 1,
+        "latency_ms": 1,
+        "output": {
+          "generation": 5,
+          "params": {
+            "cash_out_delay_seconds": 300,
+            "cash_out_fraction": "0.30",
+            "cash_out_strategy": "staged",
+            "mule_fanout": 2,
+            "recovery_probability": "0.25"
+          },
+          "parent_id": "3f1435df051a189b6eb666971f902019e8cc21ce6b5d2cda59a70152d9bc7d3f"
+        },
+        "output_tokens": 1
+      }
+    },
+    "e0f84a3d9d54e00e7bd5b0033e4d39f8e21de3ad9a7fc7deb08cf918236271e5": {
+      "model_id": "cached-default-v1",
+      "policy_version": "1.0.0",
+      "provider": "fixture",
+      "response_digest": "197561bf275e1f4f8d958ba8f2ba6f0ec07aea452f10a70fdb5f2909084431db",
+      "schema_digest": "1f58a78c0e695d919702312e06074cb43d3fadbae3e337221bf14c032618cdbc",
+      "transport": {
+        "input_tokens": 1,
+        "latency_ms": 1,
+        "output": {
+          "generation": 3,
+          "params": {
+            "cash_out_delay_seconds": 300,
+            "cash_out_fraction": "0.30",
+            "cash_out_strategy": "staged",
+            "mule_fanout": 2,
+            "recovery_probability": "0.25"
+          },
+          "parent_id": "623c3129b8544b570ba83f544311235ab2520289be485288589605cfa2656834"
+        },
+        "output_tokens": 1
+      }
+    },
+    "fbd96708491d8eab695932f0c63cd07447a5501fe944c39159c4254d822cc17d": {
+      "model_id": "cached-default-v1",
+      "policy_version": "1.0.0",
+      "provider": "fixture",
+      "response_digest": "1e5d81babaf1b1d49d05b9fd059f587a02328bcc772b3f8708469413d29d0eae",
+      "schema_digest": "1f58a78c0e695d919702312e06074cb43d3fadbae3e337221bf14c032618cdbc",
+      "transport": {
+        "input_tokens": 1,
+        "latency_ms": 1,
+        "output": {
+          "generation": 7,
+          "params": {
+            "cash_out_delay_seconds": 300,
+            "cash_out_fraction": "0.30",
+            "cash_out_strategy": "staged",
+            "mule_fanout": 2,
+            "recovery_probability": "0.25"
+          },
+          "parent_id": "b1946b7fd0578b5a1e56ab6023f42787989c0262e29e5b6c51fdb3a178c795f3"
+        },
+        "output_tokens": 1
+      }
+    }
+  },
+  "schema_version": "1.0.0"
+}

@@ -17,6 +17,7 @@ from apar.redteam import (
     Feedback,
     FixedPolicy,
     RandomPolicy,
+    SearchAuthority,
 )
 from apar.redteam.benchmark import CampaignBenchmark
 from tests.redteam.conftest import campaign_benchmark
@@ -27,13 +28,59 @@ class StaticClock:
         return 0
 
 
-def _search(policy, benchmark: CampaignBenchmark) -> AdaptiveSearch:  # type: ignore[no-untyped-def]
-    return AdaptiveSearch(
-        policy=policy,
-        bounds=benchmark.public_bounds,
-        evaluation_contract=benchmark.evaluation_contract,
-        clock_ns=StaticClock(),
-    )
+class _EvaluatorOwner:
+    def __init__(self, callback) -> None:  # type: ignore[no-untyped-def]
+        self.callback = callback
+
+    def evaluate(self, candidate: AttackCandidate) -> Feedback:
+        return self.callback(candidate)  # type: ignore[no-any-return]
+
+
+class _IssuedSearch:
+    def __init__(self, policy, benchmark: CampaignBenchmark) -> None:  # type: ignore[no-untyped-def]
+        self.policy = policy
+        self.benchmark = benchmark
+
+    def search(
+        self,
+        *,
+        seed: int,
+        budget: int,
+        wall_time_budget_ms: int,
+        evaluate=None,  # type: ignore[no-untyped-def]
+    ):  # type: ignore[no-untyped-def]
+        authority = SearchAuthority()
+        if evaluate is None or evaluate == self.benchmark.evaluate:
+            evaluator = self.benchmark.issue_evaluator_capability(authority)
+        else:
+            owner = _EvaluatorOwner(evaluate)
+            evaluator = authority.register_evaluator(
+                owner=owner,
+                bounds=self.benchmark.public_bounds,
+                evaluation_contract=self.benchmark.evaluation_contract,
+                evaluate=owner.evaluate,
+                dependency_digest="8" * 64,
+            )
+        policy = authority.register_policy(
+            self.policy,
+            name=self.policy.policy_name,
+            version=self.policy.policy_version,
+        )
+        group = authority.issue_run_group("search-test")
+        return AdaptiveSearch(
+            evaluator_capability=evaluator,
+            policy_capability=policy,
+            run_group=group,
+            clock_ns=StaticClock(),
+        ).search(
+            seed=seed,
+            budget=budget,
+            wall_time_budget_ms=wall_time_budget_ms,
+        )
+
+
+def _search(policy, benchmark: CampaignBenchmark) -> _IssuedSearch:  # type: ignore[no-untyped-def]
+    return _IssuedSearch(policy, benchmark)
 
 
 @pytest.mark.parametrize("budget", [0, 1, 12])
@@ -252,7 +299,9 @@ def test_search_is_reproducible_and_global_rng_is_unchanged(
         evaluate=evaluate,
     )
     after = np.random.get_state()
-    assert first == second
+    assert first.proposals == second.proposals
+    assert first.trials == second.trials
+    assert first.objective_values == second.objective_values
     assert all(
         (left == right).all() if hasattr(left, "all") else left == right
         for left, right in zip(state, after, strict=True)

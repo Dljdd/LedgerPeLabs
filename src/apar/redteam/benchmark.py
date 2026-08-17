@@ -8,11 +8,13 @@ fixtures, and simulator audit artifacts.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import itertools
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from decimal import ROUND_HALF_EVEN, Decimal, localcontext
+from pathlib import Path
 from types import MappingProxyType
 from typing import cast
 
@@ -44,7 +46,12 @@ from apar.redteam.policies import (
     ParameterDomain,
     reconstruct_candidate,
 )
-from apar.redteam.search import DisclosureProfile, EvaluationContract
+from apar.redteam.search import (
+    DisclosureProfile,
+    EvaluationContract,
+    EvaluatorCapability,
+    SearchAuthority,
+)
 from apar.simulator.clock import Command
 from apar.simulator.engine import SimulationEngine
 from apar.simulator.ledger import AccountReference, LedgerEntry
@@ -92,6 +99,36 @@ def _digest(document: object) -> str:
 
 def _money(value: Decimal) -> Decimal:
     return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN)
+
+
+def _evaluator_dependency_digest() -> str:
+    """Hash the exact evaluator, Task 5, replay, rail, ledger, and trust modules."""
+    paths: set[Path] = set()
+    for implementation in (
+        _CampaignEvaluator,
+        SimulationEngine,
+        LedgerEntry,
+        A2ARailAdapter,
+        AgenticRailAdapter,
+        CardRailAdapter,
+        TrustVerifier,
+        _fresh_replay,
+    ):
+        source = inspect.getsourcefile(implementation)
+        if source is None:
+            raise RuntimeError("evaluator dependency has no inspectable source")
+        paths.add(Path(source).resolve())
+    return _digest(
+        {
+            "modules": [
+                {
+                    "path": path.name,
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                }
+                for path in sorted(paths)
+            ]
+        }
+    )
 
 
 def _campaign_document(params: CampaignParams) -> dict[str, object]:
@@ -576,11 +613,17 @@ def _observable_features(
     )
 
 
-def _role_bound_value(
+def role_bound_settled_value(
     events: tuple[PaymentEvent, ...],
-    population: Population,
+    illicit_entity_ids: frozenset[str],
 ) -> Decimal:
-    illicit_entities = {entity.entity_id for entity in population.entities if entity.illicit}
+    """Return outstanding illicit principal, subtracting each principal at most once."""
+    if type(events) is not tuple or any(type(event) is not PaymentEvent for event in events):
+        raise TypeError("events must be an exact tuple of PaymentEvent records")
+    if type(illicit_entity_ids) is not frozenset or any(
+        type(entity_id) is not str for entity_id in illicit_entity_ids
+    ):
+        raise TypeError("illicit_entity_ids must be an exact frozenset of strings")
     positive = {EventKind.SETTLEMENT, EventKind.TRANSFER_POSTED}
     negative = {
         EventKind.RECOVERY,
@@ -588,15 +631,19 @@ def _role_bound_value(
         EventKind.TRANSFER_RETURNED,
         EventKind.REFUND,
     }
-    value = Decimal(0)
+    outstanding: dict[str, Decimal] = {}
     for event in events:
-        if not {event.actor_id, event.counterparty_id} & illicit_entities:
+        if not {event.actor_id, event.counterparty_id} & illicit_entity_ids:
             continue
+        raw_payment_id = event.rail_data.get("payment_id", event.trace_id)
+        if type(raw_payment_id) is not str:
+            raise ValueError("payment lifecycle identity must be an exact string")
+        current = outstanding.get(raw_payment_id, Decimal(0))
         if event.event_type in positive:
-            value += event.amount
+            outstanding[raw_payment_id] = current + event.amount
         elif event.event_type in negative:
-            value -= event.amount
-    return _money(max(value, Decimal(0)))
+            outstanding[raw_payment_id] = max(Decimal(0), current - event.amount)
+    return _money(sum(outstanding.values(), Decimal(0)))
 
 
 class CampaignBenchmark:
@@ -714,7 +761,10 @@ class CampaignBenchmark:
             return feedback, observation
         features = _observable_features(commands, evidence)
         action, reason = self._defender.decide(self._family, features)
-        executed_value = _role_bound_value(events, self._population)
+        illicit_entities = frozenset(
+            entity.entity_id for entity in self._population.entities if entity.illicit
+        )
+        executed_value = role_bound_settled_value(events, illicit_entities)
         realized = executed_value if action is Action.APPROVE else Decimal("0.00")
         feedback = Feedback(
             action=action,
@@ -736,6 +786,20 @@ class CampaignBenchmark:
         feedback, _observation = self.evaluate_with_observation(candidate)
         return feedback
 
+    def issue_evaluator_capability(
+        self,
+        authority: SearchAuthority,
+    ) -> EvaluatorCapability:
+        if type(authority) is not SearchAuthority:
+            raise TypeError("authority must be an exact SearchAuthority")
+        return authority.register_evaluator(
+            owner=self,
+            bounds=self.public_bounds,
+            evaluation_contract=self.evaluation_contract,
+            evaluate=self.evaluate,
+            dependency_digest=_evaluator_dependency_digest(),
+        )
+
 
 __all__ = [
     "BenchmarkConfigurationError",
@@ -744,4 +808,5 @@ __all__ = [
     "DefenderRule",
     "DefenderRuleSet",
     "default_defender_rules",
+    "role_bound_settled_value",
 ]

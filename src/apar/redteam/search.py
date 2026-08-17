@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
+import inspect
 import json
+import marshal
+import secrets
 import time
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from decimal import Decimal, localcontext
 from enum import StrEnum
 from typing import Self
@@ -32,12 +37,6 @@ from apar.redteam.policies import (
 )
 
 _POLICY_NAMES = ("adaptive", "cached_llm", "fixed", "random")
-_POLICY_VERSIONS = {
-    "adaptive": "1.0.0",
-    "cached_llm": "1.0.0",
-    "fixed": "1.0.0",
-    "random": "1.0.0",
-}
 _HEX = frozenset("0123456789abcdef")
 
 
@@ -53,6 +52,46 @@ def _canonical_bytes(document: object) -> bytes:
 
 def _digest(document: object) -> str:
     return hashlib.sha256(_canonical_bytes(document)).hexdigest()
+
+
+def _implementation_digest(owner: object, entrypoint: Callable[..., object]) -> str:
+    """Bind the exact registered type and all Python code reachable on that type."""
+    if not inspect.ismethod(entrypoint) or entrypoint.__self__ is not owner:
+        raise TypeError("registered entrypoint must be an exact bound owner method")
+    records: list[dict[str, str]] = []
+    for implementation_type in reversed(type(owner).__mro__):
+        if implementation_type is object:
+            continue
+        for name, member in sorted(implementation_type.__dict__.items()):
+            functions: tuple[Callable[..., object], ...] = ()
+            if inspect.isfunction(member):
+                functions = (member,)
+            elif isinstance(member, (staticmethod, classmethod)):
+                functions = (member.__func__,)
+            elif isinstance(member, property):
+                functions = tuple(
+                    function
+                    for function in (member.fget, member.fset, member.fdel)
+                    if function is not None
+                )
+            for index, function in enumerate(functions):
+                records.append(
+                    {
+                        "owner": (
+                            f"{implementation_type.__module__}."
+                            f"{implementation_type.__qualname__}"
+                        ),
+                        "member": f"{name}:{index}",
+                        "code": hashlib.sha256(marshal.dumps(function.__code__)).hexdigest(),
+                    }
+                )
+    return _digest(
+        {
+            "registered_type": f"{type(owner).__module__}.{type(owner).__qualname__}",
+            "entrypoint": entrypoint.__func__.__qualname__,
+            "implementation_records": records,
+        }
+    )
 
 
 def _exact_text(label: str, value: object) -> str:
@@ -233,6 +272,43 @@ def reconstruct_evaluation_contract(value: EvaluationContract) -> EvaluationCont
     )
 
 
+@dataclass(frozen=True, slots=True)
+class EvaluatorCapability:
+    """Exact process-local authority for one evaluator implementation and contract."""
+
+    authority_id: str
+    capability_id: str
+    evaluation_contract: EvaluationContract
+    bounds: ParameterBounds
+    evaluator_code_digest: str
+    _authority: SearchAuthority = field(repr=False, compare=False)
+    _owner: object = field(repr=False, compare=False)
+    _evaluate: Callable[[AttackCandidate], Feedback] = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyCapability:
+    """Exact process-local registration of one policy instance, type, and code."""
+
+    authority_id: str
+    capability_id: str
+    name: str
+    version: str
+    policy_code_digest: str
+    _authority: SearchAuthority = field(repr=False, compare=False)
+    _policy: Policy = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class RunGroupCapability:
+    """Process-local comparison group preventing cross-run result mixing."""
+
+    authority_id: str
+    capability_id: str
+    label: str
+    _authority: SearchAuthority = field(repr=False, compare=False)
+
+
 class SearchResult(ExternalContract):
     """Complete result bound to exact policy, environment, disclosure, and budgets."""
 
@@ -252,8 +328,16 @@ class SearchResult(ExternalContract):
     defender_digest: str
     disclosure_profile_digest: str
     evaluation_contract_digest: str
+    authority_id: str
+    evaluator_capability_id: str
+    evaluator_code_digest: str
+    policy_capability_id: str
     policy_name: str
     policy_version: str
+    policy_code_digest: str
+    run_group_id: str
+    result_id: str
+    result_seal: str
     seed: int
     proposals: tuple[AttackCandidate, ...]
     trials: tuple[VisibleTrial, ...]
@@ -284,6 +368,14 @@ class SearchResult(ExternalContract):
         "defender_digest",
         "disclosure_profile_digest",
         "evaluation_contract_digest",
+        "authority_id",
+        "evaluator_capability_id",
+        "evaluator_code_digest",
+        "policy_capability_id",
+        "policy_code_digest",
+        "run_group_id",
+        "result_id",
+        "result_seal",
         mode="before",
     )
     @classmethod
@@ -357,6 +449,10 @@ class SearchResult(ExternalContract):
 
     @model_validator(mode="after")
     def result_is_consistent(self) -> Self:
+        self._assert_consistent()
+        return self
+
+    def _assert_consistent(self) -> None:
         size = len(self.proposals)
         if len(self.trials) != size or len(self.objective_values) != size:
             raise ValueError("proposal, trial, and objective sequences must align")
@@ -380,48 +476,374 @@ class SearchResult(ExternalContract):
         if self.winner is not None and self.winner not in self.proposals:
             raise ValueError("winner must be a proposed candidate")
         reconstruct_history(self.trials)
-        return self
+
+    def canonical_document(self) -> dict[str, object]:
+        """Return every result-visible field except the process-local HMAC itself."""
+        return self.model_dump(mode="json", round_trip=True, exclude={"result_seal"})
+
+    def assert_deep_pristine(self) -> None:
+        if type(self) is not SearchResult:
+            raise CandidateContractError("search result subclasses are forbidden")
+        if self.__pydantic_extra__ or set(self.__dict__) != set(type(self).model_fields):
+            raise CandidateContractError("search result field set is not exact")
+        for candidate in self.proposals:
+            candidate.assert_pristine()
+        for trial in self.trials:
+            trial.assert_pristine()
+        if self.winner is not None:
+            self.winner.assert_pristine()
+        self._assert_consistent()
 
 
-class AdaptiveSearch:
-    """Run a policy without passing or retaining the evaluator callable."""
+class SearchAuthority:
+    """Trusted process-local issuer for executable capabilities and authentic results."""
 
     __slots__ = (
-        "_bounds",
-        "_clock_ns",
-        "_evaluation_contract",
-        "_policy",
-        "_policy_name",
-        "_policy_version",
+        "_authority_id",
+        "_counter",
+        "_evaluators",
+        "_policies",
+        "_preregistrations",
+        "_results",
+        "_run_groups",
+        "_secret",
     )
 
-    def __init__(
+    def __init__(self) -> None:
+        secret = secrets.token_bytes(32)
+        self._secret = secret
+        self._authority_id = hashlib.sha256(b"apar-search-authority-v1" + secret).hexdigest()
+        self._counter = 0
+        self._evaluators: dict[str, EvaluatorCapability] = {}
+        self._policies: dict[str, PolicyCapability] = {}
+        self._run_groups: dict[str, RunGroupCapability] = {}
+        self._results: dict[str, SearchResult] = {}
+        self._preregistrations: dict[str, CapabilityPreregistration] = {}
+
+    @property
+    def authority_id(self) -> str:
+        return self._authority_id
+
+    def _issue_id(self, label: str) -> str:
+        self._counter += 1
+        return hmac.new(
+            self._secret,
+            f"{label}:{self._counter}".encode(),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _seal(self, label: str, document: object) -> str:
+        return hmac.new(
+            self._secret,
+            label.encode() + b":" + _canonical_bytes(document),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def register_evaluator(
         self,
         *,
-        policy: Policy,
+        owner: object,
         bounds: ParameterBounds,
         evaluation_contract: EvaluationContract,
-        clock_ns: Callable[[], int] = time.monotonic_ns,
-    ) -> None:
+        evaluate: Callable[[AttackCandidate], Feedback],
+        dependency_digest: str,
+    ) -> EvaluatorCapability:
         public_bounds = reconstruct_bounds(bounds)
         contract = reconstruct_evaluation_contract(evaluation_contract)
         if contract.family != public_bounds.family:
             raise ValueError("evaluation contract family does not match public bounds")
         if contract.bounds_digest != public_bounds.bounds_digest:
             raise ValueError("evaluation contract does not bind these public bounds")
-        if not callable(getattr(policy, "propose", None)):
-            raise TypeError("policy must expose propose")
-        policy_name = _exact_text("policy_name", getattr(policy, "policy_name", None))
-        policy_version = _exact_text("policy_version", getattr(policy, "policy_version", None))
-        if policy_name not in {*_POLICY_NAMES, "llm"}:
-            raise ValueError("policy_name is undeclared")
+        checked_dependency = _exact_digest("dependency_digest", dependency_digest)
+        code_digest = _digest(
+            {
+                "owner_implementation": _implementation_digest(owner, evaluate),
+                "dependency_digest": checked_dependency,
+            }
+        )
+        capability = EvaluatorCapability(
+            authority_id=self._authority_id,
+            capability_id=self._issue_id("evaluator"),
+            evaluation_contract=contract,
+            bounds=public_bounds,
+            evaluator_code_digest=code_digest,
+            _authority=self,
+            _owner=owner,
+            _evaluate=evaluate,
+        )
+        self._evaluators[capability.capability_id] = capability
+        return capability
+
+    def register_policy(
+        self,
+        policy: Policy,
+        *,
+        name: str,
+        version: str,
+    ) -> PolicyCapability:
+        checked_name = _exact_text("registered policy name", name)
+        checked_version = _exact_text("registered policy version", version)
+        propose = getattr(policy, "propose", None)
+        if not callable(propose):
+            raise TypeError("registered policy must expose propose")
+        capability = PolicyCapability(
+            authority_id=self._authority_id,
+            capability_id=self._issue_id("policy"),
+            name=checked_name,
+            version=checked_version,
+            policy_code_digest=_implementation_digest(policy, propose),
+            _authority=self,
+            _policy=policy,
+        )
+        self._policies[capability.capability_id] = capability
+        return capability
+
+    def issue_run_group(self, label: str) -> RunGroupCapability:
+        capability = RunGroupCapability(
+            authority_id=self._authority_id,
+            capability_id=self._issue_id("run-group"),
+            label=_exact_text("run group label", label),
+            _authority=self,
+        )
+        self._run_groups[capability.capability_id] = capability
+        return capability
+
+    def run_group(self, capability_id: str) -> RunGroupCapability:
+        checked = _exact_digest("run_group_id", capability_id)
+        try:
+            return self._run_groups[checked]
+        except KeyError as error:
+            raise ValueError("run group was not issued by this authority") from error
+
+    def evaluator_capability(self, capability_id: str) -> EvaluatorCapability:
+        checked = _exact_digest("evaluator_capability_id", capability_id)
+        try:
+            return self._evaluators[checked]
+        except KeyError as error:
+            raise ValueError("evaluator capability was not issued by this authority") from error
+
+    def policy_capability(self, capability_id: str) -> PolicyCapability:
+        checked = _exact_digest("policy_capability_id", capability_id)
+        try:
+            return self._policies[checked]
+        except KeyError as error:
+            raise ValueError("policy capability was not issued by this authority") from error
+
+    def _validate_evaluator(self, capability: EvaluatorCapability) -> EvaluatorCapability:
+        if (
+            type(capability) is not EvaluatorCapability
+            or capability._authority is not self
+            or capability.authority_id != self._authority_id
+            or self._evaluators.get(capability.capability_id) is not capability
+        ):
+            raise ValueError("evaluator capability was not issued by this exact authority")
+        return capability
+
+    def _validate_policy(self, capability: PolicyCapability) -> PolicyCapability:
+        if (
+            type(capability) is not PolicyCapability
+            or capability._authority is not self
+            or capability.authority_id != self._authority_id
+            or self._policies.get(capability.capability_id) is not capability
+        ):
+            raise ValueError("policy capability was not issued by this exact authority")
+        return capability
+
+    def _validate_run_group(self, capability: RunGroupCapability) -> RunGroupCapability:
+        if (
+            type(capability) is not RunGroupCapability
+            or capability._authority is not self
+            or capability.authority_id != self._authority_id
+            or self._run_groups.get(capability.capability_id) is not capability
+        ):
+            raise ValueError("run group was not issued by this exact authority")
+        return capability
+
+    def validate_search_capabilities(
+        self,
+        evaluator: EvaluatorCapability,
+        policy: PolicyCapability,
+        run_group: RunGroupCapability,
+    ) -> tuple[EvaluatorCapability, PolicyCapability, RunGroupCapability]:
+        return (
+            self._validate_evaluator(evaluator),
+            self._validate_policy(policy),
+            self._validate_run_group(run_group),
+        )
+
+    def propose(
+        self,
+        capability: PolicyCapability,
+        history: tuple[VisibleTrial, ...],
+        bounds: ParameterBounds,
+        rng: np.random.Generator,
+    ) -> AttackCandidate:
+        checked = self._validate_policy(capability)
+        return checked._policy.propose(history, bounds, rng)
+
+    def evaluate(
+        self,
+        capability: EvaluatorCapability,
+        candidate: AttackCandidate,
+    ) -> Feedback:
+        checked = self._validate_evaluator(capability)
+        return checked._evaluate(candidate)
+
+    def issue_result(self, **values: object) -> SearchResult:
+        result_id = self._issue_id("result")
+        result = SearchResult.model_validate(
+            {
+                **values,
+                "authority_id": self._authority_id,
+                "result_id": result_id,
+                "result_seal": "0" * 64,
+            }
+        )
+        seal = self._seal("search-result-v1", result.canonical_document())
+        object.__setattr__(result, "result_seal", seal)
+        self._results[result_id] = result
+        return result
+
+    def validate_result(self, result: SearchResult) -> SearchResult:
+        if (
+            type(result) is not SearchResult
+            or result.authority_id != self._authority_id
+            or self._results.get(result.result_id) is not result
+        ):
+            raise ValueError("search result was not issued by this exact authority")
+        try:
+            result.assert_deep_pristine()
+            expected = self._seal("search-result-v1", result.canonical_document())
+        except Exception as error:
+            raise ValueError("search result is not deeply pristine") from error
+        if not hmac.compare_digest(result.result_seal, expected):
+            raise ValueError("search result authenticity seal does not match")
+        return result
+
+    def issue_preregistration(
+        self,
+        *,
+        run_group: RunGroupCapability,
+        seeds: tuple[int, ...],
+        budget: int,
+        wall_time_budget_ms: int,
+        thresholds: tuple[FamilyThreshold, ...],
+        policies: tuple[PolicyCapability, ...],
+    ) -> CapabilityPreregistration:
+        group = self._validate_run_group(run_group)
+        if type(thresholds) is not tuple:
+            raise TypeError("thresholds must be an exact tuple")
+        checked_thresholds: list[FamilyThreshold] = []
+        for threshold in thresholds:
+            if type(threshold) is not FamilyThreshold:
+                raise TypeError("thresholds must contain exact FamilyThreshold records")
+            evaluator = self._evaluators.get(threshold.evaluator_capability_id)
+            if evaluator is None or evaluator.evaluator_code_digest != (
+                threshold.evaluator_code_digest
+            ):
+                raise ValueError("threshold evaluator capability was not issued by this authority")
+            if evaluator.evaluation_contract.contract_digest != (
+                threshold.evaluation_contract.contract_digest
+            ):
+                raise ValueError("threshold evaluator contract does not match capability")
+            checked_thresholds.append(
+                FamilyThreshold(
+                    family=threshold.family,
+                    primary_outcome=threshold.primary_outcome,
+                    minimum_delta=threshold.minimum_delta,
+                    evaluation_contract=threshold.evaluation_contract,
+                    evaluator_capability_id=threshold.evaluator_capability_id,
+                    evaluator_code_digest=threshold.evaluator_code_digest,
+                )
+            )
+        if type(policies) is not tuple:
+            raise TypeError("policies must be an exact tuple")
+        checked_policies = tuple(self._validate_policy(policy) for policy in policies)
+        bindings = tuple(
+            sorted(
+                (
+                    PolicyBinding(
+                        name=policy.name,
+                        version=policy.version,
+                        capability_id=policy.capability_id,
+                        code_digest=policy.policy_code_digest,
+                    )
+                    for policy in checked_policies
+                ),
+                key=lambda binding: binding.name,
+            )
+        )
+        issuance_id = self._issue_id("preregistration")
+        preregistration = CapabilityPreregistration(
+            authority_id=self._authority_id,
+            run_group_id=group.capability_id,
+            issuance_id=issuance_id,
+            issuance_seal="0" * 64,
+            seeds=seeds,
+            budget=budget,
+            wall_time_budget_ms=wall_time_budget_ms,
+            thresholds=tuple(checked_thresholds),
+            policy_bindings=bindings,
+        )
+        seal = self._seal("capability-preregistration-v1", preregistration.canonical_document())
+        object.__setattr__(preregistration, "issuance_seal", seal)
+        self._preregistrations[issuance_id] = preregistration
+        return preregistration
+
+    def validate_preregistration(
+        self,
+        preregistration: CapabilityPreregistration,
+    ) -> CapabilityPreregistration:
+        if (
+            type(preregistration) is not CapabilityPreregistration
+            or preregistration.authority_id != self._authority_id
+            or self._preregistrations.get(preregistration.issuance_id) is not preregistration
+        ):
+            raise ValueError("preregistration was not issued by this exact authority")
+        expected = self._seal(
+            "capability-preregistration-v1",
+            preregistration.canonical_document(),
+        )
+        if not hmac.compare_digest(preregistration.issuance_seal, expected):
+            raise ValueError("preregistration authenticity seal does not match")
+        return preregistration
+
+
+class AdaptiveSearch:
+    """Run only exact evaluator and policy capabilities issued by one authority."""
+
+    __slots__ = (
+        "_authority",
+        "_bounds",
+        "_clock_ns",
+        "_evaluator",
+        "_policy",
+        "_run_group",
+    )
+
+    def __init__(
+        self,
+        *,
+        evaluator_capability: EvaluatorCapability,
+        policy_capability: PolicyCapability,
+        run_group: RunGroupCapability,
+        clock_ns: Callable[[], int] = time.monotonic_ns,
+    ) -> None:
+        if type(evaluator_capability) is not EvaluatorCapability:
+            raise TypeError("evaluator_capability must be exact")
+        authority = evaluator_capability._authority
+        evaluator, policy, group = authority.validate_search_capabilities(
+            evaluator_capability,
+            policy_capability,
+            run_group,
+        )
         if not callable(clock_ns):
             raise TypeError("clock_ns must be callable")
+        self._authority = authority
+        self._evaluator = evaluator
         self._policy = policy
-        self._policy_name = policy_name
-        self._policy_version = policy_version
-        self._bounds = public_bounds
-        self._evaluation_contract = contract
+        self._run_group = group
+        self._bounds = evaluator.bounds
         self._clock_ns = clock_ns
 
     def _clock(self, previous: int | None = None) -> int:
@@ -437,15 +859,12 @@ class AdaptiveSearch:
         seed: int,
         budget: int,
         wall_time_budget_ms: int,
-        evaluate: Callable[[AttackCandidate], Feedback],
     ) -> SearchResult:
         checked_seed = _exact_non_negative_int("seed", seed, maximum=2**63 - 1)
         checked_budget = _exact_non_negative_int("budget", budget, maximum=1000)
         checked_wall = _exact_non_negative_int(
             "wall_time_budget_ms", wall_time_budget_ms, maximum=3_600_000
         )
-        if not callable(evaluate):
-            raise TypeError("evaluate must be callable")
         rng = np.random.default_rng(checked_seed)
         proposals: list[AttackCandidate] = []
         trials: list[VisibleTrial] = []
@@ -461,22 +880,31 @@ class AdaptiveSearch:
                 break
             visible_history = normalize_internal_history(tuple(trials))
             public_bounds = self._bounds
-            candidate = self._policy.propose(visible_history, public_bounds, rng)
+            candidate = self._authority.propose(
+                self._policy,
+                visible_history,
+                public_bounds,
+                rng,
+            )
             latest = self._clock(latest)
             if latest >= deadline:
                 exhausted = True
                 break
             checked_candidate = validate_candidate_lineage(candidate, visible_history)
             public_bounds.validate_vector(checked_candidate.params)
+            expose_value = (
+                self._evaluator.evaluation_contract.disclosure_profile.expose_realized_value
+            )
             try:
-                returned = reconstruct_feedback(evaluate(checked_candidate))
+                returned = reconstruct_feedback(
+                    self._authority.evaluate(self._evaluator, checked_candidate)
+                )
                 feedback = Feedback(
                     action=returned.action,
                     reason_family=returned.reason_family,
                     realized_value=(
                         returned.realized_value
-                        if self._evaluation_contract.disclosure_profile.expose_realized_value
-                        else None
+                        if expose_value else None
                     ),
                 )
             except Exception:
@@ -504,8 +932,7 @@ class AdaptiveSearch:
         elapsed_ms = elapsed_ns // 1_000_000
         if elapsed_ns > checked_wall * 1_000_000 and elapsed_ms == checked_wall:
             elapsed_ms += 1
-        if checked_budget > len(proposals) and end >= deadline:
-            exhausted = True
+        exhausted = exhausted or end >= deadline
         winner = (
             None
             if not trials
@@ -514,8 +941,8 @@ class AdaptiveSearch:
                 key=lambda trial: (-trial.objective_value, trial.candidate.candidate_id),
             ).candidate
         )
-        contract = self._evaluation_contract
-        return SearchResult(
+        contract = self._evaluator.evaluation_contract
+        return self._authority.issue_result(
             family=contract.family,
             bounds_digest=contract.bounds_digest,
             hidden_template_digest=contract.hidden_template_digest,
@@ -525,8 +952,13 @@ class AdaptiveSearch:
             defender_digest=contract.defender_digest,
             disclosure_profile_digest=contract.disclosure_profile_digest,
             evaluation_contract_digest=contract.contract_digest,
-            policy_name=self._policy_name,
-            policy_version=self._policy_version,
+            evaluator_capability_id=self._evaluator.capability_id,
+            evaluator_code_digest=self._evaluator.evaluator_code_digest,
+            policy_capability_id=self._policy.capability_id,
+            policy_name=self._policy.name,
+            policy_version=self._policy.version,
+            policy_code_digest=self._policy.policy_code_digest,
+            run_group_id=self._run_group.capability_id,
             seed=checked_seed,
             proposals=tuple(proposals),
             trials=tuple(trials),
@@ -548,6 +980,7 @@ class AdaptiveSearch:
 class PrimaryOutcome(StrEnum):
     VALID_YIELD = "valid_yield"
     NET_SETTLED_VALUE = "net_settled_value"
+    NET_SETTLED_VALUE_RATE = "net_settled_value_rate"
     ADAPTATION_SPEED = "adaptation_speed"
     CAMPAIGN_SCALE = "campaign_scale"
 
@@ -559,6 +992,8 @@ class FamilyThreshold(ExternalContract):
     primary_outcome: PrimaryOutcome
     minimum_delta: Decimal
     evaluation_contract: EvaluationContract
+    evaluator_capability_id: str
+    evaluator_code_digest: str
 
     @field_validator("family", mode="before")
     @classmethod
@@ -587,6 +1022,11 @@ class FamilyThreshold(ExternalContract):
             raise TypeError("evaluation_contract must be exact")
         return reconstruct_evaluation_contract(value)
 
+    @field_validator("evaluator_capability_id", "evaluator_code_digest", mode="before")
+    @classmethod
+    def evaluator_binding_is_exact(cls, value: object) -> object:
+        return _exact_digest("threshold evaluator binding", value)
+
     @model_validator(mode="after")
     def family_matches_contract(self) -> Self:
         if self.family != self.evaluation_contract.family:
@@ -594,11 +1034,46 @@ class FamilyThreshold(ExternalContract):
         return self
 
 
+class PolicyBinding(ExternalContract):
+    """Preregistered exact policy capability and implementation identity."""
+
+    name: str
+    version: str
+    capability_id: str
+    code_digest: str
+
+    @field_validator("name", "version", mode="before")
+    @classmethod
+    def text_is_exact(cls, value: object) -> object:
+        return _exact_text("policy binding text", value)
+
+    @field_validator("capability_id", "code_digest", mode="before")
+    @classmethod
+    def digests_are_exact(cls, value: object) -> object:
+        return _exact_digest("policy binding digest", value)
+
+
 class CapabilityPreregistration(ExternalContract):
+    authority_id: str
+    run_group_id: str
+    issuance_id: str
+    issuance_seal: str
     seeds: tuple[int, ...]
     budget: int
     wall_time_budget_ms: int
     thresholds: tuple[FamilyThreshold, ...]
+    policy_bindings: tuple[PolicyBinding, ...]
+
+    @field_validator(
+        "authority_id",
+        "run_group_id",
+        "issuance_id",
+        "issuance_seal",
+        mode="before",
+    )
+    @classmethod
+    def issuance_digests_are_exact(cls, value: object) -> object:
+        return _exact_digest("preregistration issuance digest", value)
 
     @field_validator("seeds", mode="before")
     @classmethod
@@ -633,6 +1108,24 @@ class CapabilityPreregistration(ExternalContract):
         if families != tuple(sorted(set(families))):
             raise ValueError("threshold families must be unique and sorted")
         return value
+
+    @field_validator("policy_bindings", mode="before")
+    @classmethod
+    def policy_bindings_are_exact(cls, value: object) -> object:
+        if (
+            type(value) is not tuple
+            or any(type(item) is not PolicyBinding for item in value)
+        ):
+            raise TypeError("policy_bindings must be an exact tuple")
+        names = tuple(item.name for item in value)
+        if names != _POLICY_NAMES:
+            raise ValueError("policy bindings must contain exact comparison policies")
+        if len({item.capability_id for item in value}) != len(value):
+            raise ValueError("policy binding capabilities must be unique")
+        return value
+
+    def canonical_document(self) -> dict[str, object]:
+        return self.model_dump(mode="json", round_trip=True, exclude={"issuance_seal"})
 
 
 class PolicyMetrics(ExternalContract):
@@ -680,6 +1173,14 @@ def _observed_delta(
         return adaptive.valid_yield - random.valid_yield
     if outcome is PrimaryOutcome.NET_SETTLED_VALUE:
         return adaptive.net_settled_value - random.net_settled_value
+    if outcome is PrimaryOutcome.NET_SETTLED_VALUE_RATE:
+        if random.net_settled_value == 0:
+            return Decimal(0) if adaptive.net_settled_value == 0 else Decimal(1)
+        with localcontext() as context:
+            context.prec = 28
+            return (
+                adaptive.net_settled_value - random.net_settled_value
+            ) / random.net_settled_value
     if outcome is PrimaryOutcome.ADAPTATION_SPEED:
         return random.adaptation_speed - adaptive.adaptation_speed
     return Decimal(adaptive.campaign_scale - random.campaign_scale)
@@ -818,16 +1319,21 @@ def _aggregate(results: tuple[SearchResult, ...]) -> PolicyMetrics:
 def capability_delta_report(
     preregistration: CapabilityPreregistration,
     results: dict[str, dict[str, tuple[SearchResult, ...]]],
+    *,
+    authority: SearchAuthority,
 ) -> CapabilityDeltaReport:
     """Compute only preregistered outcomes from exact matched provenance cells."""
-    if type(preregistration) is not CapabilityPreregistration:
-        raise TypeError("preregistration must be exact")
+    if type(authority) is not SearchAuthority:
+        raise TypeError("authority must be exact")
+    authority.validate_preregistration(preregistration)
     if type(results) is not dict or any(type(key) is not str for key in results):
         raise TypeError("results must have exact string family keys")
     thresholds = {item.family: item for item in preregistration.thresholds}
+    policy_bindings = {item.name: item for item in preregistration.policy_bindings}
     if set(results) != set(thresholds):
         raise ValueError("results must contain exactly preregistered families")
     metrics: list[FamilyCapabilityMetrics] = []
+    disclosure_profiles: set[str] = set()
     for family in sorted(results):
         cells = results[family]
         if type(cells) is not dict or any(type(key) is not str for key in cells):
@@ -838,6 +1344,7 @@ def capability_delta_report(
         contract = threshold.evaluation_contract
         aggregates: dict[str, PolicyMetrics] = {}
         for policy_name in _POLICY_NAMES:
+            policy_binding = policy_bindings[policy_name]
             runs = cells[policy_name]
             if (
                 type(runs) is not tuple
@@ -848,12 +1355,24 @@ def capability_delta_report(
             if tuple(result.seed for result in runs) != preregistration.seeds:
                 raise ValueError("capability comparison seeds are not matched")
             for result in runs:
+                authority.validate_result(result)
+                if result.run_group_id != preregistration.run_group_id:
+                    raise ValueError("capability result belongs to another run group")
                 if result.policy_name != policy_name:
                     raise ValueError("capability result was relabeled under another policy")
-                if result.policy_version != _POLICY_VERSIONS[policy_name]:
-                    raise ValueError("capability result policy version does not match")
+                if (
+                    result.policy_capability_id != policy_binding.capability_id
+                    or result.policy_version != policy_binding.version
+                    or result.policy_code_digest != policy_binding.code_digest
+                ):
+                    raise ValueError("capability result policy binding does not match")
                 if result.family != family:
                     raise ValueError("capability result family was swapped")
+                if (
+                    result.evaluator_capability_id != threshold.evaluator_capability_id
+                    or result.evaluator_code_digest != threshold.evaluator_code_digest
+                ):
+                    raise ValueError("capability result evaluator implementation does not match")
                 result_provenance = (
                     result.bounds_digest,
                     result.hidden_template_digest,
@@ -884,6 +1403,16 @@ def capability_delta_report(
                     and result.wall_time_budget_ms == preregistration.wall_time_budget_ms
                 ):
                     raise ValueError("capability comparison budgets are not matched")
+                if not (
+                    result.proposals_used
+                    == result.queries_used
+                    == result.logical_time_used
+                    == preregistration.budget
+                ):
+                    raise ValueError("capability comparison actual usage is not matched")
+                if result.wall_time_exhausted or result.wall_time_overrun_ms != 0:
+                    raise ValueError("capability comparison contains an exhausted deadline")
+                disclosure_profiles.add(result.disclosure_profile_digest)
             aggregates[policy_name] = _aggregate(runs)
         metrics.append(
             FamilyCapabilityMetrics(
@@ -897,6 +1426,8 @@ def capability_delta_report(
                 cached_llm=aggregates["cached_llm"],
             )
         )
+    if len(disclosure_profiles) != 1:
+        raise ValueError("capability comparison disclosure profiles are not comparable")
     return CapabilityDeltaReport(family_metrics=tuple(metrics), matched_budgets=True)
 
 
@@ -906,10 +1437,15 @@ __all__ = [
     "CapabilityPreregistration",
     "DisclosureProfile",
     "EvaluationContract",
+    "EvaluatorCapability",
     "FamilyCapabilityMetrics",
     "FamilyThreshold",
+    "PolicyBinding",
+    "PolicyCapability",
     "PolicyMetrics",
     "PrimaryOutcome",
+    "RunGroupCapability",
+    "SearchAuthority",
     "SearchResult",
     "capability_delta_report",
     "reconstruct_evaluation_contract",

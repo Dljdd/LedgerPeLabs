@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from decimal import Decimal
 from enum import StrEnum
 from typing import Protocol, Self, cast
@@ -872,7 +873,7 @@ class RandomPolicy:
 
 class AdaptiveTournamentPolicy:
     policy_name = "adaptive"
-    policy_version = "1.0.0"
+    policy_version = "2.0.0"
 
     def propose(
         self, history: tuple[VisibleTrial, ...], bounds: ParameterBounds, rng: np.random.Generator
@@ -912,39 +913,109 @@ class AdaptiveTournamentPolicy:
         if not alternatives:
             vector = parent.candidate.params
         else:
-            guided = self._guided(alternatives, parent, public_bounds)
-            choices = guided or alternatives
-            seen = {trial.candidate.fingerprint for trial in visible}
-            novel = tuple(vector for vector in choices if vector.fingerprint not in seen)
-            pool = novel or choices
-            vector = pool[int(rng.integers(0, len(pool)))]
+            statistics = self._direction_statistics(visible, public_bounds)
+            seen = {trial.candidate.params.fingerprint for trial in visible}
+            scored = tuple(
+                (
+                    self._ucb_score(
+                        vector,
+                        parent,
+                        public_bounds,
+                        statistics,
+                        seen,
+                        len(visible),
+                    ),
+                    vector,
+                )
+                for vector in alternatives
+            )
+            best_score = max(score for score, _vector in scored)
+            best = tuple(vector for score, vector in scored if score == best_score)
+            vector = best[int(rng.integers(0, len(best)))]
         return AttackCandidate(
             params=vector, parent_id=parent.candidate.candidate_id, generation=len(visible)
         )
 
     @staticmethod
-    def _guided(
-        alternatives: tuple[AdaptiveVector, ...], parent: VisibleTrial, bounds: ParameterBounds
-    ) -> tuple[AdaptiveVector, ...]:
-        reason = parent.feedback.reason_family
-        parameter: str | None = None
-        if reason == "velocity" and "retry_intensity" in bounds.names:
-            parameter = "retry_intensity"
-        elif reason == "entity" and "mule_fanout" in bounds.names:
-            parameter = "mule_fanout"
-        elif reason == "amount" and "cash_out_fraction" in bounds.names:
-            parameter = "cash_out_fraction"
-        if parameter is None:
-            return ()
-        current = parent.candidate.params.get(parameter)
-        if type(current) not in {int, Decimal}:
-            return ()
-        return tuple(
-            vector
-            for vector in alternatives
-            if type(vector.get(parameter)) is type(current)
-            and cast(int | Decimal, vector.get(parameter)) < cast(int | Decimal, current)
-        )
+    def _direction(
+        source: AdaptiveVector,
+        destination: AdaptiveVector,
+        bounds: ParameterBounds,
+    ) -> tuple[tuple[str, int | str], ...]:
+        changes: list[tuple[str, int | str]] = []
+        for domain in bounds.domains:
+            old = source.get(domain.name)
+            new = destination.get(domain.name)
+            if _same_value(old, new):
+                continue
+            old_index = next(
+                index for index, value in enumerate(domain.values) if _same_value(value, old)
+            )
+            new_index = next(
+                index for index, value in enumerate(domain.values) if _same_value(value, new)
+            )
+            changes.append(
+                (
+                    domain.name,
+                    new_index - old_index
+                    if domain.kind is not DomainKind.CATEGORICAL
+                    else _digest(_tagged_value(new)),
+                )
+            )
+        return tuple(changes)
+
+    @classmethod
+    def _direction_statistics(
+        cls,
+        history: tuple[VisibleTrial, ...],
+        bounds: ParameterBounds,
+    ) -> dict[tuple[str, tuple[tuple[str, int | str], ...]], tuple[int, Decimal]]:
+        by_id = {trial.candidate.candidate_id: trial for trial in history}
+        observations: dict[
+            tuple[str, tuple[tuple[str, int | str], ...]], list[Decimal]
+        ] = {}
+        for trial in history:
+            parent_id = trial.candidate.parent_id
+            parent = None if parent_id is None else by_id.get(parent_id)
+            if parent is None:
+                continue
+            direction = cls._direction(
+                parent.candidate.params, trial.candidate.params, bounds
+            )
+            key = (parent.feedback.reason_family, direction)
+            observations.setdefault(key, []).append(
+                trial.objective_value - parent.objective_value
+            )
+        return {
+            key: (len(values), sum(values, Decimal(0)))
+            for key, values in observations.items()
+        }
+
+    @classmethod
+    def _ucb_score(
+        cls,
+        vector: AdaptiveVector,
+        parent: VisibleTrial,
+        bounds: ParameterBounds,
+        statistics: dict[
+            tuple[str, tuple[tuple[str, int | str], ...]], tuple[int, Decimal]
+        ],
+        seen: set[str],
+        observation_count: int,
+    ) -> tuple[float, int, str]:
+        direction = cls._direction(parent.candidate.params, vector, bounds)
+        key = (parent.feedback.reason_family, direction)
+        count, total = statistics.get(key, (0, Decimal(0)))
+        if count:
+            mean_gain = float(total / Decimal(count))
+            exploration = math.sqrt(math.log(observation_count + 2) / count)
+        else:
+            mean_gain = 0.0
+            exploration = math.sqrt(math.log(observation_count + 2)) + 1.0
+        novelty = int(vector.fingerprint not in seen)
+        # Repeatedly harmful directions acquire a negative empirical mean while
+        # unobserved directions and vectors retain a bounded exploration bonus.
+        return (mean_gain + exploration + novelty, novelty, vector.fingerprint)
 
 
 __all__ = [

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import replace
 from decimal import Decimal, localcontext
 
@@ -222,6 +223,76 @@ def test_adaptive_selection_is_invariant_to_history_order(card_bounds) -> None: 
         np.random.default_rng(42),
     )
     assert first == second
+
+
+def _generic_bounds() -> ParameterBounds:
+    vectors = tuple(
+        AdaptiveVector.from_mapping({"alpha": value, "beta": "steady"})
+        for value in (0, 1, 2)
+    )
+    return ParameterBounds(
+        family="card_testing_cnp",
+        defaults=vectors[0],
+        domains=(
+            ParameterDomain(name="alpha", kind=DomainKind.DISCRETE, values=(0, 1, 2)),
+            ParameterDomain(
+                name="beta", kind=DomainKind.CATEGORICAL, values=("steady",)
+            ),
+        ),
+        feasible_vectors=tuple(sorted(vectors, key=lambda vector: vector.fingerprint)),
+    )
+
+
+def test_adaptive_bandit_is_family_agnostic_and_explores_unseen_direction() -> None:
+    bounds = _generic_bounds()
+    root = AttackCandidate(params=bounds.defaults, parent_id=None, generation=0)
+    failed = AttackCandidate(
+        params=next(vector for vector in bounds.feasible_vectors if vector.get("alpha") == 1),
+        parent_id=root.candidate_id,
+        generation=1,
+    )
+    history = (
+        _trial(
+            root,
+            Feedback(
+                action=Action.APPROVE,
+                reason_family="approved",
+                realized_value=Decimal("1.00"),
+            ),
+        ),
+        _trial(
+            failed,
+            Feedback(
+                action=Action.DECLINE,
+                reason_family="velocity",
+                realized_value=None,
+            ),
+        ),
+    )
+
+    proposal = AdaptiveTournamentPolicy().propose(
+        history, bounds, np.random.default_rng(17)
+    )
+
+    assert proposal.parent_id == root.candidate_id
+    assert proposal.params.get("alpha") == 2
+    source = inspect.getsource(AdaptiveTournamentPolicy)
+    assert "retry_intensity" not in source
+    assert "mule_fanout" not in source
+    assert "cash_out_fraction" not in source
+
+
+def test_adaptive_bandit_uses_only_public_feedback_context(card_bounds) -> None:  # type: ignore[no-untyped-def]
+    source = inspect.getsource(AdaptiveTournamentPolicy)
+    for forbidden in (
+        "model_score",
+        "threshold",
+        "hidden_template",
+        "evaluator",
+        "gradient",
+        "expected_motif",
+    ):
+        assert forbidden not in source
 
 
 @pytest.mark.parametrize(
