@@ -414,3 +414,88 @@ was used in a policy/evaluator trial.
 - V3 result absence assertion: PASS.
 - `git diff --check`: PASS.
 - `validation_spike/`: unchanged from `dd55570`.
+
+## Fix round 3 Phase B: canceled v3 freeze
+
+Independent review after `cbeaeea` found that the public policy capability still carried
+the executable, policy instance, and authoritative digests; its runtime check covered the
+stored `propose` function but not every helper and module-global dependency. It also found
+that the runner used a check followed by overwrite-capable `write_text`, and declared a
+negative control that the confirmatory execution path never ran.
+
+The canonical `docs/experiments/task6-v3-cancellation.json` record therefore cancels the
+`cbeaeea` preregistration before execution. It preserves the original preregistration and
+history, binds its SHA-256, records the review findings, and states that no v3 result was
+created, the execute flag was not invoked, and none of its eight seeds was used. The
+replacement uses distinct `task6-v3.1-holdout-preregistration.json` and
+`task6-v3.1-holdout-result.json` paths.
+
+## Authority-private policy execution
+
+Phase B first captured nine RED reproductions spanning the opaque-handle boundary,
+instance/class/global helper substitution, atomic publication, the missing negative
+control, and missing cancellation/freeze artifacts. `PolicyCapability` now contains only
+an opaque capability nonce. A separate immutable authority-private record retains the
+exact issued handle identity, registered owner/type, stored bound callable, registration
+metadata, runtime implementation digest, callable digest, and instance references.
+
+Every proposal revalidates this private record. Its runtime digest covers all exact Python
+methods on the registered policy class hierarchy, recursively referenced module-global
+helper functions and immutable constants, callable instance slots, the LLM client's exact
+object/type/transport callable, pinned provider/model values, and registered name/version.
+Copies, synthetic handles, subclasses, cross-authority handles, coupled nonce tampering,
+and instance/class/global dependency replacement reject before execution. Mutable LLM
+audit and replay-cache contents remain usable only through their pinned original
+containers; transport or pinned-client substitution rejects. Search result and
+preregistration provenance is derived only from the authority-private record.
+
+## Atomic exclusive result publication
+
+The runner serializes the complete result to a same-directory temporary file, flushes and
+fsyncs it, then publishes through an atomic hard link that fails if the target exists. It
+removes the temporary link and fsyncs the directory where supported. A race regression
+creates sentinel result bytes after the precheck but before publication: publication
+raises `FileExistsError`, the sentinel bytes remain unchanged, and the temporary file is
+cleaned. The pre-existing-result refusal remains as an early guard; the atomic link is the
+actual local no-replace guarantee. Task 7 still owns durable append-only external receipts.
+
+## Confirmatory negative control
+
+The evaluator-owned experiment now includes the real minimum-agentic Task 5 family with a
+singleton public adaptive space and hidden realized value. The v3.1 runner executes fixed,
+random, and adaptive cells over the same confirmatory seeds, proposal/query/logical budget
+24, and wall-time cap as the target cells. It derives matched-budget status and observed
+valid-yield delta from authority-issued results, records zero network calls and sealed
+result bindings, and marks this control as excluded from target `supported_family_count`.
+A development-seed regression observes the preregistered zero delta without opening a
+confirmatory seed.
+
+## Final v3.1 freeze — results intentionally absent
+
+V3.1 retains the exact v3 policy algorithm, untouched seeds
+`(503, 607, 709, 811, 907, 1009, 1103, 1201)`, budget 24, 120,000 ms wall cap, zero-network
+cached replay, and unchanged target gates: APP role-bound net settled value relative
+improvement `>= 0.10` and card valid-yield delta `>= 0.10`. It binds the cancellation,
+complete source/environment/cache/runtime-policy digests, all target and control evaluator
+provenance, descriptive-only paired uncertainty, and the rule that no further confirmatory
+holdout opens if v3.1 fails.
+
+Phase B did not execute either confirmatory experiment. Both
+`docs/experiments/task6-v3-holdout-result.json` and
+`docs/experiments/task6-v3.1-holdout-result.json` are absent. Direct `--verify-only`
+reconstructs and checks the complete v3.1 freeze without invoking `AdaptiveSearch`.
+
+## Fix round 3 Phase B verification
+
+- Initial review reproduction: `9 failed, 1 passed` before implementation.
+- Authority, publication, control, cancellation, and freeze regressions: `11 passed`.
+- Complete Task 6 red-team suite: `120 passed`.
+- Full repository pytest: `748 passed`.
+- Ruff over `src`, `tests`, and `scripts`: PASS.
+- Strict mypy over seven Task 6 source/runner files: PASS.
+- Project mypy over 42 source files: PASS.
+- G0 verifier: PASS for 20 threat cards and reviewed contract flow.
+- Direct v3.1 verify-only invocation: PASS.
+- Canceled-v3 and v3.1 result absence assertions: PASS.
+- `git diff --check`: PASS.
+- `validation_spike/`: unchanged from `cbeaeea`.

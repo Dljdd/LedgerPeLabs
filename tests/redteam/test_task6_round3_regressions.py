@@ -36,8 +36,8 @@ from tests.redteam.test_round1_regressions import (
 )
 
 ROOT = Path(__file__).resolve().parents[2]
-V3_PREREGISTRATION = ROOT / "docs/experiments/task6-v3-holdout-preregistration.json"
-V3_RESULT = ROOT / "docs/experiments/task6-v3-holdout-result.json"
+V3_PREREGISTRATION = ROOT / "docs/experiments/task6-v3.1-holdout-preregistration.json"
+V3_RESULT = ROOT / "docs/experiments/task6-v3.1-holdout-result.json"
 
 
 class _OriginalPolicy:
@@ -81,47 +81,45 @@ def _registered(policy: object):  # type: ignore[no-untyped-def]
     return authority, evaluator_capability, policy_capability
 
 
-def test_registered_instance_callable_cannot_be_replaced_after_registration() -> None:
+def test_registered_instance_callable_replacement_is_detected() -> None:
     policy = _OriginalPolicy()
     authority, evaluator, registered = _registered(policy)
     policy.propose = MethodType(_replacement, policy)  # type: ignore[method-assign]
 
-    result = AdaptiveSearch(
-        evaluator_capability=evaluator,
-        policy_capability=registered,
-        run_group=authority.issue_run_group("instance-substitution"),
-    ).search(seed=1, budget=1, wall_time_budget_ms=1_000)
+    with pytest.raises(ValueError, match="implementation|integrity"):
+        AdaptiveSearch(
+            evaluator_capability=evaluator,
+            policy_capability=registered,
+            run_group=authority.issue_run_group("instance-substitution"),
+        )
 
-    assert result.proposals[0].params == evaluator.bounds.defaults
 
-
-def test_registered_class_callable_cannot_be_replaced_after_registration(
+def test_registered_class_callable_replacement_is_detected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     policy = _OriginalPolicy()
     authority, evaluator, registered = _registered(policy)
     monkeypatch.setattr(_OriginalPolicy, "propose", _replacement)
 
-    result = AdaptiveSearch(
-        evaluator_capability=evaluator,
-        policy_capability=registered,
-        run_group=authority.issue_run_group("class-substitution"),
-    ).search(seed=1, budget=1, wall_time_budget_ms=1_000)
-
-    assert result.proposals[0].params == evaluator.bounds.defaults
-
-
-def test_registered_callable_slot_tampering_fails_before_policy_execution() -> None:
-    policy = _OriginalPolicy()
-    authority, evaluator, registered = _registered(policy)
-    object.__setattr__(registered, "_propose", MethodType(_replacement, policy))
-
-    with pytest.raises(ValueError, match="callable|implementation|issued"):
+    with pytest.raises(ValueError, match="implementation|integrity"):
         AdaptiveSearch(
             evaluator_capability=evaluator,
             policy_capability=registered,
-            run_group=authority.issue_run_group("callable-slot-tampering"),
+            run_group=authority.issue_run_group("class-substitution"),
         )
+
+
+def test_registered_callable_is_not_present_on_the_public_handle() -> None:
+    policy = _OriginalPolicy()
+    authority, evaluator, registered = _registered(policy)
+    with pytest.raises(AttributeError):
+        object.__setattr__(registered, "_propose", MethodType(_replacement, policy))
+    result = AdaptiveSearch(
+        evaluator_capability=evaluator,
+        policy_capability=registered,
+        run_group=authority.issue_run_group("authority-private-callable"),
+    ).search(seed=1, budget=1, wall_time_budget_ms=1_000)
+    assert result.proposals[0].params == evaluator.bounds.defaults
 
 
 def test_v3_random_and_adaptive_share_the_default_baseline() -> None:
@@ -222,7 +220,7 @@ def test_v3_policy_ast_contains_no_family_or_task5_specific_strategy() -> None:
     assert AdaptiveTournamentPolicy.policy_version == "3.0.0"
 
 
-def test_v3_runner_is_directly_reproducible_and_verify_only_executes_no_trial() -> None:
+def test_v31_runner_is_directly_reproducible_and_verify_only_executes_no_trial() -> None:
     environment = dict(os.environ)
     environment.pop("PYTHONPATH", None)
     completed = subprocess.run(
@@ -235,7 +233,7 @@ def test_v3_runner_is_directly_reproducible_and_verify_only_executes_no_trial() 
     )
 
     assert completed.returncode == 0, completed.stderr
-    assert "v3" in completed.stdout
+    assert "v3.1" in completed.stdout
     assert "no holdout trial executed" in completed.stdout
     assert not V3_RESULT.exists()
 
@@ -261,7 +259,7 @@ def test_production_experiment_reconstructs_the_frozen_task6_benchmark() -> None
     }
 
 
-def test_v3_preregistration_freezes_the_complete_confirmatory_contract() -> None:
+def test_v31_preregistration_freezes_the_complete_confirmatory_contract() -> None:
     artifact = json.loads(V3_PREREGISTRATION.read_text(encoding="utf-8"))
 
     assert artifact["holdout"] == {
@@ -269,7 +267,11 @@ def test_v3_preregistration_freezes_the_complete_confirmatory_contract() -> None
         "budget": 24,
         "wall_time_budget_ms": 120000,
         "maximum_additional_confirmatory_attempts": 1,
-        "result_path": "docs/experiments/task6-v3-holdout-result.json",
+        "result_path": "docs/experiments/task6-v3.1-holdout-result.json",
+        "seed_reuse_basis": (
+            "The cancelled cbeaeea preregistration was never executed, neither result "
+            "path exists, and none of these seeds has entered a search/evaluator trial."
+        ),
     }
     assert artifact["fairness"]["shared_default_first_proposal"] is True
     assert artifact["network"]["allowed_calls"] == 0

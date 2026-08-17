@@ -1,0 +1,21 @@
+{
+  "schema_version": "1.0.0",
+  "status": "cancelled_before_execution",
+  "cancelled_preregistration_commit": "cbeaeea3e0a98a86cb22673a42abd652a2d586a9",
+  "cancelled_preregistration_path": "docs/experiments/task6-v3-holdout-preregistration.json",
+  "cancelled_preregistration_sha256": "2b72d526cf70ead0f6c3c7db2cba1e4250a037b3dc829af06812cb73fd06c56a",
+  "cancelled_result_path": "docs/experiments/task6-v3-holdout-result.json",
+  "result_created": false,
+  "confirmatory_execution_invoked": false,
+  "seeds_used": false,
+  "seeds_remain_eligible_for_v3_1": [503, 607, 709, 811, 907, 1009, 1103, 1201],
+  "review_findings": [
+    "PolicyCapability exposed executable state and authoritative digests instead of acting as an opaque authority handle.",
+    "Runtime validation did not bind all dynamically reachable helper and module-global policy dependencies.",
+    "Result publication used a check-then-write operation that could overwrite a concurrent result.",
+    "The declared negative-control cell was not executed by the confirmatory runner."
+  ],
+  "replacement_preregistration_path": "docs/experiments/task6-v3.1-holdout-preregistration.json",
+  "replacement_result_path": "docs/experiments/task6-v3.1-holdout-result.json",
+  "durable_execution_receipt_boundary": "Task 7 still owns append-only external execution receipts and durable cross-process verification."
+}

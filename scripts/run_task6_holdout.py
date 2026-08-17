@@ -1,4 +1,4 @@
-"""Verify or explicitly execute the frozen Task 6 v3 confirmatory experiment.
+"""Verify or explicitly execute the frozen Task 6 v3.1 confirmatory experiment.
 
 The local result-file check is an accidental-rerun guard, not cryptographic exactly-once
 enforcement. Durable append-only execution receipts and cross-process verification remain
@@ -11,9 +11,13 @@ import argparse
 import hashlib
 import importlib.metadata
 import json
+import os
 import platform
 import subprocess
 import sys
+import tempfile
+from collections.abc import Callable
+from contextlib import suppress
 from decimal import Decimal, localcontext
 from pathlib import Path
 from typing import Any, cast
@@ -48,9 +52,11 @@ from apar.redteam.task6_experiment import (  # noqa: E402
     build_task6_experiment,
 )
 
-PREREGISTRATION_PATH = ROOT / "docs/experiments/task6-v3-holdout-preregistration.json"
+PREREGISTRATION_PATH = ROOT / "docs/experiments/task6-v3.1-holdout-preregistration.json"
 CACHE_PATH = ROOT / "docs/experiments/task6-v3-cached-llm-replay.json"
-RESULT_PATH = ROOT / "docs/experiments/task6-v3-holdout-result.json"
+CANCELLATION_PATH = ROOT / "docs/experiments/task6-v3-cancellation.json"
+CANCELLED_RESULT_PATH = ROOT / "docs/experiments/task6-v3-holdout-result.json"
+RESULT_PATH = ROOT / "docs/experiments/task6-v3.1-holdout-result.json"
 _PACKAGES = (
     "cryptography",
     "fastapi",
@@ -74,7 +80,7 @@ class _NoNetworkClient:
 
     def complete(self, _request: dict[str, object]) -> dict[str, object]:
         self.calls += 1
-        raise AssertionError("v3 cached planner attempted network transport")
+        raise AssertionError("v3.1 cached planner attempted network transport")
 
 
 def _sha256_bytes(value: bytes) -> str:
@@ -101,6 +107,49 @@ def _canonical_digest(value: object) -> str:
         allow_nan=False,
     ).encode()
     return _sha256_bytes(encoded)
+
+
+def _atomic_publish_result(
+    path: Path,
+    payload: bytes,
+    *,
+    before_publish: Callable[[], None] | None = None,
+) -> None:
+    """Durably publish once without replacing a concurrently-created result."""
+    if not isinstance(path, Path):
+        raise TypeError("result path must be a pathlib.Path")
+    if type(payload) is not bytes:
+        raise TypeError("result payload must be exact bytes")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary = Path(temporary_name)
+    descriptor_open = True
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor_open = False
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if before_publish is not None:
+            before_publish()
+        # A same-directory hard link is atomic and fails with EEXIST instead of replacing.
+        os.link(temporary, path)
+        temporary.unlink()
+        directory_descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            # Some filesystems do not expose directory fsync.
+            with suppress(OSError):
+                os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    finally:
+        if descriptor_open:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
 
 
 def _environment_document() -> dict[str, object]:
@@ -138,9 +187,9 @@ def _require_recording_preconditions() -> None:
         text=True,
     )
     if completed.stdout:
-        raise RuntimeError("v3 execution requires a clean preregistration commit")
+        raise RuntimeError("v3.1 execution requires a clean preregistration commit")
     if RESULT_PATH.exists():
-        raise RuntimeError("local v3 result exists; refusing an accidental rerun")
+        raise RuntimeError("local v3.1 result exists; refusing an accidental rerun")
 
 
 def _runtime() -> tuple[
@@ -149,6 +198,7 @@ def _runtime() -> tuple[
     SearchAuthority,
     RunGroupCapability,
     dict[str, EvaluatorCapability],
+    EvaluatorCapability,
     dict[str, PolicyCapability],
     LLMPlannerPolicy,
     _NoNetworkClient,
@@ -156,17 +206,18 @@ def _runtime() -> tuple[
     artifact = _load_exact_json(PREREGISTRATION_PATH)
     cache_artifact = _load_exact_json(CACHE_PATH)
     if _sha256_file(CACHE_PATH) != artifact["cached_replay"]["file_sha256"]:
-        raise RuntimeError("v3 cached replay artifact digest changed")
+        raise RuntimeError("v3.1 cached replay artifact digest changed")
     if cache_artifact["development_seed"] in artifact["holdout"]["seeds"]:
-        raise RuntimeError("cache preparation seed overlaps the v3 holdout")
+        raise RuntimeError("cache preparation seed overlaps the v3.1 holdout")
 
     experiment = build_task6_experiment(ROOT)
     authority = SearchAuthority()
-    run_group = authority.issue_run_group("task6-v3-confirmatory")
+    run_group = authority.issue_run_group("task6-v3.1-confirmatory")
     evaluators = {
         family: benchmark.issue_evaluator_capability(authority)
         for family, benchmark in experiment.benchmarks.items()
     }
+    negative_evaluator = experiment.negative_control.issue_evaluator_capability(authority)
     no_network = _NoNetworkClient()
     cached_policy = LLMPlannerPolicy(
         no_network,
@@ -195,6 +246,7 @@ def _runtime() -> tuple[
         authority,
         run_group,
         evaluators,
+        negative_evaluator,
         policies,
         cached_policy,
         no_network,
@@ -204,25 +256,30 @@ def _runtime() -> tuple[
 def _verify_frozen_bindings(
     artifact: dict[str, Any],
     experiment: Task6Experiment,
+    authority: SearchAuthority,
     evaluators: dict[str, EvaluatorCapability],
+    negative_evaluator: EvaluatorCapability,
     policies: dict[str, PolicyCapability],
 ) -> None:
     for relative_path, expected in artifact["source_files"].items():
         if _sha256_file(ROOT / relative_path) != expected:
-            raise RuntimeError(f"frozen v3 source digest changed: {relative_path}")
+            raise RuntimeError(f"frozen v3.1 source digest changed: {relative_path}")
     if _environment_document() != artifact["environment"]:
-        raise RuntimeError("frozen v3 Python environment changed")
+        raise RuntimeError("frozen v3.1 Python environment changed")
     if experiment.population_digest != artifact["frozen_benchmark"]["population_digest"]:
-        raise RuntimeError("frozen v3 population changed")
+        raise RuntimeError("frozen v3.1 population changed")
     for name, expected in artifact["policy_bindings"].items():
-        policy = policies[name]
+        policy = authority.policy_binding(policies[name])
         observed = {
             "version": policy.version,
-            "code_digest": policy.policy_code_digest,
-            "callable_digest": policy.policy_callable_digest,
+            "code_digest": policy.code_digest,
+            "callable_digest": policy.callable_digest,
         }
         if observed != expected:
-            raise RuntimeError(f"frozen v3 policy binding changed: {name}")
+            raise RuntimeError(
+                f"frozen v3.1 policy binding changed: {name}; "
+                f"expected={expected!r}; observed={observed!r}"
+            )
     for family, expected in artifact["families"].items():
         evaluator = evaluators[family]
         contract = evaluator.evaluation_contract
@@ -238,7 +295,105 @@ def _verify_frozen_bindings(
             "disclosure_profile_digest": contract.disclosure_profile_digest,
         }
         if observed != expected["provenance"]:
-            raise RuntimeError(f"frozen v3 evaluator provenance changed: {family}")
+            raise RuntimeError(f"frozen v3.1 evaluator provenance changed: {family}")
+    negative_contract = negative_evaluator.evaluation_contract
+    negative_observed = {
+        "evaluator_code_digest": negative_evaluator.evaluator_code_digest,
+        "contract_digest": negative_contract.contract_digest,
+        "bounds_digest": negative_contract.bounds_digest,
+        "hidden_template_digest": negative_contract.hidden_template_digest,
+        "background_digest": negative_contract.background_digest,
+        "population_digest": negative_contract.population_digest,
+        "evaluator_digest": negative_contract.evaluator_digest,
+        "defender_digest": negative_contract.defender_digest,
+        "disclosure_profile_digest": negative_contract.disclosure_profile_digest,
+    }
+    if negative_observed != artifact["negative_control"]["provenance"]:
+        raise RuntimeError("frozen v3.1 negative-control provenance changed")
+
+
+def _valid_yield(results: tuple[SearchResult, ...]) -> Decimal:
+    proposal_count = sum(len(result.trials) for result in results)
+    if proposal_count == 0:
+        return Decimal(0)
+    approved_count = sum(
+        trial.feedback.action is Action.APPROVE
+        for result in results
+        for trial in result.trials
+    )
+    return Decimal(approved_count) / Decimal(proposal_count)
+
+
+def _run_negative_control(
+    *,
+    authority: SearchAuthority,
+    run_group: RunGroupCapability,
+    evaluator: EvaluatorCapability,
+    policies: dict[str, PolicyCapability],
+    seeds: tuple[int, ...],
+    budget: int,
+    wall_time_budget_ms: int,
+) -> dict[str, object]:
+    policy_names = ("fixed", "random", "adaptive")
+    results = {
+        name: tuple(
+            AdaptiveSearch(
+                evaluator_capability=evaluator,
+                policy_capability=policies[name],
+                run_group=run_group,
+            ).search(
+                seed=seed,
+                budget=budget,
+                wall_time_budget_ms=wall_time_budget_ms,
+            )
+            for seed in seeds
+        )
+        for name in policy_names
+    }
+    all_results = tuple(
+        result for name in policy_names for result in results[name]
+    )
+    matched = bool(all_results) and all(
+        result.proposal_budget == budget
+        and result.query_budget == budget
+        and result.logical_time_budget == budget
+        and result.wall_time_budget_ms == wall_time_budget_ms
+        and result.proposals_used == budget
+        and result.queries_used == budget
+        and result.logical_time_used == budget
+        and not result.wall_time_exhausted
+        and result.wall_time_overrun_ms == 0
+        for result in all_results
+    )
+    random_yield = _valid_yield(results["random"])
+    adaptive_yield = _valid_yield(results["adaptive"])
+    observed_delta = adaptive_yield - random_yield
+    return {
+        "family": evaluator.evaluation_contract.family,
+        "primary_outcome": "valid_yield",
+        "minimum_delta": "0.10",
+        "included_in_supported_family_count": False,
+        "matched_budgets": matched,
+        "network_call_count": 0,
+        "random_valid_yield": str(random_yield),
+        "adaptive_valid_yield": str(adaptive_yield),
+        "observed_valid_yield_delta": str(observed_delta),
+        "supported": matched and observed_delta >= Decimal("0.10"),
+        "result_bindings": {
+            name: [
+                {
+                    "seed": result.seed,
+                    "result_id": result.result_id,
+                    "result_seal": result.result_seal,
+                    "canonical_document_digest": _canonical_digest(
+                        result.canonical_document()
+                    ),
+                }
+                for result in runs
+            ]
+            for name, runs in results.items()
+        },
+    }
 
 
 def _metrics_document(metrics: PolicyMetrics) -> dict[str, object]:
@@ -323,6 +478,7 @@ def _execute(
     authority: SearchAuthority,
     group: RunGroupCapability,
     evaluators: dict[str, EvaluatorCapability],
+    negative_evaluator: EvaluatorCapability,
     policies: dict[str, PolicyCapability],
     cached_policy: LLMPlannerPolicy,
     no_network: _NoNetworkClient,
@@ -375,9 +531,18 @@ def _execute(
     )
     audit = cached_policy.take_audit_records()
     if no_network.calls != 0 or len(audit) != 2 * len(seeds) * budget:
-        raise RuntimeError("v3 cached LLM zero-network audit is incomplete")
+        raise RuntimeError("v3.1 cached LLM zero-network audit is incomplete")
     if any(record.call_status != "cache_success" for record in audit):
-        raise RuntimeError("v3 cached LLM contains a replay miss")
+        raise RuntimeError("v3.1 cached LLM contains a replay miss")
+    negative_control = _run_negative_control(
+        authority=authority,
+        run_group=group,
+        evaluator=negative_evaluator,
+        policies=policies,
+        seeds=seeds,
+        budget=budget,
+        wall_time_budget_ms=wall_budget,
+    )
 
     return {
         "schema_version": "1.0.0",
@@ -388,6 +553,7 @@ def _execute(
         "matched_budgets": report.matched_budgets,
         "supported_family_count": report.supported_family_count,
         "adaptive_claim": report.adaptive_claim,
+        "negative_control": negative_control,
         "families": {
             metric.family: {
                 "primary_outcome": metric.primary_outcome.value,
@@ -448,15 +614,28 @@ def main() -> None:
         authority,
         group,
         evaluators,
+        negative_evaluator,
         policies,
         cached_policy,
         no_network,
     ) = _runtime()
-    _verify_frozen_bindings(artifact, experiment, evaluators, policies)
+    _verify_frozen_bindings(
+        artifact,
+        experiment,
+        authority,
+        evaluators,
+        negative_evaluator,
+        policies,
+    )
     if args.verify_only:
+        cancellation = _load_exact_json(CANCELLATION_PATH)
+        if cancellation["status"] != "cancelled_before_execution":
+            raise RuntimeError("v3 cancellation record is not canonical")
+        if CANCELLED_RESULT_PATH.exists():
+            raise RuntimeError("cancelled v3 result must remain absent")
         if RESULT_PATH.exists():
-            raise RuntimeError("v3 result must be absent during Phase A verification")
-        print("verified frozen Task 6 v3 bindings; no holdout trial executed")
+            raise RuntimeError("v3.1 result must be absent during Phase B verification")
+        print("verified frozen Task 6 v3.1 bindings; no holdout trial executed")
         return
 
     _require_recording_preconditions()
@@ -465,13 +644,14 @@ def main() -> None:
         authority,
         group,
         evaluators,
+        negative_evaluator,
         policies,
         cached_policy,
         no_network,
     )
-    RESULT_PATH.write_text(
-        json.dumps(document, sort_keys=True, indent=2) + "\n",
-        encoding="utf-8",
+    _atomic_publish_result(
+        RESULT_PATH,
+        (json.dumps(document, sort_keys=True, indent=2) + "\n").encode("utf-8"),
     )
     print(json.dumps(document["families"], sort_keys=True, indent=2))
     print(f"supported_family_count={document['supported_family_count']}")

@@ -47,6 +47,7 @@ _CAMPAIGN_ID = "00000000-0000-4000-8000-000000000960"
 class Task6Experiment:
     population: Population
     benchmarks: Mapping[str, CampaignBenchmark]
+    negative_control: CampaignBenchmark
 
     @property
     def population_digest(self) -> str:
@@ -200,6 +201,11 @@ def build_task6_experiment(root: Path) -> Task6Experiment:
     return Task6Experiment(
         population=population,
         benchmarks=MappingProxyType(benchmarks),
+        negative_control=task6_campaign_benchmark(
+            "agentic_intent_abuse",
+            population,
+            expose_realized_value=False,
+        ),
     )
 
 

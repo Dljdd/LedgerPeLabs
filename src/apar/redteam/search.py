@@ -10,10 +10,12 @@ import marshal
 import secrets
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from decimal import Decimal, localcontext
 from enum import StrEnum
-from typing import Self
+from types import ModuleType
+from typing import Self, cast
 
 import numpy as np
 from pydantic import ConfigDict, PrivateAttr, field_validator, model_validator
@@ -104,6 +106,237 @@ def _bound_callable_digest(owner: object, entrypoint: Callable[..., object]) -> 
             "callable": entrypoint.__func__.__qualname__,
             "code": hashlib.sha256(marshal.dumps(entrypoint.__func__.__code__)).hexdigest(),
         }
+    )
+
+
+def _source_name(value: object) -> str:
+    source: str | None = None
+    if callable(value):
+        with suppress(OSError, TypeError):
+            source = inspect.getsourcefile(cast(Callable[..., object], value))
+    if source is None and isinstance(value, type):
+        for member in value.__dict__.values():
+            function = (
+                member.__func__
+                if isinstance(member, (staticmethod, classmethod))
+                else member
+            )
+            if inspect.isfunction(function):
+                source = function.__code__.co_filename
+                break
+    if source is None:
+        source = getattr(value, "__module__", type(value).__module__)
+    return source.replace("\\", "/").rsplit("/", maxsplit=1)[-1]
+
+
+def _type_name(value: object) -> str:
+    value_type = value if isinstance(value, type) else type(value)
+    return f"{_source_name(value_type)}:{value_type.__qualname__}"
+
+
+def _literal_document(value: object) -> object | None:
+    if value is None or type(value) in {bool, int, str}:
+        return {"type": type(value).__name__, "value": value}
+    if type(value) is float:
+        return {"type": "float", "value": value.hex()}
+    if type(value) is bytes:
+        return {"type": "bytes", "value": value.hex()}
+    if type(value) is Decimal:
+        return {"type": "Decimal", "value": str(value)}
+    if type(value) in {tuple, frozenset}:
+        items = cast(tuple[object, ...] | frozenset[object], value)
+        documents = [_literal_document(item) for item in items]
+        if any(document is None for document in documents):
+            return None
+        if type(value) is frozenset:
+            documents.sort(key=_canonical_bytes)
+        return {"type": type(value).__name__, "items": documents}
+    return None
+
+
+def _function_document(
+    function: Callable[..., object],
+    seen: set[int],
+) -> dict[str, object]:
+    if not inspect.isfunction(function):
+        raise TypeError("runtime function dependency must be a Python function")
+    code_digest = hashlib.sha256(marshal.dumps(function.__code__)).hexdigest()
+    reference = {
+        "source": _source_name(function),
+        "qualname": function.__qualname__,
+        "code": code_digest,
+    }
+    if id(function) in seen:
+        return {"function_reference": reference}
+    seen.add(id(function))
+    dependencies: dict[str, object] = {}
+    for name in sorted(set(function.__code__.co_names)):
+        if name not in function.__globals__:
+            continue
+        dependency = _global_dependency_document(function.__globals__[name], seen)
+        if dependency is not None:
+            dependencies[name] = dependency
+    defaults = _literal_document(function.__defaults__)
+    keyword_defaults = _literal_document(
+        None
+        if function.__kwdefaults__ is None
+        else tuple(sorted(function.__kwdefaults__.items()))
+    )
+    return {
+        "function": reference,
+        "defaults": defaults,
+        "keyword_defaults": keyword_defaults,
+        "globals": dependencies,
+    }
+
+
+def _callable_document(value: object, seen: set[int]) -> dict[str, object]:
+    if inspect.ismethod(value):
+        return {
+            "kind": "bound_method",
+            "owner_type": _type_name(value.__self__),
+            "function": _function_document(value.__func__, seen),
+        }
+    if inspect.isfunction(value):
+        return {"kind": "function", "function": _function_document(value, seen)}
+    if inspect.isbuiltin(value):
+        return {
+            "kind": "builtin",
+            "module": getattr(value, "__module__", None),
+            "qualname": getattr(value, "__qualname__", getattr(value, "__name__", None)),
+        }
+    call = inspect.getattr_static(type(value), "__call__", None)
+    if inspect.isfunction(call):
+        return {
+            "kind": "callable_instance",
+            "owner_type": _type_name(value),
+            "function": _function_document(call, seen),
+        }
+    return {"kind": "callable", "owner_type": _type_name(value)}
+
+
+def _global_dependency_document(value: object, seen: set[int]) -> object | None:
+    literal = _literal_document(value)
+    if literal is not None:
+        return {"kind": "constant", "document": literal}
+    if inspect.isfunction(value):
+        return {"kind": "function", "document": _function_document(value, seen)}
+    if inspect.isbuiltin(value):
+        return {"kind": "callable", "document": _callable_document(value, seen)}
+    if isinstance(value, ModuleType):
+        return {"kind": "module", "name": value.__name__}
+    if isinstance(value, type):
+        return {"kind": "type", "name": _type_name(value)}
+    return None
+
+
+def _policy_instance_items(owner: object) -> tuple[tuple[str, object], ...]:
+    values: dict[str, object] = {}
+    instance_dict = getattr(owner, "__dict__", None)
+    if type(instance_dict) is dict:
+        values.update(instance_dict)
+    for implementation_type in type(owner).__mro__:
+        slots = implementation_type.__dict__.get("__slots__", ())
+        if type(slots) is str:
+            slots = (slots,)
+        for name in slots:
+            if name in {"__dict__", "__weakref__"}:
+                continue
+            try:
+                values[name] = object.__getattribute__(owner, name)
+            except AttributeError:
+                continue
+    # Policy self-description is never authoritative; registration metadata is.
+    values.pop("policy_name", None)
+    values.pop("policy_version", None)
+    return tuple(sorted(values.items()))
+
+
+def _instance_value_document(name: str, value: object, seen: set[int]) -> object:
+    literal = _literal_document(value)
+    if literal is not None:
+        return {"kind": "constant", "document": literal}
+    if callable(value):
+        return {"kind": "callable", "document": _callable_document(value, seen)}
+    if name == "_client":
+        complete = getattr(value, "complete", None)
+        if not callable(complete):
+            raise TypeError("registered LLM client must retain complete")
+        return {
+            "kind": "pinned_client",
+            "type": _type_name(value),
+            "provider": _literal_document(getattr(value, "provider", None)),
+            "model_id": _literal_document(getattr(value, "model_id", None)),
+            "complete": _callable_document(complete, seen),
+        }
+    if type(value) in {dict, list, set}:
+        return {"kind": "mutable_state", "type": _type_name(value)}
+    return {"kind": "instance_dependency", "type": _type_name(value)}
+
+
+def _policy_runtime_document(
+    owner: object,
+    entrypoint: Callable[..., object],
+    *,
+    name: str,
+    version: str,
+) -> dict[str, object]:
+    if not inspect.ismethod(entrypoint) or entrypoint.__self__ is not owner:
+        raise TypeError("registered policy entrypoint must stay bound to its exact owner")
+    seen: set[int] = set()
+    class_records: list[dict[str, object]] = []
+    for implementation_type in reversed(type(owner).__mro__):
+        if implementation_type is object:
+            continue
+        member_records: dict[str, object] = {}
+        for member_name, member in sorted(implementation_type.__dict__.items()):
+            functions: tuple[Callable[..., object], ...] = ()
+            if inspect.isfunction(member):
+                functions = (member,)
+            elif isinstance(member, (staticmethod, classmethod)):
+                functions = (member.__func__,)
+            elif isinstance(member, property):
+                functions = tuple(
+                    function
+                    for function in (member.fget, member.fset, member.fdel)
+                    if function is not None
+                )
+            if functions:
+                member_records[member_name] = [
+                    _function_document(function, seen) for function in functions
+                ]
+                continue
+            literal = _literal_document(member)
+            if literal is not None and not member_name.startswith("__"):
+                member_records[member_name] = {"class_constant": literal}
+        class_records.append(
+            {
+                "type": _type_name(implementation_type),
+                "members": member_records,
+            }
+        )
+    instance_records = {
+        item_name: _instance_value_document(item_name, value, seen)
+        for item_name, value in _policy_instance_items(owner)
+    }
+    return {
+        "registered_type": _type_name(owner),
+        "registered_metadata": {"name": name, "version": version},
+        "stored_entrypoint": _function_document(entrypoint.__func__, seen),
+        "class_records": class_records,
+        "instance_records": instance_records,
+    }
+
+
+def _policy_runtime_digest(
+    owner: object,
+    entrypoint: Callable[..., object],
+    *,
+    name: str,
+    version: str,
+) -> str:
+    return _digest(
+        _policy_runtime_document(owner, entrypoint, name=name, version=version)
     )
 
 
@@ -301,17 +534,22 @@ class EvaluatorCapability:
 
 @dataclass(frozen=True, slots=True)
 class PolicyCapability:
-    """Exact process-local registration of one policy instance, type, and code."""
+    """Minimal opaque process-local handle; executable bindings remain authority-private."""
 
-    authority_id: str
     capability_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _PolicyRuntimeBinding:
+    capability: PolicyCapability
     name: str
     version: str
     policy_code_digest: str
     policy_callable_digest: str
-    _authority: SearchAuthority = field(repr=False, compare=False)
-    _policy: Policy = field(repr=False, compare=False)
-    _propose: Callable[
+    registered_type: type[object]
+    instance_items: tuple[tuple[str, object], ...] = field(repr=False, compare=False)
+    policy: Policy = field(repr=False, compare=False)
+    propose: Callable[
         [tuple[VisibleTrial, ...], ParameterBounds, np.random.Generator],
         AttackCandidate,
     ] = field(repr=False, compare=False)
@@ -535,7 +773,7 @@ class SearchAuthority:
         self._authority_id = hashlib.sha256(b"apar-search-authority-v1" + secret).hexdigest()
         self._counter = 0
         self._evaluators: dict[str, EvaluatorCapability] = {}
-        self._policies: dict[str, PolicyCapability] = {}
+        self._policies: dict[str, _PolicyRuntimeBinding] = {}
         self._run_groups: dict[str, RunGroupCapability] = {}
         self._results: dict[str, SearchResult] = {}
         self._preregistrations: dict[str, CapabilityPreregistration] = {}
@@ -607,17 +845,25 @@ class SearchAuthority:
         if not callable(propose):
             raise TypeError("registered policy must expose propose")
         capability = PolicyCapability(
-            authority_id=self._authority_id,
             capability_id=self._issue_id("policy"),
+        )
+        binding = _PolicyRuntimeBinding(
+            capability=capability,
             name=checked_name,
             version=checked_version,
-            policy_code_digest=_implementation_digest(policy, propose),
+            policy_code_digest=_policy_runtime_digest(
+                policy,
+                propose,
+                name=checked_name,
+                version=checked_version,
+            ),
             policy_callable_digest=_bound_callable_digest(policy, propose),
-            _authority=self,
-            _policy=policy,
-            _propose=propose,
+            registered_type=type(policy),
+            instance_items=_policy_instance_items(policy),
+            policy=policy,
+            propose=propose,
         )
-        self._policies[capability.capability_id] = capability
+        self._policies[capability.capability_id] = binding
         return capability
 
     def issue_run_group(self, label: str) -> RunGroupCapability:
@@ -647,9 +893,20 @@ class SearchAuthority:
     def policy_capability(self, capability_id: str) -> PolicyCapability:
         checked = _exact_digest("policy_capability_id", capability_id)
         try:
-            return self._policies[checked]
+            return self._policies[checked].capability
         except KeyError as error:
             raise ValueError("policy capability was not issued by this authority") from error
+
+    def policy_binding(self, capability: PolicyCapability) -> PolicyBinding:
+        """Return immutable public provenance derived only from a private binding."""
+        binding = self._validate_policy(capability)
+        return PolicyBinding(
+            name=binding.name,
+            version=binding.version,
+            capability_id=binding.capability.capability_id,
+            code_digest=binding.policy_code_digest,
+            callable_digest=binding.policy_callable_digest,
+        )
 
     def _validate_evaluator(self, capability: EvaluatorCapability) -> EvaluatorCapability:
         if (
@@ -661,27 +918,56 @@ class SearchAuthority:
             raise ValueError("evaluator capability was not issued by this exact authority")
         return capability
 
-    def _validate_policy(self, capability: PolicyCapability) -> PolicyCapability:
-        if (
-            type(capability) is not PolicyCapability
-            or capability._authority is not self
-            or capability.authority_id != self._authority_id
-            or self._policies.get(capability.capability_id) is not capability
-        ):
+    def _validate_policy(self, capability: PolicyCapability) -> _PolicyRuntimeBinding:
+        if type(capability) is not PolicyCapability:
             raise ValueError("policy capability was not issued by this exact authority")
+        binding = self._policies.get(capability.capability_id)
+        if binding is None or binding.capability is not capability:
+            raise ValueError("policy capability was not issued by this exact authority")
+        if type(binding.policy) is not binding.registered_type:
+            raise ValueError("policy runtime implementation type changed")
+        current_items = _policy_instance_items(binding.policy)
+        if tuple(name for name, _value in current_items) != tuple(
+            name for name, _value in binding.instance_items
+        ):
+            raise ValueError("policy runtime instance integrity changed")
+        for (name, expected), (_current_name, observed) in zip(
+            binding.instance_items,
+            current_items,
+            strict=True,
+        ):
+            literal = _literal_document(expected)
+            unchanged = (
+                type(observed) is type(expected) and observed == expected
+                if literal is not None
+                else observed is expected
+            )
+            if not unchanged:
+                raise ValueError(f"policy runtime instance integrity changed: {name}")
         try:
             observed_callable_digest = _bound_callable_digest(
-                capability._policy,
-                capability._propose,
+                binding.policy,
+                binding.propose,
             )
-        except (TypeError, AttributeError) as error:
+            observed_runtime_digest = _policy_runtime_digest(
+                binding.policy,
+                binding.propose,
+                name=binding.name,
+                version=binding.version,
+            )
+        except (TypeError, AttributeError, ValueError) as error:
             raise ValueError("policy callable binding is invalid") from error
         if not hmac.compare_digest(
-            capability.policy_callable_digest,
+            binding.policy_callable_digest,
             observed_callable_digest,
         ):
             raise ValueError("policy callable implementation digest changed")
-        return capability
+        if not hmac.compare_digest(
+            binding.policy_code_digest,
+            observed_runtime_digest,
+        ):
+            raise ValueError("policy runtime implementation integrity changed")
+        return binding
 
     def _validate_run_group(self, capability: RunGroupCapability) -> RunGroupCapability:
         if (
@@ -699,11 +985,10 @@ class SearchAuthority:
         policy: PolicyCapability,
         run_group: RunGroupCapability,
     ) -> tuple[EvaluatorCapability, PolicyCapability, RunGroupCapability]:
-        return (
-            self._validate_evaluator(evaluator),
-            self._validate_policy(policy),
-            self._validate_run_group(run_group),
-        )
+        checked_evaluator = self._validate_evaluator(evaluator)
+        self._validate_policy(policy)
+        checked_group = self._validate_run_group(run_group)
+        return checked_evaluator, policy, checked_group
 
     def propose(
         self,
@@ -712,8 +997,8 @@ class SearchAuthority:
         bounds: ParameterBounds,
         rng: np.random.Generator,
     ) -> AttackCandidate:
-        checked = self._validate_policy(capability)
-        return checked._propose(history, bounds, rng)
+        binding = self._validate_policy(capability)
+        return binding.propose(history, bounds, rng)
 
     def evaluate(
         self,
@@ -799,7 +1084,7 @@ class SearchAuthority:
                     PolicyBinding(
                         name=policy.name,
                         version=policy.version,
-                        capability_id=policy.capability_id,
+                        capability_id=policy.capability.capability_id,
                         code_digest=policy.policy_code_digest,
                         callable_digest=policy.policy_callable_digest,
                     )
@@ -977,6 +1262,7 @@ class AdaptiveSearch:
             ).candidate
         )
         contract = self._evaluator.evaluation_contract
+        policy_binding = self._authority.policy_binding(self._policy)
         return self._authority.issue_result(
             family=contract.family,
             bounds_digest=contract.bounds_digest,
@@ -989,11 +1275,11 @@ class AdaptiveSearch:
             evaluation_contract_digest=contract.contract_digest,
             evaluator_capability_id=self._evaluator.capability_id,
             evaluator_code_digest=self._evaluator.evaluator_code_digest,
-            policy_capability_id=self._policy.capability_id,
-            policy_name=self._policy.name,
-            policy_version=self._policy.version,
-            policy_code_digest=self._policy.policy_code_digest,
-            policy_callable_digest=self._policy.policy_callable_digest,
+            policy_capability_id=policy_binding.capability_id,
+            policy_name=policy_binding.name,
+            policy_version=policy_binding.version,
+            policy_code_digest=policy_binding.code_digest,
+            policy_callable_digest=policy_binding.callable_digest,
             run_group_id=self._run_group.capability_id,
             seed=checked_seed,
             proposals=tuple(proposals),

@@ -122,7 +122,9 @@ def test_search_accepts_only_authority_issued_evaluator_and_policy_capabilities(
 
     assert "evaluate" not in inspect.signature(search.search).parameters
     assert result.evaluator_code_digest == evaluator.evaluator_code_digest
-    assert result.policy_code_digest == policy_capability.policy_code_digest
+    assert result.policy_code_digest == authority.policy_binding(
+        policy_capability
+    ).code_digest
     assert result.policy_name == "fixed"
     with pytest.raises(TypeError):
         search.search(
@@ -221,13 +223,14 @@ def _issued_comparison(
     )
     cells: dict[str, tuple[object, ...]] = {}
     for policy in policy_capabilities:
+        binding = owner.policy_binding(policy)
         result = AdaptiveSearch(
             evaluator_capability=evaluator,
             policy_capability=policy,
             run_group=group,
             clock_ns=_Clock(),
         ).search(seed=1, budget=budget, wall_time_budget_ms=100)
-        cells[policy.name] = (result,)
+        cells[binding.name] = (result,)
     return owner, preregistration, {bounds.family: cells}
 
 
