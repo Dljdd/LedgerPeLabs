@@ -594,7 +594,10 @@ worktree`; this is the correct fail-closed behavior, not an evidence failure. Th
 postcommit command and result are recorded below after the Task 7 commit is created:
 
 ```text
-PENDING_CLEAN_POSTCOMMIT_VERIFICATION
+$ .venv/bin/python scripts/run_task6_holdout.py --verify-postcommit \
+    --approved-result-commit d6d3eecbfe2d871af8375e1455814cb5c48f2928 \
+    --approved-result-sha256 f82981a987651a7f7ebb10a9011df063b2dc54a56181cae5b838e31de5e658db
+verified Task 6 v3.4 result-only commit chronology and raw evidence; confirmatory_valid=True
 ```
 
 ## Honest claim boundary and residual scope
