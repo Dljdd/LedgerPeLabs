@@ -366,8 +366,8 @@ class PopulationGenerator:
     """Build entity identities and graph structure before sampling leaf attributes."""
 
     def __init__(self, *, seed: int) -> None:
-        if type(seed) is not int:
-            raise TypeError("seed must be an exact integer")
+        if type(seed) is not int or not 0 <= seed < 2**63:
+            raise TypeError("seed must be an exact integer in [0, 2**63)")
         self._seed = seed
         self._rng = np.random.default_rng(seed)
 

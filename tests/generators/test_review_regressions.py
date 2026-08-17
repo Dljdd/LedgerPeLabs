@@ -108,21 +108,28 @@ def test_requested_class_rate_changes_concrete_card_behavior() -> None:
         target_illicit_rate=Decimal("0.00"),
         class_rate_tolerance=Decimal("0.00"),
     )
-    illicit = replace(
+    moderate = replace(
         benign,
+        target_illicit_rate=Decimal("0.50"),
+        class_rate_tolerance=Decimal("0.00"),
+    )
+    illicit = replace(
+        moderate,
         target_illicit_rate=Decimal("1.00"),
         class_rate_tolerance=Decimal("0.00"),
     )
 
+    with pytest.raises(GenerationConstraintError):
+        _CampaignEvaluator(seed=2).generate("card_testing_cnp", population, benign)
     benign_commands, benign_audit = _CampaignEvaluator(seed=2).generate(
-        "card_testing_cnp", population, benign
+        "card_testing_cnp", population, moderate
     )
     illicit_commands, illicit_audit = _CampaignEvaluator(seed=2).generate(
         "card_testing_cnp", population, illicit
     )
 
     assert campaign_bytes(benign_commands) != campaign_bytes(illicit_commands)
-    assert benign_audit.illicit_rate == Decimal("0")
+    assert benign_audit.illicit_rate == Decimal("0.5")
     assert illicit_audit.illicit_rate == Decimal("1")
     assert benign_audit.class_labels != illicit_audit.class_labels
 
