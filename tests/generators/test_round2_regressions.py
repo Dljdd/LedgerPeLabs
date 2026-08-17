@@ -419,7 +419,7 @@ def test_no_op_adaptive_regions_reject_or_change_concrete_output() -> None:
         replace(
             app_base,
             cash_out_strategy="burst",
-            cash_out_delay_seconds=50,
+            cash_out_delay_seconds=app_base.min_delay_seconds,
         ),
     )
     delayed, delayed_audit = _CampaignEvaluator(seed=15).generate(
@@ -464,12 +464,13 @@ def test_no_op_adaptive_regions_reject_or_change_concrete_output() -> None:
         population,
         replace(card, device_reuse_rate=Decimal("1.00")),
     )
-    distributed, _ = _CampaignEvaluator(seed=15).generate(
-        "card_testing_cnp",
-        population,
-        replace(card, device_reuse_rate=Decimal("0.00")),
-    )
-    assert campaign_bytes(reused) != campaign_bytes(distributed)
+    assert reused
+    with pytest.raises(GenerationConstraintError):
+        _CampaignEvaluator(seed=15).generate(
+            "card_testing_cnp",
+            population,
+            replace(card, device_reuse_rate=Decimal("0.00")),
+        )
     concentrated, _ = _CampaignEvaluator(seed=15).generate(
         "card_testing_cnp",
         population,

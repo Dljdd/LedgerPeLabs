@@ -111,7 +111,11 @@ def test_campaign_has_declared_entities_and_motif(
     assert commands
     assert all(isinstance(command, Command) for command in commands)
     assert all(command.campaign_id == params.campaign_id for command in commands)  # type: ignore[attr-defined]
-    assert motif_signature(commands) == params.expected_motif
+    if family == "agentic_intent_abuse":
+        with pytest.raises(ValueError, match="requires evaluator execution evidence"):
+            motif_signature(commands)
+    else:
+        assert motif_signature(commands) == params.expected_motif
     assert evidence.motif_signature == params.expected_motif
     assert set(evidence.declared_entity_ids) <= {entity.entity_id for entity in population.entities}
     assert set(evidence.account_ids) <= set(population.opening_balances)
@@ -175,7 +179,12 @@ def test_deep_family_signatures_are_distinct(population: Population) -> None:
     signatures = {
         motif_signature(CampaignGenerator(seed=79).generate(family, population, _params(family)))
         for family in FAMILIES
+        if family != "agentic_intent_abuse"
     }
+    _, agentic_evidence = _CampaignEvaluator(seed=79).generate(
+        "agentic_intent_abuse", population, _params("agentic_intent_abuse")
+    )
+    signatures.add(agentic_evidence.motif_signature)
 
     assert signatures == set(FAMILIES.values())
 

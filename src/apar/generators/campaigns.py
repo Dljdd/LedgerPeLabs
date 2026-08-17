@@ -8,7 +8,7 @@ from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from decimal import ROUND_HALF_EVEN, Decimal, DecimalException
+from decimal import ROUND_CEILING, ROUND_HALF_EVEN, Decimal, DecimalException
 from types import MappingProxyType
 from typing import cast
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -619,14 +619,9 @@ def motif_signature(commands: tuple[Command, ...]) -> str:
         ):
             return CARD_TESTING_CNP_MOTIF
     if all(isinstance(command, AgenticPaymentCommand) for command in commands):
-        requests = [cast(AgenticPaymentCommand, command).request for command in commands]
-        if (
-            len(requests) >= 25
-            and len({request.request_id for request in requests}) == len(requests)
-            and len({request.nonce for request in requests}) < len(requests)
-            and len({request.signature for request in requests}) >= 24
-        ):
-            return AGENTIC_INTENT_ABUSE_MOTIF
+        raise ValueError(
+            "agentic deep motif requires evaluator execution evidence"
+        )
     raise ValueError("campaign commands do not satisfy a supported deep motif")
 
 
@@ -776,11 +771,16 @@ class CampaignGenerator:
                 selected_mules = mules[: params.mule_count]
                 layer_count = params.mule_layers
                 fanout_count = params.mule_fanout
+                recovered_count = int(
+                    (Decimal(fanout_count) * params.recovery_probability)
+                    .to_integral_value(rounding=ROUND_CEILING)
+                )
                 incoming_count = attack_count - layer_count - fanout_count
                 if (
                     params.mule_count != layer_count + 1
                     or len(selected_mules) != params.mule_count
                     or incoming_count < 2
+                    or recovered_count == 0
                     or attack_count > params.payment_count
                 ):
                     raise ValueError("APP motif cannot satisfy declared mule topology")
@@ -800,7 +800,7 @@ class CampaignGenerator:
                     ]
                     counterparty = attackers[index % len(attackers)]
                     stages = ("initiate", "accept", "post")
-                    if index == attack_count - 1:
+                    if fanout_index >= fanout_count - recovered_count:
                         stages += ("report", "freeze", "recover")
                 else:
                     actor = victims[index % len(victims)]
@@ -810,6 +810,8 @@ class CampaignGenerator:
                 if illicit:
                     if params.retry_intensity == 0:
                         raise ValueError("card-testing requires at least one probe retry")
+                    if params.retry_intensity > illicit_count - 1:
+                        raise ValueError("retry intensity exceeds eligible probes")
                     actor_span = max(
                         2,
                         min(
@@ -830,10 +832,7 @@ class CampaignGenerator:
                         ),
                     )
                     counterparty = merchants[index % concentrated]
-                    decline_count = max(
-                        1,
-                        min(illicit_count - 1, max(1, params.retry_intensity)),
-                    )
+                    decline_count = params.retry_intensity
                     stages = (
                         ("decline",)
                         if index < decline_count
@@ -855,16 +854,16 @@ class CampaignGenerator:
                     synthetic_merchants[0] if illicit else merchants[index % len(merchants)]
                 )
                 if illicit:
-                    recovered_count = max(
-                        1,
-                        min(
-                            illicit_count - 1,
-                            round(
-                                Decimal(illicit_count)
-                                * params.recovery_probability
-                            ),
-                        ),
+                    recovered_count = int(
+                        (
+                            Decimal(illicit_count)
+                            * params.recovery_probability
+                        ).to_integral_value(rounding=ROUND_CEILING)
                     )
+                    if recovered_count == 0 or recovered_count >= illicit_count:
+                        raise ValueError(
+                            "synthetic merchant motif requires recovery and refund paths"
+                        )
                     stages = (
                         (
                             "authorize",
@@ -960,6 +959,10 @@ class CampaignGenerator:
                     ):
                         raise ValueError("APP cash-out delay exceeds command delay bounds")
                     if params.cash_out_strategy == "burst":
+                        if params.cash_out_delay_seconds != params.min_delay_seconds:
+                            raise ValueError(
+                                "burst cash-out delay must equal the minimum delay"
+                            )
                         delay_low = params.min_delay_seconds
                         delay_high = params.min_delay_seconds
                     elif params.cash_out_strategy == "delayed":
@@ -1565,6 +1568,46 @@ class CampaignGenerator:
         )
         if len(set(payment_ids)) != len(payment_ids):
             raise ValueError("each opening command must use a unique payment_id")
+        payment_namespace = uuid5(
+            NAMESPACE_URL,
+            f"apar:campaign:{params.campaign_id}:{params.seed}",
+        )
+        expected_payment_ids = tuple(
+            f"{family}:{uuid5(payment_namespace, f'payment:{index}')}"
+            for index in range(params.payment_count)
+        )
+        if payment_ids != expected_payment_ids:
+            raise ValueError("payment IDs or opening order differ from canonical lineage")
+        payment_positions = {
+            payment_id: index for index, payment_id in enumerate(payment_ids)
+        }
+        for command in commands:
+            payment_id = cast(str, command.payload["payment_id"])
+            position = payment_positions[payment_id]
+            if command.name in {"a2a.initiate", "card.authorize", "card.decline"}:
+                expected_key = f"{command.name}:{payment_id}"
+                if command.payload.get("idempotency_key") != expected_key:
+                    raise ValueError("opening idempotency key differs from canonical lineage")
+            elif command.name != "agentic.pay":
+                expected_key = (
+                    f"{command.name}:{payment_id}:campaign:{params.campaign_id}"
+                )
+                if command.payload.get("idempotency_key") != expected_key:
+                    raise ValueError("lifecycle idempotency key differs from canonical lineage")
+            if command in opening_commands:
+                trace_label = (
+                    f"agentic-trace:{position}"
+                    if family == "agentic_intent_abuse"
+                    else f"trace:{position}"
+                )
+                if command.payload.get("trace_id") != self._derived_uuid(
+                    params, trace_label
+                ):
+                    raise ValueError("trace ID differs from canonical lineage")
+                if family == "agentic_intent_abuse" and command.payload.get(
+                    "request_id"
+                ) != f"agentic-request-{position}":
+                    raise ValueError("agentic request ID differs from canonical lineage")
 
         entity_by_id = {entity.entity_id: entity for entity in population.entities}
         owner_by_account = {
@@ -1609,7 +1652,18 @@ class CampaignGenerator:
             unique_attempted.setdefault(cast(str, command.payload["payment_id"]), amount)
             referenced.update((actor_id, counterparty_id))
 
-        if motif_signature(commands) != params.expected_motif:
+        if family == "agentic_intent_abuse":
+            requests = [
+                cast(AgenticPaymentCommand, command).request for command in commands
+            ]
+            if (
+                len(requests) < 25
+                or len({request.request_id for request in requests}) != len(requests)
+                or len({request.nonce for request in requests}) == len(requests)
+                or len({request.signature for request in requests}) < 24
+            ):
+                raise ValueError("agentic command structure is incomplete")
+        elif motif_signature(commands) != params.expected_motif:
             raise ValueError("candidate does not satisfy its deep structural motif")
         events = self._dry_replay(
             family,
@@ -1640,7 +1694,6 @@ class CampaignGenerator:
             for event in events
             if event.rail is Rail.AGENTIC
         )
-        entity_illicit = {entity.entity_id: entity.illicit for entity in population.entities}
         if family == "agentic_intent_abuse":
             if len(observed_reasons) != len(opening_commands):
                 raise ValueError("agentic commands must each produce one observed outcome")
@@ -1675,48 +1728,96 @@ class CampaignGenerator:
                 ):
                     raise ValueError("agentic currency drift is not causally isolated")
         else:
-            class_labels = tuple(
-                entity_illicit[cast(str, command.payload["actor_id"])]
-                or entity_illicit[cast(str, command.payload["counterparty_id"])]
-                for command in opening_commands
-            )
-            for command, illicit in zip(
-                opening_commands, class_labels, strict=True
-            ):
+            histories = _operation_histories(commands)
+            causal_labels: list[bool] = []
+            for command in opening_commands:
                 actor = entity_by_id[cast(str, command.payload["actor_id"])]
                 counterparty = entity_by_id[
                     cast(str, command.payload["counterparty_id"])
                 ]
+                path = histories[cast(str, command.payload["payment_id"])]
                 if family == "app_scam_mule":
-                    allowed = (
+                    posted = ("initiate", "accept", "post")
+                    app_recovered = (*posted, "report", "freeze", "recover")
+                    returned = (*posted, "return")
+                    if (
                         (
                             actor.role in {"victim", "consumer", "organization"}
                             and counterparty.role == "mule"
+                            and path == posted
                         )
-                        or (actor.role == "mule" and counterparty.role == "mule")
-                        or (actor.role == "mule" and counterparty.role == "attacker")
                         or (
-                            not illicit
-                            and actor.role in {"victim", "consumer", "organization"}
-                            and counterparty.role in {"merchant", "beneficiary"}
+                            actor.role == "mule"
+                            and counterparty.role == "mule"
+                            and path == posted
                         )
-                    )
+                        or (
+                            actor.role == "mule"
+                            and counterparty.role == "attacker"
+                            and path in {posted, app_recovered}
+                        )
+                    ):
+                        causal_illicit = True
+                    elif (
+                        actor.role in {"victim", "consumer", "organization"}
+                        and counterparty.role in {"merchant", "beneficiary"}
+                        and path == returned
+                    ):
+                        causal_illicit = False
+                    else:
+                        raise ValueError(
+                            "APP roles and terminal lifecycle are causally inconsistent"
+                        )
                 elif family == "card_testing_cnp":
-                    allowed = (
+                    declined = ("decline",)
+                    settled = ("authorize", "clear", "settle")
+                    if (
                         actor.role == "attacker"
-                        if illicit
-                        else actor.role in {"victim", "consumer", "organization"}
-                    ) and counterparty.role in {"merchant", "beneficiary"}
+                        and counterparty.role in {"merchant", "beneficiary"}
+                        and path in {declined, settled}
+                    ):
+                        causal_illicit = True
+                    elif (
+                        actor.role in {"victim", "consumer", "organization"}
+                        and counterparty.role in {"merchant", "beneficiary"}
+                        and path == settled
+                    ):
+                        causal_illicit = False
+                    else:
+                        raise ValueError(
+                            "card-testing roles and lifecycle are causally inconsistent"
+                        )
                 else:
-                    allowed = (
+                    refunded = ("authorize", "clear", "settle", "refund")
+                    card_recovered = (
+                        "authorize",
+                        "clear",
+                        "settle",
+                        "report",
+                        "dispute",
+                        "chargeback",
+                        "recover",
+                    )
+                    if (
                         actor.role == "attacker"
                         and counterparty.role == "synthetic_merchant"
-                        if illicit
-                        else actor.role in {"victim", "consumer", "organization"}
+                        and path in {refunded, card_recovered}
+                    ):
+                        causal_illicit = True
+                    elif (
+                        actor.role in {"victim", "consumer", "organization"}
                         and counterparty.role in {"merchant", "beneficiary"}
-                    )
-                if not allowed:
-                    raise ValueError("payment entity roles do not match the family motif")
+                        and path == refunded
+                    ):
+                        causal_illicit = False
+                    else:
+                        raise ValueError(
+                            "synthetic-merchant roles and lifecycle are causally inconsistent"
+                        )
+                if causal_illicit != (actor.illicit or counterparty.illicit):
+                    raise ValueError("causal class conflicts with population role ownership")
+                causal_labels.append(causal_illicit)
+            class_labels = tuple(causal_labels)
         rate = Decimal(sum(class_labels)) / Decimal(len(class_labels))
         value_total = attempted_value
         if family == "card_testing_cnp":
@@ -1739,7 +1840,9 @@ class CampaignGenerator:
             if max((len(actors) for actors in shared_targets.values()), default=0) < 2:
                 raise ValueError("card-testing motif lacks a shared-device attack graph")
             decline_count = sum(command.name == "card.decline" for command in opening_commands)
-            expected_declines = min(sum(class_labels) - 1, params.retry_intensity)
+            if params.retry_intensity > sum(class_labels) - 1:
+                raise ValueError("retry intensity exceeds eligible concrete probes")
+            expected_declines = params.retry_intensity
             if decline_count != expected_declines or decline_count == 0:
                 raise ValueError("card probe count differs from visible retry intensity")
             available_attackers = sum(
@@ -1782,6 +1885,57 @@ class CampaignGenerator:
                 {command.payload["payee_account"] for command in illicit_commands}
             ) != min(len(illicit_commands), concentrated):
                 raise ValueError("merchant distribution differs from visible concentration")
+            if any(
+                command.name != "card.decline"
+                for command in opening_commands[:decline_count]
+            ) or any(
+                command.name == "card.decline"
+                for command in opening_commands[decline_count:]
+            ):
+                raise ValueError("card probes must precede every success escalation")
+            probe_actor_ids = {
+                command.payload["actor_id"]
+                for command in opening_commands[:decline_count]
+            }
+            attack_success_ids = {
+                command.payload["actor_id"]
+                for command, label in zip(
+                    opening_commands[decline_count:],
+                    class_labels[decline_count:],
+                    strict=True,
+                )
+                if label
+            }
+            if not probe_actor_ids & attack_success_ids:
+                raise ValueError("probe and escalation accounts lack causal reuse")
+            span = params.max_delay_seconds - params.min_delay_seconds
+            probe_delay_floor = params.min_delay_seconds + (span * 2) // 3
+            success_delay_ceiling = params.min_delay_seconds + span // 4
+            command_positions = {
+                id(command): index for index, command in enumerate(commands)
+            }
+            for command in opening_commands[:decline_count]:
+                index = command_positions[id(command)]
+                prior_timestamp = (
+                    population.generated_at if index == 0 else schedule[index - 1]
+                )
+                if int((schedule[index] - prior_timestamp).total_seconds()) < probe_delay_floor:
+                    raise ValueError("card probe delay is outside its temporal region")
+            success_payment_ids = {
+                cast(str, command.payload["payment_id"])
+                for command in opening_commands[decline_count:]
+            }
+            for index, command in enumerate(commands):
+                if cast(str, command.payload["payment_id"]) not in success_payment_ids:
+                    continue
+                prior_timestamp = (
+                    population.generated_at if index == 0 else schedule[index - 1]
+                )
+                if (
+                    int((schedule[index] - prior_timestamp).total_seconds())
+                    > success_delay_ceiling
+                ):
+                    raise ValueError("card success burst exceeds its temporal region")
         if abs(rate - params.target_illicit_rate) > params.class_rate_tolerance:
             raise ValueError("class rate constraint not satisfied")
         if (
@@ -1825,6 +1979,16 @@ class CampaignGenerator:
             )
             if len(cash_commands) != params.mule_fanout:
                 raise ValueError("APP topology does not use the declared fan-out")
+            expected_recoveries = int(
+                (Decimal(params.mule_fanout) * params.recovery_probability)
+                .to_integral_value(rounding=ROUND_CEILING)
+            )
+            actual_recoveries = sum(
+                "recover" in histories[cast(str, command.payload["payment_id"])]
+                for command in cash_commands
+            )
+            if expected_recoveries == 0 or actual_recoveries != expected_recoveries:
+                raise ValueError("APP recovery count differs from visible probability")
             cash_total = sum(
                 (cast(Decimal, command.payload["amount"]) for command in cash_commands),
                 Decimal("0.00"),
@@ -1860,6 +2024,11 @@ class CampaignGenerator:
                 delay_seconds = int((timestamp - prior_timestamp).total_seconds())
                 if (
                     params.cash_out_strategy == "burst"
+                    and params.cash_out_delay_seconds != params.min_delay_seconds
+                ):
+                    raise ValueError("APP burst delay parameter is incompatible")
+                if (
+                    params.cash_out_strategy == "burst"
                     and delay_seconds != params.min_delay_seconds
                 ):
                     raise ValueError("APP burst cash-out timing drifted")
@@ -1875,15 +2044,16 @@ class CampaignGenerator:
                     raise ValueError("APP staged cash-out timing drifted")
         elif family == "synthetic_merchant_refund":
             illicit_count = sum(class_labels)
-            expected_recoveries = max(
-                1,
-                min(
-                    illicit_count - 1,
-                    round(Decimal(illicit_count) * params.recovery_probability),
-                ),
+            expected_recoveries = int(
+                (Decimal(illicit_count) * params.recovery_probability)
+                .to_integral_value(rounding=ROUND_CEILING)
             )
             actual_recoveries = sum(command.name == "card.recover" for command in commands)
-            if actual_recoveries != expected_recoveries:
+            if (
+                expected_recoveries == 0
+                or expected_recoveries >= illicit_count
+                or actual_recoveries != expected_recoveries
+            ):
                 raise ValueError("recovery lifecycle count differs from visible probability")
         graph_document = [
             [

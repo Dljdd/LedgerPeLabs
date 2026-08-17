@@ -270,7 +270,7 @@ def test_adaptive_dimensions_change_concrete_family_behavior() -> None:
         population,
         replace(merchant_params, recovery_probability=Decimal("0.80")),
     )
-    assert sum(command.name == "card.recover" for command in low_recovery) == 1
+    assert sum(command.name == "card.recover" for command in low_recovery) == 2
     assert sum(command.name == "card.recover" for command in high_recovery) == 6
 
 
