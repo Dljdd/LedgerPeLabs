@@ -865,28 +865,49 @@ class RandomPolicy:
         self, history: tuple[VisibleTrial, ...], bounds: ParameterBounds, rng: np.random.Generator
     ) -> AttackCandidate:
         visible, public_bounds = _inputs(history, bounds, rng)
-        vector = public_bounds.feasible_vectors[
-            int(rng.integers(0, len(public_bounds.feasible_vectors)))
-        ]
+        vector = (
+            public_bounds.defaults
+            if not visible
+            else public_bounds.feasible_vectors[
+                int(rng.integers(0, len(public_bounds.feasible_vectors)))
+            ]
+        )
         return AttackCandidate(params=vector, parent_id=_parent(visible), generation=len(visible))
 
 
 class AdaptiveTournamentPolicy:
     policy_name = "adaptive"
-    policy_version = "2.0.0"
+    policy_version = "3.0.0"
 
     def propose(
         self, history: tuple[VisibleTrial, ...], bounds: ParameterBounds, rng: np.random.Generator
     ) -> AttackCandidate:
         visible, public_bounds = _inputs(history, bounds, rng)
         if not visible:
-            alternatives = public_bounds.mutations(public_bounds.defaults)
-            vector = (
-                public_bounds.defaults
-                if not alternatives
-                else alternatives[int(rng.integers(0, len(alternatives)))]
+            return AttackCandidate(
+                params=public_bounds.defaults,
+                parent_id=None,
+                generation=0,
             )
-            return AttackCandidate(params=vector, parent_id=None, generation=0)
+        default_parent = next(
+            (
+                trial
+                for trial in visible
+                if trial.candidate.params.fingerprint
+                == public_bounds.defaults.fingerprint
+            ),
+            None,
+        )
+        boundary_frontier = self._default_boundary_frontier(
+            visible,
+            public_bounds,
+        )
+        if default_parent is not None and boundary_frontier:
+            return AttackCandidate(
+                params=boundary_frontier[0],
+                parent_id=default_parent.candidate.candidate_id,
+                generation=len(visible),
+            )
         eligible = tuple(
             sorted(
                 (
@@ -913,8 +934,18 @@ class AdaptiveTournamentPolicy:
         if not alternatives:
             vector = parent.candidate.params
         else:
-            statistics = self._direction_statistics(visible, public_bounds)
             seen = {trial.candidate.params.fingerprint for trial in visible}
+            unseen = tuple(
+                vector for vector in alternatives if vector.fingerprint not in seen
+            )
+            choices = unseen or alternatives
+            one_field = tuple(
+                vector
+                for vector in choices
+                if public_bounds.changed_field_count(parent.candidate.params, vector) == 1
+            )
+            choices = one_field or choices
+            statistics = self._direction_statistics(visible, public_bounds)
             scored = tuple(
                 (
                     self._ucb_score(
@@ -927,13 +958,39 @@ class AdaptiveTournamentPolicy:
                     ),
                     vector,
                 )
-                for vector in alternatives
+                for vector in choices
             )
             best_score = max(score for score, _vector in scored)
             best = tuple(vector for score, vector in scored if score == best_score)
             vector = best[int(rng.integers(0, len(best)))]
         return AttackCandidate(
             params=vector, parent_id=parent.candidate.candidate_id, generation=len(visible)
+        )
+
+    @staticmethod
+    def _default_boundary_frontier(
+        history: tuple[VisibleTrial, ...],
+        bounds: ParameterBounds,
+    ) -> tuple[AdaptiveVector, ...]:
+        seen = {trial.candidate.params.fingerprint for trial in history}
+        ranked: list[tuple[str, int, str, AdaptiveVector]] = []
+        for domain in bounds.domains:
+            for boundary_rank, value in enumerate(
+                (domain.values[0], domain.values[-1])
+            ):
+                for vector in bounds.feasible_vectors:
+                    if vector.fingerprint in seen:
+                        continue
+                    if bounds.changed_field_count(bounds.defaults, vector) != 1:
+                        continue
+                    if not _same_value(vector.get(domain.name), value):
+                        continue
+                    ranked.append(
+                        (domain.name, boundary_rank, vector.fingerprint, vector)
+                    )
+        return tuple(
+            item[3]
+            for item in sorted(ranked, key=lambda item: item[:3])
         )
 
     @staticmethod

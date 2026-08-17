@@ -1,0 +1,162 @@
+{
+  "schema_version": "1.0.0",
+  "status": "final_v3_frozen_before_confirmatory_execution",
+  "purpose": "Maximum one additional confirmatory evaluation of the finalized family-agnostic finite-lattice frontier/UCB policy.",
+  "source_files": {
+    "fixtures/golden/threat-card.json": "70784460375e3dac17d355f200024ca7c74f6f3601c059f9b731168ef70f0195",
+    "pyproject.toml": "4b05a8066502169f9c0afd4e259eab3657f4f9fd61785496ed82e8083d57e5ce",
+    "scripts/run_task6_holdout.py": "37b56a1b19c47499a807aef2c71fbc3a528996fd06c84f7633441802ea18b6f8",
+    "src/apar/redteam/benchmark.py": "c2eb6324ea7b8df983a75e9f1df31d9cf82a08a47f4b16a4550fad6482c8aacf",
+    "src/apar/redteam/llm_policy.py": "8105a6788041f7d73b1afa571482f4b0ff3b15980f6c28769b701ab350936622",
+    "src/apar/redteam/policies.py": "c97ab7b263a493978cf901140a97f15874a34f8ff2ce54c84253e7baa998fb82",
+    "src/apar/redteam/search.py": "93653039c997b7b4688fee4a87ab741d7ed9e275bb6cb2cb6ee04a7388979ce0",
+    "src/apar/redteam/task6_experiment.py": "205226d6228555225aaacefcfcf104002edf678193fb178fbd7a340d108c955f"
+  },
+  "environment": {
+    "python_version": "3.12.13",
+    "python_implementation": "CPython",
+    "python_cache_tag": "cpython-312",
+    "platform": "macOS-15.1-arm64-arm-64bit",
+    "pyproject_sha256": "4b05a8066502169f9c0afd4e259eab3657f4f9fd61785496ed82e8083d57e5ce",
+    "lock_file": null,
+    "lock_file_sha256": null,
+    "packages": {
+      "cryptography": "50.0.0",
+      "fastapi": "0.141.1",
+      "hypothesis": "6.165.9",
+      "mypy": "2.3.1",
+      "numpy": "2.5.2",
+      "pandas": "3.0.5",
+      "pyarrow": "25.0.1",
+      "pydantic": "2.13.4",
+      "pytest": "9.1.1",
+      "ruff": "0.16.3"
+    }
+  },
+  "policy_bindings": {
+    "adaptive": {
+      "version": "3.0.0",
+      "code_digest": "a2ff6ad0326d7871c21394b486134f8dd99cb03d346e03e2b55abce20b325101",
+      "callable_digest": "47d256722e149bd097aedb254c7abfe2f668ce2422a5ade055bbb52489ecd9ed"
+    },
+    "cached_llm": {
+      "version": "1.0.0",
+      "code_digest": "2a1a2046cb4417477086f034bf8367f47e138e76aef9c58c32e196313866f3b2",
+      "callable_digest": "d891b5609981d7157ad8560a47c942b2d01d22bc93d479507b8c37d239f231ec"
+    },
+    "fixed": {
+      "version": "1.0.0",
+      "code_digest": "8ccc3cb1293f8ed7911a324e802cbb7fa25b2a8a9cc7b7e30ef89da904e7303a",
+      "callable_digest": "4eaf4b132e34194faeae79aa95a6d64ca36d11f0f47de66d606bc00d0f2fd39a"
+    },
+    "random": {
+      "version": "1.0.0",
+      "code_digest": "8d3465f1a734d01ca217d2e3744c950db0ceef19d185fa06e2cd4e9d055d9b61",
+      "callable_digest": "87dc14b0b897f16b0699f174532709a0c38bc61bf2ada8a0354c766ae5135931"
+    }
+  },
+  "frozen_benchmark": {
+    "population_digest": "a89e4cadd335500a87a8c4bf5fa5c68612ac931d07b0659352a200f175981c5a",
+    "defender_digest": "86b3aa0762060046b001488c457331a11d1bc92179bcf40ba7c80d811ae0321a",
+    "disclosure_profile_digest": "013db90a74727c372e34c74e5447eae13802e8e12da122ba937d25702020b894",
+    "defender_changed_after_v2": false
+  },
+  "holdout": {
+    "seeds": [503, 607, 709, 811, 907, 1009, 1103, 1201],
+    "budget": 24,
+    "wall_time_budget_ms": 120000,
+    "maximum_additional_confirmatory_attempts": 1,
+    "result_path": "docs/experiments/task6-v3-holdout-result.json"
+  },
+  "fairness": {
+    "shared_default_first_proposal": true,
+    "shared_default_policies": ["random", "adaptive"],
+    "identical_proposal_query_logical_caps": true,
+    "identical_wall_time_caps": true
+  },
+  "network": {
+    "allowed_calls": 0,
+    "cached_llm_required": true
+  },
+  "families": {
+    "app_scam_mule": {
+      "primary_outcome": "net_settled_value_rate",
+      "minimum_delta": "0.10",
+      "support_rule": "Adaptive aggregate role-bound net settled value relative improvement over random must be at least 10 percent.",
+      "no_metric_switching": true,
+      "provenance": {
+        "evaluator_code_digest": "93cd559796359fe835f41982fc2f937b6fc836716e9fc68384f775cd6d024222",
+        "contract_digest": "4124bc88991f2a4a064d607ba964b4bf825bb390736181710a7ea26ab5197f58",
+        "bounds_digest": "491a405ef68b8ca40c1c70d8dbfec43dc6717f246120672057660e6a34f8b7b1",
+        "hidden_template_digest": "cffbc8bdf58d1db018b32339f3ac5d166e82bc9412b3e6e6e90083987eea0af8",
+        "background_digest": "870ff1432f490309a6fdd89ea2e4f881134ad5f41b723c86d886e2defeeefd15",
+        "population_digest": "a89e4cadd335500a87a8c4bf5fa5c68612ac931d07b0659352a200f175981c5a",
+        "evaluator_digest": "2e47a4e455079faaa641251da2e6cd60007f342cd8b6241ea60db6817f189389",
+        "defender_digest": "86b3aa0762060046b001488c457331a11d1bc92179bcf40ba7c80d811ae0321a",
+        "disclosure_profile_digest": "013db90a74727c372e34c74e5447eae13802e8e12da122ba937d25702020b894"
+      }
+    },
+    "card_testing_cnp": {
+      "primary_outcome": "valid_yield",
+      "minimum_delta": "0.10",
+      "support_rule": "Adaptive aggregate valid yield minus random aggregate valid yield must be at least 0.10.",
+      "no_metric_switching": true,
+      "provenance": {
+        "evaluator_code_digest": "93cd559796359fe835f41982fc2f937b6fc836716e9fc68384f775cd6d024222",
+        "contract_digest": "937aba3d6c8698a34bb71cd9ba10dfa0d8c9c6d37b06647ad97d1da43cf66f57",
+        "bounds_digest": "6862e2a57cd707a4659a159cf0cf257bed6dfef4147a39e6a0df25fd203bb344",
+        "hidden_template_digest": "baacde17dcbc291784213f3333f128dcf1561868eac743aa8cb7905bdbd04388",
+        "background_digest": "870ff1432f490309a6fdd89ea2e4f881134ad5f41b723c86d886e2defeeefd15",
+        "population_digest": "a89e4cadd335500a87a8c4bf5fa5c68612ac931d07b0659352a200f175981c5a",
+        "evaluator_digest": "2e47a4e455079faaa641251da2e6cd60007f342cd8b6241ea60db6817f189389",
+        "defender_digest": "86b3aa0762060046b001488c457331a11d1bc92179bcf40ba7c80d811ae0321a",
+        "disclosure_profile_digest": "013db90a74727c372e34c74e5447eae13802e8e12da122ba937d25702020b894"
+      }
+    }
+  },
+  "uncertainty": {
+    "method": "exact_paired_sign_resampling_reference_interval",
+    "reported_values": ["per_seed_deltas", "mean_per_seed_delta", "reference_interval_95"],
+    "role": "descriptive_only",
+    "post_hoc_gate": false
+  },
+  "cached_replay": {
+    "path": "docs/experiments/task6-v3-cached-llm-replay.json",
+    "file_sha256": "1b137c2de0bec6eb95acf34172217113c825ab5be9322e694f9ec9e458427efc",
+    "preparation_seed": 4,
+    "preparation_budget": 24,
+    "holdout_seed_overlap": false
+  },
+  "negative_control": {
+    "family": "agentic_intent_abuse",
+    "fixture": "minimum public adaptive space with no mutable fields",
+    "development_seeds": [1, 2],
+    "budget": 2,
+    "primary_outcome": "valid_yield",
+    "expected_observed_delta": "0",
+    "support_expected": false,
+    "test": "tests/redteam/test_capability_delta.py::test_minimum_agentic_space_is_a_negative_no_delta_control"
+  },
+  "preserved_v2_result": {
+    "commit": "dd55570ee6c4cfcdba27c3bfd1c7b684587a3526",
+    "artifact_sha256": "d73aa1fe59177e4968991383a7c7e648b688f25a2d0ba55d68adfd6b90271ae6",
+    "supported_family_count": 1,
+    "status": "permanent_development_evidence_for_v3"
+  },
+  "v3_development_observation_not_confirmatory": {
+    "source_seeds": [101, 211, 307, 401],
+    "source": "already-open v2 holdout, reclassified permanently as development data",
+    "budget": 24,
+    "app_random_value": "4720.00",
+    "app_adaptive_value": "8870.00",
+    "card_random_yield": "0.1458333333333333333333333333",
+    "card_adaptive_yield": "0.28125"
+  },
+  "execution_receipt_boundary": {
+    "phase_a_executes_confirmatory_trials": false,
+    "local_result_absence_is_durable_exact_once_proof": false,
+    "v2_claim": "One procedural execution is recorded by commit chronology and its canonical artifact.",
+    "task7_responsibility": "Append-only artifact storage, CI/external execution receipt, durable signatures, and cross-process verification."
+  },
+  "if_v3_fails": "No further confirmatory holdout will be opened; later work is exploratory or Task 7 evaluation."
+}

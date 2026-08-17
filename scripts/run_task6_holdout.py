@@ -1,37 +1,68 @@
-"""Execute the Task 6 preregistered holdout exactly once.
+"""Verify or explicitly execute the frozen Task 6 v3 confirmatory experiment.
 
-The default mode refuses a dirty worktree or an existing result artifact.  Use
-``--verify-only`` before the preregistration commit to validate all frozen digests
-without evaluating any holdout seed.
+The local result-file check is an accidental-rerun guard, not cryptographic exactly-once
+enforcement. Durable append-only execution receipts and cross-process verification remain
+a Task 7 responsibility. The historical v2 runner is preserved at commit ``10bb4c4``.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
+import platform
 import subprocess
-from decimal import Decimal
+import sys
+from decimal import Decimal, localcontext
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
-from apar.redteam import (
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE_ROOT = ROOT / "src"
+for import_root in (SOURCE_ROOT, ROOT):
+    rendered = str(import_root)
+    if rendered not in sys.path:
+        sys.path.insert(0, rendered)
+
+from apar.contracts.decisions import Action  # noqa: E402
+from apar.redteam import (  # noqa: E402
     AdaptiveSearch,
     AdaptiveTournamentPolicy,
+    EvaluatorCapability,
     FamilyThreshold,
     FixedPolicy,
     LLMPlannerPolicy,
+    Policy,
+    PolicyCapability,
+    PolicyMetrics,
     PrimaryOutcome,
     RandomPolicy,
+    RunGroupCapability,
     SearchAuthority,
+    SearchResult,
     capability_delta_report,
 )
-from tests.redteam.conftest import benchmark_population, campaign_benchmark
+from apar.redteam.task6_experiment import (  # noqa: E402
+    Task6Experiment,
+    build_task6_experiment,
+)
 
-ROOT = Path(__file__).resolve().parents[1]
-PREREGISTRATION_PATH = ROOT / "docs/experiments/task6-holdout-preregistration.json"
-CACHE_PATH = ROOT / "docs/experiments/task6-cached-llm-replay.json"
-RESULT_PATH = ROOT / "docs/experiments/task6-holdout-result.json"
+PREREGISTRATION_PATH = ROOT / "docs/experiments/task6-v3-holdout-preregistration.json"
+CACHE_PATH = ROOT / "docs/experiments/task6-v3-cached-llm-replay.json"
+RESULT_PATH = ROOT / "docs/experiments/task6-v3-holdout-result.json"
+_PACKAGES = (
+    "cryptography",
+    "fastapi",
+    "hypothesis",
+    "mypy",
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "pydantic",
+    "pytest",
+    "ruff",
+)
 
 
 class _NoNetworkClient:
@@ -43,7 +74,7 @@ class _NoNetworkClient:
 
     def complete(self, _request: dict[str, object]) -> dict[str, object]:
         self.calls += 1
-        raise AssertionError("holdout cached planner attempted network transport")
+        raise AssertionError("v3 cached planner attempted network transport")
 
 
 def _sha256_bytes(value: bytes) -> str:
@@ -72,6 +103,21 @@ def _canonical_digest(value: object) -> str:
     return _sha256_bytes(encoded)
 
 
+def _environment_document() -> dict[str, object]:
+    return {
+        "python_version": platform.python_version(),
+        "python_implementation": platform.python_implementation(),
+        "python_cache_tag": sys.implementation.cache_tag,
+        "platform": platform.platform(),
+        "pyproject_sha256": _sha256_file(ROOT / "pyproject.toml"),
+        "lock_file": None,
+        "lock_file_sha256": None,
+        "packages": {
+            package: importlib.metadata.version(package) for package in _PACKAGES
+        },
+    }
+
+
 def _head_commit() -> str:
     completed = subprocess.run(
         ["git", "rev-parse", "HEAD"],
@@ -83,7 +129,7 @@ def _head_commit() -> str:
     return completed.stdout.strip()
 
 
-def _require_clean_worktree() -> None:
+def _require_recording_preconditions() -> None:
     completed = subprocess.run(
         ["git", "status", "--porcelain"],
         cwd=ROOT,
@@ -92,35 +138,34 @@ def _require_clean_worktree() -> None:
         text=True,
     )
     if completed.stdout:
-        raise RuntimeError("holdout requires the clean preregistration commit")
+        raise RuntimeError("v3 execution requires a clean preregistration commit")
+    if RESULT_PATH.exists():
+        raise RuntimeError("local v3 result exists; refusing an accidental rerun")
 
 
 def _runtime() -> tuple[
     dict[str, Any],
+    Task6Experiment,
     SearchAuthority,
-    object,
-    dict[str, object],
-    dict[str, object],
+    RunGroupCapability,
+    dict[str, EvaluatorCapability],
+    dict[str, PolicyCapability],
     LLMPlannerPolicy,
     _NoNetworkClient,
 ]:
-    preregistration = _load_exact_json(PREREGISTRATION_PATH)
+    artifact = _load_exact_json(PREREGISTRATION_PATH)
     cache_artifact = _load_exact_json(CACHE_PATH)
-    if _sha256_file(CACHE_PATH) != preregistration["cached_replay"]["file_sha256"]:
-        raise RuntimeError("cached replay artifact digest changed")
-    if cache_artifact["development_seed"] in preregistration["holdout"]["seeds"]:
-        raise RuntimeError("cache preparation seed overlaps holdout")
+    if _sha256_file(CACHE_PATH) != artifact["cached_replay"]["file_sha256"]:
+        raise RuntimeError("v3 cached replay artifact digest changed")
+    if cache_artifact["development_seed"] in artifact["holdout"]["seeds"]:
+        raise RuntimeError("cache preparation seed overlaps the v3 holdout")
 
-    population = benchmark_population.__wrapped__()
-    benchmarks = {
-        family: campaign_benchmark(family, population, expose_realized_value=True)
-        for family in ("app_scam_mule", "card_testing_cnp")
-    }
+    experiment = build_task6_experiment(ROOT)
     authority = SearchAuthority()
-    run_group = authority.issue_run_group("task6-preregistered-holdout")
+    run_group = authority.issue_run_group("task6-v3-confirmatory")
     evaluators = {
         family: benchmark.issue_evaluator_capability(authority)
-        for family, benchmark in benchmarks.items()
+        for family, benchmark in experiment.benchmarks.items()
     }
     no_network = _NoNetworkClient()
     cached_policy = LLMPlannerPolicy(
@@ -128,16 +173,16 @@ def _runtime() -> tuple[
         replay_cache=cache_artifact["records"],
         require_cached_replay=True,
     )
-    policy_objects = {
+    policy_objects: dict[str, Policy] = {
         "fixed": FixedPolicy(),
         "random": RandomPolicy(),
         "adaptive": AdaptiveTournamentPolicy(),
-        "cached_llm": cached_policy,
+        "cached_llm": cast(Policy, cached_policy),
     }
     versions = {
         "fixed": "1.0.0",
         "random": "1.0.0",
-        "adaptive": "2.0.0",
+        "adaptive": "3.0.0",
         "cached_llm": "1.0.0",
     }
     policies = {
@@ -145,7 +190,8 @@ def _runtime() -> tuple[
         for name, policy in policy_objects.items()
     }
     return (
-        preregistration,
+        artifact,
+        experiment,
         authority,
         run_group,
         evaluators,
@@ -157,15 +203,26 @@ def _runtime() -> tuple[
 
 def _verify_frozen_bindings(
     artifact: dict[str, Any],
-    evaluators: dict[str, object],
-    policies: dict[str, object],
+    experiment: Task6Experiment,
+    evaluators: dict[str, EvaluatorCapability],
+    policies: dict[str, PolicyCapability],
 ) -> None:
     for relative_path, expected in artifact["source_files"].items():
         if _sha256_file(ROOT / relative_path) != expected:
-            raise RuntimeError(f"frozen source digest changed: {relative_path}")
-    adaptive = policies["adaptive"]
-    if adaptive.policy_code_digest != artifact["adaptive_policy"]["code_digest"]:
-        raise RuntimeError("adaptive registered implementation digest changed")
+            raise RuntimeError(f"frozen v3 source digest changed: {relative_path}")
+    if _environment_document() != artifact["environment"]:
+        raise RuntimeError("frozen v3 Python environment changed")
+    if experiment.population_digest != artifact["frozen_benchmark"]["population_digest"]:
+        raise RuntimeError("frozen v3 population changed")
+    for name, expected in artifact["policy_bindings"].items():
+        policy = policies[name]
+        observed = {
+            "version": policy.version,
+            "code_digest": policy.policy_code_digest,
+            "callable_digest": policy.policy_callable_digest,
+        }
+        if observed != expected:
+            raise RuntimeError(f"frozen v3 policy binding changed: {name}")
     for family, expected in artifact["families"].items():
         evaluator = evaluators[family]
         contract = evaluator.evaluation_contract
@@ -181,10 +238,10 @@ def _verify_frozen_bindings(
             "disclosure_profile_digest": contract.disclosure_profile_digest,
         }
         if observed != expected["provenance"]:
-            raise RuntimeError(f"frozen evaluator provenance changed: {family}")
+            raise RuntimeError(f"frozen v3 evaluator provenance changed: {family}")
 
 
-def _metrics_document(metrics: object) -> dict[str, object]:
+def _metrics_document(metrics: PolicyMetrics) -> dict[str, object]:
     return {
         "proposal_count": metrics.proposal_count,
         "approved_count": metrics.approved_count,
@@ -195,21 +252,81 @@ def _metrics_document(metrics: object) -> dict[str, object]:
     }
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--verify-only", action="store_true")
-    args = parser.parse_args()
-    artifact, authority, group, evaluators, policies, cached_policy, no_network = (
-        _runtime()
+def _primary_value(result: SearchResult, outcome: PrimaryOutcome) -> Decimal:
+    approved = tuple(
+        trial for trial in result.trials if trial.feedback.action is Action.APPROVE
     )
-    _verify_frozen_bindings(artifact, evaluators, policies)
-    if args.verify_only:
-        print("verified frozen Task 6 holdout bindings; no holdout trial executed")
-        return
-    _require_clean_worktree()
-    if RESULT_PATH.exists():
-        raise RuntimeError("holdout result already exists; refusing a second execution")
+    if outcome is PrimaryOutcome.VALID_YIELD:
+        if not result.trials:
+            return Decimal(0)
+        return Decimal(len(approved)) / Decimal(len(result.trials))
+    return sum(
+        (trial.feedback.realized_value or Decimal(0) for trial in approved),
+        Decimal(0),
+    )
 
+
+def _paired_delta(
+    adaptive: Decimal,
+    random: Decimal,
+    outcome: PrimaryOutcome,
+) -> Decimal:
+    if outcome is not PrimaryOutcome.NET_SETTLED_VALUE_RATE:
+        return adaptive - random
+    if random == 0:
+        return Decimal(0) if adaptive == 0 else Decimal(1)
+    with localcontext() as context:
+        context.prec = 28
+        return (adaptive - random) / random
+
+
+def _descriptive_uncertainty(
+    adaptive: tuple[SearchResult, ...],
+    random: tuple[SearchResult, ...],
+    outcome: PrimaryOutcome,
+) -> dict[str, object]:
+    deltas = tuple(
+        _paired_delta(
+            _primary_value(adaptive_run, outcome),
+            _primary_value(random_run, outcome),
+            outcome,
+        )
+        for adaptive_run, random_run in zip(adaptive, random, strict=True)
+    )
+    with localcontext() as context:
+        context.prec = 28
+        observed_mean = sum(deltas, Decimal(0)) / Decimal(len(deltas))
+        sign_means = sorted(
+            sum(
+                (
+                    delta if mask & (1 << index) else -delta
+                    for index, delta in enumerate(deltas)
+                ),
+                Decimal(0),
+            )
+            / Decimal(len(deltas))
+            for mask in range(2 ** len(deltas))
+        )
+    lower = sign_means[int(Decimal("0.025") * Decimal(len(sign_means) - 1))]
+    upper = sign_means[int(Decimal("0.975") * Decimal(len(sign_means) - 1))]
+    return {
+        "method": "exact_paired_sign_resampling_reference_interval",
+        "role": "descriptive_only",
+        "per_seed_deltas": [str(delta) for delta in deltas],
+        "mean_per_seed_delta": str(observed_mean),
+        "reference_interval_95": [str(lower), str(upper)],
+    }
+
+
+def _execute(
+    artifact: dict[str, Any],
+    authority: SearchAuthority,
+    group: RunGroupCapability,
+    evaluators: dict[str, EvaluatorCapability],
+    policies: dict[str, PolicyCapability],
+    cached_policy: LLMPlannerPolicy,
+    no_network: _NoNetworkClient,
+) -> dict[str, object]:
     holdout = artifact["holdout"]
     seeds = tuple(holdout["seeds"])
     budget = holdout["budget"]
@@ -258,11 +375,11 @@ def main() -> None:
     )
     audit = cached_policy.take_audit_records()
     if no_network.calls != 0 or len(audit) != 2 * len(seeds) * budget:
-        raise RuntimeError("cached LLM zero-network audit is incomplete")
+        raise RuntimeError("v3 cached LLM zero-network audit is incomplete")
     if any(record.call_status != "cache_success" for record in audit):
-        raise RuntimeError("cached LLM holdout contains a replay miss")
+        raise RuntimeError("v3 cached LLM contains a replay miss")
 
-    document = {
+    return {
         "schema_version": "1.0.0",
         "preregistration_commit": _head_commit(),
         "preregistration_file_sha256": _sha256_file(PREREGISTRATION_PATH),
@@ -281,6 +398,11 @@ def main() -> None:
                 "random": _metrics_document(metric.random),
                 "adaptive": _metrics_document(metric.adaptive),
                 "cached_llm": _metrics_document(metric.cached_llm),
+                "uncertainty": _descriptive_uncertainty(
+                    results[metric.family]["adaptive"],
+                    results[metric.family]["random"],
+                    metric.primary_outcome,
+                ),
             }
             for metric in report.family_metrics
         },
@@ -312,12 +434,47 @@ def main() -> None:
             for family, cells in results.items()
         },
     }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--verify-only", action="store_true")
+    mode.add_argument("--execute-confirmatory", action="store_true")
+    args = parser.parse_args()
+    (
+        artifact,
+        experiment,
+        authority,
+        group,
+        evaluators,
+        policies,
+        cached_policy,
+        no_network,
+    ) = _runtime()
+    _verify_frozen_bindings(artifact, experiment, evaluators, policies)
+    if args.verify_only:
+        if RESULT_PATH.exists():
+            raise RuntimeError("v3 result must be absent during Phase A verification")
+        print("verified frozen Task 6 v3 bindings; no holdout trial executed")
+        return
+
+    _require_recording_preconditions()
+    document = _execute(
+        artifact,
+        authority,
+        group,
+        evaluators,
+        policies,
+        cached_policy,
+        no_network,
+    )
     RESULT_PATH.write_text(
         json.dumps(document, sort_keys=True, indent=2) + "\n",
         encoding="utf-8",
     )
     print(json.dumps(document["families"], sort_keys=True, indent=2))
-    print(f"supported_family_count={report.supported_family_count}")
+    print(f"supported_family_count={document['supported_family_count']}")
 
 
 if __name__ == "__main__":

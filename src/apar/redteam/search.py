@@ -94,6 +94,19 @@ def _implementation_digest(owner: object, entrypoint: Callable[..., object]) -> 
     )
 
 
+def _bound_callable_digest(owner: object, entrypoint: Callable[..., object]) -> str:
+    """Digest the exact stored bound callable without a dynamic attribute lookup."""
+    if not inspect.ismethod(entrypoint) or entrypoint.__self__ is not owner:
+        raise TypeError("registered callable must remain bound to the exact owner")
+    return _digest(
+        {
+            "owner_type": f"{type(owner).__module__}.{type(owner).__qualname__}",
+            "callable": entrypoint.__func__.__qualname__,
+            "code": hashlib.sha256(marshal.dumps(entrypoint.__func__.__code__)).hexdigest(),
+        }
+    )
+
+
 def _exact_text(label: str, value: object) -> str:
     if type(value) is not str or not value:
         raise TypeError(f"{label} must be an exact non-empty string")
@@ -295,8 +308,13 @@ class PolicyCapability:
     name: str
     version: str
     policy_code_digest: str
+    policy_callable_digest: str
     _authority: SearchAuthority = field(repr=False, compare=False)
     _policy: Policy = field(repr=False, compare=False)
+    _propose: Callable[
+        [tuple[VisibleTrial, ...], ParameterBounds, np.random.Generator],
+        AttackCandidate,
+    ] = field(repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -335,6 +353,7 @@ class SearchResult(ExternalContract):
     policy_name: str
     policy_version: str
     policy_code_digest: str
+    policy_callable_digest: str
     run_group_id: str
     result_id: str
     result_seal: str
@@ -373,6 +392,7 @@ class SearchResult(ExternalContract):
         "evaluator_code_digest",
         "policy_capability_id",
         "policy_code_digest",
+        "policy_callable_digest",
         "run_group_id",
         "result_id",
         "result_seal",
@@ -592,8 +612,10 @@ class SearchAuthority:
             name=checked_name,
             version=checked_version,
             policy_code_digest=_implementation_digest(policy, propose),
+            policy_callable_digest=_bound_callable_digest(policy, propose),
             _authority=self,
             _policy=policy,
+            _propose=propose,
         )
         self._policies[capability.capability_id] = capability
         return capability
@@ -647,6 +669,18 @@ class SearchAuthority:
             or self._policies.get(capability.capability_id) is not capability
         ):
             raise ValueError("policy capability was not issued by this exact authority")
+        try:
+            observed_callable_digest = _bound_callable_digest(
+                capability._policy,
+                capability._propose,
+            )
+        except (TypeError, AttributeError) as error:
+            raise ValueError("policy callable binding is invalid") from error
+        if not hmac.compare_digest(
+            capability.policy_callable_digest,
+            observed_callable_digest,
+        ):
+            raise ValueError("policy callable implementation digest changed")
         return capability
 
     def _validate_run_group(self, capability: RunGroupCapability) -> RunGroupCapability:
@@ -679,7 +713,7 @@ class SearchAuthority:
         rng: np.random.Generator,
     ) -> AttackCandidate:
         checked = self._validate_policy(capability)
-        return checked._policy.propose(history, bounds, rng)
+        return checked._propose(history, bounds, rng)
 
     def evaluate(
         self,
@@ -767,6 +801,7 @@ class SearchAuthority:
                         version=policy.version,
                         capability_id=policy.capability_id,
                         code_digest=policy.policy_code_digest,
+                        callable_digest=policy.policy_callable_digest,
                     )
                     for policy in checked_policies
                 ),
@@ -958,6 +993,7 @@ class AdaptiveSearch:
             policy_name=self._policy.name,
             policy_version=self._policy.version,
             policy_code_digest=self._policy.policy_code_digest,
+            policy_callable_digest=self._policy.policy_callable_digest,
             run_group_id=self._run_group.capability_id,
             seed=checked_seed,
             proposals=tuple(proposals),
@@ -1041,13 +1077,14 @@ class PolicyBinding(ExternalContract):
     version: str
     capability_id: str
     code_digest: str
+    callable_digest: str
 
     @field_validator("name", "version", mode="before")
     @classmethod
     def text_is_exact(cls, value: object) -> object:
         return _exact_text("policy binding text", value)
 
-    @field_validator("capability_id", "code_digest", mode="before")
+    @field_validator("capability_id", "code_digest", "callable_digest", mode="before")
     @classmethod
     def digests_are_exact(cls, value: object) -> object:
         return _exact_digest("policy binding digest", value)
@@ -1364,6 +1401,7 @@ def capability_delta_report(
                     result.policy_capability_id != policy_binding.capability_id
                     or result.policy_version != policy_binding.version
                     or result.policy_code_digest != policy_binding.code_digest
+                    or result.policy_callable_digest != policy_binding.callable_digest
                 ):
                     raise ValueError("capability result policy binding does not match")
                 if result.family != family:

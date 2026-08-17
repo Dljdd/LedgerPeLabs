@@ -269,7 +269,7 @@ as holdout evidence.
 ## Frozen holdout preregistration
 
 Commit `10bb4c4c9634b1c5f3b0cc1deb8554c9b22d2547` precedes every holdout trial and contains
-the finalized policy, integrity corrections, tests, one-shot runner, cached replay, and
+the finalized policy, integrity corrections, tests, preregistered runner, cached replay, and
 machine-readable preregistration. The preregistration binds source and registered code
 digests, exact evaluator contracts, bounds/template/background/population/evaluator/
 defender/disclosure digests, untouched seeds `(101, 211, 307, 401)`, budget 16, equal
@@ -281,14 +281,17 @@ defender/disclosure digests, untouched seeds `(101, 211, 307, 401)`, budget 16, 
 
 The minimum-agentic singleton remains the bound negative/no-delta control. The cached LLM
 replay was prepared only on development seed 4, has no holdout-seed overlap, and is frozen
-by file digest. The runner refuses a dirty preregistration tree, an existing result file,
-changed source/provenance/cache digests, any cache miss, or any network call.
+by file digest. The runner checked a clean preregistration tree, source/provenance/cache
+digests, cache hits, and zero network calls. Its local result-file check was only a
+procedural accidental-rerun guard, not durable exactly-once enforcement.
 
-## One-time untouched holdout result
+## Recorded untouched holdout result
 
-The holdout was executed exactly once from `10bb4c4`; no policy, seed, budget, metric,
-threshold, benchmark, defender, or test was changed after observing it. The canonical
-result artifact SHA-256 is
+One procedural execution is recorded from `10bb4c4` by commit chronology and its canonical
+artifact; no policy, seed, budget, metric, threshold, benchmark, defender, or test was
+changed after observing it. This evidence does not cryptographically exclude an unrecorded
+local invocation. Append-only storage, an external CI receipt, durable signatures, and
+cross-process verification remain Task 7 responsibilities. The recorded artifact SHA-256 is
 `d73aa1fe59177e4968991383a7c7e648b688f25a2d0ba55d68adfd6b90271ae6`.
 
 | Family | Random | Adaptive | Observed primary delta | Threshold | Supported |
@@ -316,3 +319,98 @@ is retained without metric switching or post-hoc tuning.
 - Frozen holdout binding verification: PASS without executing a trial before commit.
 - `git diff --check`: PASS.
 - `validation_spike/`: unchanged from `4d3c8f5`.
+
+## Fix round 3 Phase A: exact callable execution
+
+Rereview found that v2 registration hashed `policy.propose`, but execution later performed
+a fresh `_policy.propose` lookup. An instance or class attribute replacement after
+registration could therefore redirect execution away from the hashed method. Phase A
+captured instance replacement, class replacement, and stored-callable tampering as RED
+reproductions before changing the authority.
+
+`PolicyCapability` now retains the exact bound callable observed at trusted registration,
+its bound-callable implementation digest, the broader registered type implementation
+digest, and the exact policy instance. `SearchAuthority` validates exact issuance,
+owner/callable binding, and the callable digest, then invokes only that stored callable.
+It never performs a dynamic `policy.propose` lookup during a search. Search results and
+preregistration policy bindings include both implementation and callable digests. Copied
+and cross-authority capabilities remain rejected. Documented policy state can still
+mutate internally, so the cached LLM can append digest-only audit records without changing
+its executable binding.
+
+## V2 execution-record correction
+
+The v2 result remains permanent at commit `dd55570` with artifact SHA-256
+`d73aa1fe59177e4968991383a7c7e648b688f25a2d0ba55d68adfd6b90271ae6`. Its accurate
+claim is that one procedural execution is recorded by preregistration/result commit
+chronology and the canonical artifact. A local result-file absence check cannot
+cryptographically enforce or prove exactly-once execution and cannot exclude an
+unrecorded invocation. Task 7 owns append-only storage, an external CI/execution receipt,
+durable signatures, cross-process verification, and hostile worker isolation.
+
+The current runner is the v3 runner; the historical v2 runner is preserved at commit
+`10bb4c4`. Direct `.venv/bin/python scripts/run_task6_holdout.py --verify-only` invocation
+now bootstraps the production source path and imports no test fixtures. Production module
+`apar.redteam.task6_experiment` reconstructs the exact Task 6 population and evaluator
+contracts from a bound reviewed fixture.
+
+## Final v3 generic frontier/UCB policy
+
+V3 retains no family name, Task 5 field name, defender feature/threshold, v2 outcome
+constant, hidden reason, or confirmatory seed. Static AST checks enforce that boundary.
+Random and adaptive both use the public default as proposal zero, as preregistered for
+fairness. Adaptive then:
+
+- deterministically covers unique feasible one-field default-to-domain-boundary vectors;
+- avoids duplicate vectors whenever an unseen feasible mutation exists;
+- prefers unseen one-field directions before broader lattice moves;
+- learns public parent-child objective deltas in the parent's coarse reason context;
+- applies novelty/UCB exploration and repeated-bad-direction decay; and
+- uses the existing genuine sampled tournament for later exploitation.
+
+After implementation was fixed, it was evaluated only on the already-open v2 seeds
+`(101, 211, 307, 401)` as development data at budget 24. APP adaptive value was `8870.00`
+versus random `4720.00`; card adaptive yield was `27/96 = 0.28125` versus random
+`14/96 = 0.145833...`. These observations are permanently development evidence, not v3
+confirmatory evidence, and no further policy tuning followed them.
+
+## Final v3 preregistration — result intentionally absent
+
+`docs/experiments/task6-v3-holdout-preregistration.json` freezes:
+
+- untouched seeds `(503, 607, 709, 811, 907, 1009, 1103, 1201)`;
+- equal proposal/query/logical caps at budget 24 and equal wall-time caps at 120,000 ms;
+- a maximum of one additional confirmatory attempt;
+- zero network calls and a development-seed-only cached LLM replay;
+- unchanged APP relative role-bound value improvement `>= 0.10`;
+- unchanged card valid-yield delta `>= 0.10`;
+- shared random/adaptive default proposal and otherwise identical opportunities;
+- the negative minimum-agentic no-delta control;
+- per-seed deltas and an exact paired sign-resampling reference interval as descriptive
+  uncertainty only, never a post-hoc gate;
+- exact policy code/callable, evaluator, bounds, template, background, population,
+  defender, disclosure, runner, `llm_policy.py`, fixture, and source digests; and
+- Python 3.12.13, CPython/cache tag, platform, pyproject digest, explicit absence of a
+  lockfile, and exact installed dependency versions.
+
+If v3 fails, no further confirmatory holdout will be opened; later work is exploratory or
+Task 7 evaluation. The runner requires the explicit `--execute-confirmatory` flag, while
+`--verify-only` validates every frozen binding without calling `AdaptiveSearch`.
+
+Phase A did **not** execute a v3 holdout. The file
+`docs/experiments/task6-v3-holdout-result.json` is absent, and none of the eight v3 seeds
+was used in a policy/evaluator trial.
+
+## Fix round 3 Phase A verification
+
+- Callable substitution/tampering reproductions: `3 passed`.
+- Complete Task 6 red-team suite: `109 passed`.
+- Full repository pytest: `737 passed`.
+- Ruff over `src`, `tests`, and `scripts`: PASS.
+- Strict mypy over seven Task 6 source/runner files: PASS.
+- Project mypy over 42 source files: PASS.
+- G0 verifier: PASS for 20 threat cards and reviewed contract flow.
+- Direct v3 verify-only invocation without `PYTHONPATH`: PASS.
+- V3 result absence assertion: PASS.
+- `git diff --check`: PASS.
+- `validation_spike/`: unchanged from `dd55570`.
