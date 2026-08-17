@@ -1,0 +1,22 @@
+{
+  "schema_version": "1.0.0",
+  "status": "cancelled_before_execution",
+  "cancelled_preregistration_commit": "6ad59cdf178f23be8c7ad4a54a7b565e9bc5bf39",
+  "cancelled_preregistration_path": "docs/experiments/task6-v3.1-holdout-preregistration.json",
+  "cancelled_preregistration_sha256": "cb28cb43c95f41c861de3513c0b341a5310d462e20c58df728e41dad3a1d6142",
+  "cancelled_result_path": "docs/experiments/task6-v3.1-holdout-result.json",
+  "result_created": false,
+  "confirmatory_execution_invoked": false,
+  "seeds_used": false,
+  "seeds_remain_eligible_for_v3_2": [503, 607, 709, 811, 907, 1009, 1103, 1201],
+  "review_findings": [
+    "The trusted-process runtime snapshot bound a referenced module only by module name, not exact module identity and behavior-affecting attributes.",
+    "The preregistration did not bind a complete tracked behavior-input manifest to a preceding source commit.",
+    "Directory fsync failures other than explicitly unsupported operations were suppressed.",
+    "Target support was not hard-gated by exact target/control validity and zero-network evidence."
+  ],
+  "replacement_preregistration_path": "docs/experiments/task6-v3.2-holdout-preregistration.json",
+  "replacement_result_path": "docs/experiments/task6-v3.2-holdout-result.json",
+  "seed_reuse_basis": "The v3.1 runner was never invoked in confirmatory mode, its result path remains absent, and none of the reserved seeds entered search or evaluation.",
+  "durable_execution_receipt_boundary": "Task 7 owns append-only external receipts, durable cross-process verification, clean worker provisioning, and hostile-code isolation."
+}

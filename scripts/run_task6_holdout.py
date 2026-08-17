@@ -1,4 +1,4 @@
-"""Verify or explicitly execute the frozen Task 6 v3.1 confirmatory experiment.
+"""Verify or explicitly execute the frozen Task 6 v3.2 confirmatory experiment.
 
 The local result-file check is an accidental-rerun guard, not cryptographic exactly-once
 enforcement. Durable append-only execution receipts and cross-process verification remain
@@ -8,6 +8,7 @@ a Task 7 responsibility. The historical v2 runner is preserved at commit ``10bb4
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import importlib.metadata
 import json
@@ -17,7 +18,6 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Callable
-from contextlib import suppress
 from decimal import Decimal, localcontext
 from pathlib import Path
 from typing import Any, cast
@@ -52,22 +52,37 @@ from apar.redteam.task6_experiment import (  # noqa: E402
     build_task6_experiment,
 )
 
-PREREGISTRATION_PATH = ROOT / "docs/experiments/task6-v3.1-holdout-preregistration.json"
+PREREGISTRATION_PATH = ROOT / "docs/experiments/task6-v3.2-holdout-preregistration.json"
 CACHE_PATH = ROOT / "docs/experiments/task6-v3-cached-llm-replay.json"
 CANCELLATION_PATH = ROOT / "docs/experiments/task6-v3-cancellation.json"
 CANCELLED_RESULT_PATH = ROOT / "docs/experiments/task6-v3-holdout-result.json"
-RESULT_PATH = ROOT / "docs/experiments/task6-v3.1-holdout-result.json"
-_PACKAGES = (
-    "cryptography",
-    "fastapi",
-    "hypothesis",
-    "mypy",
-    "numpy",
-    "pandas",
-    "pyarrow",
-    "pydantic",
-    "pytest",
-    "ruff",
+V31_CANCELLATION_PATH = ROOT / "docs/experiments/task6-v3.1-cancellation.json"
+V31_RESULT_PATH = ROOT / "docs/experiments/task6-v3.1-holdout-result.json"
+RESULT_PATH = ROOT / "docs/experiments/task6-v3.2-holdout-result.json"
+_LOCK_FILES = ("uv.lock", "poetry.lock", "Pipfile.lock", "requirements.lock")
+
+
+class ResultPublicationDurabilityError(RuntimeError):
+    """The result name is visible but its directory durability is unconfirmed."""
+
+    def __init__(self, path: Path, error: OSError) -> None:
+        self.path = path
+        self.target_published = True
+        super().__init__(
+            f"result was published at {path}, but directory durability failed; "
+            "inspect the existing result before retrying"
+        )
+        self.__cause__ = error
+
+
+_UNSUPPORTED_DIRECTORY_FSYNC = frozenset(
+    value
+    for value in (
+        errno.EINVAL,
+        getattr(errno, "ENOTSUP", None),
+        getattr(errno, "EOPNOTSUPP", None),
+    )
+    if value is not None
 )
 
 
@@ -80,7 +95,7 @@ class _NoNetworkClient:
 
     def complete(self, _request: dict[str, object]) -> dict[str, object]:
         self.calls += 1
-        raise AssertionError("v3.1 cached planner attempted network transport")
+        raise AssertionError("v3.2 cached planner attempted network transport")
 
 
 def _sha256_bytes(value: bytes) -> str:
@@ -139,11 +154,19 @@ def _atomic_publish_result(
         # A same-directory hard link is atomic and fails with EEXIST instead of replacing.
         os.link(temporary, path)
         temporary.unlink()
-        directory_descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            directory_descriptor = os.open(path.parent, os.O_RDONLY)
+        except OSError as error:
+            if error.errno not in _UNSUPPORTED_DIRECTORY_FSYNC:
+                raise ResultPublicationDurabilityError(path, error) from error
+            return
         try:
             # Some filesystems do not expose directory fsync.
-            with suppress(OSError):
+            try:
                 os.fsync(directory_descriptor)
+            except OSError as error:
+                if error.errno not in _UNSUPPORTED_DIRECTORY_FSYNC:
+                    raise ResultPublicationDurabilityError(path, error) from error
         finally:
             os.close(directory_descriptor)
     finally:
@@ -153,43 +176,154 @@ def _atomic_publish_result(
 
 
 def _environment_document() -> dict[str, object]:
+    installed = sorted(
+        (
+            {
+                "name": (distribution.metadata.get("Name") or "").lower().replace("_", "-"),
+                "version": distribution.version,
+            }
+            for distribution in importlib.metadata.distributions()
+        ),
+        key=lambda item: (item["name"], item["version"]),
+    )
     return {
         "python_version": platform.python_version(),
         "python_implementation": platform.python_implementation(),
         "python_cache_tag": sys.implementation.cache_tag,
         "platform": platform.platform(),
-        "pyproject_sha256": _sha256_file(ROOT / "pyproject.toml"),
-        "lock_file": None,
-        "lock_file_sha256": None,
-        "packages": {
-            package: importlib.metadata.version(package) for package in _PACKAGES
+        "installed_distributions": installed,
+        "installed_distributions_digest": _canonical_digest(installed),
+    }
+
+
+def _git_output(arguments: list[str], *, text: bool = True) -> str | bytes:
+    completed = subprocess.run(
+        ["git", *arguments],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=text,
+    )
+    output: object = completed.stdout
+    if type(output) not in {str, bytes}:
+        raise TypeError("git output was not exact text or bytes")
+    return cast(str | bytes, output)
+
+
+def _tracked_paths(commit: str) -> tuple[str, ...]:
+    output = cast(str, _git_output(["ls-tree", "-r", "--name-only", commit]))
+    return tuple(path for path in output.splitlines() if path)
+
+
+def _is_behavior_affecting_path(path: str) -> bool:
+    return (
+        (path.startswith("src/") and path.endswith(".py"))
+        or (path.startswith("scripts/") and path.endswith(".py"))
+        or path == "pyproject.toml"
+        or path in _LOCK_FILES
+        or path.startswith("fixtures/")
+        or path
+        in {
+            "docs/experiments/task6-v3-cached-llm-replay.json",
+            "docs/experiments/task6-v3-cancellation.json",
+            "docs/experiments/task6-v3.1-cancellation.json",
+        }
+    )
+
+
+def _source_freeze_document(source_commit: str) -> dict[str, object]:
+    if type(source_commit) is not str or len(source_commit) != 40:
+        raise TypeError("source commit must be exact full Git object ID")
+    entries = {
+        path: _sha256_bytes(
+            cast(
+                bytes,
+                _git_output(["show", f"{source_commit}:{path}"], text=False),
+            )
+        )
+        for path in _tracked_paths(source_commit)
+        if _is_behavior_affecting_path(path)
+    }
+    present_locks = tuple(path for path in _LOCK_FILES if path in entries)
+    if present_locks:
+        lock_file: dict[str, object] = {
+            "path": present_locks[0],
+            "status": "tracked",
+            "sha256": entries[present_locks[0]],
+        }
+    else:
+        lock_file = {"path": None, "status": "explicitly_absent"}
+    git_tree = cast(str, _git_output(["rev-parse", f"{source_commit}^{{tree}}"])).strip()
+    return {
+        "source_commit": source_commit,
+        "git_tree": git_tree,
+        "behavior_manifest": {
+            "entries": entries,
+            "digest": _canonical_digest(entries),
         },
+        "lock_file": lock_file,
+        "environment": _environment_document(),
     }
 
 
 def _head_commit() -> str:
-    completed = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
+    return cast(str, _git_output(["rev-parse", "HEAD"])).strip()
+
+
+def _require_clean_worktree() -> None:
+    status = cast(str, _git_output(["status", "--porcelain"])).strip()
+    if status:
+        raise RuntimeError("v3.2 verification requires a clean Git worktree")
+
+
+def _verify_source_freeze(artifact: dict[str, Any]) -> None:
+    source = artifact.get("source_freeze")
+    if type(source) is not dict:
+        raise RuntimeError("v3.2 source freeze is missing")
+    source_commit = source.get("source_commit")
+    if type(source_commit) is not str:
+        raise RuntimeError("v3.2 source commit is not exact")
+    ancestor = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", source_commit, "HEAD"],
         cwd=ROOT,
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
     )
-    return completed.stdout.strip()
+    if ancestor.returncode != 0:
+        raise RuntimeError("v3.2 source commit is not an ancestor of this checkout")
+    observed = _source_freeze_document(source_commit)
+    if observed != source:
+        raise RuntimeError("v3.2 source tree, manifest, or environment binding changed")
+    entries = source["behavior_manifest"]["entries"]
+    if type(entries) is not dict:
+        raise RuntimeError("v3.2 behavior manifest entries are invalid")
+    for relative_path, expected in entries.items():
+        if type(relative_path) is not str or type(expected) is not str:
+            raise RuntimeError("v3.2 behavior manifest is non-canonical")
+        path = ROOT / relative_path
+        if not path.is_file() or _sha256_file(path) != expected:
+            raise RuntimeError(
+                f"bound executable input differs from source commit: {relative_path}"
+            )
+    _require_clean_worktree()
+
+
+def _verify_cancelled_predecessors() -> None:
+    v3 = _load_exact_json(CANCELLATION_PATH)
+    v31 = _load_exact_json(V31_CANCELLATION_PATH)
+    if v3.get("status") != "cancelled_before_execution":
+        raise RuntimeError("v3 cancellation record is not canonical")
+    if v31.get("status") != "cancelled_before_execution":
+        raise RuntimeError("v3.1 cancellation record is not canonical")
+    if CANCELLED_RESULT_PATH.exists() or V31_RESULT_PATH.exists():
+        raise RuntimeError("a cancelled confirmatory result must remain absent")
 
 
 def _require_recording_preconditions() -> None:
-    completed = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    if completed.stdout:
-        raise RuntimeError("v3.1 execution requires a clean preregistration commit")
+    _require_clean_worktree()
     if RESULT_PATH.exists():
-        raise RuntimeError("local v3.1 result exists; refusing an accidental rerun")
+        raise RuntimeError("local v3.2 result exists; refusing an accidental rerun")
 
 
 def _runtime() -> tuple[
@@ -206,13 +340,13 @@ def _runtime() -> tuple[
     artifact = _load_exact_json(PREREGISTRATION_PATH)
     cache_artifact = _load_exact_json(CACHE_PATH)
     if _sha256_file(CACHE_PATH) != artifact["cached_replay"]["file_sha256"]:
-        raise RuntimeError("v3.1 cached replay artifact digest changed")
+        raise RuntimeError("v3.2 cached replay artifact digest changed")
     if cache_artifact["development_seed"] in artifact["holdout"]["seeds"]:
-        raise RuntimeError("cache preparation seed overlaps the v3.1 holdout")
+        raise RuntimeError("cache preparation seed overlaps the v3.2 holdout")
 
     experiment = build_task6_experiment(ROOT)
     authority = SearchAuthority()
-    run_group = authority.issue_run_group("task6-v3.1-confirmatory")
+    run_group = authority.issue_run_group("task6-v3.2-confirmatory")
     evaluators = {
         family: benchmark.issue_evaluator_capability(authority)
         for family, benchmark in experiment.benchmarks.items()
@@ -261,13 +395,9 @@ def _verify_frozen_bindings(
     negative_evaluator: EvaluatorCapability,
     policies: dict[str, PolicyCapability],
 ) -> None:
-    for relative_path, expected in artifact["source_files"].items():
-        if _sha256_file(ROOT / relative_path) != expected:
-            raise RuntimeError(f"frozen v3.1 source digest changed: {relative_path}")
-    if _environment_document() != artifact["environment"]:
-        raise RuntimeError("frozen v3.1 Python environment changed")
+    _verify_source_freeze(artifact)
     if experiment.population_digest != artifact["frozen_benchmark"]["population_digest"]:
-        raise RuntimeError("frozen v3.1 population changed")
+        raise RuntimeError("frozen v3.2 population changed")
     for name, expected in artifact["policy_bindings"].items():
         policy = authority.policy_binding(policies[name])
         observed = {
@@ -277,7 +407,7 @@ def _verify_frozen_bindings(
         }
         if observed != expected:
             raise RuntimeError(
-                f"frozen v3.1 policy binding changed: {name}; "
+                f"frozen v3.2 policy binding changed: {name}; "
                 f"expected={expected!r}; observed={observed!r}"
             )
     for family, expected in artifact["families"].items():
@@ -295,7 +425,7 @@ def _verify_frozen_bindings(
             "disclosure_profile_digest": contract.disclosure_profile_digest,
         }
         if observed != expected["provenance"]:
-            raise RuntimeError(f"frozen v3.1 evaluator provenance changed: {family}")
+            raise RuntimeError(f"frozen v3.2 evaluator provenance changed: {family}")
     negative_contract = negative_evaluator.evaluation_contract
     negative_observed = {
         "evaluator_code_digest": negative_evaluator.evaluator_code_digest,
@@ -309,7 +439,7 @@ def _verify_frozen_bindings(
         "disclosure_profile_digest": negative_contract.disclosure_profile_digest,
     }
     if negative_observed != artifact["negative_control"]["provenance"]:
-        raise RuntimeError("frozen v3.1 negative-control provenance changed")
+        raise RuntimeError("frozen v3.2 negative-control provenance changed")
 
 
 def _valid_yield(results: tuple[SearchResult, ...]) -> Decimal:
@@ -393,6 +523,52 @@ def _run_negative_control(
             ]
             for name, runs in results.items()
         },
+    }
+
+
+def _confirmatory_gate(
+    *,
+    target_cells_bound: bool,
+    target_matched_budgets: bool,
+    target_network_call_count: int,
+    target_supported_family_count: int,
+    target_adaptive_claim: str,
+    negative_control: dict[str, object],
+) -> dict[str, object]:
+    """Derive every support claim from targets and the frozen zero-delta control."""
+    target_valid = (
+        type(target_cells_bound) is bool
+        and target_cells_bound
+        and type(target_matched_budgets) is bool
+        and target_matched_budgets
+        and type(target_network_call_count) is int
+        and target_network_call_count == 0
+        and type(target_supported_family_count) is int
+        and 0 <= target_supported_family_count <= 2
+        and type(target_adaptive_claim) is str
+        and target_adaptive_claim in {"supported", "not_supported"}
+    )
+    control_valid = (
+        type(negative_control) is dict
+        and negative_control.get("matched_budgets") is True
+        and type(negative_control.get("network_call_count")) is int
+        and negative_control.get("network_call_count") == 0
+        and type(negative_control.get("observed_valid_yield_delta")) is str
+        and negative_control.get("observed_valid_yield_delta") == "0"
+        and negative_control.get("supported") is False
+    )
+    confirmatory_valid = target_valid and control_valid
+    supported_count = target_supported_family_count if confirmatory_valid else 0
+    claim_supported = (
+        confirmatory_valid
+        and supported_count == 2
+        and target_adaptive_claim == "supported"
+    )
+    return {
+        "confirmatory_valid": confirmatory_valid,
+        "criterion_met": claim_supported,
+        "supported_family_count": supported_count,
+        "adaptive_claim": "supported" if claim_supported else "not_supported",
     }
 
 
@@ -531,9 +707,9 @@ def _execute(
     )
     audit = cached_policy.take_audit_records()
     if no_network.calls != 0 or len(audit) != 2 * len(seeds) * budget:
-        raise RuntimeError("v3.1 cached LLM zero-network audit is incomplete")
+        raise RuntimeError("v3.2 cached LLM zero-network audit is incomplete")
     if any(record.call_status != "cache_success" for record in audit):
-        raise RuntimeError("v3.1 cached LLM contains a replay miss")
+        raise RuntimeError("v3.2 cached LLM contains a replay miss")
     negative_control = _run_negative_control(
         authority=authority,
         run_group=group,
@@ -543,6 +719,24 @@ def _execute(
         budget=budget,
         wall_time_budget_ms=wall_budget,
     )
+    target_cells_bound = (
+        {metric.family for metric in report.family_metrics}
+        == set(artifact["families"])
+        and set(results) == set(artifact["families"])
+        and all(
+            set(cells) == {"fixed", "random", "adaptive", "cached_llm"}
+            and all(len(runs) == len(seeds) for runs in cells.values())
+            for cells in results.values()
+        )
+    )
+    confirmatory_claim = _confirmatory_gate(
+        target_cells_bound=target_cells_bound,
+        target_matched_budgets=report.matched_budgets,
+        target_network_call_count=no_network.calls,
+        target_supported_family_count=report.supported_family_count,
+        target_adaptive_claim=report.adaptive_claim,
+        negative_control=negative_control,
+    )
 
     return {
         "schema_version": "1.0.0",
@@ -551,15 +745,15 @@ def _execute(
         "preregistration_canonical_digest": _canonical_digest(artifact),
         "holdout": holdout,
         "matched_budgets": report.matched_budgets,
-        "supported_family_count": report.supported_family_count,
-        "adaptive_claim": report.adaptive_claim,
+        **confirmatory_claim,
         "negative_control": negative_control,
         "families": {
             metric.family: {
                 "primary_outcome": metric.primary_outcome.value,
                 "minimum_delta": str(metric.minimum_delta),
                 "observed_delta": str(metric.observed_delta),
-                "supported": metric.supported,
+                "supported": metric.supported
+                and bool(confirmatory_claim["confirmatory_valid"]),
                 "fixed": _metrics_document(metric.fixed),
                 "random": _metrics_document(metric.random),
                 "adaptive": _metrics_document(metric.adaptive),
@@ -606,8 +800,18 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--verify-only", action="store_true")
+    mode.add_argument("--verify-source-only", action="store_true")
     mode.add_argument("--execute-confirmatory", action="store_true")
     args = parser.parse_args()
+    if args.verify_source_only or not PREREGISTRATION_PATH.exists():
+        _verify_cancelled_predecessors()
+        if RESULT_PATH.exists():
+            raise RuntimeError("v3.2 result must remain absent before preregistration")
+        print(
+            "v3.1 cancelled; verified Task 6 v3.2 source stage; "
+            "no holdout trial executed"
+        )
+        return
     (
         artifact,
         experiment,
@@ -628,14 +832,13 @@ def main() -> None:
         policies,
     )
     if args.verify_only:
-        cancellation = _load_exact_json(CANCELLATION_PATH)
-        if cancellation["status"] != "cancelled_before_execution":
-            raise RuntimeError("v3 cancellation record is not canonical")
-        if CANCELLED_RESULT_PATH.exists():
-            raise RuntimeError("cancelled v3 result must remain absent")
+        _verify_cancelled_predecessors()
         if RESULT_PATH.exists():
-            raise RuntimeError("v3.1 result must be absent during Phase B verification")
-        print("verified frozen Task 6 v3.1 bindings; no holdout trial executed")
+            raise RuntimeError("v3.2 result must be absent during preregistration verification")
+        print(
+            "v3.1 cancelled; verified frozen Task 6 v3.2 bindings; "
+            "no holdout trial executed"
+        )
         return
 
     _require_recording_preconditions()

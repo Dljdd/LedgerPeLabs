@@ -499,3 +499,69 @@ reconstructs and checks the complete v3.1 freeze without invoking `AdaptiveSearc
 - Canceled-v3 and v3.1 result absence assertions: PASS.
 - `git diff --check`: PASS.
 - `validation_spike/`: unchanged from `cbeaeea`.
+
+## Fix round 3 Phase C: canceled v3.1 and source freeze
+
+Independent review canceled the `6ad59cd` v3.1 preregistration before execution. The
+canonical `task6-v3.1-cancellation.json` records the exact preregistration commit and file
+digest, absent result, uninvoked confirmatory path, unused reserved seeds, review findings,
+and distinct v3.2 replacement paths. The original v3 and v3.1 preregistrations remain in
+history; neither result exists.
+
+The policy authority now snapshots the exact referenced module objects plus referenced
+behavior attributes, recursive Python globals, function code/defaults/keyword defaults/
+closure cells, every policy class/MRO callable and immutable class datum, callable-object
+type code and state, exact instance slots, registered metadata, and pinned LLM client
+identity. Registration keeps exact module references in its private binding. Before each
+proposal, it rederives the runtime document and rejects module replacement (including a
+same-named fake), same-object module-attribute mutation, class/helper/global/default/
+closure/callable-state mutation, or capability substitution before policy behavior runs.
+The stored bound callable remains the only executable entrypoint.
+
+This is layered mutation detection in a trusted Python process, not a hostile-code sandbox
+and not a claim of mathematical completeness over every possible Python behavior. Task 7
+still owns a clean policy worker, process isolation/termination, durable signatures, and
+append-only execution receipts. V3.2 adds a complementary clean-process/full-tree control:
+its preregistration must point to a preceding source commit and bind that commit's Git tree
+and canonical manifest of every tracked `src/**/*.py`, Python runner/verification script,
+fixture, cached replay/config/cancellation input, pyproject, explicit lockfile absence,
+Python/platform identity, and the complete installed-distribution freeze.
+
+Result publication continues to use a same-directory fsynced temporary file and atomic
+exclusive hard-link publication. Directory fsync now suppresses only explicitly unsupported
+errors (`EINVAL`/platform `ENOTSUP`); `EIO` and other failures propagate as a recovery error
+that states the target is already published and must be inspected before retry. The target
+bytes are never overwritten and the temporary link is cleaned.
+
+The confirmatory result derives every support field through one hard gate. Exact target
+cells, matched non-exhausted budgets, zero network calls, and the matched zero-delta/
+unsupported negative control are all mandatory. If any condition fails, `confirmatory_valid`
+and `criterion_met` are false, the reported supported-family count becomes zero, every
+family support field is false, and `adaptive_claim` is `not_supported`.
+
+Phase C uses two commits. The first is this source state and intentionally contains no v3.2
+preregistration or result. A later preregistration-only commit may bind this exact source
+commit. The runner supports source-only verification without constructing `AdaptiveSearch`;
+after the preregistration exists, direct `--verify-only` must prove source ancestry, clean
+worktree, exact current file hashes, source-tree/manifest/environment bindings, evaluator
+and policy provenance, cancellation records, and result absence. Only the explicit
+`--execute-confirmatory` mode can open the reserved seeds.
+
+## Fix round 3 Phase C source-stage verification
+
+- Initial Phase C regressions: `14 failed, 1 passed` before implementation.
+- Phase C dependency, durability, gate, cancellation, and source tests: `19 passed`.
+- Complete Task 6 red-team suite: `139 passed`.
+- Simulator/trust/generator/red-team/G0-flow integration: `668 passed`.
+- Full repository pytest: `767 passed`.
+- Ruff over `src`, `tests`, and `scripts`: PASS.
+- Strict mypy over seven Task 6 source/runner files: PASS.
+- Project mypy over 42 source files: PASS.
+- G0 verifier: PASS for 20 threat cards and reviewed contract flow.
+- Direct v3.2 source-only invocation without `PYTHONPATH`: PASS.
+- V3, v3.1, and v3.2 result absence plus v3.2 preregistration absence: PASS.
+- `git diff --check`: PASS.
+- `validation_spike/`: unchanged from `6ad59cd`.
+
+No v3.2 confirmatory search was invoked, and reserved seeds
+`(503, 607, 709, 811, 907, 1009, 1103, 1201)` remain untouched.

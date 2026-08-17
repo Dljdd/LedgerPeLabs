@@ -157,6 +157,7 @@ def _literal_document(value: object) -> object | None:
 def _function_document(
     function: Callable[..., object],
     seen: set[int],
+    modules: dict[str, ModuleType],
 ) -> dict[str, object]:
     if not inspect.isfunction(function):
         raise TypeError("runtime function dependency must be a Python function")
@@ -173,64 +174,39 @@ def _function_document(
     for name in sorted(set(function.__code__.co_names)):
         if name not in function.__globals__:
             continue
-        dependency = _global_dependency_document(function.__globals__[name], seen)
+        dependency = _global_dependency_document(
+            function.__globals__[name],
+            seen,
+            modules,
+            referenced_names=frozenset(function.__code__.co_names),
+        )
         if dependency is not None:
             dependencies[name] = dependency
-    defaults = _literal_document(function.__defaults__)
-    keyword_defaults = _literal_document(
-        None
-        if function.__kwdefaults__ is None
-        else tuple(sorted(function.__kwdefaults__.items()))
-    )
+    defaults = _runtime_value_document(function.__defaults__, seen, modules)
+    keyword_defaults = _runtime_value_document(function.__kwdefaults__, seen, modules)
+    closure: dict[str, object] = {}
+    if function.__closure__ is not None:
+        for name, cell in zip(
+            function.__code__.co_freevars,
+            function.__closure__,
+            strict=True,
+        ):
+            try:
+                value = cell.cell_contents
+            except ValueError:
+                closure[name] = {"kind": "empty_cell"}
+            else:
+                closure[name] = _runtime_value_document(value, seen, modules)
     return {
         "function": reference,
         "defaults": defaults,
         "keyword_defaults": keyword_defaults,
+        "closure": closure,
         "globals": dependencies,
     }
 
 
-def _callable_document(value: object, seen: set[int]) -> dict[str, object]:
-    if inspect.ismethod(value):
-        return {
-            "kind": "bound_method",
-            "owner_type": _type_name(value.__self__),
-            "function": _function_document(value.__func__, seen),
-        }
-    if inspect.isfunction(value):
-        return {"kind": "function", "function": _function_document(value, seen)}
-    if inspect.isbuiltin(value):
-        return {
-            "kind": "builtin",
-            "module": getattr(value, "__module__", None),
-            "qualname": getattr(value, "__qualname__", getattr(value, "__name__", None)),
-        }
-    call = inspect.getattr_static(type(value), "__call__", None)
-    if inspect.isfunction(call):
-        return {
-            "kind": "callable_instance",
-            "owner_type": _type_name(value),
-            "function": _function_document(call, seen),
-        }
-    return {"kind": "callable", "owner_type": _type_name(value)}
-
-
-def _global_dependency_document(value: object, seen: set[int]) -> object | None:
-    literal = _literal_document(value)
-    if literal is not None:
-        return {"kind": "constant", "document": literal}
-    if inspect.isfunction(value):
-        return {"kind": "function", "document": _function_document(value, seen)}
-    if inspect.isbuiltin(value):
-        return {"kind": "callable", "document": _callable_document(value, seen)}
-    if isinstance(value, ModuleType):
-        return {"kind": "module", "name": value.__name__}
-    if isinstance(value, type):
-        return {"kind": "type", "name": _type_name(value)}
-    return None
-
-
-def _policy_instance_items(owner: object) -> tuple[tuple[str, object], ...]:
+def _object_instance_items(owner: object) -> tuple[tuple[str, object], ...]:
     values: dict[str, object] = {}
     instance_dict = getattr(owner, "__dict__", None)
     if type(instance_dict) is dict:
@@ -246,18 +222,204 @@ def _policy_instance_items(owner: object) -> tuple[tuple[str, object], ...]:
                 values[name] = object.__getattribute__(owner, name)
             except AttributeError:
                 continue
+    return tuple(sorted(values.items()))
+
+
+def _callable_document(
+    value: object,
+    seen: set[int],
+    modules: dict[str, ModuleType],
+) -> dict[str, object]:
+    if inspect.ismethod(value):
+        if not inspect.isfunction(value.__func__):
+            return {
+                "kind": "extension_bound_method",
+                "owner_type": _type_name(value.__self__),
+                "module": getattr(value, "__module__", None),
+                "qualname": getattr(value, "__qualname__", None),
+            }
+        return {
+            "kind": "bound_method",
+            "owner_type": _type_name(value.__self__),
+            "function": _function_document(value.__func__, seen, modules),
+        }
+    if inspect.isfunction(value):
+        return {
+            "kind": "function",
+            "function": _function_document(value, seen, modules),
+        }
+    if inspect.isbuiltin(value):
+        return {
+            "kind": "builtin",
+            "module": getattr(value, "__module__", None),
+            "qualname": getattr(value, "__qualname__", getattr(value, "__name__", None)),
+        }
+    call = inspect.getattr_static(type(value), "__call__", None)
+    if inspect.isfunction(call):
+        if id(value) in seen:
+            return {
+                "kind": "callable_instance_reference",
+                "owner_type": _type_name(value),
+            }
+        seen.add(id(value))
+        return {
+            "kind": "callable_instance",
+            "owner_type": _type_name(value),
+            "function": _function_document(call, seen, modules),
+            "state": {
+                name: _runtime_value_document(item, seen, modules)
+                for name, item in _object_instance_items(value)
+            },
+        }
+    return {"kind": "callable", "owner_type": _type_name(value)}
+
+
+def _module_document(
+    value: ModuleType,
+    seen: set[int],
+    modules: dict[str, ModuleType],
+    *,
+    referenced_names: frozenset[str],
+) -> dict[str, object]:
+    module_name = value.__name__
+    registered = modules.get(module_name)
+    if registered is not None and registered is not value:
+        return {"name": module_name, "identity_conflict": True}
+    modules[module_name] = value
+    attributes: dict[str, object] = {}
+    namespace = vars(value)
+    for name in sorted(referenced_names):
+        if name.startswith("_") or name not in namespace:
+            continue
+        attribute = namespace[name]
+        literal = _literal_document(attribute)
+        if literal is not None:
+            attributes[name] = {"kind": "constant", "document": literal}
+        elif isinstance(attribute, type):
+            attributes[name] = {"kind": "type", "name": _type_name(attribute)}
+        elif inspect.isfunction(attribute) or inspect.isbuiltin(attribute) or callable(attribute):
+            attributes[name] = {
+                "kind": "callable",
+                "document": _callable_document(attribute, seen, modules),
+            }
+        elif isinstance(attribute, ModuleType):
+            attributes[name] = {
+                "kind": "module",
+                "document": _module_document(
+                    attribute,
+                    seen,
+                    modules,
+                    referenced_names=referenced_names,
+                ),
+            }
+    return {"name": module_name, "attributes": attributes}
+
+
+def _runtime_value_document(
+    value: object,
+    seen: set[int],
+    modules: dict[str, ModuleType],
+) -> object:
+    literal = _literal_document(value)
+    if literal is not None:
+        return {"kind": "constant", "document": literal}
+    if type(value) in {list, tuple}:
+        if id(value) in seen:
+            return {"kind": "sequence_reference", "type": type(value).__name__}
+        seen.add(id(value))
+        sequence = cast(list[object] | tuple[object, ...], value)
+        return {
+            "kind": "sequence",
+            "type": type(value).__name__,
+            "items": [
+                _runtime_value_document(item, seen, modules) for item in sequence
+            ],
+        }
+    if type(value) is dict:
+        if id(value) in seen:
+            return {"kind": "mapping_reference"}
+        seen.add(id(value))
+        if any(type(key) is not str for key in value):
+            return {"kind": "mapping", "invalid_key_type": True}
+        return {
+            "kind": "mapping",
+            "items": {
+                key: _runtime_value_document(value[key], seen, modules)
+                for key in sorted(value)
+            },
+        }
+    if isinstance(value, ModuleType):
+        return {
+            "kind": "module",
+            "document": _module_document(
+                value,
+                seen,
+                modules,
+                referenced_names=frozenset(),
+            ),
+        }
+    if isinstance(value, type):
+        return {"kind": "type", "name": _type_name(value)}
+    if callable(value):
+        return {
+            "kind": "callable",
+            "document": _callable_document(value, seen, modules),
+        }
+    return {"kind": "object", "type": _type_name(value)}
+
+
+def _global_dependency_document(
+    value: object,
+    seen: set[int],
+    modules: dict[str, ModuleType],
+    *,
+    referenced_names: frozenset[str],
+) -> object | None:
+    literal = _literal_document(value)
+    if literal is not None:
+        return {"kind": "constant", "document": literal}
+    if inspect.isfunction(value):
+        return {
+            "kind": "function",
+            "document": _function_document(value, seen, modules),
+        }
+    if inspect.isbuiltin(value):
+        return {
+            "kind": "callable",
+            "document": _callable_document(value, seen, modules),
+        }
+    if isinstance(value, ModuleType):
+        return {
+            "kind": "module",
+            "document": _module_document(
+                value,
+                seen,
+                modules,
+                referenced_names=referenced_names,
+            ),
+        }
+    if isinstance(value, type):
+        return {"kind": "type", "name": _type_name(value)}
+    return None
+
+
+def _policy_instance_items(owner: object) -> tuple[tuple[str, object], ...]:
+    values = dict(_object_instance_items(owner))
     # Policy self-description is never authoritative; registration metadata is.
     values.pop("policy_name", None)
     values.pop("policy_version", None)
     return tuple(sorted(values.items()))
 
 
-def _instance_value_document(name: str, value: object, seen: set[int]) -> object:
+def _instance_value_document(
+    name: str,
+    value: object,
+    seen: set[int],
+    modules: dict[str, ModuleType],
+) -> object:
     literal = _literal_document(value)
     if literal is not None:
         return {"kind": "constant", "document": literal}
-    if callable(value):
-        return {"kind": "callable", "document": _callable_document(value, seen)}
     if name == "_client":
         complete = getattr(value, "complete", None)
         if not callable(complete):
@@ -267,7 +429,12 @@ def _instance_value_document(name: str, value: object, seen: set[int]) -> object
             "type": _type_name(value),
             "provider": _literal_document(getattr(value, "provider", None)),
             "model_id": _literal_document(getattr(value, "model_id", None)),
-            "complete": _callable_document(complete, seen),
+            "complete": _callable_document(complete, seen, modules),
+        }
+    if callable(value):
+        return {
+            "kind": "callable",
+            "document": _callable_document(value, seen, modules),
         }
     if type(value) in {dict, list, set}:
         return {"kind": "mutable_state", "type": _type_name(value)}
@@ -280,10 +447,11 @@ def _policy_runtime_document(
     *,
     name: str,
     version: str,
-) -> dict[str, object]:
+) -> tuple[dict[str, object], tuple[tuple[str, ModuleType], ...]]:
     if not inspect.ismethod(entrypoint) or entrypoint.__self__ is not owner:
         raise TypeError("registered policy entrypoint must stay bound to its exact owner")
     seen: set[int] = set()
+    modules: dict[str, ModuleType] = {}
     class_records: list[dict[str, object]] = []
     for implementation_type in reversed(type(owner).__mro__):
         if implementation_type is object:
@@ -303,7 +471,7 @@ def _policy_runtime_document(
                 )
             if functions:
                 member_records[member_name] = [
-                    _function_document(function, seen) for function in functions
+                    _function_document(function, seen, modules) for function in functions
                 ]
                 continue
             literal = _literal_document(member)
@@ -316,16 +484,17 @@ def _policy_runtime_document(
             }
         )
     instance_records = {
-        item_name: _instance_value_document(item_name, value, seen)
+        item_name: _instance_value_document(item_name, value, seen, modules)
         for item_name, value in _policy_instance_items(owner)
     }
-    return {
+    document: dict[str, object] = {
         "registered_type": _type_name(owner),
         "registered_metadata": {"name": name, "version": version},
-        "stored_entrypoint": _function_document(entrypoint.__func__, seen),
+        "stored_entrypoint": _function_document(entrypoint.__func__, seen, modules),
         "class_records": class_records,
         "instance_records": instance_records,
     }
+    return document, tuple(sorted(modules.items()))
 
 
 def _policy_runtime_digest(
@@ -334,10 +503,14 @@ def _policy_runtime_digest(
     *,
     name: str,
     version: str,
-) -> str:
-    return _digest(
-        _policy_runtime_document(owner, entrypoint, name=name, version=version)
+) -> tuple[str, tuple[tuple[str, ModuleType], ...]]:
+    document, modules = _policy_runtime_document(
+        owner,
+        entrypoint,
+        name=name,
+        version=version,
     )
+    return _digest(document), modules
 
 
 def _exact_text(label: str, value: object) -> str:
@@ -548,6 +721,7 @@ class _PolicyRuntimeBinding:
     policy_callable_digest: str
     registered_type: type[object]
     instance_items: tuple[tuple[str, object], ...] = field(repr=False, compare=False)
+    module_items: tuple[tuple[str, ModuleType], ...] = field(repr=False, compare=False)
     policy: Policy = field(repr=False, compare=False)
     propose: Callable[
         [tuple[VisibleTrial, ...], ParameterBounds, np.random.Generator],
@@ -847,19 +1021,21 @@ class SearchAuthority:
         capability = PolicyCapability(
             capability_id=self._issue_id("policy"),
         )
+        runtime_digest, module_items = _policy_runtime_digest(
+            policy,
+            propose,
+            name=checked_name,
+            version=checked_version,
+        )
         binding = _PolicyRuntimeBinding(
             capability=capability,
             name=checked_name,
             version=checked_version,
-            policy_code_digest=_policy_runtime_digest(
-                policy,
-                propose,
-                name=checked_name,
-                version=checked_version,
-            ),
+            policy_code_digest=runtime_digest,
             policy_callable_digest=_bound_callable_digest(policy, propose),
             registered_type=type(policy),
             instance_items=_policy_instance_items(policy),
+            module_items=module_items,
             policy=policy,
             propose=propose,
         )
@@ -949,7 +1125,7 @@ class SearchAuthority:
                 binding.policy,
                 binding.propose,
             )
-            observed_runtime_digest = _policy_runtime_digest(
+            observed_runtime_digest, observed_modules = _policy_runtime_digest(
                 binding.policy,
                 binding.propose,
                 name=binding.name,
@@ -957,6 +1133,17 @@ class SearchAuthority:
             )
         except (TypeError, AttributeError, ValueError) as error:
             raise ValueError("policy callable binding is invalid") from error
+        if tuple(name for name, _module in observed_modules) != tuple(
+            name for name, _module in binding.module_items
+        ) or any(
+            observed is not expected
+            for (_name, expected), (_observed_name, observed) in zip(
+                binding.module_items,
+                observed_modules,
+                strict=True,
+            )
+        ):
+            raise ValueError("policy referenced module identity changed")
         if not hmac.compare_digest(
             binding.policy_callable_digest,
             observed_callable_digest,
@@ -1138,6 +1325,7 @@ class AdaptiveSearch:
         "_clock_ns",
         "_evaluator",
         "_policy",
+        "_policy_binding",
         "_run_group",
     )
 
@@ -1162,6 +1350,7 @@ class AdaptiveSearch:
         self._authority = authority
         self._evaluator = evaluator
         self._policy = policy
+        self._policy_binding = authority.policy_binding(policy)
         self._run_group = group
         self._bounds = evaluator.bounds
         self._clock_ns = clock_ns
@@ -1262,7 +1451,7 @@ class AdaptiveSearch:
             ).candidate
         )
         contract = self._evaluator.evaluation_contract
-        policy_binding = self._authority.policy_binding(self._policy)
+        policy_binding = self._policy_binding
         return self._authority.issue_result(
             family=contract.family,
             bounds_digest=contract.bounds_digest,
