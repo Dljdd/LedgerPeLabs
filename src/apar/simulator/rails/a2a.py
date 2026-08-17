@@ -153,7 +153,18 @@ class A2ACommand(Command):
 
     @property
     def campaign_id(self) -> str:
-        return cast(str, self.payload.get("campaign_id", ""))
+        direct = self.payload.get("campaign_id")
+        if type(direct) is str:
+            return direct
+        key = self.payload.get("idempotency_key")
+        if type(key) is str and ":campaign:" in key:
+            candidate = key.rsplit(":campaign:", 1)[1]
+            try:
+                if str(UUID(candidate)) == candidate:
+                    return candidate
+            except ValueError:
+                pass
+        return ""
 
 
 class InitiateA2A(A2ACommand):
