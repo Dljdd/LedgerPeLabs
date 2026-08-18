@@ -15,6 +15,7 @@ import sys
 import sysconfig
 import unicodedata
 from collections.abc import Callable, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -78,6 +79,7 @@ _ENVIRONMENT_MEDIA = "application/vnd.apar.environment-lock+json"
 _SOURCE_MEDIA = "application/vnd.apar.source-inventory+json"
 _RELOAD_MEDIA = "application/vnd.apar.reload-fixture+json"
 _SPLIT_MEDIA = "application/vnd.apar.evaluation-split+json"
+_TRAINING_BINDING_MEDIA = "application/vnd.apar.training-binding+json"
 _CALIBRATION_BINDING_MEDIA = "application/vnd.apar.calibration-binding+json"
 _THRESHOLD_BINDING_MEDIA = "application/vnd.apar.threshold-binding+json"
 _CALLBACK_CONTRACT_VERSION = "truth-blind-intervention-mask-v1"
@@ -98,6 +100,7 @@ _COMPONENT_FIELD_MEDIA: dict[str, tuple[str, str]] = {
     "threshold": ("threshold_digest", _THRESHOLD_MEDIA),
     "threshold_binding": ("threshold_binding_digest", _THRESHOLD_BINDING_MEDIA),
     "threshold_matrix": ("threshold_matrix_digest", _PARQUET_MEDIA),
+    "training_binding": ("training_binding_digest", _TRAINING_BINDING_MEDIA),
     "training_matrix": ("training_matrix_digest", _PARQUET_MEDIA),
 }
 
@@ -335,19 +338,22 @@ class SourceInventory(ExternalContract):
 
 def build_source_inventory(source_root: Path, paths: Sequence[str]) -> SourceInventory:
     """Hash an explicit public path allowlist without following any symlink."""
-    root = _validated_source_root(source_root)
     raw_paths = tuple(paths)
     if any(type(path) is not str for path in raw_paths):
         raise BundleContractError("source inventory paths must be exact strings")
-    entries: list[SourceInventoryEntry] = []
-    for raw_path in sorted(raw_paths):
-        provisional = SourceInventoryEntry(path=raw_path, sha256="0" * 64)
-        payload = _read_verified_source(root, provisional.path)
-        entries.append(SourceInventoryEntry(path=provisional.path, sha256=_digest(payload)))
+    root_fd, root_identity = _open_source_root(source_root)
     try:
-        return SourceInventory(entries=tuple(entries))
-    except ValidationError as error:
-        raise BundleContractError("source inventory paths are invalid") from error
+        entries: list[SourceInventoryEntry] = []
+        for raw_path in sorted(raw_paths):
+            provisional = SourceInventoryEntry(path=raw_path, sha256="0" * 64)
+            digest = _read_verified_source(root_fd, root_identity, provisional.path)
+            entries.append(SourceInventoryEntry(path=provisional.path, sha256=digest))
+        try:
+            return SourceInventory(entries=tuple(entries))
+        except ValidationError as error:
+            raise BundleContractError("source inventory paths are invalid") from error
+    finally:
+        os.close(root_fd)
 
 
 class _ReloadFixture(ExternalContract):
@@ -377,6 +383,78 @@ class _ReloadFixture(ExternalContract):
         for values in (self.probability_scores, self.calibrated_scores):
             if any(not 0.0 <= value <= 1.0 for value in values):
                 raise ValueError("reload probabilities must be in [0, 1]")
+        return self
+
+
+class TrainingBindingReceipt(ExternalContract):
+    """Signed requested, mandatory-excluded, and final-fit training lineage."""
+
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    split_artifact_digest: str
+    split_semantic_digest: str
+    training_matrix_digest: str
+    training_matrix_semantic_digest: str
+    training_receipt_digest: str
+    requested_row_ids: tuple[str, ...]
+    excluded_row_ids: tuple[str, ...]
+    final_fit_row_ids: tuple[str, ...]
+    requested_count: int = Field(ge=1)
+    excluded_count: int = Field(ge=0)
+    final_fit_count: int = Field(ge=1)
+    requested_row_ids_digest: str
+    excluded_row_ids_digest: str
+    final_fit_row_ids_digest: str
+
+    @field_validator(
+        "split_artifact_digest",
+        "split_semantic_digest",
+        "training_matrix_digest",
+        "training_matrix_semantic_digest",
+        "training_receipt_digest",
+        "requested_row_ids_digest",
+        "excluded_row_ids_digest",
+        "final_fit_row_ids_digest",
+    )
+    @classmethod
+    def digest_fields_are_sha256(cls, value: str) -> str:
+        return _validate_digest(value, label="training binding digest")
+
+    @field_validator("requested_row_ids", "excluded_row_ids", "final_fit_row_ids")
+    @classmethod
+    def row_ids_are_exact(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(type(row_id) is not str or not row_id for row_id in value):
+            raise ValueError("training binding row IDs must be exact nonblank strings")
+        if len(value) != len(set(value)):
+            raise ValueError("training binding row IDs must be unique")
+        return value
+
+    @model_validator(mode="after")
+    def partitions_and_digests_are_exact(self) -> TrainingBindingReceipt:
+        if not self.requested_row_ids or not self.final_fit_row_ids:
+            raise ValueError("requested and final training rows must not be empty")
+        excluded = set(self.excluded_row_ids)
+        expected_excluded = tuple(
+            row_id for row_id in self.requested_row_ids if row_id in excluded
+        )
+        expected_final = tuple(
+            row_id for row_id in self.requested_row_ids if row_id not in excluded
+        )
+        if expected_excluded != self.excluded_row_ids:
+            raise ValueError("mandatory excluded rows must be a requested-order subset")
+        if expected_final != self.final_fit_row_ids:
+            raise ValueError("final-fit rows must equal requested rows minus exclusions")
+        if (
+            self.requested_count != len(self.requested_row_ids)
+            or self.excluded_count != len(self.excluded_row_ids)
+            or self.final_fit_count != len(self.final_fit_row_ids)
+        ):
+            raise ValueError("training binding counts are inconsistent")
+        if (
+            self.requested_row_ids_digest != _row_ids_digest(self.requested_row_ids)
+            or self.excluded_row_ids_digest != _row_ids_digest(self.excluded_row_ids)
+            or self.final_fit_row_ids_digest != _row_ids_digest(self.final_fit_row_ids)
+        ):
+            raise ValueError("training binding row-ID digest is inconsistent")
         return self
 
 
@@ -521,6 +599,7 @@ class DefenderBundleManifest(ExternalContract):
     rule_semantic_digest: str
     model_digest: str
     training_receipt_digest: str
+    training_binding_digest: str
     calibration_digest: str
     calibration_binding_digest: str
     threshold_digest: str
@@ -575,6 +654,7 @@ class DefenderBundleManifest(ExternalContract):
         "rule_semantic_digest",
         "model_digest",
         "training_receipt_digest",
+        "training_binding_digest",
         "calibration_digest",
         "calibration_binding_digest",
         "threshold_digest",
@@ -676,29 +756,33 @@ def _validated_base64(value: object, size: int, *, label: str) -> bytes:
     return decoded
 
 
-class LoadedDefenderBundle:
-    """Verified runtime with mutable contracts reconstructed on every access."""
+@dataclass(frozen=True, slots=True)
+class _LoadedSnapshot:
+    manifest: DefenderBundleManifest
+    model_bytes: bytes
+    receipt_bytes: bytes
+    catalog_bytes: bytes
+    training_bytes: bytes
+    calibration_fit_bytes: bytes
+    calibration_selection_bytes: bytes
+    threshold_matrix_bytes: bytes
+    training_binding_bytes: bytes
+    reload_bytes: bytes
+    rules_bytes: bytes
+    calibration_bytes: bytes
+    threshold_bytes: bytes
+    environment_bytes: bytes
+    source_inventory_bytes: bytes
+    calibration_binding_bytes: bytes
+    threshold_binding_bytes: bytes
+    reload_fixture_bytes: bytes
 
-    __slots__ = (
-        "_calibration_binding_bytes",
-        "_calibration_bytes",
-        "_calibration_fit_bytes",
-        "_calibration_selection_bytes",
-        "_catalog_bytes",
-        "_environment_bytes",
-        "_manifest",
-        "_model_bytes",
-        "_receipt_bytes",
-        "_reload_bytes",
-        "_reload_fixture_bytes",
-        "_rules_bytes",
-        "_source_inventory_bytes",
-        "_split_bytes",
-        "_threshold_binding_bytes",
-        "_threshold_bytes",
-        "_threshold_matrix_bytes",
-        "_training_bytes",
-    )
+
+class LoadedDefenderBundle:
+    """Sealed verified runtime rebuilding mutable public contracts from safe bytes."""
+
+    __slots__ = ("_snapshot",)
+    _snapshot: _LoadedSnapshot
 
     def __init__(
         self,
@@ -706,100 +790,122 @@ class LoadedDefenderBundle:
         manifest: DefenderBundleManifest,
         component_bytes: dict[str, bytes],
     ) -> None:
-        self._manifest = manifest
-        self._model_bytes = bytes(component_bytes["model"])
-        self._receipt_bytes = bytes(component_bytes["receipt"])
-        self._catalog_bytes = bytes(component_bytes["catalog"])
-        self._training_bytes = bytes(component_bytes["training_matrix"])
-        self._calibration_fit_bytes = bytes(component_bytes["calibration_fit_matrix"])
-        self._calibration_selection_bytes = bytes(component_bytes["calibration_selection_matrix"])
-        self._threshold_matrix_bytes = bytes(component_bytes["threshold_matrix"])
-        self._reload_bytes = bytes(component_bytes["reload_matrix"])
-        self._rules_bytes = bytes(component_bytes["rules"])
-        self._calibration_bytes = bytes(component_bytes["calibration"])
-        self._threshold_bytes = bytes(component_bytes["threshold"])
-        self._environment_bytes = bytes(component_bytes["environment"])
-        self._source_inventory_bytes = bytes(component_bytes["source_inventory"])
-        self._split_bytes = bytes(component_bytes["split"])
-        self._calibration_binding_bytes = bytes(component_bytes["calibration_binding"])
-        self._threshold_binding_bytes = bytes(component_bytes["threshold_binding"])
-        self._reload_fixture_bytes = bytes(component_bytes["reload_fixture"])
+        snapshot = _LoadedSnapshot(
+            manifest=manifest,
+            model_bytes=bytes(component_bytes["model"]),
+            receipt_bytes=bytes(component_bytes["receipt"]),
+            catalog_bytes=bytes(component_bytes["catalog"]),
+            training_bytes=bytes(component_bytes["training_matrix"]),
+            calibration_fit_bytes=bytes(component_bytes["calibration_fit_matrix"]),
+            calibration_selection_bytes=bytes(
+                component_bytes["calibration_selection_matrix"]
+            ),
+            threshold_matrix_bytes=bytes(component_bytes["threshold_matrix"]),
+            training_binding_bytes=bytes(component_bytes["training_binding"]),
+            reload_bytes=bytes(component_bytes["reload_matrix"]),
+            rules_bytes=bytes(component_bytes["rules"]),
+            calibration_bytes=bytes(component_bytes["calibration"]),
+            threshold_bytes=bytes(component_bytes["threshold"]),
+            environment_bytes=bytes(component_bytes["environment"]),
+            source_inventory_bytes=bytes(component_bytes["source_inventory"]),
+            calibration_binding_bytes=bytes(component_bytes["calibration_binding"]),
+            threshold_binding_bytes=bytes(component_bytes["threshold_binding"]),
+            reload_fixture_bytes=bytes(component_bytes["reload_fixture"]),
+        )
+        object.__setattr__(self, "_snapshot", snapshot)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError(f"{type(self).__name__} is read-only: {name}")
 
     @property
     def manifest(self) -> DefenderBundleManifest:
-        return self._manifest
+        return self._snapshot.manifest
 
     @property
     def scorer(self) -> CatBoostScorer:
-        receipt = TrainingReceipt.model_validate(strict_json_loads(self._receipt_bytes))
-        return CatBoostScorer.from_bytes(self._model_bytes, receipt)
+        receipt = TrainingReceipt.model_validate(
+            strict_json_loads(self._snapshot.receipt_bytes)
+        )
+        return CatBoostScorer.from_bytes(self._snapshot.model_bytes, receipt)
 
     @property
     def catalog(self) -> FeatureCatalog:
-        return FeatureCatalog.model_validate(strict_json_loads(self._catalog_bytes))
+        return FeatureCatalog.model_validate(strict_json_loads(self._snapshot.catalog_bytes))
 
     @property
     def training_matrix(self) -> FeatureMatrix:
-        return _matrix_from_parquet(self._training_bytes, self.catalog)
+        return _matrix_from_parquet(self._snapshot.training_bytes, self.catalog)
+
+    @property
+    def training_binding(self) -> TrainingBindingReceipt:
+        return TrainingBindingReceipt.model_validate(
+            strict_json_loads(self._snapshot.training_binding_bytes)
+        )
 
     @property
     def calibration_fit_matrix(self) -> FeatureMatrix:
-        return _matrix_from_parquet(self._calibration_fit_bytes, self.catalog)
+        return _matrix_from_parquet(self._snapshot.calibration_fit_bytes, self.catalog)
 
     @property
     def calibration_selection_matrix(self) -> FeatureMatrix:
-        return _matrix_from_parquet(self._calibration_selection_bytes, self.catalog)
+        return _matrix_from_parquet(self._snapshot.calibration_selection_bytes, self.catalog)
 
     @property
     def threshold_matrix(self) -> FeatureMatrix:
-        return _matrix_from_parquet(self._threshold_matrix_bytes, self.catalog)
+        return _matrix_from_parquet(self._snapshot.threshold_matrix_bytes, self.catalog)
 
     @property
     def reload_matrix(self) -> FeatureMatrix:
-        return _matrix_from_parquet(self._reload_bytes, self.catalog)
+        return _matrix_from_parquet(self._snapshot.reload_bytes, self.catalog)
 
     @property
     def rule_manifest(self) -> RuleManifest:
-        return RuleManifest.model_validate(strict_json_loads(self._rules_bytes))
+        return RuleManifest.model_validate(strict_json_loads(self._snapshot.rules_bytes))
 
     @property
     def calibrator(self) -> ProbabilityCalibrator:
-        return ProbabilityCalibrator.from_json(self._calibration_bytes)
+        return ProbabilityCalibrator.from_json(self._snapshot.calibration_bytes)
 
     @property
     def threshold_report(self) -> ThresholdReport:
-        return ThresholdReport.from_json(self._threshold_bytes)
+        return ThresholdReport.from_json(self._snapshot.threshold_bytes)
 
     @property
     def environment_lock(self) -> EnvironmentLock:
-        return EnvironmentLock.model_validate(strict_json_loads(self._environment_bytes))
+        return EnvironmentLock.model_validate(
+            strict_json_loads(self._snapshot.environment_bytes)
+        )
 
     @property
     def source_inventory(self) -> SourceInventory:
-        return SourceInventory.model_validate(strict_json_loads(self._source_inventory_bytes))
+        return SourceInventory.model_validate(
+            strict_json_loads(self._snapshot.source_inventory_bytes)
+        )
 
     @property
     def calibration_binding(self) -> CalibrationBindingReceipt:
         return CalibrationBindingReceipt.model_validate(
-            strict_json_loads(self._calibration_binding_bytes)
+            strict_json_loads(self._snapshot.calibration_binding_bytes)
         )
 
     @property
     def threshold_binding(self) -> ThresholdBindingReceipt:
         return ThresholdBindingReceipt.model_validate(
-            strict_json_loads(self._threshold_binding_bytes)
+            strict_json_loads(self._snapshot.threshold_binding_bytes)
         )
 
     def verify_reload(self) -> None:
         """Re-run signed reload parity from private immutable component bytes."""
-        fixture = _ReloadFixture.model_validate(strict_json_loads(self._reload_fixture_bytes))
+        fixture = _ReloadFixture.model_validate(
+            strict_json_loads(self._snapshot.reload_fixture_bytes)
+        )
         _verify_reload_parity(self.scorer, self.calibrator, self.reload_matrix, fixture)
 
 
 class DefenderBundlePublisher:
     """Publish and load defender bundles under one exact store and signing authority."""
 
-    __slots__ = ("_source_root", "_store", "_signer")
+    __slots__ = ("_closed", "_source_root_fd", "_source_root_identity", "_store", "_signer")
 
     def __init__(self, store: ArtifactStore, signer: RunSigningIdentity, source_root: Path) -> None:
         if type(store) is not ArtifactStore:
@@ -808,7 +914,30 @@ class DefenderBundlePublisher:
             raise BundleContractError("publisher requires an exact RunSigningIdentity")
         self._store = store
         self._signer = signer
-        self._source_root = _validated_source_root(source_root)
+        self._source_root_fd, self._source_root_identity = _open_source_root(source_root)
+        self._closed = False
+
+    def __enter__(self) -> DefenderBundlePublisher:
+        self._require_open()
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Close the pinned source-root descriptor; repeated calls are harmless."""
+        if not getattr(self, "_closed", True):
+            descriptor = self._source_root_fd
+            self._closed = True
+            with suppress(OSError):
+                os.close(descriptor)
+
+    def _require_open(self) -> None:
+        if getattr(self, "_closed", True):
+            raise BundleContractError("defender bundle publisher is closed")
 
     def freeze(
         self,
@@ -817,6 +946,7 @@ class DefenderBundlePublisher:
         catalog: FeatureCatalog,
         split: EvaluationSplit,
         training_matrix: FeatureMatrix,
+        mandatory_excluded_row_ids: tuple[str, ...] = (),
         calibration_fit_matrix: FeatureMatrix,
         calibration_fit_labels: np.ndarray,
         calibration_selection_matrix: FeatureMatrix,
@@ -838,12 +968,14 @@ class DefenderBundlePublisher:
         rollback_ref: str = GENESIS_ROLLBACK_REF,
     ) -> tuple[DefenderBundleManifest, ArtifactRef]:
         """Validate every binding, then atomically expose a signed top manifest."""
+        self._require_open()
         try:
             components = self._prepare_components(
                 scorer=scorer,
                 catalog=catalog,
                 split=split,
                 training_matrix=training_matrix,
+                mandatory_excluded_row_ids=mandatory_excluded_row_ids,
                 calibration_fit_matrix=calibration_fit_matrix,
                 calibration_fit_labels=calibration_fit_labels,
                 calibration_selection_matrix=calibration_selection_matrix,
@@ -884,6 +1016,7 @@ class DefenderBundlePublisher:
                 "feature_semantic_digest": components.feature_semantic_digest,
                 "training_matrix_digest": refs["training_matrix"].sha256,
                 "training_matrix_semantic_digest": components.training_semantic_digest,
+                "training_binding_digest": refs["training_binding"].sha256,
                 "calibration_fit_matrix_digest": refs["calibration_fit_matrix"].sha256,
                 "calibration_fit_matrix_semantic_digest": (
                     components.calibration_fit_semantic_digest
@@ -942,6 +1075,7 @@ class DefenderBundlePublisher:
     def verify(self, manifest: object) -> bool:
         """Return false, never raise, for any hostile manifest or component state."""
         try:
+            self._require_open()
             if type(manifest) is not DefenderBundleManifest:
                 return False
             validated = DefenderBundleManifest.model_validate(manifest.model_dump(mode="python"))
@@ -952,6 +1086,7 @@ class DefenderBundlePublisher:
 
     def load(self, ref: ArtifactRef) -> LoadedDefenderBundle:
         """Load only after top-ref, signature, chain, component, and parity checks."""
+        self._require_open()
         try:
             if type(ref) is not ArtifactRef or ref.media_type != _BUNDLE_MEDIA:
                 raise BundleContractError("bundle reference has an invalid type or media type")
@@ -975,6 +1110,7 @@ class DefenderBundlePublisher:
         catalog: FeatureCatalog,
         split: EvaluationSplit,
         training_matrix: FeatureMatrix,
+        mandatory_excluded_row_ids: tuple[str, ...],
         calibration_fit_matrix: FeatureMatrix,
         calibration_fit_labels: np.ndarray,
         calibration_selection_matrix: FeatureMatrix,
@@ -1040,7 +1176,9 @@ class DefenderBundlePublisher:
         if type(bundle_id) is not str or bundle_id != canonical_bundle_id:
             raise BundleContractError("bundle ID must be a canonical UUID")
         _validate_environment(environment_lock, scorer, calibrator)
-        _validate_source_inventory(self._source_root, source_inventory)
+        _validate_source_inventory(
+            self._source_root_fd, self._source_root_identity, source_inventory
+        )
         if not threshold_report.feasible or threshold_report.thresholds is None:
             raise BundleContractError("only a feasible threshold report may be frozen")
         if rollback_ref != GENESIS_ROLLBACK_REF:
@@ -1101,6 +1239,9 @@ class DefenderBundlePublisher:
         if receipt.model_payload_digest != _digest(scorer.to_bytes()):
             raise BundleContractError("model payload does not match its receipt")
         training_ids = tuple(row.event_id for row in training_matrix.rows)
+        excluded_ids, final_fit_ids = _training_partitions(
+            training_ids, mandatory_excluded_row_ids
+        )
         if len(training_ids) != receipt.requested_training_count:
             raise BundleContractError("training matrix count does not match the receipt")
         if (
@@ -1109,12 +1250,12 @@ class DefenderBundlePublisher:
         ):
             raise BundleContractError("training matrix row IDs do not match the receipt")
         if (
-            receipt.mandatory_excluded_count != 0
-            or receipt.final_training_count != len(training_ids)
-            or receipt.final_training_row_ids_digest != _row_ids_digest(training_ids)
+            receipt.mandatory_excluded_count != len(excluded_ids)
+            or receipt.final_training_count != len(final_fit_ids)
+            or receipt.final_training_row_ids_digest != _row_ids_digest(final_fit_ids)
         ):
             raise BundleContractError(
-                "published training matrix must equal the receipt's final training rows"
+                "mandatory excluded rows do not match the model receipt"
             )
         if any(row.decision_at > receipt.training_cutoff for row in training_matrix.rows):
             raise BundleContractError("training matrix contains a row after its cutoff")
@@ -1198,6 +1339,23 @@ class DefenderBundlePublisher:
         calibration_payload = calibrator.to_json()
         threshold_payload = threshold_report.to_json()
         model_payload = scorer.to_bytes()
+        receipt_payload = canonical_json_bytes(receipt.model_dump(mode="json"))
+        training_binding = TrainingBindingReceipt(
+            split_artifact_digest=_digest(split_payload),
+            split_semantic_digest=split_semantic,
+            training_matrix_digest=_digest(matrix_payloads["training"]),
+            training_matrix_semantic_digest=training_semantic,
+            training_receipt_digest=_digest(receipt_payload),
+            requested_row_ids=training_ids,
+            excluded_row_ids=excluded_ids,
+            final_fit_row_ids=final_fit_ids,
+            requested_count=len(training_ids),
+            excluded_count=len(excluded_ids),
+            final_fit_count=len(final_fit_ids),
+            requested_row_ids_digest=_row_ids_digest(training_ids),
+            excluded_row_ids_digest=_row_ids_digest(excluded_ids),
+            final_fit_row_ids_digest=_row_ids_digest(final_fit_ids),
+        )
         calibration_binding = CalibrationBindingReceipt(
             split_artifact_digest=_digest(split_payload),
             split_semantic_digest=split_semantic,
@@ -1253,7 +1411,11 @@ class DefenderBundlePublisher:
             "threshold_matrix": (matrix_payloads["threshold"], _PARQUET_MEDIA),
             "rules": (canonical_json_bytes(rule_manifest.model_dump(mode="json")), _RULE_MEDIA),
             "model": (model_payload, _MODEL_MEDIA),
-            "receipt": (canonical_json_bytes(receipt.model_dump(mode="json")), _RECEIPT_MEDIA),
+            "receipt": (receipt_payload, _RECEIPT_MEDIA),
+            "training_binding": (
+                canonical_json_bytes(training_binding.model_dump(mode="json")),
+                _TRAINING_BINDING_MEDIA,
+            ),
             "calibration": (calibration_payload, _CALIBRATION_MEDIA),
             "calibration_binding": (
                 canonical_json_bytes(calibration_binding.model_dump(mode="json")),
@@ -1328,7 +1490,9 @@ class DefenderBundlePublisher:
             strict_json_loads(component_bytes["source_inventory"])
         )
         _validate_environment(environment, scorer, calibrator)
-        _validate_source_inventory(self._source_root, source_inventory)
+        _validate_source_inventory(
+            self._source_root_fd, self._source_root_identity, source_inventory
+        )
         split = _split_from_bytes(component_bytes["split"])
         split_semantic = _validate_split(split)
         if split.split_digest != manifest.split_manifest_digest:
@@ -1364,15 +1528,17 @@ class DefenderBundlePublisher:
         )
         _require_matrix_rows(threshold_matrix, split.row_ids["threshold"], label="threshold")
         _require_matrix_rows(reload_matrix, split.row_ids["development"], label="reload")
-        training_ids = tuple(row.event_id for row in training.rows)
-        if (
-            _row_ids_digest(training_ids) != receipt.requested_training_row_ids_digest
-            or _row_ids_digest(training_ids) != receipt.final_training_row_ids_digest
-            or len(training_ids) != receipt.requested_training_count
-            or receipt.mandatory_excluded_count != 0
-            or any(row.decision_at > receipt.training_cutoff for row in training.rows)
-        ):
-            raise BundleContractError("training matrix does not match the model receipt")
+        training_binding = TrainingBindingReceipt.model_validate(
+            strict_json_loads(component_bytes["training_binding"])
+        )
+        _verify_training_binding(
+            training_binding,
+            manifest,
+            split_semantic,
+            receipt,
+            training,
+            component_bytes,
+        )
         calibration_binding = CalibrationBindingReceipt.model_validate(
             strict_json_loads(component_bytes["calibration_binding"])
         )
@@ -1564,68 +1730,133 @@ def _media_size_limit(media_type: str) -> int:
     return _MAX_JSON_BYTES
 
 
-def _validated_source_root(source_root: Path) -> Path:
+def _open_source_root(source_root: Path) -> tuple[int, tuple[int, int, int]]:
     if not isinstance(source_root, Path):
         raise BundleContractError("source root must be a Path")
     try:
-        metadata = source_root.lstat()
+        lexical = source_root.lstat()
     except OSError as error:
         raise BundleContractError("source root is unavailable") from error
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+    if stat.S_ISLNK(lexical.st_mode) or not stat.S_ISDIR(lexical.st_mode):
         raise BundleContractError("source root must be a non-symlink directory")
     try:
-        return source_root.resolve(strict=True)
+        descriptor = os.open(
+            source_root,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
     except OSError as error:
-        raise BundleContractError("source root cannot be resolved") from error
-
-
-def _read_verified_source(source_root: Path, relative_path: str) -> bytes:
-    entry = SourceInventoryEntry(path=relative_path, sha256="0" * 64)
-    current = source_root
-    for index, part in enumerate(PurePosixPath(entry.path).parts):
-        current = current / part
-        try:
-            metadata = current.lstat()
-        except OSError as error:
-            raise BundleContractError(f"source path is unavailable: {entry.path}") from error
-        if stat.S_ISLNK(metadata.st_mode):
-            raise BundleContractError(f"source path contains a symlink: {entry.path}")
-        if index < len(PurePosixPath(entry.path).parts) - 1:
-            if not stat.S_ISDIR(metadata.st_mode):
-                raise BundleContractError(f"source parent is not a directory: {entry.path}")
-        elif not stat.S_ISREG(metadata.st_mode):
-            raise BundleContractError(f"source path is not a regular file: {entry.path}")
-    try:
-        resolved = current.resolve(strict=True)
-        relative = resolved.relative_to(source_root)
-    except (OSError, ValueError) as error:
-        raise BundleContractError("source path escapes the pinned source root") from error
-    resolved_text = relative.as_posix().lower()
-    if any(
-        token in resolved_text for token in ("private", "hidden", "restricted", "evaluation_hidden")
-    ):
-        raise BundleContractError("resolved source path is forbidden")
-    descriptor = os.open(current, os.O_RDONLY | os.O_NOFOLLOW)
+        raise BundleContractError("source root must be a non-symlink directory") from error
     try:
         opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or (opened.st_dev, opened.st_ino, opened.st_mode)
+            != (lexical.st_dev, lexical.st_ino, lexical.st_mode)
+        ):
+            raise BundleContractError("source root changed while it was pinned")
+        return descriptor, (opened.st_dev, opened.st_ino, opened.st_mode)
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _source_fingerprint(metadata: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _read_verified_source(
+    source_root_fd: int,
+    source_root_identity: tuple[int, int, int],
+    relative_path: str,
+) -> str:
+    entry = SourceInventoryEntry(path=relative_path, sha256="0" * 64)
+    parts = PurePosixPath(entry.path).parts
+    parent_descriptors: list[tuple[int, tuple[int, int, int, int, int, int]]] = []
+    final_descriptor: int | None = None
+    try:
+        root_before = os.fstat(source_root_fd)
+        if (
+            not stat.S_ISDIR(root_before.st_mode)
+            or (root_before.st_dev, root_before.st_ino, root_before.st_mode)
+            != source_root_identity
+        ):
+            raise BundleContractError("pinned source root identity changed")
+        root_fingerprint = _source_fingerprint(root_before)
+        current_parent_fd = source_root_fd
+        for part in parts[:-1]:
+            parent_fd = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=current_parent_fd,
+            )
+            try:
+                parent_metadata = os.fstat(parent_fd)
+                if not stat.S_ISDIR(parent_metadata.st_mode):
+                    raise BundleContractError(
+                        f"source parent is not a directory: {entry.path}"
+                    )
+            except Exception:
+                with suppress(OSError):
+                    os.close(parent_fd)
+                raise
+            parent_descriptors.append((parent_fd, _source_fingerprint(parent_metadata)))
+            current_parent_fd = parent_fd
+        final_descriptor = os.open(
+            parts[-1],
+            os.O_RDONLY | os.O_NOFOLLOW,
+            dir_fd=current_parent_fd,
+        )
+        opened = os.fstat(final_descriptor)
+        opened_fingerprint = _source_fingerprint(opened)
         if not stat.S_ISREG(opened.st_mode) or opened.st_size > _MAX_JSON_BYTES:
             raise BundleContractError("source file type or size is invalid")
-        chunks: list[bytes] = []
+        hasher = hashlib.sha256()
         remaining = opened.st_size
         while remaining:
-            chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+            chunk = os.read(final_descriptor, min(remaining, 1024 * 1024))
             if not chunk:
                 raise BundleContractError("source file changed while being read")
-            chunks.append(chunk)
+            hasher.update(chunk)
             remaining -= len(chunk)
-        return b"".join(chunks)
+        if _source_fingerprint(os.fstat(final_descriptor)) != opened_fingerprint:
+            raise BundleContractError("source file changed while being hashed")
+        if any(
+            _source_fingerprint(os.fstat(parent_fd)) != before
+            for parent_fd, before in parent_descriptors
+        ):
+            raise BundleContractError("source parent changed while file was being hashed")
+        if _source_fingerprint(os.fstat(source_root_fd)) != root_fingerprint:
+            raise BundleContractError("source root changed while file was being hashed")
+        return hasher.hexdigest()
+    except BundleContractError:
+        raise
+    except OSError as error:
+        raise BundleContractError(
+            f"source path contains a symlink or invalid component: {entry.path}"
+        ) from error
     finally:
-        os.close(descriptor)
+        if final_descriptor is not None:
+            with suppress(OSError):
+                os.close(final_descriptor)
+        for parent_fd, _ in reversed(parent_descriptors):
+            with suppress(OSError):
+                os.close(parent_fd)
 
 
-def _validate_source_inventory(source_root: Path, inventory: SourceInventory) -> None:
+def _validate_source_inventory(
+    source_root_fd: int,
+    source_root_identity: tuple[int, int, int],
+    inventory: SourceInventory,
+) -> None:
     for entry in inventory.entries:
-        if _digest(_read_verified_source(source_root, entry.path)) != entry.sha256:
+        if _read_verified_source(source_root_fd, source_root_identity, entry.path) != entry.sha256:
             raise BundleContractError(f"source inventory hash mismatch: {entry.path}")
 
 
@@ -1705,6 +1936,28 @@ def _split_from_bytes(payload: bytes) -> EvaluationSplit:
 
 def _row_ids_digest(row_ids: Sequence[str]) -> str:
     return _digest(canonical_json_bytes(list(row_ids)))
+
+
+def _training_partitions(
+    requested_row_ids: tuple[str, ...],
+    mandatory_excluded_row_ids: tuple[str, ...],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    if type(mandatory_excluded_row_ids) is not tuple or any(
+        type(row_id) is not str or not row_id for row_id in mandatory_excluded_row_ids
+    ):
+        raise BundleContractError("mandatory excluded row IDs must be an exact string tuple")
+    if len(mandatory_excluded_row_ids) != len(set(mandatory_excluded_row_ids)):
+        raise BundleContractError("mandatory excluded row IDs must be unique")
+    excluded = set(mandatory_excluded_row_ids)
+    if not excluded <= set(requested_row_ids):
+        raise BundleContractError("mandatory excluded rows must be requested training rows")
+    expected_excluded = tuple(row_id for row_id in requested_row_ids if row_id in excluded)
+    if mandatory_excluded_row_ids != expected_excluded:
+        raise BundleContractError("mandatory exclusions must follow requested row order")
+    final_fit = tuple(row_id for row_id in requested_row_ids if row_id not in excluded)
+    if not final_fit:
+        raise BundleContractError("mandatory exclusions cannot remove every training row")
+    return expected_excluded, final_fit
 
 
 def _require_matrix_rows(matrix: FeatureMatrix, expected: Sequence[str], *, label: str) -> None:
@@ -1798,6 +2051,40 @@ def _require_split_values(
     actual = np.asarray(values, dtype=np.float64)
     if actual.shape != expected.shape or not np.array_equal(actual, expected):
         raise BundleContractError("threshold values do not match evaluator split truth")
+
+
+def _verify_training_binding(
+    binding: TrainingBindingReceipt,
+    manifest: DefenderBundleManifest,
+    split_semantic: str,
+    receipt: TrainingReceipt,
+    matrix: FeatureMatrix,
+    component_bytes: dict[str, bytes],
+) -> None:
+    requested = tuple(row.event_id for row in matrix.rows)
+    excluded, final_fit = _training_partitions(requested, binding.excluded_row_ids)
+    expected = {
+        "split_artifact_digest": manifest.split_artifact_digest,
+        "split_semantic_digest": split_semantic,
+        "training_matrix_digest": manifest.training_matrix_digest,
+        "training_matrix_semantic_digest": manifest.training_matrix_semantic_digest,
+        "training_receipt_digest": _digest(component_bytes["receipt"]),
+        "requested_row_ids": requested,
+        "excluded_row_ids": excluded,
+        "final_fit_row_ids": final_fit,
+    }
+    document = binding.model_dump(mode="python")
+    if any(document[name] != value for name, value in expected.items()):
+        raise BundleContractError("training binding receipt is inconsistent")
+    if (
+        receipt.requested_training_count != len(requested)
+        or receipt.requested_training_row_ids_digest != _row_ids_digest(requested)
+        or receipt.mandatory_excluded_count != len(excluded)
+        or receipt.final_training_count != len(final_fit)
+        or receipt.final_training_row_ids_digest != _row_ids_digest(final_fit)
+        or any(row.decision_at > receipt.training_cutoff for row in matrix.rows)
+    ):
+        raise BundleContractError("training matrix does not match the model receipt")
 
 
 def _verify_calibration_binding(

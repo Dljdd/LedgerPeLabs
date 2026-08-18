@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import os
 import platform
 import sys
 import sysconfig
-from dataclasses import dataclass
+from dataclasses import FrozenInstanceError, dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -37,6 +38,7 @@ from apar.defense.bundle import (
     SourceInventory,
     SourceInventoryEntry,
     ThresholdBindingReceipt,
+    TrainingBindingReceipt,
     build_source_inventory,
     current_environment_lock,
 )
@@ -113,7 +115,10 @@ def _matrix(count: int = 32) -> FeatureMatrix:
     )
 
 
-def _train(matrix: FeatureMatrix) -> CatBoostScorer:
+def _train(
+    matrix: FeatureMatrix,
+    mandatory_excluded_row_ids: tuple[str, ...] = (),
+) -> CatBoostScorer:
     labels = {row.event_id: int(index % 3 == 0) for index, row in enumerate(matrix.rows[:20])}
     ids = tuple(labels)
     folds = (
@@ -127,6 +132,7 @@ def _train(matrix: FeatureMatrix) -> CatBoostScorer:
         folds,
         GbdtTrainingConfig(depths=(2,), learning_rates=(0.1,), l2_leaf_regs=(3.0,), iterations=8),
         training_cutoff=matrix.rows[19].decision_at,
+        mandatory_row_ids=mandatory_excluded_row_ids,
     )
 
 
@@ -361,6 +367,7 @@ def test_public_api_is_closed_and_immutable(bundle_fixture: BundleFixture) -> No
         "catalog",
         "split",
         "training_matrix",
+        "mandatory_excluded_row_ids",
         "calibration_fit_matrix",
         "calibration_fit_labels",
         "calibration_selection_matrix",
@@ -407,6 +414,8 @@ def test_valid_publish_load_is_deterministic_and_reproduces_all_scores(
     assert loaded.rule_manifest == bundle_fixture.kwargs["rule_manifest"]
     assert loaded.training_matrix == bundle_fixture.kwargs["training_matrix"]
     assert loaded.reload_matrix == bundle_fixture.reload_matrix
+    assert len(manifest.components) == 18
+    assert len({component.name for component in manifest.components}) == 18
     assert bundle_fixture.publisher.verify(manifest) is True
     np.testing.assert_allclose(
         loaded.scorer.predict(loaded.reload_matrix),
@@ -478,6 +487,53 @@ def test_loaded_scorer_mutation_cannot_change_private_signed_runtime(
         atol=0.0,
     )
     loaded.verify_reload()
+
+
+def test_loaded_runtime_is_sealed_and_retains_no_evaluator_truth(
+    bundle_fixture: BundleFixture,
+) -> None:
+    _, ref = bundle_fixture.publisher.freeze(**bundle_fixture.kwargs)
+    loaded = bundle_fixture.publisher.load(ref)
+    pending: list[object] = [loaded]
+    seen: set[int] = set()
+    slot_names: list[str] = []
+    retained_bytes: list[bytes] = []
+    while pending:
+        value = pending.pop()
+        if id(value) in seen:
+            continue
+        seen.add(id(value))
+        for base in type(value).__mro__:
+            for name in cast(tuple[str, ...], getattr(base, "__slots__", ())):
+                slot_names.append(name)
+                retained = getattr(value, name)
+                if isinstance(retained, bytes):
+                    retained_bytes.append(retained)
+                elif type(retained).__module__ == bundle_module.__name__:
+                    pending.append(retained)
+    truth_tokens = (
+        b'"row_is_fraud"',
+        b'"row_families"',
+        b'"row_campaigns"',
+        b'"row_net_settled_values"',
+        b"agentic_intent_abuse",
+        b"campaign-024",
+    )
+
+    assert "_split_bytes" not in slot_names
+    assert not hasattr(loaded, "__dict__")
+    assert all(token not in payload for token in truth_tokens for payload in retained_bytes)
+    for name in (
+        "_model_bytes",
+        "_threshold_bytes",
+        "_reload_bytes",
+        "_manifest",
+        "_snapshot",
+    ):
+        with pytest.raises((FrozenInstanceError, AttributeError)):
+            setattr(loaded, name, getattr(loaded, name, b"forged"))
+    with pytest.raises((FrozenInstanceError, AttributeError)):
+        loaded._snapshot.model_bytes = b"forged"
 
 
 def test_freeze_rederives_calibration_thresholds_and_enforces_split_roles(
@@ -614,12 +670,128 @@ def test_threshold_binding_preserves_optional_no_value_objective(
     assert loaded.threshold_report.input_values_digest is None
 
 
+def _kwargs_for_excluded_scorer(
+    bundle_fixture: BundleFixture,
+    scorer: CatBoostScorer,
+    excluded: tuple[str, ...],
+) -> dict[str, object]:
+    kwargs = bundle_fixture.kwargs
+    fit = cast(FeatureMatrix, kwargs["calibration_fit_matrix"])
+    selection = cast(FeatureMatrix, kwargs["calibration_selection_matrix"])
+    fit_labels = cast(np.ndarray, kwargs["calibration_fit_labels"])
+    selection_labels = cast(np.ndarray, kwargs["calibration_selection_labels"])
+    actions = cast(np.ndarray, kwargs["threshold_mandatory_actions"])
+    values = cast(np.ndarray, kwargs["threshold_values"])
+    calibrator = select_calibrator(
+        scorer.predict(fit),
+        fit_labels,
+        scorer.predict(selection),
+        selection_labels,
+        min_class_count=50,
+    )
+    threshold_report = select_policy_thresholds(
+        calibrator.predict(scorer.predict(selection)),
+        selection_labels,
+        actions,
+        _review_case_counter,
+        cast(ThresholdReport, kwargs["threshold_report"]).budget,
+        values,
+    )
+    lineage = cast(BundleLineage, kwargs["lineage"]).model_copy(
+        update={
+            "hyperparameter_digest": hashlib.sha256(
+                canonical_json_bytes(scorer.receipt.selected_params.model_dump(mode="json"))
+            ).hexdigest()
+        }
+    )
+    return {
+        **kwargs,
+        "scorer": scorer,
+        "mandatory_excluded_row_ids": excluded,
+        "calibrator": calibrator,
+        "threshold_report": threshold_report,
+        "lineage": lineage,
+        "bundle_id": "62345678-1234-5678-9234-567812345678",
+    }
+
+
+def test_training_binding_supports_one_mandatory_exclusion(
+    bundle_fixture: BundleFixture,
+) -> None:
+    training = cast(FeatureMatrix, bundle_fixture.kwargs["training_matrix"])
+    excluded = ("bundle-row-005",)
+    scorer = _train(training, excluded)
+    kwargs = _kwargs_for_excluded_scorer(bundle_fixture, scorer, excluded)
+
+    manifest, ref = bundle_fixture.publisher.freeze(**kwargs)
+    loaded = bundle_fixture.publisher.load(ref)
+    binding = loaded.training_binding
+
+    assert scorer.receipt.requested_training_count == 20
+    assert scorer.receipt.mandatory_excluded_count == 1
+    assert scorer.receipt.final_training_count == 19
+    assert type(binding) is TrainingBindingReceipt
+    assert binding.requested_row_ids == tuple(row.event_id for row in training.rows)
+    assert binding.excluded_row_ids == excluded
+    assert binding.final_fit_row_ids == tuple(
+        row.event_id for row in training.rows if row.event_id not in excluded
+    )
+    assert binding.training_receipt_digest == manifest.training_receipt_digest
+
+
+def test_training_binding_rejects_excluded_id_order_count_and_digest_tamper(
+    bundle_fixture: BundleFixture,
+) -> None:
+    training = cast(FeatureMatrix, bundle_fixture.kwargs["training_matrix"])
+    excluded = ("bundle-row-005",)
+    scorer = _train(training, excluded)
+    kwargs = _kwargs_for_excluded_scorer(bundle_fixture, scorer, excluded)
+    with pytest.raises(BundleContractError, match="excluded"):
+        bundle_fixture.publisher.freeze(
+            **{**kwargs, "mandatory_excluded_row_ids": ("bundle-row-006",)}
+        )
+
+    ordered = ("bundle-row-005", "bundle-row-006")
+    scorer_two = _train(training, ordered)
+    kwargs_two = _kwargs_for_excluded_scorer(bundle_fixture, scorer_two, ordered)
+    with pytest.raises(BundleContractError, match="order"):
+        bundle_fixture.publisher.freeze(
+            **{**kwargs_two, "mandatory_excluded_row_ids": tuple(reversed(ordered))}
+        )
+
+    manifest, _ = bundle_fixture.publisher.freeze(**kwargs)
+    descriptor = manifest.component("training_binding")
+    original = cast(
+        dict[str, object],
+        strict_json_loads(
+            bundle_fixture.store.read(bundle_fixture.store.resolve(descriptor.sha256))
+        ),
+    )
+    for field_name, replacement in (
+        ("excluded_count", 2),
+        ("excluded_row_ids_digest", _sha("wrong-excluded-digest")),
+        ("final_fit_row_ids_digest", _sha("wrong-final-digest")),
+    ):
+        document = {**original, field_name: replacement}
+        changed_ref = bundle_fixture.store.put_bytes(
+            canonical_json_bytes(document), descriptor.media_type
+        )
+        attack = _resign_component(
+            manifest,
+            bundle_fixture.signer,
+            "training_binding",
+            changed_ref,
+        )
+        assert bundle_fixture.publisher.verify(attack) is False
+
+
 @pytest.mark.parametrize(
     "field",
     (
         "feature_catalog_digest",
         "split_artifact_digest",
         "training_matrix_digest",
+        "training_binding_digest",
         "calibration_fit_matrix_digest",
         "calibration_selection_matrix_digest",
         "threshold_matrix_digest",
@@ -650,6 +822,7 @@ def test_every_component_address_tamper_fails_closed(
         "feature_catalog_digest",
         "split_artifact_digest",
         "training_matrix_digest",
+        "training_binding_digest",
         "calibration_fit_matrix_digest",
         "calibration_selection_matrix_digest",
         "threshold_matrix_digest",
@@ -683,6 +856,7 @@ def test_every_component_media_type_substitution_fails_closed(
         ("feature_catalog_digest", "application/vnd.apar.feature-catalog+json"),
         ("split_artifact_digest", "application/vnd.apar.evaluation-split+json"),
         ("training_matrix_digest", "application/vnd.apache.parquet"),
+        ("training_binding_digest", "application/vnd.apar.training-binding+json"),
         ("calibration_fit_matrix_digest", "application/vnd.apache.parquet"),
         ("calibration_selection_matrix_digest", "application/vnd.apache.parquet"),
         ("threshold_matrix_digest", "application/vnd.apache.parquet"),
@@ -988,6 +1162,87 @@ def test_source_root_rejects_symlinks_aliases_and_noncanonical_paths(tmp_path: P
             RunSigningIdentity.from_private_bytes(b"s" * 32),
             root_link,
         )
+
+
+def test_source_reader_rejects_parent_swap_between_check_and_final_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "source"
+    parent = root / "parent"
+    parent.mkdir(parents=True)
+    (parent / "tracked.py").write_bytes(b"original\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "tracked.py").write_bytes(b"escaped\n")
+    held = root / "held-parent"
+    original_open = os.open
+    attacked = False
+    opened_fds: list[int] = []
+
+    def attacking_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal attacked
+        if not attacked and Path(os.fsdecode(path)).name == "tracked.py":
+            parent.rename(held)
+            parent.symlink_to(outside, target_is_directory=True)
+            attacked = True
+        if dir_fd is None:
+            descriptor = original_open(path, flags, mode)
+        else:
+            descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+        opened_fds.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(bundle_module.os, "open", attacking_open)
+    try:
+        with pytest.raises(BundleContractError, match="changed|source"):
+            build_source_inventory(root, ("parent/tracked.py",))
+    finally:
+        if parent.is_symlink():
+            parent.unlink()
+        if held.exists():
+            held.rename(parent)
+    for descriptor in opened_fds:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_publisher_root_fd_context_and_closed_state_are_explicit(
+    bundle_fixture: BundleFixture,
+) -> None:
+    publisher = bundle_fixture.publisher
+    manifest, ref = publisher.freeze(**bundle_fixture.kwargs)
+    root_fd = publisher._source_root_fd
+    os.fstat(root_fd)
+
+    publisher.close()
+    publisher.close()
+
+    with pytest.raises(OSError):
+        os.fstat(root_fd)
+    with pytest.raises(BundleContractError, match="closed"):
+        publisher.freeze(**bundle_fixture.kwargs)
+    with pytest.raises(BundleContractError, match="closed"):
+        publisher.load(ref)
+    assert publisher.verify(manifest) is False
+
+    context_publisher = DefenderBundlePublisher(
+        bundle_fixture.store,
+        bundle_fixture.signer,
+        bundle_fixture.source_root,
+    )
+    context_fd = context_publisher._source_root_fd
+    with context_publisher as entered:
+        assert entered is context_publisher
+        os.fstat(context_fd)
+    with pytest.raises(OSError):
+        os.fstat(context_fd)
 
 
 @pytest.mark.parametrize(
