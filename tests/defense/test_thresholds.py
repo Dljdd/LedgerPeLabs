@@ -615,6 +615,79 @@ def test_rate_count_integrality_tolerance_rejects_material_near_integers(
         ThresholdReport.from_json(_rechecksum_threshold_document(document))
 
 
+def _large_review_rate_report() -> ThresholdReport:
+    row_count = 33_253
+    review_case_count = 11_084
+    scores = np.full(row_count, 0.5, dtype=np.float64)
+    labels = np.concatenate(
+        (
+            np.ones(review_case_count, dtype=np.int8),
+            np.zeros(row_count - review_case_count, dtype=np.int8),
+        )
+    )
+    mandatory = _actions(
+        *(
+            [Action.DECLINE] * review_case_count
+            + [Action.APPROVE] * (row_count - review_case_count)
+        )
+    )
+
+    def fixed_review_count(_actions: np.ndarray) -> int:
+        return review_case_count
+
+    return select_policy_thresholds(
+        scores,
+        labels,
+        mandatory,
+        fixed_review_count,
+        OperatingBudget(
+            false_decline_rate_max=0.0,
+            challenge_rate_max=1.0,
+            review_case_rate_max=1.0,
+        ),
+    )
+
+
+def test_large_canonical_review_rate_generated_by_selector_validates() -> None:
+    report = _large_review_rate_report()
+
+    assert report.feasible
+    assert report.review_case_count == 11_084
+    assert report.intervention_count == 11_084
+    assert report.calibration_review_case_rate == 11_084 / 33_253
+    assert report.minimum_review_case_rate == 11_084 / 33_253
+    assert ThresholdReport.from_json(report.to_json()) == report
+
+
+@pytest.mark.parametrize(
+    ("field", "direction"),
+    [
+        ("calibration_review_case_rate", 0.0),
+        ("calibration_review_case_rate", 1.0),
+        ("minimum_review_case_rate", 0.0),
+        ("minimum_review_case_rate", 1.0),
+    ],
+)
+def test_rechecksummed_adjacent_review_rate_float_is_rejected(
+    field: str, direction: float
+) -> None:
+    report = _large_review_rate_report()
+    document = json.loads(report.to_json())
+    original = document[field]
+    assert isinstance(original, float)
+    perturbed = float(np.nextafter(original, direction))
+    document[field] = perturbed
+    if field == "calibration_review_case_rate" and direction == 0.0:
+        document["minimum_review_case_rate"] = perturbed
+    if field == "minimum_review_case_rate" and direction == 1.0:
+        document["calibration_review_case_rate"] = perturbed
+
+    with pytest.raises(
+        (ThresholdContractError, ValidationError), match="reconstruct an integer count"
+    ):
+        ThresholdReport.from_json(_rechecksum_threshold_document(document))
+
+
 def _brute_force_thresholds(
     raw_scores: np.ndarray,
     labels: np.ndarray,
@@ -700,6 +773,22 @@ def test_value_objective_matches_literal_exhaustive_adversarial_fixture() -> Non
     assert report.thresholds is not None
     assert (report.thresholds.challenge, report.thresholds.decline) == expected[1]
     assert report.objective_value == expected[2]
+
+
+def test_finite_individual_fraud_values_that_overflow_aggregate_fail_closed() -> None:
+    with pytest.raises(ThresholdContractError, match="fraud value.*finite"):
+        select_policy_thresholds(
+            np.array([0.1, 0.8, 0.9], dtype=np.float64),
+            np.array([0, 1, 1], dtype=np.int8),
+            _actions(Action.APPROVE, Action.APPROVE, Action.APPROVE),
+            _zero_cases,
+            OperatingBudget(
+                false_decline_rate_max=1.0,
+                challenge_rate_max=1.0,
+                review_case_rate_max=1.0,
+            ),
+            np.array([0.0, 1e308, 1e308], dtype=np.float64),
+        )
 
 
 def test_value_objective_matches_brute_force_for_mixed_significands_and_magnitudes() -> None:

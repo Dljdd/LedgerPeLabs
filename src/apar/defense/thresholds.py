@@ -21,7 +21,6 @@ _SCORE_MIN = 1e-8
 _SCORE_MAX = 1.0 - 1e-8
 _SHA256_LENGTH = 64
 MAX_UNIQUE_OPERATING_SCORES = 4096
-_COUNT_INTEGRAL_TOLERANCE = 1e-12
 
 
 class ThresholdContractError(ValueError):
@@ -622,13 +621,21 @@ def _captured_fraud_value(
     values: NDArray[np.float64],
     challenge: float,
 ) -> float:
-    return math.fsum(
-        float(value)
-        for score, label, action, value in zip(
-            scores, labels, mandatory, values, strict=True
+    try:
+        total = math.fsum(
+            float(value)
+            for score, label, action, value in zip(
+                scores, labels, mandatory, values, strict=True
+            )
+            if label == 1 and (action is Action.DECLINE or score >= challenge)
         )
-        if label == 1 and (action is Action.DECLINE or score >= challenge)
-    )
+    except OverflowError as error:
+        raise ThresholdContractError(
+            "captured fraud value aggregate must remain finite"
+        ) from error
+    if not math.isfinite(total):
+        raise ThresholdContractError("captured fraud value aggregate must remain finite")
+    return total
 
 
 def _last_challenge_feasible_decline(
@@ -731,18 +738,14 @@ def _is_real_numeric_dtype(dtype: np.dtype[np.generic]) -> bool:
 
 
 def _integral_count(rate: float, denominator: int, *, label: str) -> int:
-    """Recover an exact count from a generated count/denominator rate.
-
-    The absolute ``1e-12`` tolerance covers only floating arithmetic noise from
-    rates created by this module; it is intentionally too tight to legitimize
-    materially fractional counts.
-    """
+    """Accept only the canonical float emitted by exact integer division."""
     scaled = rate * denominator
     nearest = round(scaled)
-    if abs(scaled - nearest) > _COUNT_INTEGRAL_TOLERANCE:
-        raise ValueError(f"{label} must reconstruct an integer count")
     if nearest < 0 or nearest > denominator:
         raise ValueError(f"{label} reconstructs a count outside its denominator")
+    canonical_rate = nearest / denominator
+    if rate != canonical_rate:
+        raise ValueError(f"{label} must reconstruct an integer count")
     return nearest
 
 
