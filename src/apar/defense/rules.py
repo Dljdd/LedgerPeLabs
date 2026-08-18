@@ -2,14 +2,22 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from apar.contracts._validation import ExternalContract, validate_semantic_version
+from apar.contracts._validation import (
+    ExternalContract,
+    validate_semantic_version,
+    validate_utc_timestamp,
+)
+from apar.contracts.events import EventKind, Rail
 from apar.defense.contracts import ObservedEvent
 from apar.features.state import FeatureVector
 
@@ -81,6 +89,27 @@ class RuleManifest(ExternalContract):
         return cls()
 
 
+def rule_manifest_digest(manifest: RuleManifest) -> str:
+    """Hash every rule-manifest field in canonical JSON form."""
+    if type(manifest) is not RuleManifest:
+        raise TypeError("manifest must be an exact RuleManifest")
+    validated = RuleManifest.model_validate(manifest)
+    return _digest(validated.model_dump(mode="json"))
+
+
+def feature_vector_digest(vector: FeatureVector) -> str:
+    """Hash complete feature values and decision/provenance metadata canonically."""
+    if type(vector) is not FeatureVector:
+        raise TypeError("vector must be an exact FeatureVector")
+    validated = FeatureVector.model_validate(vector)
+    ordered_values = tuple(sorted(validated.values.items()))
+    if any(not math.isfinite(value) for _, value in ordered_values):
+        raise ValueError("feature vector values must be finite")
+    document = validated.model_dump(mode="json", exclude={"values"})
+    document["ordered_values"] = ordered_values
+    return _digest(document)
+
+
 class RuleHit(ExternalContract):
     """One deterministic rule signal and its complete observation evidence."""
 
@@ -132,12 +161,19 @@ class RuleHit(ExternalContract):
 
 
 class RuleResult(ExternalContract):
-    """Canonical deterministic hits and their strongest continuous risk score."""
+    """Canonical deterministic hits bound to one rule evaluation context."""
 
     schema_version: Literal["1.0.0"] = "1.0.0"
     hits: tuple[RuleHit, ...] = ()
     score: float = Field(default=0.0, ge=0.0, le=1.0)
     manifest_version: str = "1.0.0"
+    event_id: str | None = None
+    decision_at: datetime | None = None
+    catalog_digest: str | None = None
+    vector_digest: str | None = None
+    manifest_digest: str = Field(
+        default_factory=lambda: rule_manifest_digest(RuleManifest.default())
+    )
 
     @field_validator("score")
     @classmethod
@@ -151,6 +187,20 @@ class RuleResult(ExternalContract):
     def manifest_version_is_semantic(cls, value: str) -> str:
         return validate_semantic_version(value, field_name="manifest_version")
 
+    @field_validator("decision_at")
+    @classmethod
+    def decision_at_is_utc(cls, value: datetime | None) -> datetime | None:
+        return None if value is None else validate_utc_timestamp(value)
+
+    @field_validator("catalog_digest", "vector_digest", "manifest_digest")
+    @classmethod
+    def digests_are_sha256(cls, value: str | None) -> str | None:
+        if value is not None and (
+            len(value) != 64 or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValueError("rule provenance digests must be lowercase SHA-256")
+        return value
+
     @model_validator(mode="after")
     def result_is_canonical(self) -> RuleResult:
         if self.hits != tuple(sorted(self.hits, key=_hit_order)):
@@ -163,12 +213,31 @@ class RuleResult(ExternalContract):
         expected = _aggregate_risk(self.hits)
         if self.score != expected:
             raise ValueError("rule result score must equal the aggregate risk")
+        bindings = (
+            self.event_id,
+            self.decision_at,
+            self.catalog_digest,
+            self.vector_digest,
+        )
+        bound = all(value is not None for value in bindings)
+        unbound = all(value is None for value in bindings)
+        if not bound and not unbound:
+            raise ValueError("rule result must have a complete provenance binding")
+        if unbound and (
+            self.hits
+            or self.score != 0.0
+            or self.manifest_version != RuleManifest.default().version
+            or self.manifest_digest != rule_manifest_digest(RuleManifest.default())
+        ):
+            raise ValueError("only the neutral default sentinel may omit provenance binding")
+        if bound and (not self.event_id or not self.catalog_digest):
+            raise ValueError("rule result provenance binding must not be blank")
         return self
 
     @classmethod
-    def clear(cls, *, manifest_version: str = "1.0.0") -> RuleResult:
-        """Return a version-bound result containing no rule signal."""
-        return cls(manifest_version=manifest_version)
+    def clear(cls) -> RuleResult:
+        """Return the sole unbound, score-zero, default-manifest sentinel."""
+        return cls()
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,11 +263,7 @@ class RuleEngine:
             raise ValueError("event and vector must have the same decision time")
 
         evidence = tuple(sorted({event.event_id, *vector.source_event_ids}))
-        hits: list[RuleHit] = []
-        if event.integrity_status == "fail":
-            hits.append(self._hit(DefenseReason.INTEGRITY_FAILURE, 1.0, True, evidence))
-        if _required_data_missing(event):
-            hits.append(self._hit(DefenseReason.REQUIRED_DATA_MISSING, 1.0, True, evidence))
+        hits = [self._hit(reason, 1.0, True, evidence) for reason in mandatory_reasons(event)]
 
         actor_velocity = _strongest(
             _rule_score(self._value(vector, "actor_count_1m"), self.manifest.actor_count_1m),
@@ -267,6 +332,11 @@ class RuleEngine:
             hits=ordered,
             score=_aggregate_risk(ordered),
             manifest_version=self.manifest.version,
+            event_id=event.event_id,
+            decision_at=vector.decision_at,
+            catalog_digest=vector.catalog_digest,
+            vector_digest=feature_vector_digest(vector),
+            manifest_digest=rule_manifest_digest(self.manifest),
         )
 
     def _value(self, vector: FeatureVector, name: str) -> float:
@@ -304,8 +374,29 @@ class RuleEngine:
         )
 
 
-def _required_data_missing(event: ObservedEvent) -> bool:
-    return (
+def mandatory_reasons(event: ObservedEvent) -> tuple[DefenseReason, ...]:
+    """Classify mandatory schema and integrity gates from the current event only."""
+    if type(event) is not ObservedEvent:
+        raise TypeError("event must be an exact ObservedEvent")
+    allowed_kinds = {
+        Rail.CARD: {EventKind.AUTHORIZATION, EventKind.AUTHORIZATION_DECLINED},
+        Rail.A2A: {EventKind.TRANSFER_INITIATED},
+        Rail.AGENTIC: {
+            EventKind.AUTHORIZATION,
+            EventKind.AUTHENTICATION_CHALLENGE,
+            EventKind.AUTHORIZATION_DECLINED,
+        },
+    }
+    expected_integrity = (
+        {"pass", "fail"} if event.rail is Rail.AGENTIC else {"not_applicable"}
+    )
+    coherent_schema = (
+        event.is_decision_point
+        and event.decision_at is not None
+        and event.event_type in allowed_kinds[event.rail]
+        and event.integrity_status in expected_integrity
+    )
+    required_missing = (
         not event.event_id
         or not event.payment_id
         or not event.actor_id
@@ -314,7 +405,18 @@ def _required_data_missing(event: ObservedEvent) -> bool:
         or event.decision_at is None
         or not event.amount.is_finite()
         or event.amount < 0
+        or not coherent_schema
     )
+    reasons: list[DefenseReason] = []
+    if (
+        coherent_schema
+        and event.rail is Rail.AGENTIC
+        and event.integrity_status == "fail"
+    ):
+        reasons.append(DefenseReason.INTEGRITY_FAILURE)
+    if required_missing:
+        reasons.append(DefenseReason.REQUIRED_DATA_MISSING)
+    return tuple(reasons)
 
 
 def _rule_score(value: float, threshold: float) -> float | None:
@@ -335,3 +437,14 @@ def _aggregate_risk(hits: tuple[RuleHit, ...]) -> float:
 
 def _hit_order(hit: RuleHit) -> tuple[bool, float, str]:
     return (not hit.mandatory, -hit.score, hit.reason.value)
+
+
+def _digest(document: object) -> str:
+    payload = json.dumps(
+        document,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()

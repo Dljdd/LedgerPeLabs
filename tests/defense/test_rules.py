@@ -32,23 +32,30 @@ def event(
     integrity_reason: str | None = None,
     actor_id: str = "actor-a",
     counterparty_id: str = "counterparty-a",
+    rail: Rail | None = None,
+    event_type: EventKind = EventKind.AUTHORIZATION,
+    decision_at: datetime | None = NOW,
+    is_decision_point: bool = True,
 ) -> ObservedEvent:
+    selected_rail = rail or (
+        Rail.AGENTIC if integrity_status != "not_applicable" else Rail.CARD
+    )
     return ObservedEvent(
         event_id="event-current",
         payment_id="payment-current",
-        rail=Rail.AGENTIC if integrity_status != "not_applicable" else Rail.CARD,
-        event_type=EventKind.AUTHORIZATION,
+        rail=selected_rail,
+        event_type=event_type,
         amount=Decimal("100.00"),
         currency="USD",
         event_time=NOW,
         available_at=NOW,
-        decision_at=NOW,
+        decision_at=decision_at,
         actor_id=actor_id,
         counterparty_id=counterparty_id,
         optional_refs={},
         integrity_status=integrity_status,
         integrity_reason=integrity_reason,
-        is_decision_point=True,
+        is_decision_point=is_decision_point,
     )
 
 
@@ -84,6 +91,7 @@ def test_rules_have_only_event_and_vector_inputs(rule_engine: RuleEngine) -> Non
         ("graph_actor_fanout", 4.999, 5.0, DefenseReason.GRAPH_FAN_OUT),
         ("actor_amount_zscore_24h", 3.999, 4.0, DefenseReason.AMOUNT_DEVIATION),
         ("counterparty_amount_zscore_24h", 3.999, 4.0, DefenseReason.AMOUNT_DEVIATION),
+        ("actor_amount_zscore_24h", -3.999, -4.0, DefenseReason.AMOUNT_DEVIATION),
         ("graph_shared_neighbor_count", 2.999, 3.0, DefenseReason.GRAPH_SHARED_NEIGHBOR),
         ("pair_prior_count", 3.999, 4.0, DefenseReason.COUNTERPARTY_VELOCITY),
     ),
@@ -120,6 +128,84 @@ def test_integrity_and_required_data_failures_are_mandatory(rule_engine: RuleEng
     assert integrity.hits[0].mandatory is required.hits[0].mandatory is True
     assert integrity.hits[0].severity is required.hits[0].severity is RuleSeverity.DECLINE
     assert integrity.score == required.score == 1.0
+
+
+@pytest.mark.parametrize(
+    ("rail", "event_type", "integrity_status", "expected"),
+    (
+        (Rail.CARD, EventKind.AUTHORIZATION, "not_applicable", ()),
+        (Rail.CARD, EventKind.AUTHORIZATION_DECLINED, "not_applicable", ()),
+        (Rail.A2A, EventKind.TRANSFER_INITIATED, "not_applicable", ()),
+        (Rail.AGENTIC, EventKind.AUTHORIZATION, "pass", ()),
+        (
+            Rail.AGENTIC,
+            EventKind.AUTHORIZATION,
+            "fail",
+            (DefenseReason.INTEGRITY_FAILURE,),
+        ),
+        (Rail.AGENTIC, EventKind.AUTHENTICATION_CHALLENGE, "pass", ()),
+        (
+            Rail.AGENTIC,
+            EventKind.AUTHENTICATION_CHALLENGE,
+            "fail",
+            (DefenseReason.INTEGRITY_FAILURE,),
+        ),
+        (Rail.AGENTIC, EventKind.AUTHORIZATION_DECLINED, "pass", ()),
+        (
+            Rail.AGENTIC,
+            EventKind.AUTHORIZATION_DECLINED,
+            "fail",
+            (DefenseReason.INTEGRITY_FAILURE,),
+        ),
+    ),
+)
+def test_valid_rail_event_integrity_combinations_have_exact_mandatory_reasons(
+    rule_engine: RuleEngine,
+    rail: Rail,
+    event_type: EventKind,
+    integrity_status: str,
+    expected: tuple[DefenseReason, ...],
+) -> None:
+    result = rule_engine.evaluate(
+        event(rail=rail, event_type=event_type, integrity_status=integrity_status),
+        vector(),
+    )
+    assert tuple(hit.reason for hit in result.hits if hit.mandatory) == expected
+
+
+@pytest.mark.parametrize(
+    "observed",
+    (
+        event(
+            rail=Rail.CARD,
+            event_type=EventKind.TRANSFER_INITIATED,
+            integrity_status="not_applicable",
+        ),
+        event(
+            rail=Rail.A2A,
+            event_type=EventKind.AUTHORIZATION,
+            integrity_status="not_applicable",
+        ),
+        event(
+            rail=Rail.AGENTIC,
+            event_type=EventKind.TRANSFER_INITIATED,
+            integrity_status="pass",
+        ),
+        event(rail=Rail.CARD, integrity_status="pass"),
+        event(rail=Rail.CARD, integrity_status="fail"),
+        event(rail=Rail.A2A, integrity_status="pass"),
+        event(rail=Rail.AGENTIC, integrity_status="not_applicable"),
+        event(is_decision_point=False),
+    ),
+)
+def test_malformed_schema_combinations_emit_only_required_data_missing(
+    rule_engine: RuleEngine,
+    observed: ObservedEvent,
+) -> None:
+    result = rule_engine.evaluate(observed, vector())
+    assert tuple(hit.reason for hit in result.hits if hit.mandatory) == (
+        DefenseReason.REQUIRED_DATA_MISSING,
+    )
 
 
 def test_hits_have_stable_order_and_complete_evidence(rule_engine: RuleEngine) -> None:
@@ -210,10 +296,54 @@ def test_rule_result_rejects_noncanonical_hits_and_fabricated_score() -> None:
         evidence_source_ids=(),
         rule_version="1.0.0",
     )
+    bindings = {
+        "event_id": "event-current",
+        "decision_at": NOW,
+        "catalog_digest": "a" * 64,
+        "vector_digest": "b" * 64,
+        "manifest_digest": "c" * 64,
+    }
     with pytest.raises(ValidationError, match="canonical order"):
-        RuleResult(hits=(low, high), score=0.8, manifest_version="1.0.0")
+        RuleResult(
+            hits=(low, high), score=0.8, manifest_version="1.0.0", **bindings
+        )
     with pytest.raises(ValidationError, match="aggregate risk"):
-        RuleResult(hits=(high,), score=0.7, manifest_version="1.0.0")
+        RuleResult(hits=(high,), score=0.7, manifest_version="1.0.0", **bindings)
+
+
+def test_non_neutral_rule_result_requires_complete_provenance_bindings() -> None:
+    hit = RuleHit(
+        reason=DefenseReason.ACTOR_VELOCITY,
+        score=0.6,
+        severity=RuleSeverity.CHALLENGE,
+        mandatory=False,
+        evidence_source_ids=("event-current",),
+        rule_version="1.0.0",
+    )
+    with pytest.raises(ValidationError, match="provenance binding"):
+        RuleResult(hits=(hit,), score=0.6, manifest_version="1.0.0")
+
+
+def test_rule_engine_binds_complete_vector_and_manifest_provenance(
+    rule_engine: RuleEngine,
+) -> None:
+    result = rule_engine.evaluate(event(), vector(actor_count_1m=4.0))
+    assert result.event_id == "event-current"
+    assert result.decision_at == NOW
+    assert result.catalog_digest == "a" * 64
+    assert len(result.vector_digest or "") == 64
+    assert len(result.manifest_digest) == 64
+
+
+def test_neutral_clear_is_the_only_unbound_default_sentinel() -> None:
+    clear = RuleResult.clear()
+    assert clear.hits == ()
+    assert clear.score == 0.0
+    assert clear.event_id is None
+    assert clear.decision_at is None
+    assert clear.catalog_digest is None
+    assert clear.vector_digest is None
+    assert len(clear.manifest_digest) == 64
 
 
 def test_rule_hit_rejects_noncanonical_evidence_and_mandatory_misclassification() -> None:

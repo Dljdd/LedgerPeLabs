@@ -10,7 +10,15 @@ from pydantic import Field, field_validator, model_validator
 from apar.contracts._validation import ExternalContract, validate_semantic_version
 from apar.contracts.decisions import Action
 from apar.defense.contracts import ObservedEvent, PolicyThresholds
-from apar.defense.rules import DefenseReason, RuleResult
+from apar.defense.rules import (
+    DefenseReason,
+    RuleManifest,
+    RuleResult,
+    feature_vector_digest,
+    mandatory_reasons,
+    rule_manifest_digest,
+)
+from apar.features.state import FeatureVector
 
 
 class OperatingBudget(ExternalContract):
@@ -82,6 +90,11 @@ class DefenseDecision(ExternalContract):
                 raise ValueError("fallback reason must appear in decision reason codes")
             if self.calibrated_score is not None:
                 raise ValueError("fallback decision cannot claim a calibrated score")
+            if (
+                self.failed_component_version is None
+                or not self.failed_component_version.strip()
+            ):
+                raise ValueError("fallback decision must identify a nonblank failed component")
         elif self.fallback_reason is not None or self.failed_component_version is not None:
             raise ValueError("non-fallback decision cannot identify a failed component")
         return self
@@ -95,6 +108,9 @@ class ActionPolicy(ExternalContract):
     operating_budget: OperatingBudget = Field(default_factory=OperatingBudget)
     rules_challenge_threshold: float = Field(default=0.60, ge=0.0, le=1.0)
     rules_decline_threshold: float = Field(default=0.90, ge=0.0, le=1.0)
+    rule_manifest_digest: str = Field(
+        default_factory=lambda: rule_manifest_digest(RuleManifest.default())
+    )
 
     @field_validator("version")
     @classmethod
@@ -106,6 +122,15 @@ class ActionPolicy(ExternalContract):
     def thresholds_are_finite(cls, value: float) -> float:
         if not math.isfinite(value):
             raise ValueError("rules-only thresholds must be finite")
+        return value
+
+    @field_validator("rule_manifest_digest")
+    @classmethod
+    def manifest_digest_is_sha256(cls, value: str) -> str:
+        if len(value) != 64 or any(
+            character not in "0123456789abcdef" for character in value
+        ):
+            raise ValueError("rule manifest digest must be lowercase SHA-256")
         return value
 
     @model_validator(mode="after")
@@ -129,6 +154,7 @@ class ActionPolicy(ExternalContract):
         model_failure: DefenseReason | None = None,
         failed_component_version: str | None = None,
         latency_ms: float = 0.0,
+        vector: FeatureVector | None = None,
     ) -> DefenseDecision:
         """Apply mandatory decline, hybrid bands, then explicit rules fallback."""
         if type(event) is not ObservedEvent:
@@ -136,8 +162,12 @@ class ActionPolicy(ExternalContract):
         if type(rule_result) is not RuleResult:
             raise TypeError("rule_result must be an exact RuleResult")
         rule_result = RuleResult.model_validate(rule_result)
-        if not event.is_decision_point or event.decision_at is None:
-            raise ValueError("policy requires a decision-point event")
+        _validate_rule_binding(
+            event,
+            rule_result,
+            vector,
+            expected_manifest_digest=self.rule_manifest_digest,
+        )
         _validate_latency(latency_ms)
         if calibrated_score is not None:
             _validate_score(calibrated_score)
@@ -151,19 +181,29 @@ class ActionPolicy(ExternalContract):
             DefenseReason.MODEL_TIMEOUT,
         }:
             raise ValueError("model failure must be unavailable or timeout")
+        if failed_component_version is not None and not failed_component_version.strip():
+            raise ValueError("failed component identity must be nonblank")
+        if model_failure is not None and failed_component_version is None:
+            raise ValueError("explicit model failure requires a failed component identity")
         model_available = calibrated_score is not None and thresholds is not None
         if model_available and model_failure is not None:
             raise ValueError("model failure cannot accompany an available calibrated score")
+        if model_available and failed_component_version is not None:
+            raise ValueError("available model cannot identify a failed component")
 
-        mandatory_reasons = _mandatory_reasons(event, rule_result)
-        if mandatory_reasons:
+        current_mandatory = mandatory_reasons(event)
+        supplied_mandatory = tuple(hit.reason for hit in rule_result.hits if hit.mandatory)
+        unjustified = set(supplied_mandatory) - set(current_mandatory)
+        if unjustified:
+            raise ValueError("rule result contains an unjustified mandatory hit")
+        if current_mandatory:
             return self._decision(
                 event,
                 rule_result,
                 action=Action.DECLINE,
                 score=1.0,
                 calibrated_score=None,
-                reasons=mandatory_reasons,
+                reasons=current_mandatory,
                 fallback_reason=None,
                 failed_component_version=None,
                 latency_ms=latency_ms,
@@ -192,6 +232,7 @@ class ActionPolicy(ExternalContract):
             )
 
         failure = model_failure or DefenseReason.MODEL_UNAVAILABLE
+        component_identity = failed_component_version or "unknown"
         if rule_result.score >= self.rules_decline_threshold:
             fallback_action = Action.DECLINE
         elif rule_result.score >= self.rules_challenge_threshold:
@@ -209,7 +250,7 @@ class ActionPolicy(ExternalContract):
             calibrated_score=None,
             reasons=fallback_reasons,
             fallback_reason=failure,
-            failed_component_version=failed_component_version,
+            failed_component_version=component_identity,
             latency_ms=latency_ms,
         )
 
@@ -249,26 +290,6 @@ class ActionPolicy(ExternalContract):
         )
 
 
-def _mandatory_reasons(
-    event: ObservedEvent, rule_result: RuleResult
-) -> tuple[DefenseReason, ...]:
-    reasons: list[DefenseReason] = []
-    if event.integrity_status == "fail":
-        reasons.append(DefenseReason.INTEGRITY_FAILURE)
-    if (
-        not event.event_id
-        or not event.payment_id
-        or not event.actor_id
-        or not event.counterparty_id
-        or not event.currency
-        or not event.amount.is_finite()
-        or event.amount < 0
-    ):
-        reasons.append(DefenseReason.REQUIRED_DATA_MISSING)
-    reasons.extend(hit.reason for hit in rule_result.hits if hit.mandatory)
-    return _unique_reasons(*reasons)
-
-
 def _unique_reasons(*reasons: DefenseReason) -> tuple[DefenseReason, ...]:
     return tuple(dict.fromkeys(reasons))
 
@@ -281,3 +302,33 @@ def _validate_score(value: float) -> None:
 def _validate_latency(value: float) -> None:
     if type(value) not in {int, float} or not math.isfinite(value) or value < 0.0:
         raise ValueError("latency_ms must be finite and non-negative")
+
+
+def _validate_rule_binding(
+    event: ObservedEvent,
+    result: RuleResult,
+    vector: FeatureVector | None,
+    *,
+    expected_manifest_digest: str,
+) -> None:
+    if result.manifest_digest != expected_manifest_digest:
+        raise ValueError("rule result manifest provenance does not match the policy")
+    if result.event_id is None:
+        if vector is not None:
+            raise ValueError("neutral unbound rule sentinel cannot claim vector provenance")
+        return
+    if vector is None:
+        raise ValueError("bound rule result requires its feature vector provenance")
+    if type(vector) is not FeatureVector:
+        raise TypeError("vector must be an exact FeatureVector")
+    if result.event_id != event.event_id or vector.event_id != event.event_id:
+        raise ValueError("rule result event binding does not match the current event")
+    if result.decision_at != event.decision_at or vector.decision_at != event.decision_at:
+        raise ValueError("rule result decision-time binding does not match the current event")
+    if result.catalog_digest != vector.catalog_digest:
+        raise ValueError("rule result catalog provenance does not match the feature vector")
+    if result.vector_digest != feature_vector_digest(vector):
+        raise ValueError("rule result vector provenance does not match the feature vector")
+    expected_evidence = tuple(sorted({event.event_id, *vector.source_event_ids}))
+    if any(hit.evidence_source_ids != expected_evidence for hit in result.hits):
+        raise ValueError("rule hit evidence does not match the feature vector provenance")
