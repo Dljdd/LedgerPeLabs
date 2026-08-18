@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import math
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -10,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from catboost import CatBoostClassifier, Pool
 from pydantic import ValidationError
 
 from apar.contracts.events import EventKind, Rail
@@ -21,8 +23,12 @@ from apar.defense.gbdt import (
     HyperParameters,
     ModelContractError,
     RollingFold,
+    TrainingReceipt,
     _classifier,
+    _digest_bytes,
+    _load_native_model,
     _parameter_grid,
+    _save_native_model,
     _selection_key,
     train_gbdt,
 )
@@ -127,6 +133,80 @@ def _subset(matrix: FeatureMatrix, start: int, end: int) -> FeatureMatrix:
     )
 
 
+def _semantic_catalog_mutation(matrix: FeatureMatrix) -> FeatureMatrix:
+    mutated_feature = matrix.catalog.features[0].model_copy(update={"missing_behavior": "zero"})
+    catalog = matrix.catalog.model_copy(
+        update={"features": (mutated_feature, *matrix.catalog.features[1:])}
+    )
+    digest = feature_catalog_digest(catalog)
+    return matrix.model_copy(
+        update={
+            "catalog": catalog,
+            "catalog_digest": digest,
+            "rows": tuple(row.model_copy(update={"catalog_digest": digest}) for row in matrix.rows),
+        }
+    )
+
+
+def _forge_native_payload(
+    scorer: CatBoostScorer, mutation: str, tmp_path: Path
+) -> tuple[bytes, TrainingReceipt]:
+    matrix = _matrix()
+    train_ids = tuple(f"row-{index:03d}" for index in range(20))
+    rows = {row.event_id: row for row in matrix.rows}
+    data = np.asarray(
+        [[rows[row_id].values[name] for name in EXPECTED_FEATURE_NAMES] for row_id in train_ids],
+        dtype=np.float64,
+    )
+    labels = np.asarray([_labels()[row_id] for row_id in train_ids], dtype=np.int64)
+    selected = scorer.receipt.selected_params
+    settings: dict[str, object] = {
+        "loss_function": "Logloss",
+        "iterations": selected.iterations,
+        "depth": selected.depth,
+        "learning_rate": selected.learning_rate,
+        "l2_leaf_reg": selected.l2_leaf_reg,
+        "class_weights": list(scorer.receipt.class_weights),
+        "random_seed": scorer.receipt.seed,
+        "task_type": "CPU",
+        "thread_count": 1,
+        "allow_writing_files": False,
+        "bootstrap_type": "No",
+        "random_strength": 0,
+        "verbose": False,
+        "metadata": {"apar_training_contract_digest": scorer.receipt.training_contract_digest},
+    }
+    overrides: dict[str, dict[str, object]] = {
+        "random_seed": {"random_seed": 999},
+        "random_strength": {"random_strength": 1.0},
+        "bootstrap_type": {"bootstrap_type": "Bernoulli"},
+        "loss_function": {"loss_function": "MultiClass"},
+        "thread_count": {"thread_count": 2},
+        "allow_writing_files": {
+            "allow_writing_files": True,
+            "train_dir": str(tmp_path / "forged-catboost-info"),
+        },
+        "verbose": {"verbose": 1},
+    }
+    settings.update(overrides[mutation])
+    model = CatBoostClassifier(**settings)
+    model.fit(Pool(data=data, label=labels, feature_names=list(EXPECTED_FEATURE_NAMES)))
+    payload = _save_native_model(model)
+    importance = tuple(
+        float(value)
+        for value in np.asarray(
+            model.get_feature_importance(type="PredictionValuesChange"), dtype=np.float64
+        )
+    )
+    receipt = scorer.receipt.model_copy(
+        update={
+            "model_payload_digest": _digest_bytes(payload),
+            "global_feature_importance": importance,
+        }
+    )
+    return payload, receipt
+
+
 def test_production_defaults_and_parameter_grid_are_exact() -> None:
     config = GbdtTrainingConfig()
     assert config.seed == 260816
@@ -141,6 +221,12 @@ def test_production_defaults_and_parameter_grid_are_exact() -> None:
         for rate in (0.03, 0.08)
         for l2 in (3.0, 8.0)
     )
+
+
+@pytest.mark.parametrize("threshold", (0.0, 0.49, 0.5000001, 1.0))
+def test_fpr_tie_break_threshold_is_immutably_frozen_at_half(threshold: float) -> None:
+    with pytest.raises(ValidationError, match="FPR|fpr_probability_threshold"):
+        GbdtTrainingConfig(fpr_probability_threshold=threshold)
 
 
 def test_classifier_freezes_deterministic_cpu_settings() -> None:
@@ -161,6 +247,49 @@ def test_classifier_freezes_deterministic_cpu_settings() -> None:
         "random_strength": 0,
         "verbose": False,
     }
+
+
+def test_native_model_persists_every_declared_deterministic_setting() -> None:
+    scorer = _train()
+    model = _load_native_model(scorer.to_bytes())
+    params = model.get_all_params()
+    assert {
+        "loss_function": params["loss_function"],
+        "random_seed": params["random_seed"],
+        "random_strength": params["random_strength"],
+        "bootstrap_type": params["bootstrap_type"],
+        "task_type": params["task_type"],
+    } == {
+        "loss_function": "Logloss",
+        "random_seed": 260816,
+        "random_strength": 0,
+        "bootstrap_type": "No",
+        "task_type": "CPU",
+    }
+    native_params = json.loads(model.get_metadata()["params"])
+    flat = native_params["flat_params"]
+    assert flat["thread_count"] == 1
+    assert flat["allow_writing_files"] is False
+    assert flat["verbose"] == 0
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "random_seed",
+        "random_strength",
+        "bootstrap_type",
+        "loss_function",
+        "thread_count",
+        "allow_writing_files",
+        "verbose",
+    ),
+)
+def test_loader_rejects_forged_native_deterministic_settings(mutation: str, tmp_path: Path) -> None:
+    scorer = _train()
+    payload, forged_receipt = _forge_native_payload(scorer, mutation, tmp_path)
+    with pytest.raises(ModelContractError, match="native model|deterministic|setting"):
+        CatBoostScorer.from_bytes(payload, forged_receipt)
 
 
 @pytest.mark.parametrize(
@@ -220,7 +349,7 @@ def test_scores_and_shap_contributions_are_finite_and_reconstruct_logits() -> No
         contributions[:, :-1].sum(axis=1) + contributions[:, -1],
         raw,
         rtol=0.0,
-        atol=1e-10,
+        atol=1e-12,
     )
     importance = scorer.global_feature_importance()
     assert tuple(importance) == EXPECTED_FEATURE_NAMES
@@ -437,6 +566,32 @@ def test_training_rejects_any_feature_matrix_contract_mutation(mutation: str) ->
             _config(),
             training_cutoff=T0 + timedelta(hours=19),
         )
+
+
+def test_training_rejects_audit_valid_semantic_catalog_substitution() -> None:
+    changed = _semantic_catalog_mutation(_matrix())
+    assert changed.catalog.names == EXPECTED_FEATURE_NAMES
+    assert changed.catalog_digest == feature_catalog_digest(changed.catalog)
+    with pytest.raises(ModelContractError, match="frozen competition catalog"):
+        train_gbdt(
+            changed,
+            _labels(),
+            tuple(f"row-{index:03d}" for index in range(20)),
+            _folds(),
+            _config(),
+            training_cutoff=T0 + timedelta(hours=19),
+        )
+
+
+def test_scoring_rejects_audit_valid_semantic_catalog_substitution() -> None:
+    scorer = _train()
+    changed = _semantic_catalog_mutation(_subset(_matrix(), 20, 24))
+    forged_receipt = scorer.receipt.model_copy(update={"catalog_digest": changed.catalog_digest})
+    forged_scorer = CatBoostScorer(
+        _load_native_model(scorer.to_bytes()), scorer.to_bytes(), forged_receipt
+    )
+    with pytest.raises(ModelContractError, match="frozen competition catalog"):
+        forged_scorer.predict(changed)
 
 
 def test_scorer_rejects_a_scoring_matrix_catalog_or_row_mutation() -> None:

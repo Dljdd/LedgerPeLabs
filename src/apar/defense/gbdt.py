@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import platform as platform_module
 import tempfile
@@ -88,7 +89,14 @@ class GbdtTrainingConfig(ExternalContract):
     learning_rates: tuple[float, ...] = (0.03, 0.08)
     l2_leaf_regs: tuple[float, ...] = (3.0, 8.0)
     iterations: int = Field(default=300, ge=1)
-    fpr_probability_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    fpr_probability_threshold: float = 0.5
+
+    @field_validator("fpr_probability_threshold")
+    @classmethod
+    def fpr_threshold_is_frozen(cls, value: float) -> float:
+        if value != 0.5:
+            raise ValueError("FPR probability threshold must remain frozen at 0.5")
+        return value
 
     @model_validator(mode="after")
     def grid_is_bounded_and_finite(self) -> GbdtTrainingConfig:
@@ -107,8 +115,6 @@ class GbdtTrainingConfig(ExternalContract):
             raise ValueError("learning rates must be finite and in (0, 1]")
         if any(not math.isfinite(value) or value < 0.0 for value in self.l2_leaf_regs):
             raise ValueError("L2 regularization values must be finite and non-negative")
-        if not math.isfinite(self.fpr_probability_threshold):
-            raise ValueError("FPR probability threshold must be finite")
         return self
 
 
@@ -161,7 +167,7 @@ class TrainingReceipt(ExternalContract):
     final_training_count: int = Field(ge=1)
     training_cutoff: datetime
     seed: int = Field(ge=0)
-    fpr_probability_threshold: float = Field(ge=0.0, le=1.0)
+    fpr_probability_threshold: float
     selected_params: HyperParameters
     class_weights: tuple[float, float]
     fold_results: tuple[FoldResult, ...]
@@ -191,9 +197,9 @@ class TrainingReceipt(ExternalContract):
 
     @field_validator("fpr_probability_threshold")
     @classmethod
-    def fpr_threshold_is_finite(cls, value: float) -> float:
-        if not math.isfinite(value):
-            raise ValueError("FPR probability threshold must be finite")
+    def fpr_threshold_is_frozen(cls, value: float) -> float:
+        if value != 0.5:
+            raise ValueError("FPR probability threshold must remain frozen at 0.5")
         return value
 
     @field_validator("class_weights")
@@ -315,7 +321,7 @@ class CatBoostScorer:
             dtype=np.float64,
         ).reshape(-1)
         reconstructed = contributions[:, :-1].sum(axis=1) + contributions[:, -1]
-        if not np.allclose(reconstructed, raw, rtol=0.0, atol=1e-10):
+        if not np.allclose(reconstructed, raw, rtol=0.0, atol=1e-12):
             raise ModelContractError("SHAP contributions do not reconstruct raw logits")
         return contributions
 
@@ -575,6 +581,8 @@ def _validated_matrix(
         raise ModelContractError("feature order must match the frozen 48-column catalog")
     if matrix.catalog_digest != actual_digest:
         raise ModelContractError("matrix catalog digest does not match its catalog")
+    if matrix.catalog_digest != _competition_catalog_digest():
+        raise ModelContractError("feature matrix does not match the frozen competition catalog")
     event_ids = tuple(event.event_id for event in matrix.events)
     if len(event_ids) != len(set(event_ids)):
         raise ModelContractError("matrix contains duplicate event IDs")
@@ -764,6 +772,15 @@ def _load_native_model(payload: bytes) -> CatBoostClassifier:
 
 
 def _validate_loaded_model(model: CatBoostClassifier, receipt: TrainingReceipt) -> None:
+    try:
+        _validate_loaded_model_inner(model, receipt)
+    except ModelContractError:
+        raise
+    except (catboost.CatBoostError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+        raise ModelContractError("native model validation failed") from error
+
+
+def _validate_loaded_model_inner(model: CatBoostClassifier, receipt: TrainingReceipt) -> None:
     if tuple(model.feature_names_) != receipt.feature_order:
         raise ModelContractError("native model feature order does not match the receipt")
     if int(model.tree_count_) != receipt.selected_params.iterations:
@@ -772,6 +789,7 @@ def _validate_loaded_model(model: CatBoostClassifier, receipt: TrainingReceipt) 
     if metadata.get("apar_training_contract_digest") != receipt.training_contract_digest:
         raise ModelContractError("native model training contract does not match the receipt")
     params = cast(dict[str, object], model.get_all_params())
+    _validate_deterministic_native_settings(params, metadata, receipt)
     if int(cast(int, params.get("depth"))) != receipt.selected_params.depth:
         raise ModelContractError("native model depth does not match the receipt")
     learning_rate = float(cast(float, params.get("learning_rate")))
@@ -808,6 +826,55 @@ def _validate_loaded_model(model: CatBoostClassifier, receipt: TrainingReceipt) 
         raise ModelContractError(
             "native model global feature importance does not match the receipt"
         )
+
+
+def _validate_deterministic_native_settings(
+    params: Mapping[str, object], metadata: Mapping[str, str], receipt: TrainingReceipt
+) -> None:
+    exact_expected: dict[str, object] = {
+        "loss_function": "Logloss",
+        "random_seed": receipt.seed,
+        "bootstrap_type": "No",
+        "task_type": "CPU",
+    }
+    for name, expected in exact_expected.items():
+        if params.get(name) != expected:
+            raise ModelContractError(f"native model deterministic setting mismatch: {name}")
+    random_strength = params.get("random_strength")
+    if (
+        type(random_strength) not in {int, float}
+        or float(cast(int | float, random_strength)) != 0.0
+    ):
+        raise ModelContractError("native model deterministic setting mismatch: random_strength")
+
+    raw_native_params = metadata.get("params")
+    if type(raw_native_params) is not str:
+        raise ModelContractError("native model persisted settings are unavailable")
+    native_document = json.loads(raw_native_params)
+    if type(native_document) is not dict:
+        raise ModelContractError("native model persisted settings are invalid")
+    flat_params = native_document.get("flat_params")
+    if type(flat_params) is not dict:
+        raise ModelContractError("native model flat settings are unavailable")
+    flat = cast(dict[str, object], flat_params)
+    flat_expected: dict[str, object] = {
+        "loss_function": "Logloss",
+        "random_seed": receipt.seed,
+        "bootstrap_type": "No",
+        "task_type": "CPU",
+        "thread_count": 1,
+        "allow_writing_files": False,
+        "verbose": 0,
+    }
+    for name, expected in flat_expected.items():
+        if flat.get(name) != expected:
+            raise ModelContractError(f"native model deterministic setting mismatch: {name}")
+    flat_random_strength = flat.get("random_strength")
+    if (
+        type(flat_random_strength) not in {int, float}
+        or float(cast(int | float, flat_random_strength)) != 0.0
+    ):
+        raise ModelContractError("native model deterministic setting mismatch: random_strength")
 
 
 def _validate_environment(receipt: TrainingReceipt) -> None:
