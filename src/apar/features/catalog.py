@@ -11,7 +11,6 @@ from pydantic import Field, ValidationError, field_validator
 
 from apar.contracts._validation import ExternalContract, validate_semantic_version
 from apar.contracts.events import Rail
-from apar.defense.contracts import ObservedEvent
 
 EXPECTED_FEATURE_NAMES = (
     "txn_log_amount",
@@ -87,6 +86,16 @@ _ALLOWED_STATE_PATHS = frozenset(
     {"state.past_observed_events", "state.past_observed_graph", "state.late_observed_events"}
 )
 _ALLOWED_PROVENANCE_PATHS = frozenset({"provenance.source_event_ids"})
+_ALLOWED_OBSERVED_PATHS = frozenset(
+    {
+        "observed.amount",
+        "observed.rail",
+        "observed.event_time",
+        "observed.integrity_status",
+        "observed.optional_refs",
+        "observed.available_at",
+    }
+)
 
 
 class FeatureCatalogError(ValueError):
@@ -182,11 +191,7 @@ def _audit_source_path(source_path: str) -> None:
     if _is_raw_id_path(source_path):
         raise FeatureCatalogError(f"raw ID source is not permitted: {source_path}")
 
-    if source_path.startswith(f"{FeatureSource.OBSERVED}."):
-        field_name = source_path.removeprefix(f"{FeatureSource.OBSERVED}.")
-        if field_name in ObservedEvent.model_fields and field_name not in _RAW_ID_FIELDS:
-            return
-    elif source_path in _ALLOWED_STATE_PATHS:
+    if source_path in _ALLOWED_OBSERVED_PATHS or source_path in _ALLOWED_STATE_PATHS:
         return
     raise FeatureCatalogError(f"unapproved source path: {source_path}")
 

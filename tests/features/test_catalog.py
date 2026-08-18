@@ -142,3 +142,12 @@ def test_unknown_state_path_is_rejected_as_not_provably_past_observed_state() ->
 
     with pytest.raises(FeatureCatalogError, match="unapproved source"):
         audit_feature_catalog(FeatureCatalog(version="1.0.0", features=(definition,)))
+
+
+@pytest.mark.parametrize("source", ("observed.decision_at", "observed.currency"))
+def test_unlisted_current_observation_source_is_rejected(source: str) -> None:
+    """Catches a visible field becoming a model input without catalog justification."""
+    definition = _definition(name="ordinary_count", source_paths=(source,))
+
+    with pytest.raises(FeatureCatalogError, match="unapproved source"):
+        audit_feature_catalog(FeatureCatalog(version="1.0.0", features=(definition,)))
