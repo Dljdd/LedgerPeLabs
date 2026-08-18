@@ -7,6 +7,7 @@ import binascii
 import contextlib
 import ctypes
 import hashlib
+import importlib.metadata as importlib_metadata
 import json
 import os
 import re
@@ -395,6 +396,281 @@ def _git(*arguments: str, binary: bool = False) -> bytes | str:
     return output
 
 
+_EXECUTION_INVENTORY_STATIC_PATHS = (
+    "pyproject.toml",
+    "scripts/run_task6_holdout.py",
+    "scripts/verify_g0.py",
+    "scripts/verify_g1_g2.py",
+)
+
+
+def _git_metadata_present() -> bool:
+    try:
+        git_metadata = (_REPOSITORY_ROOT / ".git").lstat()
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(git_metadata.st_mode) or not (
+        stat.S_ISREG(git_metadata.st_mode) or stat.S_ISDIR(git_metadata.st_mode)
+    ):
+        raise RunExecutionError("Git metadata path has an invalid type")
+    return True
+
+
+def _read_inventory_file(path: Path) -> tuple[bytes, int]:
+    """Read a stable regular non-symlink source path and its declared mode."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as error:
+        raise RunExecutionError(f"execution inventory path is unavailable: {path}") from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise RunExecutionError(f"execution inventory path is not regular: {path}")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev != after.st_dev
+            or before.st_ino != after.st_ino
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+            or before.st_ctime_ns != after.st_ctime_ns
+        ):
+            raise RunExecutionError(f"execution inventory path changed while read: {path}")
+        return raw, stat.S_IMODE(after.st_mode)
+    finally:
+        os.close(descriptor)
+
+
+def _inventory_paths() -> tuple[str, ...]:
+    source_root = _REPOSITORY_ROOT / "src" / "apar"
+    if not source_root.is_dir() or source_root.is_symlink():
+        raise RunExecutionError("APAR execution source root is not a regular directory")
+    paths = {
+        path.relative_to(_REPOSITORY_ROOT).as_posix()
+        for path in source_root.rglob("*.py")
+    }
+    paths.update(_EXECUTION_INVENTORY_STATIC_PATHS)
+    if not paths:
+        raise RunExecutionError("execution source inventory is empty")
+    return tuple(sorted(paths))
+
+
+def _git_inventory(
+    paths: tuple[str, ...],
+) -> tuple[str, dict[str, tuple[str, str]]]:
+    """Return object format and exact stage-zero index entries when Git is present."""
+    if not _git_metadata_present():
+        return "sha256", {}
+    object_format = cast(str, _git("rev-parse", "--show-object-format")).strip()
+    if object_format not in hashlib.algorithms_available:
+        raise RunExecutionError("Git object hash format is unavailable")
+    raw = cast(bytes, _git("ls-files", "--stage", "-z", "--", *paths, binary=True))
+    entries: dict[str, tuple[str, str]] = {}
+    for record in raw.split(b"\0"):
+        if not record:
+            continue
+        try:
+            metadata, encoded_path = record.split(b"\t", 1)
+            mode, object_id, stage = metadata.decode("ascii").split(" ")
+            relative = encoded_path.decode("utf-8")
+        except (UnicodeDecodeError, ValueError) as error:
+            raise RunExecutionError("Git execution inventory is malformed") from error
+        if stage != "0" or relative in entries:
+            raise RunExecutionError("Git execution inventory has ambiguous index entries")
+        entries[relative] = (mode, object_id)
+    return object_format, entries
+
+
+def _git_blob_oid(raw: bytes, object_format: str) -> str:
+    digest = hashlib.new(object_format)
+    digest.update(b"blob ")
+    digest.update(str(len(raw)).encode("ascii"))
+    digest.update(b"\0")
+    digest.update(raw)
+    return digest.hexdigest()
+
+
+def _installed_distributions() -> list[dict[str, str]]:
+    versions: dict[str, str] = {}
+    for distribution in importlib_metadata.distributions():
+        raw_name = distribution.metadata.get("Name")
+        raw_version = distribution.version
+        if type(raw_name) is not str or not raw_name or not raw_version:
+            continue
+        name = re.sub(r"[-_.]+", "-", raw_name).lower()
+        previous = versions.get(name)
+        if previous is not None and previous != raw_version:
+            raise RunExecutionError(f"conflicting installed distribution versions: {name}")
+        versions[name] = raw_version
+    return [
+        {"name": name, "version": versions[name]}
+        for name in sorted(versions)
+    ]
+
+
+def _execution_inventory() -> dict[str, object]:
+    """Freeze exact working source bytes and the installed execution environment."""
+    paths = _inventory_paths()
+    object_format, index_entries = _git_inventory(paths)
+    entries: list[dict[str, object]] = []
+    for relative in paths:
+        raw, mode = _read_inventory_file(_REPOSITORY_ROOT / relative)
+        index_entry = index_entries.get(relative)
+        working_blob_oid = _git_blob_oid(raw, object_format)
+        entries.append(
+            {
+                "filesystem_mode": format(mode, "04o"),
+                "git": {
+                    "index_blob_oid": None if index_entry is None else index_entry[1],
+                    "index_mode": None if index_entry is None else index_entry[0],
+                    "tracked": index_entry is not None,
+                    "working_blob_oid": working_blob_oid,
+                    "working_matches_index": (
+                        index_entry is not None and working_blob_oid == index_entry[1]
+                    ),
+                },
+                "path": relative,
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "size_bytes": len(raw),
+                "type": "regular_file",
+            }
+        )
+    unsigned: dict[str, object] = {
+        "dependencies": _installed_distributions(),
+        "entries": entries,
+        "environment": {
+            "byteorder": sys.byteorder,
+            "implementation": sys.implementation.name,
+            "platform": sys.platform,
+            "python_version": (
+                f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+            ),
+        },
+        "schema_version": "1.0.0",
+    }
+    return {**unsigned, "inventory_sha256": _digest_document(unsigned)}
+
+
+def _valid_execution_inventory(value: object) -> bool:
+    if type(value) is not dict:
+        return False
+    inventory = cast(dict[str, object], value)
+    if set(inventory) != {
+        "dependencies",
+        "entries",
+        "environment",
+        "inventory_sha256",
+        "schema_version",
+    } or inventory["schema_version"] != "1.0.0":
+        return False
+    digest = inventory["inventory_sha256"]
+    if type(digest) is not str or digest != _digest_document(
+        {key: item for key, item in inventory.items() if key != "inventory_sha256"}
+    ):
+        return False
+    entries = inventory["entries"]
+    if type(entries) is not list or not entries:
+        return False
+    entry_paths: list[str] = []
+    for raw_entry in cast(list[object], entries):
+        if type(raw_entry) is not dict:
+            return False
+        entry = cast(dict[str, object], raw_entry)
+        if set(entry) != {
+            "filesystem_mode",
+            "git",
+            "path",
+            "sha256",
+            "size_bytes",
+            "type",
+        }:
+            return False
+        path = entry["path"]
+        if (
+            type(path) is not str
+            or not path
+            or Path(path).is_absolute()
+            or ".." in Path(path).parts
+            or entry["type"] != "regular_file"
+            or type(entry["size_bytes"]) is not int
+            or entry["size_bytes"] < 0
+            or type(entry["filesystem_mode"]) is not str
+            or re.fullmatch(r"[0-7]{4}", entry["filesystem_mode"]) is None
+            or type(entry["sha256"]) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) is None
+        ):
+            return False
+        git_value = entry["git"]
+        if type(git_value) is not dict:
+            return False
+        git = cast(dict[str, object], git_value)
+        if set(git) != {
+            "index_blob_oid",
+            "index_mode",
+            "tracked",
+            "working_blob_oid",
+            "working_matches_index",
+        } or type(git["tracked"]) is not bool or type(git["working_matches_index"]) is not bool:
+            return False
+        if type(git["working_blob_oid"]) is not str or re.fullmatch(
+            r"[0-9a-f]{40}|[0-9a-f]{64}", git["working_blob_oid"]
+        ) is None:
+            return False
+        if git["tracked"] is True:
+            if type(git["index_blob_oid"]) is not str or re.fullmatch(
+                r"[0-9a-f]{40}|[0-9a-f]{64}", git["index_blob_oid"]
+            ) is None or type(git["index_mode"]) is not str or re.fullmatch(
+                r"(?:100644|100755)", git["index_mode"]
+            ) is None:
+                return False
+            if git["working_matches_index"] is not (
+                git["working_blob_oid"] == git["index_blob_oid"]
+            ):
+                return False
+        elif (
+            git["index_blob_oid"] is not None
+            or git["index_mode"] is not None
+            or git["working_matches_index"] is not False
+        ):
+            return False
+        entry_paths.append(path)
+    if entry_paths != sorted(set(entry_paths)):
+        return False
+    dependencies = inventory["dependencies"]
+    if type(dependencies) is not list:
+        return False
+    dependency_names: list[str] = []
+    for raw_dependency in cast(list[object], dependencies):
+        if type(raw_dependency) is not dict:
+            return False
+        dependency = cast(dict[str, object], raw_dependency)
+        if (
+            set(dependency) != {"name", "version"}
+            or type(dependency["name"]) is not str
+            or not dependency["name"]
+            or type(dependency["version"]) is not str
+            or not dependency["version"]
+        ):
+            return False
+        dependency_names.append(dependency["name"])
+    if dependency_names != sorted(set(dependency_names)):
+        return False
+    environment = inventory["environment"]
+    return bool(
+        type(environment) is dict
+        and set(environment) == {
+            "byteorder",
+            "implementation",
+            "platform",
+            "python_version",
+        }
+        and all(type(item) is str and item for item in environment.values())
+    )
+
+
 def _provenance_document(private_state_fd: int | None) -> dict[str, object]:
     """Verify current regular-file modes and separately pin historical Git mode."""
     if private_state_fd is None:
@@ -425,28 +701,34 @@ def _provenance_document(private_state_fd: int | None) -> dict[str, object]:
             "sha256": digest,
             "size_bytes": len(raw),
         }
-    tree_line = cast(
-        str,
-        _git("ls-tree", _TASK6_RESULT_COMMIT, "--", _TASK6_RESULT),
-    ).rstrip("\n")
-    parts = tree_line.split(maxsplit=3)
-    if (
-        len(parts) != 4
-        or parts[0] != _TASK6_HISTORICAL_MODE
-        or parts[1] != "blob"
-        or parts[3] != _TASK6_RESULT
-    ):
-        raise RunExecutionError("historical Task 6 Git mode or object type changed")
-    historical_raw = cast(
-        bytes,
-        _git("show", f"{_TASK6_RESULT_COMMIT}:{_TASK6_RESULT}", binary=True),
-    )
-    if hashlib.sha256(historical_raw).hexdigest() != _TASK6_RESULT_SHA256:
-        raise RunExecutionError("historical Task 6 result bytes changed")
-    head = cast(str, _git("rev-parse", "HEAD")).strip()
+    if _git_metadata_present():
+        tree_line = cast(
+            str,
+            _git("ls-tree", _TASK6_RESULT_COMMIT, "--", _TASK6_RESULT),
+        ).rstrip("\n")
+        parts = tree_line.split(maxsplit=3)
+        if (
+            len(parts) != 4
+            or parts[0] != _TASK6_HISTORICAL_MODE
+            or parts[1] != "blob"
+            or parts[3] != _TASK6_RESULT
+        ):
+            raise RunExecutionError("historical Task 6 Git mode or object type changed")
+        historical_raw = cast(
+            bytes,
+            _git("show", f"{_TASK6_RESULT_COMMIT}:{_TASK6_RESULT}", binary=True),
+        )
+        if hashlib.sha256(historical_raw).hexdigest() != _TASK6_RESULT_SHA256:
+            raise RunExecutionError("historical Task 6 result bytes changed")
+        head = cast(str, _git("rev-parse", "HEAD")).strip()
+        historical_verification = "git_object"
+    else:
+        head = "git-unavailable"
+        historical_verification = "embedded_pin_without_git"
     return {
         "current_source_head": head,
         "current_task6_files": current_files,
+        "execution_inventory": _execution_inventory(),
         "policy_worker": {
             "clean_process_per_proposal": True,
             "import_restrictions": True,
@@ -463,6 +745,7 @@ def _provenance_document(private_state_fd: int | None) -> dict[str, object]:
             "historical_commit": _TASK6_RESULT_COMMIT,
             "historical_git_mode": _TASK6_HISTORICAL_MODE,
             "historical_object_type": "blob",
+            "historical_verification": historical_verification,
             "path": _TASK6_RESULT,
             "private_admission_filesystem_mode": "0600",
             "private_admission_regular_non_symlink": True,
@@ -596,6 +879,7 @@ class PolicyWorkerProposalAudit(ExternalContract):
     cache_hit: bool
     cache_source: str | None
     network_call_count: int = Field(ge=0, strict=True)
+    proposal_seed: int = Field(ge=0, lt=2**63, strict=True)
 
 
 class PolicyWorkerClient:
@@ -667,6 +951,7 @@ class PolicyWorkerClient:
         if (
             audit.policy_kind is not kind
             or audit.network_call_count != 0
+            or audit.proposal_seed != seed
             or audit.cache_hit != cached
             or audit.cache_source
             != ("task6-v3-frozen-replay" if cached else None)
@@ -1091,6 +1376,13 @@ class RunRunner:
         """Execute one deterministic evaluator-owned run around disposable policies."""
         checked_bundle = self._validated_bundle(bundle)
         checked_policy = self._validated_policy(policy)
+        from apar.evaluation_hidden.validity import (
+            _issue_runner_completion_capability,
+            _mark_runner_execution_completed,
+            _release_completed_runner_report,
+        )
+
+        validity_capability = _issue_runner_completion_capability(self)
         try:
             binding = ScenarioRunBinding.model_validate(
                 checked_bundle.extensions[_RUN_BINDING_EXTENSION]
@@ -1169,12 +1461,17 @@ class RunRunner:
             ),
             "scenario": self.artifact_store.put_json(checked_bundle),
         }
-        input_lineage = _artifact_digest_document(inputs)
+        public_input_lineage = _artifact_digest_document(
+            {
+                name: inputs[name]
+                for name in ("policy", "population", "scenario")
+            }
+        )
         run_digest = _digest_document(
             {
-                "inputs": input_lineage,
+                "public_inputs": public_input_lineage,
                 "signer_key_id": self._signer.key_id,
-                "version": "run-v1",
+                "version": "public-run-v2",
             }
         )
         run_id = f"run-{run_digest[:32]}"
@@ -1198,7 +1495,6 @@ class RunRunner:
             population=population,
             policy=checked_policy,
             feedback_fields=tuple(checked_bundle.feedback),
-            run_id=run_id,
         )
         worker_audits = worker.take_audit_records()
         if len(worker_audits) != checked_policy.query_budget:
@@ -1230,12 +1526,13 @@ class RunRunner:
 
         from apar.evaluation_hidden import HiddenValidityOracle
 
+        _mark_runner_execution_completed(self, validity_capability)
         oracle = HiddenValidityOracle()
         public_validity = oracle.evaluate(hidden_events)
-        from apar.evaluation_hidden.validity import _evaluate_completed_run
-
-        restricted_validity = _evaluate_completed_run(hidden_events)
-        if public_validity.valid != restricted_validity.valid:
+        restricted_validity = _release_completed_runner_report(
+            self, validity_capability, hidden_events
+        )
+        if public_validity.valid is not restricted_validity["valid"]:
             raise RunExecutionError("hidden validity views disagree")
         outputs = {
             "events": self.artifact_store.put_bytes(
@@ -1438,6 +1735,8 @@ class RunRunner:
             if type(stored_provenance) is not dict:
                 return False
             stored = cast(dict[str, object], stored_provenance)
+            if not _valid_execution_inventory(stored.get("execution_inventory")):
+                return False
             if set(stored) != set(current_provenance):
                 return False
             for key in set(stored) - {"current_source_head"}:
@@ -1561,7 +1860,6 @@ class RunRunner:
         population: object,
         policy: AttackerPolicy,
         feedback_fields: tuple[FeedbackField, ...],
-        run_id: str,
     ) -> tuple[tuple[VisibleTrial, ...], tuple[BenchmarkObservation, ...]]:
         from apar.generators import Population, campaign_bytes
         from apar.redteam.benchmark import BenchmarkObservation, CampaignBenchmark
@@ -1573,7 +1871,20 @@ class RunRunner:
         observations: list[BenchmarkObservation] = []
         for generation in range(policy.query_budget):
             seed = int.from_bytes(
-                hashlib.sha256(f"{run_id}:proposal:{generation}".encode()).digest()[:8],
+                hashlib.sha256(
+                    canonical_json_bytes(
+                        {
+                            "attacker_mode": policy.attacker_mode.value,
+                            "domain": "policy-proposal-v1",
+                            "family": policy.family,
+                            "generation": generation,
+                            "replay_random_seed": bundle.replay_manifest.random_seed,
+                            "scenario_id": bundle.scenario_id,
+                            "scenario_seed": bundle.seed,
+                            "threat_card_ref": bundle.threat_card_ref,
+                        }
+                    )
+                ).digest()[:8],
                 "big",
             ) & (2**63 - 1)
             candidate = worker.propose(

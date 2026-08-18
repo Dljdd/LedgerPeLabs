@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import math
+import weakref
 from collections import defaultdict, deque
+from collections.abc import Callable
 from datetime import timedelta
 from decimal import Decimal, InvalidOperation
+from typing import Protocol
 
 from pydantic import field_validator
 
@@ -62,15 +65,6 @@ class HiddenValidityResult(ExternalContract):
         return value
 
 
-class RestrictedValidityReport(ExternalContract):
-    """Evaluator-only post-run reasons stored in a restricted artifact."""
-
-    schema_version: str = "1.0.0"
-    valid: bool
-    reason_codes: tuple[str, ...]
-    metrics: dict[str, str | int | bool]
-
-
 def _payment_id(event: PaymentEvent) -> str | None:
     value = event.rail_data.get("payment_id")
     return value if type(value) is str and value else None
@@ -87,22 +81,19 @@ def _owned_events(events: tuple[PaymentEvent, ...]) -> tuple[PaymentEvent, ...]:
     return tuple(owned)
 
 
-class HiddenValidityOracle:
-    """Apply independent economic, lifecycle, graph, role, and distance checks."""
+class _ValidityEngine:
+    """Module-private implementation retained only inside gated closures."""
 
-    def evaluate(self, events: tuple[PaymentEvent, ...]) -> HiddenValidityResult:
-        """Return one bit and deliberately discard all hidden rejection details."""
-        return HiddenValidityResult(valid=self._report(events).valid)
-
-    def _report(self, events: tuple[PaymentEvent, ...]) -> RestrictedValidityReport:
+    def analyze(self, events: tuple[PaymentEvent, ...]) -> dict[str, object]:
         try:
             checked = _owned_events(events)
         except (TypeError, ValueError):
-            return RestrictedValidityReport(
-                valid=False,
-                reason_codes=("MALFORMED_EVENT_INPUT",),
-                metrics={"event_count": 0, "payment_count": 0},
-            )
+            return {
+                "schema_version": "1.0.0",
+                "valid": False,
+                "reason_codes": ["MALFORMED_EVENT_INPUT"],
+                "metrics": {"event_count": 0, "payment_count": 0},
+            }
 
         reasons: set[str] = set()
         identifiers = tuple(event.event_id for event in checked)
@@ -130,17 +121,18 @@ class HiddenValidityOracle:
         distance = self._benign_distance(checked)
         if distance > Decimal("0.85"):
             reasons.add("BENIGN_DISTANCE_EXCEEDED")
-        return RestrictedValidityReport(
-            valid=not reasons,
-            reason_codes=tuple(sorted(reasons)),
-            metrics={
+        return {
+            "schema_version": "1.0.0",
+            "valid": not reasons,
+            "reason_codes": sorted(reasons),
+            "metrics": {
                 "event_count": len(checked),
                 "payment_count": len(grouped),
                 "campaign_count": len({event.campaign_id for event in checked}),
                 "benign_distance": str(distance),
                 "value_conserved": "VALUE_CONSERVATION_FAILED" not in reasons,
             },
-        )
+        }
 
     @staticmethod
     def _check_lifecycles(
@@ -479,11 +471,113 @@ class HiddenValidityOracle:
         )
 
 
-def _evaluate_completed_run(
-    events: tuple[PaymentEvent, ...],
-) -> RestrictedValidityReport:
-    """Evaluator-private detailed view, called only after runner-owned completion."""
-    return HiddenValidityOracle()._report(events)
+class _ValidityAnalyzer(Protocol):
+    def analyze(self, events: tuple[PaymentEvent, ...]) -> dict[str, object]: ...
 
 
-__all__ = ["HiddenValidityOracle", "HiddenValidityResult", "RestrictedValidityReport"]
+def _make_boolean_evaluator(
+    engine_type: Callable[[], _ValidityAnalyzer],
+) -> Callable[[tuple[PaymentEvent, ...]], bool]:
+    def evaluate(events: tuple[PaymentEvent, ...]) -> bool:
+        valid = engine_type().analyze(events)["valid"]
+        if type(valid) is not bool:
+            raise RuntimeError("hidden validity engine returned an invalid result")
+        return valid
+
+    return evaluate
+
+
+def _make_runner_report_channel(
+    engine_type: Callable[[], _ValidityAnalyzer],
+) -> tuple[
+    Callable[[object], object],
+    Callable[[object, object], None],
+    Callable[[object, object, tuple[PaymentEvent, ...]], dict[str, object]],
+]:
+    class _RunnerCompletionCapability:
+        """Identity-only token whose authority lives in this inaccessible closure."""
+
+        __slots__ = ("__weakref__",)
+
+        def __copy__(self) -> _RunnerCompletionCapability:
+            raise TypeError("runner completion capability cannot be copied")
+
+        def __deepcopy__(self, _memo: object) -> _RunnerCompletionCapability:
+            raise TypeError("runner completion capability cannot be copied")
+
+    states: weakref.WeakKeyDictionary[
+        _RunnerCompletionCapability, tuple[weakref.ReferenceType[object], str]
+    ] = weakref.WeakKeyDictionary()
+
+    def exact_runner(owner: object) -> bool:
+        from apar.runs.runner import RunRunner
+
+        return type(owner) is RunRunner
+
+    def issue(owner: object) -> object:
+        if not exact_runner(owner):
+            raise PermissionError("completion capability requires an exact owning runner")
+        capability = _RunnerCompletionCapability()
+        states[capability] = (weakref.ref(owner), "pending")
+        return capability
+
+    def checked_state(
+        owner: object, capability: object
+    ) -> tuple[_RunnerCompletionCapability, weakref.ReferenceType[object], str]:
+        if not exact_runner(owner) or type(capability) is not _RunnerCompletionCapability:
+            raise PermissionError("invalid runner completion capability")
+        checked = capability
+        try:
+            record = states.get(checked)
+        except TypeError as error:
+            raise PermissionError("invalid runner completion capability") from error
+        if record is None:
+            raise PermissionError("invalid runner completion capability")
+        owner_reference, state = record
+        if owner_reference() is not owner:
+            raise PermissionError("capability belongs to a different owning runner")
+        return checked, owner_reference, state
+
+    def mark_completed(owner: object, capability: object) -> None:
+        checked, owner_reference, state = checked_state(owner, capability)
+        if state != "pending":
+            raise PermissionError("runner completion capability state is invalid")
+        states[checked] = (owner_reference, "completed")
+
+    def release(
+        owner: object,
+        capability: object,
+        events: tuple[PaymentEvent, ...],
+    ) -> dict[str, object]:
+        checked, owner_reference, state = checked_state(owner, capability)
+        if state == "pending":
+            raise PermissionError("owning runner has not completed execution")
+        if state != "completed":
+            raise PermissionError("runner completion capability was already consumed")
+        report = engine_type().analyze(events)
+        states[checked] = (owner_reference, "consumed")
+        return report
+
+    return issue, mark_completed, release
+
+
+_boolean_validity = _make_boolean_evaluator(_ValidityEngine)
+(
+    _issue_runner_completion_capability,
+    _mark_runner_execution_completed,
+    _release_completed_runner_report,
+) = _make_runner_report_channel(_ValidityEngine)
+del _ValidityEngine, _make_boolean_evaluator, _make_runner_report_channel
+
+
+class HiddenValidityOracle:
+    """Apply independent checks while exposing only one boolean to callers."""
+
+    __slots__ = ()
+
+    def evaluate(self, events: tuple[PaymentEvent, ...]) -> HiddenValidityResult:
+        """Return one bit and deliberately discard all hidden rejection details."""
+        return HiddenValidityResult(valid=_boolean_validity(events))
+
+
+__all__ = ["HiddenValidityOracle", "HiddenValidityResult"]

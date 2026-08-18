@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import json
 import os
@@ -17,11 +18,13 @@ import numpy as np
 import pytest
 from pydantic import ValidationError
 
+import apar.evaluation_hidden.validity as hidden_validity_module
 import apar.runs.runner as runner_module
 from apar.compiler import compile_scenario
 from apar.contracts.decisions import Action
-from apar.contracts.events import Rail
+from apar.contracts.events import PaymentEvent, Rail
 from apar.contracts.scenarios import AttackerMode, FeedbackField, ScenarioBundle
+from apar.evaluation_hidden import HiddenCampaignGenerator, HiddenValidityOracle
 from apar.generators import Population
 from apar.redteam import Feedback, FixedPolicy, VisibleTrial, visible_objective
 from apar.runs import (
@@ -49,6 +52,60 @@ def _bound_app_bundle(population: Population) -> ScenarioBundle:
     return bind_scenario_for_run(
         population.bundle,
         threat_family="app_scam_mule",
+    )
+
+
+def _resign_with_replaced_provenance(
+    *,
+    runner: RunRunner,
+    store: ArtifactStore,
+    signer: RunSigningIdentity,
+    manifest: runner_module.RunManifest,
+    provenance: dict[str, object],
+) -> runner_module.RunManifest:
+    provenance_ref = store.put_json(provenance)
+    authorization = SignedRunReceipt.model_validate_json(
+        store.read(manifest.artifacts["authorization_receipt"])
+    )
+    authorization_values = authorization.unsigned_document()
+    authorization_digests = dict(authorization.artifact_digests)
+    authorization_digests["provenance"] = provenance_ref.sha256
+    authorization_values["artifact_digests"] = authorization_digests
+    authorization_values["subject_sha256"] = runner_module._digest_document(
+        dict(sorted(authorization_digests.items()))
+    )
+    forged_authorization = SignedRunReceipt.model_validate(
+        {
+            **authorization_values,
+            "signature_base64": signer.sign(authorization_values),
+        }
+    )
+    authorization_ref = store.put_json(forged_authorization)
+    completion = SignedRunReceipt.model_validate_json(
+        store.read(manifest.artifacts["completion_receipt"])
+    )
+    completion_values = completion.unsigned_document()
+    completion_values["previous_receipt_sha256"] = authorization_ref.sha256
+    forged_completion = SignedRunReceipt.model_validate(
+        {
+            **completion_values,
+            "signature_base64": signer.sign(completion_values),
+        }
+    )
+    artifacts = {
+        **manifest.artifacts,
+        "authorization_receipt": authorization_ref,
+        "completion_receipt": store.put_json(forged_completion),
+        "provenance": provenance_ref,
+    }
+    draft = manifest.model_copy(
+        update={
+            "artifacts": artifacts,
+            "lineage_digest": runner._lineage_digest(artifacts),
+        }
+    )
+    return draft.model_copy(
+        update={"signature_base64": signer.sign(draft.unsigned_document())}
     )
 
 
@@ -481,6 +538,7 @@ def test_cached_worker_uses_the_real_cache_only_planner_with_zero_network(
             "cache_source": "task6-v3-frozen-replay",
             "network_call_count": 0,
             "policy_kind": "cached_llm",
+            "proposal_seed": 17,
         }
     ]
 
@@ -548,6 +606,281 @@ def test_completed_run_manifest_resolves_and_authenticates_every_artifact(
         <= set(event["party_refs"])
         for event in events
     )
+
+
+def test_detailed_validity_requires_the_exact_owning_completed_runner_capability(
+    tmp_path: Path,
+    benchmark_population: Population,
+) -> None:
+    """Catch direct, copied, forged, pre-completion, or cross-runner detail release."""
+    assert "RestrictedValidityReport" not in hidden_validity_module.__all__
+    assert not hasattr(hidden_validity_module, "RestrictedValidityReport")
+    assert not hasattr(hidden_validity_module, "_evaluate_completed_run")
+    assert not hasattr(hidden_validity_module, "_CAPABILITY_STATES")
+    assert not hasattr(hidden_validity_module, "_RunnerCompletionCapability")
+    assert not hasattr(HiddenValidityOracle(), "_report")
+
+    first_runner = RunRunner(
+        ArtifactStore(tmp_path / "first-artifacts"),
+        _signer(),
+        tmp_path / "first-runs",
+    )
+    second_runner = RunRunner(
+        ArtifactStore(tmp_path / "second-artifacts"),
+        _signer(),
+        tmp_path / "second-runs",
+    )
+    capability = hidden_validity_module._issue_runner_completion_capability(first_runner)
+    events = HiddenCampaignGenerator().generate("app_scam_mule", seed=11, count=8)
+
+    with pytest.raises(TypeError, match="cannot be copied"):
+        copy.copy(capability)
+    forged = object.__new__(type(capability))
+    with pytest.raises(PermissionError, match="capability"):
+        hidden_validity_module._release_completed_runner_report(
+            first_runner, forged, events
+        )
+    with pytest.raises(PermissionError, match="owning runner"):
+        hidden_validity_module._release_completed_runner_report(
+            second_runner, capability, events
+        )
+    with pytest.raises(PermissionError, match="not completed"):
+        hidden_validity_module._release_completed_runner_report(
+            first_runner, capability, events
+        )
+
+    manifest = first_runner.execute(
+        _bound_app_bundle(benchmark_population),
+        AttackerPolicy(
+            attacker_mode=AttackerMode.DECISION_ONLY,
+            family="app_scam_mule",
+            kind=AttackerPolicyKind.FIXED,
+            query_budget=1,
+            worker_timeout_ms=5_000,
+        ),
+    )
+    detail = strict_json_loads(
+        first_runner.artifact_store.read(manifest.artifacts["restricted_validity"])
+    )
+    assert type(detail) is dict
+    assert detail["valid"] is True
+    assert type(detail["reason_codes"]) is list
+
+
+def test_signed_provenance_inventories_and_revalidates_exact_execution_bytes(
+    tmp_path: Path,
+    benchmark_population: Population,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch dirty, relabelled, omitted, added, or dependency-unpinned execution code."""
+    signer = _signer()
+    store = ArtifactStore(tmp_path / "artifacts")
+    runner = RunRunner(store, signer, tmp_path / "runs")
+    manifest = runner.execute(
+        _bound_app_bundle(benchmark_population),
+        AttackerPolicy(
+            attacker_mode=AttackerMode.DECISION_ONLY,
+            family="app_scam_mule",
+            kind=AttackerPolicyKind.FIXED,
+            query_budget=1,
+            worker_timeout_ms=5_000,
+        ),
+    )
+    loaded = strict_json_loads(store.read(manifest.artifacts["provenance"]))
+    assert type(loaded) is dict
+    provenance = loaded
+    inventory = provenance["execution_inventory"]
+    assert type(inventory) is dict
+    assert set(inventory) == {
+        "dependencies",
+        "entries",
+        "environment",
+        "inventory_sha256",
+        "schema_version",
+    }
+    entries = inventory["entries"]
+    assert type(entries) is list
+    paths = [entry["path"] for entry in entries]
+    expected_apar_sources = {
+        path.as_posix() for path in Path("src/apar").rglob("*.py")
+    }
+    assert expected_apar_sources <= set(paths)
+    assert {
+        "pyproject.toml",
+        "scripts/run_task6_holdout.py",
+        "scripts/verify_g0.py",
+        "scripts/verify_g1_g2.py",
+    } <= set(paths)
+    assert paths == sorted(paths)
+    assert all(
+        set(entry)
+        == {"filesystem_mode", "git", "path", "sha256", "size_bytes", "type"}
+        and entry["type"] == "regular_file"
+        and type(entry["git"]) is dict
+        and set(entry["git"])
+        == {
+            "index_blob_oid",
+            "index_mode",
+            "tracked",
+            "working_blob_oid",
+            "working_matches_index",
+        }
+        for entry in entries
+    )
+    dependencies = inventory["dependencies"]
+    assert type(dependencies) is list
+    assert {dependency["name"] for dependency in dependencies} >= {
+        "cryptography",
+        "fastapi",
+        "numpy",
+        "pandas",
+        "pydantic",
+        "pyarrow",
+    }
+    unsigned_inventory = {
+        key: value for key, value in inventory.items() if key != "inventory_sha256"
+    }
+    assert inventory["inventory_sha256"] == runner_module._digest_document(
+        unsigned_inventory
+    )
+
+    def changed_sha(document: dict[str, object]) -> None:
+        checked = document["entries"]
+        assert type(checked) is list and type(checked[0]) is dict
+        checked[0]["sha256"] = "0" * 64
+
+    def relabelled_path(document: dict[str, object]) -> None:
+        checked = document["entries"]
+        assert type(checked) is list and type(checked[0]) is dict
+        checked[0]["path"] = "src/apar/relabelled.py"
+
+    def omitted_entry(document: dict[str, object]) -> None:
+        checked = document["entries"]
+        assert type(checked) is list
+        checked.pop()
+
+    def added_entry(document: dict[str, object]) -> None:
+        checked = document["entries"]
+        assert type(checked) is list and type(checked[0]) is dict
+        checked.append({**checked[0], "path": "src/apar/untracked-extra.py"})
+
+    def changed_dependency(document: dict[str, object]) -> None:
+        checked = document["dependencies"]
+        assert type(checked) is list and type(checked[0]) is dict
+        checked[0]["version"] = "0.invalid"
+
+    for mutation in (
+        changed_sha,
+        relabelled_path,
+        omitted_entry,
+        added_entry,
+        changed_dependency,
+    ):
+        forged_provenance = copy.deepcopy(provenance)
+        forged_inventory = forged_provenance["execution_inventory"]
+        assert type(forged_inventory) is dict
+        mutation(forged_inventory)
+        unsigned = {
+            key: value
+            for key, value in forged_inventory.items()
+            if key != "inventory_sha256"
+        }
+        forged_inventory["inventory_sha256"] = runner_module._digest_document(unsigned)
+        forged = _resign_with_replaced_provenance(
+            runner=runner,
+            store=store,
+            signer=signer,
+            manifest=manifest,
+            provenance=forged_provenance,
+        )
+        assert not runner.verify_run(forged)
+
+    forged_provenance = copy.deepcopy(provenance)
+    forged_inventory = forged_provenance["execution_inventory"]
+    assert type(forged_inventory) is dict
+    forged_inventory["inventory_sha256"] = "f" * 64
+    forged = _resign_with_replaced_provenance(
+        runner=runner,
+        store=store,
+        signer=signer,
+        manifest=manifest,
+        provenance=forged_provenance,
+    )
+    assert not runner.verify_run(forged)
+
+    original_inventory = runner_module._execution_inventory
+
+    def changed_current_inventory() -> dict[str, object]:
+        current = copy.deepcopy(original_inventory())
+        current["inventory_sha256"] = "e" * 64
+        return current
+
+    monkeypatch.setattr(runner_module, "_execution_inventory", changed_current_inventory)
+    assert not runner.verify_run(manifest)
+    with pytest.raises(RunExecutionError, match="authenticated verification"):
+        runner.get(manifest.run_id)
+
+
+def test_git_source_relationship_fails_closed_but_inventory_supports_no_git_install(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch a present-but-broken Git index being silently labelled as no Git."""
+
+    def broken_git(*_arguments: str, binary: bool = False) -> bytes | str:
+        del binary
+        raise RunExecutionError("broken Git metadata")
+
+    monkeypatch.setattr(runner_module, "_git", broken_git)
+    with pytest.raises(RunExecutionError, match="broken Git metadata"):
+        runner_module._git_inventory(("src/apar/runs/runner.py",))
+
+    installed_root = tmp_path / "installed-apar"
+    installed_root.mkdir()
+    monkeypatch.setattr(runner_module, "_REPOSITORY_ROOT", installed_root)
+    assert runner_module._git_inventory(("apar/runs/runner.py",)) == ("sha256", {})
+
+    def admit_without_git(
+        source: Path,
+        state_fd: int,
+        private_name: str,
+        expected_sha256: str,
+    ) -> int:
+        del source, state_fd, private_name, expected_sha256
+        return 0o644
+
+    def read_admitted(
+        directory_fd: int,
+        name: str,
+        *,
+        label: str,
+        max_bytes: int,
+    ) -> bytes:
+        del directory_fd, name, label, max_bytes
+        return b"pinned-task6-result"
+
+    def read_pinned(
+        path: Path,
+        *,
+        expected_mode: int,
+        expected_sha256: str,
+    ) -> bytes:
+        del path, expected_mode, expected_sha256
+        return b"pinned-current-file"
+
+    monkeypatch.setattr(runner_module, "_admit_private_evidence", admit_without_git)
+    monkeypatch.setattr(runner_module, "_read_private_file_at", read_admitted)
+    monkeypatch.setattr(runner_module, "_strict_regular_file", read_pinned)
+    monkeypatch.setattr(
+        runner_module,
+        "_execution_inventory",
+        lambda: {"inventory_sha256": "self-contained"},
+    )
+    provenance = runner_module._provenance_document(1)
+    task6 = provenance["task6_result"]
+    assert type(task6) is dict
+    assert task6["historical_verification"] == "embedded_pin_without_git"
+    assert provenance["current_source_head"] == "git-unavailable"
 
 
 def test_manifest_signature_detects_relabelled_lineage(
@@ -783,6 +1116,89 @@ def test_seeded_runs_are_byte_identical_without_exposing_private_signing_materia
         name: second_store.read(ref) for name, ref in second.artifacts.items()
     }
     assert all(encoded_private not in first_store.read(ref) for ref in first.artifacts.values())
+
+
+def test_restricted_bytes_do_not_influence_public_identity_or_policy_randomness(
+    tmp_path: Path,
+    benchmark_population: Population,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch evaluator-only commitments influencing worker seeds or public run identity."""
+    bundle = _bound_app_bundle(benchmark_population)
+    policy = AttackerPolicy(
+        attacker_mode=AttackerMode.DECISION_ONLY,
+        family="app_scam_mule",
+        kind=AttackerPolicyKind.RANDOM,
+        query_budget=3,
+        worker_timeout_ms=5_000,
+    )
+    signer = _signer()
+    first_store = ArtifactStore(tmp_path / "first-artifacts")
+    first_runner = RunRunner(first_store, signer, tmp_path / "first-runs")
+    first = first_runner.execute(bundle, policy)
+
+    original_template_document = runner_module._campaign_template_document
+    original_generate = HiddenCampaignGenerator.generate
+
+    def alternate_template_document(params: object) -> dict[str, object]:
+        return {
+            **original_template_document(params),
+            "evaluator_variant": "alternate-restricted-template",
+        }
+
+    def alternate_hidden_corpus(
+        generator: HiddenCampaignGenerator,
+        family: str,
+        seed: int,
+        count: int,
+    ) -> tuple[PaymentEvent, ...]:
+        return tuple(
+            event.model_copy(
+                update={
+                    "privacy": {
+                        **event.privacy,
+                        "evaluator_variant": "alternate-restricted-corpus",
+                    }
+                }
+            )
+            for event in original_generate(generator, family, seed, count)
+        )
+
+    monkeypatch.setattr(
+        runner_module, "_campaign_template_document", alternate_template_document
+    )
+    monkeypatch.setattr(HiddenCampaignGenerator, "generate", alternate_hidden_corpus)
+    second_store = ArtifactStore(tmp_path / "second-artifacts")
+    second_runner = RunRunner(second_store, signer, tmp_path / "second-runs")
+    second = second_runner.execute(bundle, policy)
+
+    def proposal_seeds(store: ArtifactStore, manifest: runner_module.RunManifest) -> list[int]:
+        audit = strict_json_loads(
+            store.read(manifest.artifacts["restricted_evaluation_audit"])
+        )
+        assert type(audit) is dict
+        proposals = audit["policy_worker_proposals"]
+        assert type(proposals) is list
+        return [proposal["proposal_seed"] for proposal in proposals]
+
+    assert first.run_id == second.run_id
+    assert proposal_seeds(first_store, first) == proposal_seeds(second_store, second)
+    assert first_store.read(first.artifacts["feedback"]) == second_store.read(
+        second.artifacts["feedback"]
+    )
+    assert first_store.read(first.artifacts["events"]) == second_store.read(
+        second.artifacts["events"]
+    )
+    assert first_runner.public_view(first) == second_runner.public_view(second)
+    assert (
+        first.artifacts["restricted_evaluation_input"].sha256
+        != second.artifacts["restricted_evaluation_input"].sha256
+    )
+    assert (
+        first.artifacts["restricted_hidden_evaluation_events"].sha256
+        != second.artifacts["restricted_hidden_evaluation_events"].sha256
+    )
+    assert first.lineage_digest != second.lineage_digest
 
 
 def test_agentic_final_artifact_replays_each_policy_winner_and_keeps_hidden_corpus_separate(

@@ -343,6 +343,7 @@ def _main() -> int:
                     ),
                     "network_call_count": 0,
                     "policy_kind": policy_kind,
+                    "proposal_seed": seed,
                 },
                 "candidate": candidate_to_wire(candidate),
                 "ok": True,

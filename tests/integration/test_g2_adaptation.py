@@ -80,6 +80,7 @@ def test_g2_disposable_policies_use_matched_budgets_and_seeded_bytes(tmp_path: P
     )
     bundle = _bundle()
     manifests = {}
+    seed_sequences: dict[AttackerPolicyKind, list[int]] = {}
     for kind in AttackerPolicyKind:
         manifest = runner.execute(
             bundle,
@@ -120,20 +121,44 @@ def test_g2_disposable_policies_use_matched_budgets_and_seeded_bytes(tmp_path: P
         assert "reason_codes" not in feedback
         assert "hidden" not in feedback
         assert summary["hidden_valid"] is True
+        audit = cast(
+            dict[str, object],
+            json.loads(store.read(manifest.artifacts["restricted_evaluation_audit"])),
+        )
+        proposals = cast(list[dict[str, object]], audit["policy_worker_proposals"])
+        seed_sequences[kind] = [cast(int, proposal["proposal_seed"]) for proposal in proposals]
         if kind is AttackerPolicyKind.CACHED_LLM:
-            audit = cast(
-                dict[str, object],
-                json.loads(store.read(manifest.artifacts["restricted_evaluation_audit"])),
-            )
-            proposals = cast(list[dict[str, object]], audit["policy_worker_proposals"])
             assert proposals == [
                 {
                     "cache_hit": True,
                     "cache_source": "task6-v3-frozen-replay",
                     "network_call_count": 0,
                     "policy_kind": "cached_llm",
+                    "proposal_seed": 7_664_614_645_859_848_164,
+                },
+                {
+                    "cache_hit": True,
+                    "cache_source": "task6-v3-frozen-replay",
+                    "network_call_count": 0,
+                    "policy_kind": "cached_llm",
+                    "proposal_seed": 6_479_548_443_684_787_591,
+                },
+                {
+                    "cache_hit": True,
+                    "cache_source": "task6-v3-frozen-replay",
+                    "network_call_count": 0,
+                    "policy_kind": "cached_llm",
+                    "proposal_seed": 1_839_419_232_351_933_406,
                 }
-            ] * 3
+            ]
+
+    assert set(map(tuple, seed_sequences.values())) == {
+        (
+            7_664_614_645_859_848_164,
+            6_479_548_443_684_787_591,
+            1_839_419_232_351_933_406,
+        )
+    }
 
     repeated = runner.execute(
         bundle,
