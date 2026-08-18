@@ -1,0 +1,101 @@
+{
+  "threat_id": "cnp-checkout-automation",
+  "title": "Automated card-not-present checkout abuse",
+  "version": 1,
+  "status": "approved",
+  "family": "card_testing_cnp",
+  "confidence": 0.91,
+  "implementation_status": "evidence_only",
+  "rails": [
+    "card"
+  ],
+  "viewpoint": "merchant_and_network",
+  "channels": [
+    "ecommerce"
+  ],
+  "lifecycle_stages": [
+    "checkout",
+    "authorization"
+  ],
+  "genai_capability": {
+    "workflow_automation": true,
+    "iteration_speed": true
+  },
+  "attacker_objective": "fraudulent_purchase_value",
+  "observables": [
+    "checkout_velocity",
+    "failed_authentication_rate",
+    "device_account_ratio",
+    "cnp_indicator"
+  ],
+  "defender_knowledge_boundary": "decision-available payment signals only",
+  "simulation_status": "simulatable",
+  "safety_class": "synthetic_only",
+  "evidence": [
+    {
+      "evidence_id": "nist-cnp-fact-2019",
+      "direct_source_url": "https://www.nist.gov/publications/multifactor-authentication-e-commerce",
+      "source_type": "standards_guidance",
+      "publisher": "National Institute of Standards and Technology",
+      "published_on": "2019-07-30",
+      "accessed_on": "2026-08-16",
+      "claim": "NIST reports increased fraudulent CNP e-commerce transactions and documents risk-based authentication for online retail purchases.",
+      "is_project_inference": false,
+      "quality_grade": "A",
+      "reviewer_notes": "Direct NIST publication page."
+    },
+    {
+      "evidence_id": "apar-cnp-automation-inference",
+      "direct_source_url": "https://www.nist.gov/publications/multifactor-authentication-e-commerce",
+      "source_type": "standards_guidance",
+      "publisher": "National Institute of Standards and Technology",
+      "published_on": "2019-07-30",
+      "accessed_on": "2026-08-16",
+      "claim": "APAR infers that synthetic workflow automation can be represented by bounded checkout velocity and device reuse shifts.",
+      "is_project_inference": true,
+      "quality_grade": "B",
+      "reviewer_notes": "Project inference; no checkout automation implementation is included."
+    }
+  ],
+  "default_config": {
+    "scenario_id": "cnp-checkout-automation-v1",
+    "version": "1.0.0",
+    "rail": "card",
+    "viewpoint": "merchant_and_network",
+    "attacker_mode": "static",
+    "attacker_objective": "fraudulent_purchase_value",
+    "query_budget": 50,
+    "feedback": [
+      "action",
+      "reason_family"
+    ],
+    "benign_entity_count": 5500,
+    "illicit_entity_count": 65,
+    "duration_hours": 12,
+    "seed": 260822,
+    "campaign_stages": [
+      {
+        "stage_id": "checkout",
+        "description": "Synthetic checkout stage"
+      },
+      {
+        "stage_id": "authorization",
+        "description": "Synthetic authorization stage"
+      }
+    ],
+    "transition_rules": [
+      {
+        "from_stage": "checkout",
+        "to_stage": "authorization",
+        "condition": "stage_completed"
+      }
+    ],
+    "replay": {
+      "random_seed": 260822,
+      "simulation_start": "2026-08-16T00:00:00Z",
+      "generator_version": "0.1.0",
+      "event_ordering": "event_time_then_event_id"
+    },
+    "export_level": "sanitized"
+  }
+}

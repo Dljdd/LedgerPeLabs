@@ -1,0 +1,781 @@
+{
+  "cached_replay": {
+    "file_sha256": "1b137c2de0bec6eb95acf34172217113c825ab5be9322e694f9ec9e458427efc",
+    "path": "docs/experiments/task6-v3-cached-llm-replay.json",
+    "preparation_budget": 24,
+    "preparation_seed": 4
+  },
+  "cancellation_record": {
+    "cancelled_results_absent": true,
+    "reserved_seeds_unused": true,
+    "v3_1_path": "docs/experiments/task6-v3.1-cancellation.json",
+    "v3_1_sha256": "9cd23e63914d1d45824dc65ad3ae0868aac5fc0de53bceaeb8c877268d3e6b2d",
+    "v3_2_path": "docs/experiments/task6-v3.2-cancellation.json",
+    "v3_2_sha256": "e5866fb4eae9ce68a12b60726ac60026e2e36d706f218e32c147c79e92b2367c",
+    "v3_path": "docs/experiments/task6-v3-cancellation.json",
+    "v3_sha256": "6eedd0a064e7e59fcfb2a68a8fce0f995f6fd612f935fbd2e06d64f2cdb7f03f"
+  },
+  "families": {
+    "app_scam_mule": {
+      "provenance": {
+        "background_digest": "870ff1432f490309a6fdd89ea2e4f881134ad5f41b723c86d886e2defeeefd15",
+        "bounds_digest": "491a405ef68b8ca40c1c70d8dbfec43dc6717f246120672057660e6a34f8b7b1",
+        "contract_digest": "4124bc88991f2a4a064d607ba964b4bf825bb390736181710a7ea26ab5197f58",
+        "defender_digest": "86b3aa0762060046b001488c457331a11d1bc92179bcf40ba7c80d811ae0321a",
+        "disclosure_profile_digest": "013db90a74727c372e34c74e5447eae13802e8e12da122ba937d25702020b894",
+        "evaluator_code_digest": "93cd559796359fe835f41982fc2f937b6fc836716e9fc68384f775cd6d024222",
+        "evaluator_digest": "2e47a4e455079faaa641251da2e6cd60007f342cd8b6241ea60db6817f189389",
+        "hidden_template_digest": "cffbc8bdf58d1db018b32339f3ac5d166e82bc9412b3e6e6e90083987eea0af8",
+        "population_digest": "a89e4cadd335500a87a8c4bf5fa5c68612ac931d07b0659352a200f175981c5a"
+      }
+    },
+    "card_testing_cnp": {
+      "provenance": {
+        "background_digest": "870ff1432f490309a6fdd89ea2e4f881134ad5f41b723c86d886e2defeeefd15",
+        "bounds_digest": "6862e2a57cd707a4659a159cf0cf257bed6dfef4147a39e6a0df25fd203bb344",
+        "contract_digest": "937aba3d6c8698a34bb71cd9ba10dfa0d8c9c6d37b06647ad97d1da43cf66f57",
+        "defender_digest": "86b3aa0762060046b001488c457331a11d1bc92179bcf40ba7c80d811ae0321a",
+        "disclosure_profile_digest": "013db90a74727c372e34c74e5447eae13802e8e12da122ba937d25702020b894",
+        "evaluator_code_digest": "93cd559796359fe835f41982fc2f937b6fc836716e9fc68384f775cd6d024222",
+        "evaluator_digest": "2e47a4e455079faaa641251da2e6cd60007f342cd8b6241ea60db6817f189389",
+        "hidden_template_digest": "baacde17dcbc291784213f3333f128dcf1561868eac743aa8cb7905bdbd04388",
+        "population_digest": "a89e4cadd335500a87a8c4bf5fa5c68612ac931d07b0659352a200f175981c5a"
+      }
+    }
+  },
+  "frozen_benchmark": {
+    "defender_digest": "86b3aa0762060046b001488c457331a11d1bc92179bcf40ba7c80d811ae0321a",
+    "disclosure_profile_digest": "013db90a74727c372e34c74e5447eae13802e8e12da122ba937d25702020b894",
+    "population_digest": "a89e4cadd335500a87a8c4bf5fa5c68612ac931d07b0659352a200f175981c5a"
+  },
+  "negative_control_provenance": {
+    "provenance": {
+      "background_digest": "870ff1432f490309a6fdd89ea2e4f881134ad5f41b723c86d886e2defeeefd15",
+      "bounds_digest": "3f34fd15bec84e19f43fd486639d7e905cf9d5c1aa95a1918ec62d531a0e0552",
+      "contract_digest": "9b9aabb5796f12477e46bb6b151aa9dbee93a53b7c4a62075963c05c4a86cb1f",
+      "defender_digest": "86b3aa0762060046b001488c457331a11d1bc92179bcf40ba7c80d811ae0321a",
+      "disclosure_profile_digest": "6093bdf7b09c4a6a33c7eac5df5b5822a70b08b98ec3c7b63bd97bd0e8ebfba1",
+      "evaluator_code_digest": "93cd559796359fe835f41982fc2f937b6fc836716e9fc68384f775cd6d024222",
+      "evaluator_digest": "2e47a4e455079faaa641251da2e6cd60007f342cd8b6241ea60db6817f189389",
+      "hidden_template_digest": "4286830057e2ebfdd96f44ad54d5ba257250b9d24f344a32014871a816a3136e",
+      "population_digest": "a89e4cadd335500a87a8c4bf5fa5c68612ac931d07b0659352a200f175981c5a"
+    }
+  },
+  "policy_bindings": {
+    "adaptive": {
+      "callable_digest": "47d256722e149bd097aedb254c7abfe2f668ce2422a5ade055bbb52489ecd9ed",
+      "code_digest": "577e08cdcdb59a3723bd416a17003b6f09e6669c737f573da01e2afd92a0ea81",
+      "version": "3.0.0"
+    },
+    "cached_llm": {
+      "callable_digest": "d891b5609981d7157ad8560a47c942b2d01d22bc93d479507b8c37d239f231ec",
+      "code_digest": "823cd614c52feb59f84f9f15964041dbab457652d8730efc0fe1445ae16d4806",
+      "version": "1.0.0"
+    },
+    "fixed": {
+      "callable_digest": "4eaf4b132e34194faeae79aa95a6d64ca36d11f0f47de66d606bc00d0f2fd39a",
+      "code_digest": "5704ac50f8adfc55700577ec99ed3508f402b121ecbc3659173693600dd9c85a",
+      "version": "1.0.0"
+    },
+    "random": {
+      "callable_digest": "87dc14b0b897f16b0699f174532709a0c38bc61bf2ada8a0354c766ae5135931",
+      "code_digest": "27fffa91b44de8a4a726bd8d167aebd8ade32305dc368b2e8837f5bfb60013e0",
+      "version": "1.0.0"
+    }
+  },
+  "protocol": {
+    "approval_boundary": {
+      "approval_scope": "The supplied commit and SHA-256 are out-of-band controller/reviewer authorization, not self-authenticating caller input.",
+      "local_approval_is_durable_authenticity": false,
+      "task7_responsibility": "Durably sign approval, isolate and terminate workers, and retain an append-only execution receipt."
+    },
+    "budgets": {
+      "logical_time": 24,
+      "proposal": 24,
+      "query": 24,
+      "wall_time_ms": 120000
+    },
+    "experiment_id": "task6-v3.3-confirmatory",
+    "fairness": {
+      "identical_proposal_query_logical_caps": true,
+      "identical_wall_time_caps": true,
+      "shared_default_first_proposal": true,
+      "shared_default_policies": [
+        "random",
+        "adaptive"
+      ]
+    },
+    "maximum_confirmatory_attempts": 1,
+    "metrics": {
+      "app_scam_mule": {
+        "minimum_delta": "0.10",
+        "no_metric_switching": true,
+        "primary_outcome": "net_settled_value_rate"
+      },
+      "card_testing_cnp": {
+        "minimum_delta": "0.10",
+        "no_metric_switching": true,
+        "primary_outcome": "valid_yield"
+      }
+    },
+    "negative_control": {
+      "expected_observed_delta": "0",
+      "family": "agentic_intent_abuse",
+      "included_in_supported_family_count": false,
+      "minimum_delta": "0.10",
+      "policy_cells": [
+        "fixed",
+        "random",
+        "adaptive"
+      ],
+      "primary_outcome": "valid_yield",
+      "same_seeds_and_budgets_as_targets": true,
+      "support_expected": false
+    },
+    "network": {
+      "allowed_calls": 0,
+      "cached_llm_required": true
+    },
+    "policies": {
+      "adaptive": "3.0.0",
+      "cached_llm": "1.0.0",
+      "fixed": "1.0.0",
+      "random": "1.0.0"
+    },
+    "protocol_version": "1.0.0",
+    "seeds": [
+      503,
+      607,
+      709,
+      811,
+      907,
+      1009,
+      1103,
+      1201
+    ],
+    "stopping_rule": "If v3.3 fails either preregistered target threshold or its confirmatory validity hard gate, no further confirmatory holdout will be opened; later work is exploratory or Task 7 evaluation.",
+    "uncertainty": {
+      "method": "exact_paired_sign_resampling_reference_interval",
+      "post_hoc_gate": false,
+      "reported_values": [
+        "per_seed_deltas",
+        "mean_per_seed_delta",
+        "reference_interval_95"
+      ],
+      "role": "descriptive_only"
+    }
+  },
+  "purpose": "Maximum one final confirmatory evaluation of the unchanged family-agnostic finite-lattice frontier/UCB policy under an externally approved exact freeze.",
+  "schema_version": "1.0.0",
+  "source_freeze": {
+    "behavior_manifest": {
+      "digest": "667c9030f51c786af19b21d362c25ba1febfb937fd1a279cd530a43c97f1e884",
+      "entries": {
+        "docs/experiments/task6-v3-cached-llm-replay.json": {
+          "content_sha256": "1b137c2de0bec6eb95acf34172217113c825ab5be9322e694f9ec9e458427efc",
+          "git_mode": "100644",
+          "git_object_id": "479683f0a9bc287b30af570b6807644654e667d4",
+          "object_type": "blob"
+        },
+        "docs/experiments/task6-v3-cancellation.json": {
+          "content_sha256": "6eedd0a064e7e59fcfb2a68a8fce0f995f6fd612f935fbd2e06d64f2cdb7f03f",
+          "git_mode": "100644",
+          "git_object_id": "5724755096700afc9bfb479aae3c03964b57984f",
+          "object_type": "blob"
+        },
+        "docs/experiments/task6-v3.1-cancellation.json": {
+          "content_sha256": "9cd23e63914d1d45824dc65ad3ae0868aac5fc0de53bceaeb8c877268d3e6b2d",
+          "git_mode": "100644",
+          "git_object_id": "1d94297930f80b2dfd2649026df70fcbea68b554",
+          "object_type": "blob"
+        },
+        "docs/experiments/task6-v3.2-cancellation.json": {
+          "content_sha256": "e5866fb4eae9ce68a12b60726ac60026e2e36d706f218e32c147c79e92b2367c",
+          "git_mode": "100644",
+          "git_object_id": "8032f585e0a8f3fe26b412d4abe81066073fef33",
+          "object_type": "blob"
+        },
+        "fixtures/golden/canonical-sha256.json": {
+          "content_sha256": "1ca83c9e822b6dfff4ba146fbfbbc748e790a77765626a46380c8e426a899caf",
+          "git_mode": "100644",
+          "git_object_id": "a1132ac8f340c22cfe761e248399446da297a001",
+          "object_type": "blob"
+        },
+        "fixtures/golden/scenario-config.json": {
+          "content_sha256": "f22e96f3923063b91553dc66b88c42a567145e788f48d463207928d14863f4b5",
+          "git_mode": "100644",
+          "git_object_id": "b518c21590dbc814716156de2cf4129d1d36a896",
+          "object_type": "blob"
+        },
+        "fixtures/golden/threat-card.json": {
+          "content_sha256": "70784460375e3dac17d355f200024ca7c74f6f3601c059f9b731168ef70f0195",
+          "git_mode": "100644",
+          "git_object_id": "abbf1aea9d0ce4cd7a6a6ce5b878cd05de1a1989",
+          "object_type": "blob"
+        },
+        "fixtures/threats/adaptive-card-testing.json": {
+          "content_sha256": "68ed89bf792948231f7bf069c666380cb51c008d56db016f5ed72346b0999b43",
+          "git_mode": "100644",
+          "git_object_id": "95374bd7c797c6457b9e8b62df97042f303e1d7b",
+          "object_type": "blob"
+        },
+        "fixtures/threats/agentic-cart-tampering.json": {
+          "content_sha256": "73edfcd1009975d1e469a37433889b8a5fef419c6bdc01118bc477b4a4cbfd4c",
+          "git_mode": "100644",
+          "git_object_id": "bb003c4d2b6203b4e5276eacca4e7d3d7546619e",
+          "object_type": "blob"
+        },
+        "fixtures/threats/agentic-mandate-escalation.json": {
+          "content_sha256": "eaf656d0cc95e532869d275903b599270699e2d72b61ab6899d3da0416bc1693",
+          "git_mode": "100644",
+          "git_object_id": "361fb9f72693e4bb5e18e35b6dd1ab053a275d90",
+          "object_type": "blob"
+        },
+        "fixtures/threats/agentic-payee-substitution.json": {
+          "content_sha256": "ab5f138c5f4b443bfadf849a7941b22fe3494fe499e159f8c7825bd71e08d38f",
+          "git_mode": "100644",
+          "git_object_id": "f4030f3caf1d10608e293b93e26ceb1579c368a6",
+          "object_type": "blob"
+        },
+        "fixtures/threats/app-personalized-mule.json": {
+          "content_sha256": "70784460375e3dac17d355f200024ca7c74f6f3601c059f9b731168ef70f0195",
+          "git_mode": "100644",
+          "git_object_id": "abbf1aea9d0ce4cd7a6a6ce5b878cd05de1a1989",
+          "object_type": "blob"
+        },
+        "fixtures/threats/cnp-checkout-automation.json": {
+          "content_sha256": "b1ca16c4154409ea004c301493a1d906aed94684b7f91857fcd266f3497692cc",
+          "git_mode": "100644",
+          "git_object_id": "96256217f4682f1f5fca089c04e6692029007fef",
+          "object_type": "blob"
+        },
+        "fixtures/threats/credential-stuffing-ato.json": {
+          "content_sha256": "001f136928d2e54e1869792870183ed6746b2322a7cd315b3ec33977e27d2afe",
+          "git_mode": "100644",
+          "git_object_id": "774fc04d73c84ae7e42a501860dadc156b42384f",
+          "object_type": "blob"
+        },
+        "fixtures/threats/first-party-dispute-automation.json": {
+          "content_sha256": "003d2afb6571661adfd97ec764c1536fd5a8540b5e67f710fac664c2b5034228",
+          "git_mode": "100644",
+          "git_object_id": "472e5e011fd1de13d8e3843302598c1f210bd499",
+          "object_type": "blob"
+        },
+        "fixtures/threats/instant-payment-velocity.json": {
+          "content_sha256": "4303b145412edc3528c1c42c791b7bf5b4004e03f8b94dbdd210ec3cadeb3e93",
+          "git_mode": "100644",
+          "git_object_id": "c6ec2325b5e2cd065dfea123a9f902dec236c8f7",
+          "object_type": "blob"
+        },
+        "fixtures/threats/investment-persuasion.json": {
+          "content_sha256": "2f7932fdc841a516e6e982d961e7097bea5d906f2a97ea17de683d378da833f4",
+          "git_mode": "100644",
+          "git_object_id": "641f19970260f9234b482a81c6908e7fec0f17ad",
+          "object_type": "blob"
+        },
+        "fixtures/threats/invoice-payee-substitution.json": {
+          "content_sha256": "28d53552438d8dcb0210c7a9c4910fea7da83312539fa0ed6c82b83ad1bbf4de",
+          "git_mode": "100644",
+          "git_object_id": "cb4139ac715db616866316285806bcd93ccc0583",
+          "object_type": "blob"
+        },
+        "fixtures/threats/merchant-laundering.json": {
+          "content_sha256": "aefd7feb5424d0a532cf5138f3a103ae3191aca379309467bc3abda31fcd04de",
+          "git_mode": "100644",
+          "git_object_id": "c0ade1d7fa7226bf2d0bab9368a2d39863ed3e19",
+          "object_type": "blob"
+        },
+        "fixtures/threats/mule-fanout-layering.json": {
+          "content_sha256": "43e1a59609d35ff6eeac1bf0370dd10f98740b52f778603fd4748c0dd197d2a2",
+          "git_mode": "100644",
+          "git_object_id": "7955c1d02ac1f5166cd15c756859b694f32e6279",
+          "object_type": "blob"
+        },
+        "fixtures/threats/mule-recruitment.json": {
+          "content_sha256": "3834fb9d696ac5efdab07b0f7af7934e23f65c4a5f5f443edba8b58f49f81cbe",
+          "git_mode": "100644",
+          "git_object_id": "6f7b26c7d9613e9d35ea66c171579d67ef4e7521",
+          "object_type": "blob"
+        },
+        "fixtures/threats/promotion-abuse.json": {
+          "content_sha256": "7709ce7882a67047f0dfa0f6bcf4d368bc4e8b5ff76a2705a52db44e2d142aec",
+          "git_mode": "100644",
+          "git_object_id": "6041d4b9252a96c446f821391b4a370c8d5d8e22",
+          "object_type": "blob"
+        },
+        "fixtures/threats/qr-social-engineering.json": {
+          "content_sha256": "10795279648061276d0629e81b9518092b302a7aaefe6d671f258371088fc912",
+          "git_mode": "100644",
+          "git_object_id": "af26841a35f73dc52561b3b34afb3c4c9d21583d",
+          "object_type": "blob"
+        },
+        "fixtures/threats/remote-access-guidance.json": {
+          "content_sha256": "89cbc4e25b21b6e3b4a66a3997cdb890b2b41e41923447e767be860c026c67ad",
+          "git_mode": "100644",
+          "git_object_id": "4baef675fecb7a7d952e0c0fc50d710620515532",
+          "object_type": "blob"
+        },
+        "fixtures/threats/synthetic-identity-bustout.json": {
+          "content_sha256": "0f885a8bd75200117f5af2b906192e52c9338279ba8ffc0c2bf1d0f809b94c74",
+          "git_mode": "100644",
+          "git_object_id": "5538f6eccdf2517139f3de5cddf837fe49622373",
+          "object_type": "blob"
+        },
+        "fixtures/threats/synthetic-merchant-refund.json": {
+          "content_sha256": "867b2f6d4dc823511062545a4f68766a42edb618a12e80f7036aae9fc00f4cc0",
+          "git_mode": "100644",
+          "git_object_id": "d806252b8ec2f43d4397e907483c211ac22fc78f",
+          "object_type": "blob"
+        },
+        "fixtures/threats/voice-clone-app.json": {
+          "content_sha256": "754b6ecde29630f2bb6fd3ae0a577549b990ca5b9dc56c57b9230400d14f6e57",
+          "git_mode": "100644",
+          "git_object_id": "b66fa7bb3a984f72215e96573b026dde37373637",
+          "object_type": "blob"
+        },
+        "pyproject.toml": {
+          "content_sha256": "4b05a8066502169f9c0afd4e259eab3657f4f9fd61785496ed82e8083d57e5ce",
+          "git_mode": "100644",
+          "git_object_id": "88a6cdb770c359d0946a4cef6a24277caab6adc5",
+          "object_type": "blob"
+        },
+        "scripts/run_task6_holdout.py": {
+          "content_sha256": "b05761b87ce88e0cd46a422477d9c5e502f8d772063522f0969edeae9ffc131b",
+          "git_mode": "100644",
+          "git_object_id": "59090e9404e53fdfbafc60a0b2db34eb45ae5718",
+          "object_type": "blob"
+        },
+        "scripts/verify_g0.py": {
+          "content_sha256": "3255fc55ddfdb1fc36c222dc51d9684da946f7c4f7ca0eb0fd35022dac7e7b8c",
+          "git_mode": "100644",
+          "git_object_id": "ade2a64c80458eb329bcd2d9ce4718bfcfc3ccf7",
+          "object_type": "blob"
+        },
+        "src/apar/__init__.py": {
+          "content_sha256": "91447944015cec709e8aa7655f7e9d64e1e4508e7023a57fe3746911c0fc6fed",
+          "git_mode": "100644",
+          "git_object_id": "3dc1f76bc69e3f559bee6253b24fc93acee9e1f9",
+          "object_type": "blob"
+        },
+        "src/apar/api/__init__.py": {
+          "content_sha256": "a0e19e56c0008122987405734b8a2201988650c263169366e5a7fc13ad86ebac",
+          "git_mode": "100644",
+          "git_object_id": "b420b472ba0d7c695245bcd008d8edd572986e86",
+          "object_type": "blob"
+        },
+        "src/apar/api/app.py": {
+          "content_sha256": "ddd3df9699d61ffae1d35d62a00eb9d7bee53d78f2cfe11a3cf9b8c52be807a7",
+          "git_mode": "100644",
+          "git_object_id": "7b8d752f7b91b2e4f01d4c9390528adf2d506c7f",
+          "object_type": "blob"
+        },
+        "src/apar/api/dependencies.py": {
+          "content_sha256": "9769e8eb2ac49b4e7cd100c5ebf0071c0fcdc97b7b9d274da80c8302aa77018a",
+          "git_mode": "100644",
+          "git_object_id": "01ebd629908cebbf45a91bf6e161f7184e3ff8cf",
+          "object_type": "blob"
+        },
+        "src/apar/api/routes/__init__.py": {
+          "content_sha256": "51bf83470168d705beb38744164cc071189699478cdb8ceebd28fd927f332148",
+          "git_mode": "100644",
+          "git_object_id": "fb0a2f808230d18b89b49b68b2bce37b7c869206",
+          "object_type": "blob"
+        },
+        "src/apar/api/routes/health.py": {
+          "content_sha256": "98822b13e43b88e89b2fa3545cb81855f687f384098eb5e070910caeeebf1088",
+          "git_mode": "100644",
+          "git_object_id": "8abcc41fa6de8fb361a5aef7db9b33583726bcb3",
+          "object_type": "blob"
+        },
+        "src/apar/api/routes/registry.py": {
+          "content_sha256": "7d0a0ae49fb8c5e023326ac0a6f825b047f38197fa7938c8089e3069d62d43fa",
+          "git_mode": "100644",
+          "git_object_id": "c720647c5665907a3768e5de2dd662f7120a3373",
+          "object_type": "blob"
+        },
+        "src/apar/compiler/__init__.py": {
+          "content_sha256": "9b36c9e98bd3c928062e417ee0ca5d22428c226dd66b2d96de89366b040f84fd",
+          "git_mode": "100644",
+          "git_object_id": "cefd1cda01db723ca5096dd064dc1fbc1ace3167",
+          "object_type": "blob"
+        },
+        "src/apar/compiler/compiler.py": {
+          "content_sha256": "b3a3c9b764d00b45d3dccd788c9aa9ecc56d88b056b0f140236631573f639963",
+          "git_mode": "100644",
+          "git_object_id": "a835c555f051d6f8ef3823ebc1dcc5de26bf0afe",
+          "object_type": "blob"
+        },
+        "src/apar/compiler/errors.py": {
+          "content_sha256": "82ec8c0f4ec52decfd6c4276ce9bee0fc0c3f1863477a8d1e6b8299a06f9244a",
+          "git_mode": "100644",
+          "git_object_id": "059355666343181661df3ffd688878f94527c74b",
+          "object_type": "blob"
+        },
+        "src/apar/config.py": {
+          "content_sha256": "8c2a2f94c148ff6de36eabf718b4ee0d718f70e9cfda19a648a3e0d4a6e21dac",
+          "git_mode": "100644",
+          "git_object_id": "fc2b38d5de02fde2300d2737135b0937b01dae2e",
+          "object_type": "blob"
+        },
+        "src/apar/contracts/__init__.py": {
+          "content_sha256": "1fb8d299efe37e76d12ae1c6da66223d8976e4861c5f6e02e773b68ca5f565f1",
+          "git_mode": "100644",
+          "git_object_id": "ec27ef8aa19e5361f23ca2ec13b13854c4cce93c",
+          "object_type": "blob"
+        },
+        "src/apar/contracts/_validation.py": {
+          "content_sha256": "83d5234e59b3dd5b003562b12fd09850008ea3a5535c462d349b2b7874766a64",
+          "git_mode": "100644",
+          "git_object_id": "e43b41e48c5e28f7b7feb8cd98817948ccc250a7",
+          "object_type": "blob"
+        },
+        "src/apar/contracts/decisions.py": {
+          "content_sha256": "62ae405e57f0235af60ba0376be7e2f4784843a1112aade8b00134ddd39241f8",
+          "git_mode": "100644",
+          "git_object_id": "93e8bbe8348554863a1033c7ad925ed5320a2373",
+          "object_type": "blob"
+        },
+        "src/apar/contracts/events.py": {
+          "content_sha256": "93ef74802a57e0af536f6393f7e5ab1c9bdc49e26e615cb7aa1889001d8da960",
+          "git_mode": "100644",
+          "git_object_id": "fd6c59dd277d59b8bcbb693d1c74e5a630112468",
+          "object_type": "blob"
+        },
+        "src/apar/contracts/reports.py": {
+          "content_sha256": "3c320c7f8d2001b04ba0d12220deedca52aefe329787eb79b2cbd6b274086ee0",
+          "git_mode": "100644",
+          "git_object_id": "6f9331c87bd643eeb39eeac8c96abcfb15008a97",
+          "object_type": "blob"
+        },
+        "src/apar/contracts/scenarios.py": {
+          "content_sha256": "e690e2bf14a4163e3a20dffba28b54abd96ec83de96bf576458dc35bce31ee28",
+          "git_mode": "100644",
+          "git_object_id": "6334ac0c03ce11f000aafe247100fc5bd5ec35e0",
+          "object_type": "blob"
+        },
+        "src/apar/generators/__init__.py": {
+          "content_sha256": "c4b3cdb979f1ec154cd6d55b40317495f024be7e09f7d9b6f7a93101b99d2886",
+          "git_mode": "100644",
+          "git_object_id": "d50956daec121e0aafd8e0f1df81470b04fdba5f",
+          "object_type": "blob"
+        },
+        "src/apar/generators/campaigns.py": {
+          "content_sha256": "670b4a3ec358f82d88f9655bd41d878fbee11d4841ff264655554bae31c3b31a",
+          "git_mode": "100644",
+          "git_object_id": "a40e9549c006a82d8029c0e34d9a4e7d03e1eea3",
+          "object_type": "blob"
+        },
+        "src/apar/generators/population.py": {
+          "content_sha256": "2e54862322980414098c17930ec95bd268372da8968a78384a5bd661bfdaa2e5",
+          "git_mode": "100644",
+          "git_object_id": "b561f8406f98c6b7f3072d883ef739f5616acdb9",
+          "object_type": "blob"
+        },
+        "src/apar/redteam/__init__.py": {
+          "content_sha256": "4f70824745ae39c3d1d34123b5f49da19bb5ff15b120101696e6715dde8aa8e3",
+          "git_mode": "100644",
+          "git_object_id": "ffac822ffce7454a55c3bb68a6a4be24794b1116",
+          "object_type": "blob"
+        },
+        "src/apar/redteam/benchmark.py": {
+          "content_sha256": "c2eb6324ea7b8df983a75e9f1df31d9cf82a08a47f4b16a4550fad6482c8aacf",
+          "git_mode": "100644",
+          "git_object_id": "2ab1517fbac0bac9e69d2d087053ef487f70cccc",
+          "object_type": "blob"
+        },
+        "src/apar/redteam/llm_policy.py": {
+          "content_sha256": "8105a6788041f7d73b1afa571482f4b0ff3b15980f6c28769b701ab350936622",
+          "git_mode": "100644",
+          "git_object_id": "b5dd3a0f3dc74f7f93490f27ff8af97da1d04aab",
+          "object_type": "blob"
+        },
+        "src/apar/redteam/policies.py": {
+          "content_sha256": "c97ab7b263a493978cf901140a97f15874a34f8ff2ce54c84253e7baa998fb82",
+          "git_mode": "100644",
+          "git_object_id": "4f97869c42c37a9cafa61d66d25a425182ba7bf8",
+          "object_type": "blob"
+        },
+        "src/apar/redteam/search.py": {
+          "content_sha256": "ee05348ab07a9852a68a3f6a477eeec7ad6837d94f187e6fbb97767220f60e89",
+          "git_mode": "100644",
+          "git_object_id": "c31f8215041e42d41317d8ff96c9fa2bca26fc55",
+          "object_type": "blob"
+        },
+        "src/apar/redteam/task6_experiment.py": {
+          "content_sha256": "a1367a8bb4310eeea2812a7d118ccb738ae1d9c32bfbc21c87413b1a869ce056",
+          "git_mode": "100644",
+          "git_object_id": "a02e6cd58eb71342f3d175e79080dfa4a3a76be2",
+          "object_type": "blob"
+        },
+        "src/apar/registry/__init__.py": {
+          "content_sha256": "467fe609123c0c0ef265f2ca99cada7de65d09302ad166dcae6d110e55f57675",
+          "git_mode": "100644",
+          "git_object_id": "751a80133097076dcf79c7c7c4d7600e58f33c07",
+          "object_type": "blob"
+        },
+        "src/apar/registry/models.py": {
+          "content_sha256": "0be0ca245fc80beb26217bc45571bb8f2cd7c4466fccd4af435fe847b2b3ba74",
+          "git_mode": "100644",
+          "git_object_id": "cbc6ae7055123188b58294d4ec996d6316239128",
+          "object_type": "blob"
+        },
+        "src/apar/registry/repository.py": {
+          "content_sha256": "e647d8c2db0300209c53f2159c160e4762e47c3a8c55e79e076db6762f1b5bcd",
+          "git_mode": "100644",
+          "git_object_id": "d629debe77d9b91ce3cad326f304658a40f139ba",
+          "object_type": "blob"
+        },
+        "src/apar/simulator/__init__.py": {
+          "content_sha256": "7e44b3619e4b779ca9a4180c1c90d3c11cb91aa6a9086f229536d62a3767ffb2",
+          "git_mode": "100644",
+          "git_object_id": "f69456f506972772deaea317efe1073f91d1d337",
+          "object_type": "blob"
+        },
+        "src/apar/simulator/clock.py": {
+          "content_sha256": "db2e5ffc264c3ba31ba900a88fc765cd7b1c665d85760b29625e3ac51ae8cf4a",
+          "git_mode": "100644",
+          "git_object_id": "a7659232898eaedb96889ea8183fc023a531738c",
+          "object_type": "blob"
+        },
+        "src/apar/simulator/engine.py": {
+          "content_sha256": "f25805e01801591ead78eed8318842de2f3bc3b4fc01eb00fca5fb4feb84884e",
+          "git_mode": "100644",
+          "git_object_id": "87c8fe0a08f0422b1f46ba5967a27486c057e95d",
+          "object_type": "blob"
+        },
+        "src/apar/simulator/ledger.py": {
+          "content_sha256": "5c28b1cc8677cf2e969f292a2f36def4d34ed607bab48530744db09776bf16b4",
+          "git_mode": "100644",
+          "git_object_id": "f899e37fea355523aff9c9c1845f1cbff2837fc6",
+          "object_type": "blob"
+        },
+        "src/apar/simulator/rails/__init__.py": {
+          "content_sha256": "b1b4b5f7602b4289ffe4b6c75477cb04dc3132282496af79f69c33ce64235359",
+          "git_mode": "100644",
+          "git_object_id": "58781b50f792ef9bef9c9fb744a14af1365ac66e",
+          "object_type": "blob"
+        },
+        "src/apar/simulator/rails/a2a.py": {
+          "content_sha256": "26a64ba43a1a5d3bbfff975422e98076a1221f0e83d8ee3c627f6d41b6b30f84",
+          "git_mode": "100644",
+          "git_object_id": "215de72d48006b5e9bb3e6f39198a11b5005b615",
+          "object_type": "blob"
+        },
+        "src/apar/simulator/rails/agentic.py": {
+          "content_sha256": "5ebac3a3220f761c4e3b76d0cdf80f0956764c57e5a1251a8778e9f2a168be16",
+          "git_mode": "100644",
+          "git_object_id": "ce6fd937ab12eab8f18afa13971ed15ea2c723dd",
+          "object_type": "blob"
+        },
+        "src/apar/simulator/rails/base.py": {
+          "content_sha256": "89573c15ce371a27c3eeb1c50a38e5656990b9f0ee11d9283b2b9ff4dd7ccc61",
+          "git_mode": "100644",
+          "git_object_id": "eb8cdf48317747d366cd3b48e1c8c04dd7bf6394",
+          "object_type": "blob"
+        },
+        "src/apar/simulator/rails/card.py": {
+          "content_sha256": "1969e60c08cacd2848348529160c19b1a1ca30d6932e31a40dc3affdd31a5cb9",
+          "git_mode": "100644",
+          "git_object_id": "5a2a3f7a39a9086ac975e10fbc5f307ae89597c3",
+          "object_type": "blob"
+        },
+        "src/apar/storage/artifacts.py": {
+          "content_sha256": "62a7dbdccc36abe25933b6312941848880c712842f4f3ceae7900305eac8c74c",
+          "git_mode": "100644",
+          "git_object_id": "13e25cbd128ff872243e30a75437f3296982befb",
+          "object_type": "blob"
+        },
+        "src/apar/storage/database.py": {
+          "content_sha256": "705513c69c2694a8db475c706589908ba4a1a4bdbe44ebed150b4d2509913cf3",
+          "git_mode": "100644",
+          "git_object_id": "c187d7cfc37598c26228494b31944298816e938e",
+          "object_type": "blob"
+        },
+        "src/apar/trust/__init__.py": {
+          "content_sha256": "8cfdc9cb0166959aa352886687773dc4cdd1ce6b0e6774beaa47c91cb77b77ee",
+          "git_mode": "100644",
+          "git_object_id": "3d7869f5a335393be3147c1a5f79b5a1c11656d4",
+          "object_type": "blob"
+        },
+        "src/apar/trust/verifier.py": {
+          "content_sha256": "4cee724a64907c5b94489cc025daa09372a87d42f697b2d923e4f87365d618b6",
+          "git_mode": "100644",
+          "git_object_id": "0397d30e9992c6ac6af08bdfe0d873603429fd62",
+          "object_type": "blob"
+        }
+      }
+    },
+    "environment": {
+      "installed_distributions": [
+        {
+          "name": "annotated-doc",
+          "version": "0.0.5"
+        },
+        {
+          "name": "annotated-types",
+          "version": "0.8.0"
+        },
+        {
+          "name": "anyio",
+          "version": "4.14.2"
+        },
+        {
+          "name": "apar",
+          "version": "0.1.0"
+        },
+        {
+          "name": "ast-serialize",
+          "version": "0.8.0"
+        },
+        {
+          "name": "certifi",
+          "version": "2026.7.22"
+        },
+        {
+          "name": "cffi",
+          "version": "2.1.1"
+        },
+        {
+          "name": "cryptography",
+          "version": "50.0.0"
+        },
+        {
+          "name": "fastapi",
+          "version": "0.141.1"
+        },
+        {
+          "name": "h11",
+          "version": "0.16.0"
+        },
+        {
+          "name": "httpcore",
+          "version": "1.0.9"
+        },
+        {
+          "name": "httpcore2",
+          "version": "2.10.0"
+        },
+        {
+          "name": "httpx2",
+          "version": "2.10.0"
+        },
+        {
+          "name": "hypothesis",
+          "version": "6.165.9"
+        },
+        {
+          "name": "idna",
+          "version": "3.18"
+        },
+        {
+          "name": "iniconfig",
+          "version": "2.3.0"
+        },
+        {
+          "name": "librt",
+          "version": "0.15.0"
+        },
+        {
+          "name": "mypy",
+          "version": "2.3.1"
+        },
+        {
+          "name": "mypy-extensions",
+          "version": "1.1.0"
+        },
+        {
+          "name": "numpy",
+          "version": "2.5.2"
+        },
+        {
+          "name": "packaging",
+          "version": "26.3"
+        },
+        {
+          "name": "pandas",
+          "version": "3.0.5"
+        },
+        {
+          "name": "pathspec",
+          "version": "1.1.1"
+        },
+        {
+          "name": "pip",
+          "version": "25.0.1"
+        },
+        {
+          "name": "pluggy",
+          "version": "1.6.0"
+        },
+        {
+          "name": "pyarrow",
+          "version": "25.0.1"
+        },
+        {
+          "name": "pycparser",
+          "version": "3.0"
+        },
+        {
+          "name": "pydantic",
+          "version": "2.13.4"
+        },
+        {
+          "name": "pydantic-core",
+          "version": "2.46.4"
+        },
+        {
+          "name": "pygments",
+          "version": "2.20.0"
+        },
+        {
+          "name": "pytest",
+          "version": "9.1.1"
+        },
+        {
+          "name": "python-dateutil",
+          "version": "2.9.0.post0"
+        },
+        {
+          "name": "ruff",
+          "version": "0.16.3"
+        },
+        {
+          "name": "six",
+          "version": "1.17.0"
+        },
+        {
+          "name": "sortedcontainers",
+          "version": "2.4.0"
+        },
+        {
+          "name": "starlette",
+          "version": "1.6.0"
+        },
+        {
+          "name": "truststore",
+          "version": "0.10.4"
+        },
+        {
+          "name": "typing-extensions",
+          "version": "4.16.0"
+        },
+        {
+          "name": "typing-inspection",
+          "version": "0.4.4"
+        }
+      ],
+      "installed_distributions_digest": "fcb5e1d03e605540d416a436b797f30b532518b4c52d241f1dd58408c4ebc9e6",
+      "platform": "macOS-15.1-arm64-arm-64bit",
+      "python_cache_tag": "cpython-312",
+      "python_implementation": "CPython",
+      "python_version": "3.12.13"
+    },
+    "git_tree": "f299be92fd533a3357556695573524b70a308374",
+    "lock_file": {
+      "path": null,
+      "status": "explicitly_absent"
+    },
+    "source_commit": "ef8199de82c9bd76c05aff97d62703e55f9b31aa"
+  },
+  "status": "final_v3_3_frozen_before_confirmatory_execution"
+}

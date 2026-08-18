@@ -1,0 +1,112 @@
+{
+  "threat_id": "merchant-laundering",
+  "title": "Merchant and processor laundering patterns",
+  "version": 1,
+  "status": "approved",
+  "family": "merchant_risk",
+  "confidence": 0.93,
+  "implementation_status": "evidence_only",
+  "rails": [
+    "card",
+    "a2a"
+  ],
+  "viewpoint": "acquirer_and_network",
+  "channels": [
+    "merchant_processing"
+  ],
+  "lifecycle_stages": [
+    "merchant_onboarding",
+    "processing",
+    "settlement"
+  ],
+  "genai_capability": {
+    "synthetic_profile_generation": true,
+    "content_generation": true
+  },
+  "attacker_objective": "laundered_settlement_value",
+  "observables": [
+    "merchant_return_rate",
+    "originator_return_rate",
+    "merchant_volume_change",
+    "settlement_concentration"
+  ],
+  "defender_knowledge_boundary": "decision-available payment signals only",
+  "simulation_status": "simulatable",
+  "safety_class": "synthetic_only",
+  "evidence": [
+    {
+      "evidence_id": "fincen-processor-risk-fact-2012",
+      "direct_source_url": "https://www.fincen.gov/resources/advisories/fincen-advisory-fin-2012-a010",
+      "source_type": "regulator_guidance",
+      "publisher": "Financial Crimes Enforcement Network",
+      "published_on": "2012-10-22",
+      "accessed_on": "2026-08-16",
+      "claim": "FinCEN warns that criminals can use payment processors to mask suspicious transactions and launder proceeds, and identifies processor and originator return-rate patterns.",
+      "is_project_inference": false,
+      "quality_grade": "A",
+      "reviewer_notes": "Direct FinCEN advisory."
+    },
+    {
+      "evidence_id": "apar-merchant-laundering-inference",
+      "direct_source_url": "https://www.fincen.gov/resources/advisories/fincen-advisory-fin-2012-a010",
+      "source_type": "regulator_guidance",
+      "publisher": "Financial Crimes Enforcement Network",
+      "published_on": "2012-10-22",
+      "accessed_on": "2026-08-16",
+      "claim": "APAR infers generative business-profile variation can be tested through synthetic merchant linkage and settlement-pattern shifts.",
+      "is_project_inference": true,
+      "quality_grade": "B",
+      "reviewer_notes": "Project inference; no laundering method or onboarding evasion is supplied."
+    }
+  ],
+  "default_config": {
+    "scenario_id": "merchant-laundering-v1",
+    "version": "1.0.0",
+    "rail": "card",
+    "viewpoint": "acquirer_and_network",
+    "attacker_mode": "static",
+    "attacker_objective": "laundered_settlement_value",
+    "query_budget": 30,
+    "feedback": [
+      "action",
+      "reason_family"
+    ],
+    "benign_entity_count": 4000,
+    "illicit_entity_count": 40,
+    "duration_hours": 72,
+    "seed": 260826,
+    "campaign_stages": [
+      {
+        "stage_id": "merchant_onboarding",
+        "description": "Synthetic merchant onboarding stage"
+      },
+      {
+        "stage_id": "processing",
+        "description": "Synthetic processing stage"
+      },
+      {
+        "stage_id": "settlement",
+        "description": "Synthetic settlement stage"
+      }
+    ],
+    "transition_rules": [
+      {
+        "from_stage": "merchant_onboarding",
+        "to_stage": "processing",
+        "condition": "stage_completed"
+      },
+      {
+        "from_stage": "processing",
+        "to_stage": "settlement",
+        "condition": "stage_completed"
+      }
+    ],
+    "replay": {
+      "random_seed": 260826,
+      "simulation_start": "2026-08-16T00:00:00Z",
+      "generator_version": "0.1.0",
+      "event_ordering": "event_time_then_event_id"
+    },
+    "export_level": "sanitized"
+  }
+}

@@ -1,0 +1,97 @@
+{
+  "schema_version": "1.0.0",
+  "status": "frozen_before_holdout",
+  "purpose": "One untouched-seed test of the family-agnostic contextual UCB adaptive policy after the Task 6 development result.",
+  "source_files": {
+    "scripts/run_task6_holdout.py": "ea1ce4a8ac052c30222d1c0620bdff771d43a1b3c103773e2df72bf56618fd83",
+    "src/apar/redteam/benchmark.py": "c2eb6324ea7b8df983a75e9f1df31d9cf82a08a47f4b16a4550fad6482c8aacf",
+    "src/apar/redteam/policies.py": "3f28ae725840fd22ae2ab69748cf2fec670a0d30f6841c213c7622efdc1be11e",
+    "src/apar/redteam/search.py": "e8a865ff02493ddaffadffd300aa1c6acce37b2cbe5e05791880c5c2cd7ce499"
+  },
+  "adaptive_policy": {
+    "class": "apar.redteam.policies.AdaptiveTournamentPolicy",
+    "version": "2.0.0",
+    "code_digest": "a1d3f06d38ab0de37812301f7eefde7e6fae48fdad0bdd49b86bd0f786ea8114",
+    "design": "Family-agnostic novelty-aware contextual UCB over public parent mutation directions and coarse feedback only."
+  },
+  "frozen_benchmark": {
+    "defender_rules_changed_after_development": false,
+    "defender_digest": "86b3aa0762060046b001488c457331a11d1bc92179bcf40ba7c80d811ae0321a",
+    "population_digest": "a89e4cadd335500a87a8c4bf5fa5c68612ac931d07b0659352a200f175981c5a",
+    "disclosure_profile_digest": "013db90a74727c372e34c74e5447eae13802e8e12da122ba937d25702020b894"
+  },
+  "holdout": {
+    "seeds": [101, 211, 307, 401],
+    "budget": 16,
+    "wall_time_budget_ms": 60000,
+    "one_execution_only": true,
+    "requires_clean_preregistration_commit": true,
+    "result_path": "docs/experiments/task6-holdout-result.json"
+  },
+  "families": {
+    "app_scam_mule": {
+      "primary_outcome": "net_settled_value_rate",
+      "minimum_delta": "0.10",
+      "support_rule": "Adaptive aggregate role-bound net settled value must improve by at least 10 percent over random.",
+      "no_metric_switching": true,
+      "provenance": {
+        "evaluator_code_digest": "93cd559796359fe835f41982fc2f937b6fc836716e9fc68384f775cd6d024222",
+        "contract_digest": "4124bc88991f2a4a064d607ba964b4bf825bb390736181710a7ea26ab5197f58",
+        "bounds_digest": "491a405ef68b8ca40c1c70d8dbfec43dc6717f246120672057660e6a34f8b7b1",
+        "hidden_template_digest": "cffbc8bdf58d1db018b32339f3ac5d166e82bc9412b3e6e6e90083987eea0af8",
+        "background_digest": "870ff1432f490309a6fdd89ea2e4f881134ad5f41b723c86d886e2defeeefd15",
+        "population_digest": "a89e4cadd335500a87a8c4bf5fa5c68612ac931d07b0659352a200f175981c5a",
+        "evaluator_digest": "2e47a4e455079faaa641251da2e6cd60007f342cd8b6241ea60db6817f189389",
+        "defender_digest": "86b3aa0762060046b001488c457331a11d1bc92179bcf40ba7c80d811ae0321a",
+        "disclosure_profile_digest": "013db90a74727c372e34c74e5447eae13802e8e12da122ba937d25702020b894"
+      }
+    },
+    "card_testing_cnp": {
+      "primary_outcome": "valid_yield",
+      "minimum_delta": "0.10",
+      "support_rule": "Adaptive aggregate valid yield must exceed random by at least 0.10.",
+      "no_metric_switching": true,
+      "provenance": {
+        "evaluator_code_digest": "93cd559796359fe835f41982fc2f937b6fc836716e9fc68384f775cd6d024222",
+        "contract_digest": "937aba3d6c8698a34bb71cd9ba10dfa0d8c9c6d37b06647ad97d1da43cf66f57",
+        "bounds_digest": "6862e2a57cd707a4659a159cf0cf257bed6dfef4147a39e6a0df25fd203bb344",
+        "hidden_template_digest": "baacde17dcbc291784213f3333f128dcf1561868eac743aa8cb7905bdbd04388",
+        "background_digest": "870ff1432f490309a6fdd89ea2e4f881134ad5f41b723c86d886e2defeeefd15",
+        "population_digest": "a89e4cadd335500a87a8c4bf5fa5c68612ac931d07b0659352a200f175981c5a",
+        "evaluator_digest": "2e47a4e455079faaa641251da2e6cd60007f342cd8b6241ea60db6817f189389",
+        "defender_digest": "86b3aa0762060046b001488c457331a11d1bc92179bcf40ba7c80d811ae0321a",
+        "disclosure_profile_digest": "013db90a74727c372e34c74e5447eae13802e8e12da122ba937d25702020b894"
+      }
+    }
+  },
+  "cached_replay": {
+    "path": "docs/experiments/task6-cached-llm-replay.json",
+    "file_sha256": "27fbd96cb4a8097138090ad3345b6b883c153987a7242c2fdb8a0a81ed00fef4",
+    "preparation_seed": 4,
+    "preparation_budget": 16,
+    "holdout_seed_overlap": false,
+    "required_network_calls_during_holdout": 0
+  },
+  "negative_control": {
+    "family": "agentic_intent_abuse",
+    "fixture": "minimum public adaptive space with no mutable fields",
+    "development_seeds": [1, 2],
+    "budget": 2,
+    "primary_outcome": "valid_yield",
+    "expected_observed_delta": "0",
+    "support_expected": false,
+    "test": "tests/redteam/test_capability_delta.py::test_minimum_agentic_space_is_a_negative_no_delta_control"
+  },
+  "development_observation_not_holdout": {
+    "seeds": [4, 9],
+    "budget": 8,
+    "app_scam_mule_net_settled_value_rate": "0.2526881720430107526881720430",
+    "card_testing_cnp_valid_yield_delta": "0.125",
+    "used_only_to_finalize_generic_policy": true
+  },
+  "decision_rule": {
+    "supported_family_count": "Sum of the two family-specific preregistered support booleans.",
+    "acceptance_criterion": "supported_family_count must equal 2",
+    "if_below_two": "Report the criterion unmet without changing policy, seeds, budget, outcomes, thresholds, benchmark, defender, or tests."
+  }
+}

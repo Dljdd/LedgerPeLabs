@@ -1,0 +1,114 @@
+{
+  "threat_id": "agentic-cart-tampering",
+  "title": "Agentic cart manipulation through misleading signals",
+  "version": 1,
+  "status": "approved",
+  "family": "agentic_intent_abuse",
+  "confidence": 0.87,
+  "implementation_status": "evidence_only",
+  "rails": [
+    "agentic",
+    "card"
+  ],
+  "viewpoint": "agent_merchant_and_network",
+  "channels": [
+    "agent_catalog",
+    "checkout"
+  ],
+  "lifecycle_stages": [
+    "recommendation",
+    "cart",
+    "checkout"
+  ],
+  "genai_capability": {
+    "indirect_instruction_exposure": true,
+    "tool_use": true
+  },
+  "attacker_objective": "unintended_cart_value",
+  "observables": [
+    "requested_cart_match",
+    "price_change_indicator",
+    "merchant_identity",
+    "confirmation_indicator",
+    "agent_identity"
+  ],
+  "defender_knowledge_boundary": "decision-available payment signals only",
+  "simulation_status": "simulatable",
+  "safety_class": "synthetic_only",
+  "evidence": [
+    {
+      "evidence_id": "mastercard-agent-logic-fact-2025",
+      "direct_source_url": "https://www.mastercard.com/news/ap/en/perspectives/en/2025/as-ai-agents-gain-autonomy-trust-becomes-the-new-currency-mastercard-wants-to-power-both/",
+      "source_type": "payment_network_guidance",
+      "publisher": "Mastercard",
+      "published_on": "2025-07-03",
+      "accessed_on": "2026-08-16",
+      "claim": "Mastercard warns that bad actors may game agent logic through inflated prices, imitated legitimate offers, or misleading signals that trigger purchases.",
+      "is_project_inference": false,
+      "quality_grade": "A",
+      "reviewer_notes": "Direct Mastercard agentic-commerce perspective."
+    },
+    {
+      "evidence_id": "apar-agentic-cart-inference",
+      "direct_source_url": "https://www.mastercard.com/news/ap/en/perspectives/en/2025/as-ai-agents-gain-autonomy-trust-becomes-the-new-currency-mastercard-wants-to-power-both/",
+      "source_type": "payment_network_guidance",
+      "publisher": "Mastercard",
+      "published_on": "2025-07-03",
+      "accessed_on": "2026-08-16",
+      "claim": "APAR infers synthetic requested-versus-executed cart and price mismatches can test agentic checkout controls.",
+      "is_project_inference": true,
+      "quality_grade": "B",
+      "reviewer_notes": "Project inference; no manipulation payload or live merchant interaction is included."
+    }
+  ],
+  "default_config": {
+    "scenario_id": "agentic-cart-tampering-v1",
+    "version": "1.0.0",
+    "rail": "agentic",
+    "viewpoint": "agent_merchant_and_network",
+    "attacker_mode": "static",
+    "attacker_objective": "unintended_cart_value",
+    "query_budget": 30,
+    "feedback": [
+      "action",
+      "reason_family"
+    ],
+    "benign_entity_count": 4000,
+    "illicit_entity_count": 40,
+    "duration_hours": 24,
+    "seed": 260835,
+    "campaign_stages": [
+      {
+        "stage_id": "recommendation",
+        "description": "Synthetic recommendation stage"
+      },
+      {
+        "stage_id": "cart",
+        "description": "Synthetic cart stage"
+      },
+      {
+        "stage_id": "checkout",
+        "description": "Synthetic checkout stage"
+      }
+    ],
+    "transition_rules": [
+      {
+        "from_stage": "recommendation",
+        "to_stage": "cart",
+        "condition": "stage_completed"
+      },
+      {
+        "from_stage": "cart",
+        "to_stage": "checkout",
+        "condition": "stage_completed"
+      }
+    ],
+    "replay": {
+      "random_seed": 260835,
+      "simulation_start": "2026-08-16T00:00:00Z",
+      "generator_version": "0.1.0",
+      "event_ordering": "event_time_then_event_id"
+    },
+    "export_level": "sanitized"
+  }
+}

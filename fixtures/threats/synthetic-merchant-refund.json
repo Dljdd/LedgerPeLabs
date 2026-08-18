@@ -1,0 +1,135 @@
+{
+  "threat_id": "synthetic-merchant-refund",
+  "title": "Synthetic merchant and anomalous refund campaign",
+  "version": 1,
+  "status": "approved",
+  "family": "synthetic_merchant_refund",
+  "confidence": 0.91,
+  "implementation_status": "deep_scenario",
+  "rails": [
+    "card"
+  ],
+  "viewpoint": "acquirer_and_network",
+  "channels": [
+    "merchant_onboarding",
+    "merchant_processing"
+  ],
+  "lifecycle_stages": [
+    "onboarding",
+    "sale",
+    "refund",
+    "settlement"
+  ],
+  "genai_capability": {
+    "synthetic_profile_generation": true,
+    "document_variation": true
+  },
+  "attacker_objective": "improper_refund_value",
+  "observables": [
+    "merchant_identity_linkage",
+    "merchant_age",
+    "refund_velocity",
+    "refund_beneficiary_concentration",
+    "sale_refund_ratio"
+  ],
+  "defender_knowledge_boundary": "decision-available payment signals only",
+  "simulation_status": "simulatable",
+  "safety_class": "synthetic_only",
+  "evidence": [
+    {
+      "evidence_id": "visa-scam-merchant-fact-2025",
+      "direct_source_url": "https://corporate.visa.com/en/sites/visa-perspectives/security-trust/scam-disruption-hits-one-billion-milestone.html",
+      "source_type": "payment_network_guidance",
+      "publisher": "Visa",
+      "published_on": "2025-09-25",
+      "accessed_on": "2026-08-16",
+      "claim": "Visa reports that its Scam Disruption practice helped dismantle more than 25,000 scam merchants and strengthened detection of deceptive merchant practices.",
+      "is_project_inference": false,
+      "quality_grade": "A",
+      "reviewer_notes": "Direct dated Visa payment-network article."
+    },
+    {
+      "evidence_id": "mastercard-refund-signal-fact-2026",
+      "direct_source_url": "https://www.mastercard.com/us/en/news-and-trends/stories/2026/return-risk-intelligence.html",
+      "source_type": "payment_network_guidance",
+      "publisher": "Mastercard",
+      "published_on": "2026-04-09",
+      "accessed_on": "2026-08-16",
+      "claim": "Mastercard describes analyzing current and historic returns, refunds, disputes, and chargebacks to identify patterns correlated with fraud.",
+      "is_project_inference": false,
+      "quality_grade": "A",
+      "reviewer_notes": "Direct Mastercard product-owner article."
+    },
+    {
+      "evidence_id": "apar-synthetic-merchant-refund-inference",
+      "direct_source_url": "https://corporate.visa.com/en/sites/visa-perspectives/security-trust/scam-disruption-hits-one-billion-milestone.html",
+      "source_type": "payment_network_guidance",
+      "publisher": "Visa",
+      "published_on": "2025-09-25",
+      "accessed_on": "2026-08-16",
+      "claim": "APAR infers a bounded synthetic campaign can join merchant-onboarding risk with anomalous refund flow patterns.",
+      "is_project_inference": true,
+      "quality_grade": "B",
+      "reviewer_notes": "Project inference; all merchants, sales, refunds, and identities are synthetic."
+    }
+  ],
+  "default_config": {
+    "scenario_id": "synthetic-merchant-refund-v1",
+    "version": "1.0.0",
+    "rail": "card",
+    "viewpoint": "acquirer_and_network",
+    "attacker_mode": "decision_only",
+    "attacker_objective": "improper_refund_value",
+    "query_budget": 50,
+    "feedback": [
+      "action",
+      "reason_family"
+    ],
+    "benign_entity_count": 4500,
+    "illicit_entity_count": 55,
+    "duration_hours": 48,
+    "seed": 260827,
+    "campaign_stages": [
+      {
+        "stage_id": "onboarding",
+        "description": "Synthetic onboarding stage"
+      },
+      {
+        "stage_id": "sale",
+        "description": "Synthetic sale stage"
+      },
+      {
+        "stage_id": "refund",
+        "description": "Synthetic refund stage"
+      },
+      {
+        "stage_id": "settlement",
+        "description": "Synthetic settlement stage"
+      }
+    ],
+    "transition_rules": [
+      {
+        "from_stage": "onboarding",
+        "to_stage": "sale",
+        "condition": "stage_completed"
+      },
+      {
+        "from_stage": "sale",
+        "to_stage": "refund",
+        "condition": "stage_completed"
+      },
+      {
+        "from_stage": "refund",
+        "to_stage": "settlement",
+        "condition": "stage_completed"
+      }
+    ],
+    "replay": {
+      "random_seed": 260827,
+      "simulation_start": "2026-08-16T00:00:00Z",
+      "generator_version": "0.1.0",
+      "event_ordering": "event_time_then_event_id"
+    },
+    "export_level": "sanitized"
+  }
+}

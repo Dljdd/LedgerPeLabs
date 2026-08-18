@@ -1,0 +1,123 @@
+{
+  "threat_id": "instant-payment-velocity",
+  "title": "High-velocity instant-payment abuse",
+  "version": 1,
+  "status": "approved",
+  "family": "instant_payment_fraud",
+  "confidence": 0.88,
+  "implementation_status": "evidence_only",
+  "rails": [
+    "a2a"
+  ],
+  "viewpoint": "network_native",
+  "channels": [
+    "instant_payment"
+  ],
+  "lifecycle_stages": [
+    "initiation",
+    "risk_assessment",
+    "posting"
+  ],
+  "genai_capability": {
+    "iteration_speed": true,
+    "workflow_automation": true
+  },
+  "attacker_objective": "rapid_settled_value",
+  "observables": [
+    "account_activity_threshold",
+    "receiver_account_age",
+    "payment_velocity",
+    "receiver_fan_in"
+  ],
+  "defender_knowledge_boundary": "decision-available payment signals only",
+  "simulation_status": "simulatable",
+  "safety_class": "synthetic_only",
+  "evidence": [
+    {
+      "evidence_id": "fednow-network-intelligence-fact-2026",
+      "direct_source_url": "https://www.frbservices.org/news/fed360/issues/051426/fednow-service-network-intelligence-api",
+      "source_type": "regulator_guidance",
+      "publisher": "Federal Reserve Financial Services",
+      "published_on": "2026-05-14",
+      "accessed_on": "2026-08-16",
+      "claim": "Federal Reserve Financial Services describes receiver account-level network data as an added input for participant risk assessment before an instant payment.",
+      "is_project_inference": false,
+      "quality_grade": "A",
+      "reviewer_notes": "Direct FedNow service-owner announcement."
+    },
+    {
+      "evidence_id": "psr-faster-payments-fraud-fact-2024",
+      "direct_source_url": "https://www.psr.org.uk/news-and-updates/speeches/speeches/chris-hemsley-speech-at-the-fraud-leaders-summit-on-28-february-2024/",
+      "source_type": "regulator_guidance",
+      "publisher": "Payment Systems Regulator",
+      "published_on": "2024-02-28",
+      "accessed_on": "2026-08-16",
+      "claim": "The UK Payment Systems Regulator states that the speed and convenience of the Faster Payments System have made it a prime target for fraudsters.",
+      "is_project_inference": false,
+      "quality_grade": "A",
+      "reviewer_notes": "Direct dated regulator speech; phenomenon fact only, with no automation inference."
+    },
+    {
+      "evidence_id": "apar-instant-velocity-inference",
+      "direct_source_url": "https://www.frbservices.org/news/fed360/issues/051426/fednow-service-network-intelligence-api",
+      "source_type": "regulator_guidance",
+      "publisher": "Federal Reserve Financial Services",
+      "published_on": "2026-05-14",
+      "accessed_on": "2026-08-16",
+      "claim": "APAR infers bounded synthetic velocity and receiver-network shifts can test pre-payment controls under instant settlement timing.",
+      "is_project_inference": true,
+      "quality_grade": "B",
+      "reviewer_notes": "Project inference; no real account or payment endpoint is used."
+    }
+  ],
+  "default_config": {
+    "scenario_id": "instant-payment-velocity-v1",
+    "version": "1.0.0",
+    "rail": "a2a",
+    "viewpoint": "network_native",
+    "attacker_mode": "decision_only",
+    "attacker_objective": "rapid_settled_value",
+    "query_budget": 45,
+    "feedback": [
+      "action",
+      "reason_family"
+    ],
+    "benign_entity_count": 5500,
+    "illicit_entity_count": 60,
+    "duration_hours": 12,
+    "seed": 260831,
+    "campaign_stages": [
+      {
+        "stage_id": "initiation",
+        "description": "Synthetic initiation stage"
+      },
+      {
+        "stage_id": "risk_assessment",
+        "description": "Synthetic risk assessment stage"
+      },
+      {
+        "stage_id": "posting",
+        "description": "Synthetic posting stage"
+      }
+    ],
+    "transition_rules": [
+      {
+        "from_stage": "initiation",
+        "to_stage": "risk_assessment",
+        "condition": "stage_completed"
+      },
+      {
+        "from_stage": "risk_assessment",
+        "to_stage": "posting",
+        "condition": "stage_completed"
+      }
+    ],
+    "replay": {
+      "random_seed": 260831,
+      "simulation_start": "2026-08-16T00:00:00Z",
+      "generator_version": "0.1.0",
+      "event_ordering": "event_time_then_event_id"
+    },
+    "export_level": "sanitized"
+  }
+}

@@ -1,0 +1,111 @@
+{
+  "threat_id": "promotion-abuse",
+  "title": "Generated-account promotion abuse",
+  "version": 1,
+  "status": "approved",
+  "family": "promotion_abuse",
+  "confidence": 0.84,
+  "implementation_status": "evidence_only",
+  "rails": [
+    "card"
+  ],
+  "viewpoint": "merchant_and_network",
+  "channels": [
+    "ecommerce"
+  ],
+  "lifecycle_stages": [
+    "account_creation",
+    "promotion_redemption",
+    "purchase"
+  ],
+  "genai_capability": {
+    "synthetic_profile_generation": true,
+    "workflow_automation": true
+  },
+  "attacker_objective": "improper_promotion_value",
+  "observables": [
+    "account_device_density",
+    "promotion_redemption_velocity",
+    "shared_payment_instrument_rate",
+    "account_age"
+  ],
+  "defender_knowledge_boundary": "decision-available payment signals only",
+  "simulation_status": "simulatable",
+  "safety_class": "synthetic_only",
+  "evidence": [
+    {
+      "evidence_id": "promotion-abuse-research-fact-2021",
+      "direct_source_url": "https://www.inderscience.com/info/inarticle.php?artid=114111",
+      "source_type": "original_research",
+      "publisher": "Inderscience Publishers",
+      "published_on": "2021-04-08",
+      "accessed_on": "2026-08-16",
+      "claim": "Peer-reviewed research reports abuse of first-time e-commerce promotional discounts and validates transaction-based rules for flagging probable abuse.",
+      "is_project_inference": false,
+      "quality_grade": "B",
+      "reviewer_notes": "Direct publication record and abstract for the original study."
+    },
+    {
+      "evidence_id": "apar-promotion-abuse-inference",
+      "direct_source_url": "https://www.inderscience.com/info/inarticle.php?artid=114111",
+      "source_type": "original_research",
+      "publisher": "Inderscience Publishers",
+      "published_on": "2021-04-08",
+      "accessed_on": "2026-08-16",
+      "claim": "APAR infers generative profile variation may change synthetic account-linkage density while leaving redemption rules fixed.",
+      "is_project_inference": true,
+      "quality_grade": "B",
+      "reviewer_notes": "Project inference; no real promotion or account is targeted."
+    }
+  ],
+  "default_config": {
+    "scenario_id": "promotion-abuse-v1",
+    "version": "1.0.0",
+    "rail": "card",
+    "viewpoint": "merchant_and_network",
+    "attacker_mode": "static",
+    "attacker_objective": "improper_promotion_value",
+    "query_budget": 30,
+    "feedback": [
+      "action",
+      "reason_family"
+    ],
+    "benign_entity_count": 4000,
+    "illicit_entity_count": 60,
+    "duration_hours": 24,
+    "seed": 260828,
+    "campaign_stages": [
+      {
+        "stage_id": "account_creation",
+        "description": "Synthetic account creation stage"
+      },
+      {
+        "stage_id": "promotion_redemption",
+        "description": "Synthetic promotion redemption stage"
+      },
+      {
+        "stage_id": "purchase",
+        "description": "Synthetic purchase stage"
+      }
+    ],
+    "transition_rules": [
+      {
+        "from_stage": "account_creation",
+        "to_stage": "promotion_redemption",
+        "condition": "stage_completed"
+      },
+      {
+        "from_stage": "promotion_redemption",
+        "to_stage": "purchase",
+        "condition": "stage_completed"
+      }
+    ],
+    "replay": {
+      "random_seed": 260828,
+      "simulation_start": "2026-08-16T00:00:00Z",
+      "generator_version": "0.1.0",
+      "event_ordering": "event_time_then_event_id"
+    },
+    "export_level": "sanitized"
+  }
+}

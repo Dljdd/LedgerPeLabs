@@ -1,0 +1,111 @@
+{
+  "threat_id": "remote-access-guidance",
+  "title": "AI-tailored remote-access scam guidance",
+  "version": 1,
+  "status": "approved",
+  "family": "app_scam_mule",
+  "confidence": 0.9,
+  "implementation_status": "evidence_only",
+  "rails": [
+    "a2a"
+  ],
+  "viewpoint": "issuer_and_network",
+  "channels": [
+    "voice",
+    "messaging"
+  ],
+  "lifecycle_stages": [
+    "impersonation",
+    "account_guidance",
+    "transfer"
+  ],
+  "genai_capability": {
+    "personalization": true,
+    "interactive_guidance": true
+  },
+  "attacker_objective": "authorized_transfer_value",
+  "observables": [
+    "new_device_indicator",
+    "new_beneficiary_indicator",
+    "unusual_transfer_value"
+  ],
+  "defender_knowledge_boundary": "decision-available payment signals only",
+  "simulation_status": "simulatable",
+  "safety_class": "synthetic_only",
+  "evidence": [
+    {
+      "evidence_id": "fbi-phantom-hacker-fact-2023",
+      "direct_source_url": "https://www.fbi.gov/contact-us/field-offices/sanfrancisco/news/the-phantom-hacker-fbi-san-francisco-warns-public-of-new-financial-scam",
+      "source_type": "government_advisory",
+      "publisher": "Federal Bureau of Investigation",
+      "published_on": "2023-10-03",
+      "accessed_on": "2026-08-16",
+      "claim": "The FBI describes tech-support impostors directing victims to install remote-access software before urging transfers to supposed safe accounts.",
+      "is_project_inference": false,
+      "quality_grade": "A",
+      "reviewer_notes": "Direct FBI warning; description remains capability-level."
+    },
+    {
+      "evidence_id": "apar-remote-guidance-inference",
+      "direct_source_url": "https://www.fbi.gov/contact-us/field-offices/sanfrancisco/news/the-phantom-hacker-fbi-san-francisco-warns-public-of-new-financial-scam",
+      "source_type": "government_advisory",
+      "publisher": "Federal Bureau of Investigation",
+      "published_on": "2023-10-03",
+      "accessed_on": "2026-08-16",
+      "claim": "APAR infers that adaptive conversational guidance may change the timing and value distribution of synthetic transfers.",
+      "is_project_inference": true,
+      "quality_grade": "B",
+      "reviewer_notes": "Project modeling inference; no remote-access procedure is supplied."
+    }
+  ],
+  "default_config": {
+    "scenario_id": "remote-access-guidance-v1",
+    "version": "1.0.0",
+    "rail": "a2a",
+    "viewpoint": "issuer_and_network",
+    "attacker_mode": "decision_only",
+    "attacker_objective": "authorized_transfer_value",
+    "query_budget": 30,
+    "feedback": [
+      "action",
+      "reason_family"
+    ],
+    "benign_entity_count": 3000,
+    "illicit_entity_count": 35,
+    "duration_hours": 24,
+    "seed": 260818,
+    "campaign_stages": [
+      {
+        "stage_id": "impersonation",
+        "description": "Synthetic impersonation stage"
+      },
+      {
+        "stage_id": "account_guidance",
+        "description": "Synthetic account guidance stage"
+      },
+      {
+        "stage_id": "transfer",
+        "description": "Synthetic transfer stage"
+      }
+    ],
+    "transition_rules": [
+      {
+        "from_stage": "impersonation",
+        "to_stage": "account_guidance",
+        "condition": "stage_completed"
+      },
+      {
+        "from_stage": "account_guidance",
+        "to_stage": "transfer",
+        "condition": "stage_completed"
+      }
+    ],
+    "replay": {
+      "random_seed": 260818,
+      "simulation_start": "2026-08-16T00:00:00Z",
+      "generator_version": "0.1.0",
+      "event_ordering": "event_time_then_event_id"
+    },
+    "export_level": "sanitized"
+  }
+}

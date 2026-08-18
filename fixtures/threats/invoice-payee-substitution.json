@@ -1,0 +1,112 @@
+{
+  "threat_id": "invoice-payee-substitution",
+  "title": "Generated invoice payee-substitution messaging",
+  "version": 1,
+  "status": "approved",
+  "family": "business_email_compromise",
+  "confidence": 0.94,
+  "implementation_status": "evidence_only",
+  "rails": [
+    "a2a",
+    "agentic"
+  ],
+  "viewpoint": "network_with_bank_enrichment",
+  "channels": [
+    "email",
+    "agent_message"
+  ],
+  "lifecycle_stages": [
+    "impersonation",
+    "payee_change",
+    "transfer"
+  ],
+  "genai_capability": {
+    "content_generation": true,
+    "personalization": true
+  },
+  "attacker_objective": "misdirected_invoice_value",
+  "observables": [
+    "payee_change_indicator",
+    "new_beneficiary_indicator",
+    "invoice_value_deviation"
+  ],
+  "defender_knowledge_boundary": "decision-available payment signals only",
+  "simulation_status": "simulatable",
+  "safety_class": "synthetic_only",
+  "evidence": [
+    {
+      "evidence_id": "fbi-bec-payee-fact-2020",
+      "direct_source_url": "https://www.fbi.gov/news/press-releases/fbi-anticipates-rise-in-business-email-compromise-schemes-related-to-the-covid-19-pandemic",
+      "source_type": "government_advisory",
+      "publisher": "Federal Bureau of Investigation",
+      "published_on": "2020-04-06",
+      "accessed_on": "2026-08-16",
+      "claim": "The FBI describes BEC messages that request funds be sent to a new account or alter normal payment practices, including changed invoice bank details.",
+      "is_project_inference": false,
+      "quality_grade": "A",
+      "reviewer_notes": "Direct FBI press release."
+    },
+    {
+      "evidence_id": "apar-invoice-substitution-inference",
+      "direct_source_url": "https://www.fbi.gov/news/press-releases/fbi-anticipates-rise-in-business-email-compromise-schemes-related-to-the-covid-19-pandemic",
+      "source_type": "government_advisory",
+      "publisher": "Federal Bureau of Investigation",
+      "published_on": "2020-04-06",
+      "accessed_on": "2026-08-16",
+      "claim": "APAR infers that generated business context can be modeled as a higher synthetic payee-change acceptance rate without generating deceptive content.",
+      "is_project_inference": true,
+      "quality_grade": "B",
+      "reviewer_notes": "Project inference; only aggregate event effects are simulated."
+    }
+  ],
+  "default_config": {
+    "scenario_id": "invoice-payee-substitution-v1",
+    "version": "1.0.0",
+    "rail": "a2a",
+    "viewpoint": "network_with_bank_enrichment",
+    "attacker_mode": "decision_only",
+    "attacker_objective": "misdirected_invoice_value",
+    "query_budget": 25,
+    "feedback": [
+      "action",
+      "reason_family"
+    ],
+    "benign_entity_count": 3500,
+    "illicit_entity_count": 30,
+    "duration_hours": 48,
+    "seed": 260820,
+    "campaign_stages": [
+      {
+        "stage_id": "impersonation",
+        "description": "Synthetic impersonation stage"
+      },
+      {
+        "stage_id": "payee_change",
+        "description": "Synthetic payee change stage"
+      },
+      {
+        "stage_id": "transfer",
+        "description": "Synthetic transfer stage"
+      }
+    ],
+    "transition_rules": [
+      {
+        "from_stage": "impersonation",
+        "to_stage": "payee_change",
+        "condition": "stage_completed"
+      },
+      {
+        "from_stage": "payee_change",
+        "to_stage": "transfer",
+        "condition": "stage_completed"
+      }
+    ],
+    "replay": {
+      "random_seed": 260820,
+      "simulation_start": "2026-08-16T00:00:00Z",
+      "generator_version": "0.1.0",
+      "event_ordering": "event_time_then_event_id"
+    },
+    "export_level": "sanitized"
+  }
+}

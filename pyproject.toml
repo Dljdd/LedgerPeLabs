@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "apar"
+version = "0.1.0"
+description = "Adaptive Payment Assurance Range competition system"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "cryptography>=43.0",
+    "fastapi>=0.115",
+    "numpy>=2.0",
+    "pandas>=2.2",
+    "pydantic>=2.0",
+    "pyarrow>=18.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "hypothesis>=6.0",
+    "httpx2>=2.0.0",
+    "mypy>=1.13",
+    "pytest>=8.0",
+    "ruff>=0.8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
