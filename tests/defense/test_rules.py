@@ -92,6 +92,12 @@ def test_rules_have_only_event_and_vector_inputs(rule_engine: RuleEngine) -> Non
         ("actor_amount_zscore_24h", 3.999, 4.0, DefenseReason.AMOUNT_DEVIATION),
         ("counterparty_amount_zscore_24h", 3.999, 4.0, DefenseReason.AMOUNT_DEVIATION),
         ("actor_amount_zscore_24h", -3.999, -4.0, DefenseReason.AMOUNT_DEVIATION),
+        (
+            "counterparty_amount_zscore_24h",
+            -3.999,
+            -4.0,
+            DefenseReason.AMOUNT_DEVIATION,
+        ),
         ("graph_shared_neighbor_count", 2.999, 3.0, DefenseReason.GRAPH_SHARED_NEIGHBOR),
         ("pair_prior_count", 3.999, 4.0, DefenseReason.COUNTERPARTY_VELOCITY),
     ),

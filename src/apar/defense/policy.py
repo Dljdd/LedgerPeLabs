@@ -12,6 +12,7 @@ from apar.contracts.decisions import Action
 from apar.defense.contracts import ObservedEvent, PolicyThresholds
 from apar.defense.rules import (
     DefenseReason,
+    RuleEngine,
     RuleManifest,
     RuleResult,
     feature_vector_digest,
@@ -108,9 +109,7 @@ class ActionPolicy(ExternalContract):
     operating_budget: OperatingBudget = Field(default_factory=OperatingBudget)
     rules_challenge_threshold: float = Field(default=0.60, ge=0.0, le=1.0)
     rules_decline_threshold: float = Field(default=0.90, ge=0.0, le=1.0)
-    rule_manifest_digest: str = Field(
-        default_factory=lambda: rule_manifest_digest(RuleManifest.default())
-    )
+    rule_manifest: RuleManifest = Field(default_factory=RuleManifest.default)
 
     @field_validator("version")
     @classmethod
@@ -122,15 +121,6 @@ class ActionPolicy(ExternalContract):
     def thresholds_are_finite(cls, value: float) -> float:
         if not math.isfinite(value):
             raise ValueError("rules-only thresholds must be finite")
-        return value
-
-    @field_validator("rule_manifest_digest")
-    @classmethod
-    def manifest_digest_is_sha256(cls, value: str) -> str:
-        if len(value) != 64 or any(
-            character not in "0123456789abcdef" for character in value
-        ):
-            raise ValueError("rule manifest digest must be lowercase SHA-256")
         return value
 
     @model_validator(mode="after")
@@ -162,11 +152,13 @@ class ActionPolicy(ExternalContract):
         if type(rule_result) is not RuleResult:
             raise TypeError("rule_result must be an exact RuleResult")
         rule_result = RuleResult.model_validate(rule_result)
-        _validate_rule_binding(
+        current_mandatory = mandatory_reasons(event)
+        _validate_rule_result(
             event,
             rule_result,
             vector,
-            expected_manifest_digest=self.rule_manifest_digest,
+            manifest=self.rule_manifest,
+            current_mandatory=current_mandatory,
         )
         _validate_latency(latency_ms)
         if calibrated_score is not None:
@@ -191,11 +183,6 @@ class ActionPolicy(ExternalContract):
         if model_available and failed_component_version is not None:
             raise ValueError("available model cannot identify a failed component")
 
-        current_mandatory = mandatory_reasons(event)
-        supplied_mandatory = tuple(hit.reason for hit in rule_result.hits if hit.mandatory)
-        unjustified = set(supplied_mandatory) - set(current_mandatory)
-        if unjustified:
-            raise ValueError("rule result contains an unjustified mandatory hit")
         if current_mandatory:
             return self._decision(
                 event,
@@ -304,19 +291,24 @@ def _validate_latency(value: float) -> None:
         raise ValueError("latency_ms must be finite and non-negative")
 
 
-def _validate_rule_binding(
+def _validate_rule_result(
     event: ObservedEvent,
     result: RuleResult,
     vector: FeatureVector | None,
     *,
-    expected_manifest_digest: str,
+    manifest: RuleManifest,
+    current_mandatory: tuple[DefenseReason, ...],
 ) -> None:
-    if result.manifest_digest != expected_manifest_digest:
-        raise ValueError("rule result manifest provenance does not match the policy")
     if result.event_id is None:
         if vector is not None:
             raise ValueError("neutral unbound rule sentinel cannot claim vector provenance")
+        if not current_mandatory:
+            raise ValueError(
+                "neutral unbound rule sentinel is only valid for mandatory reconstruction"
+            )
         return
+    if result.manifest_digest != rule_manifest_digest(manifest):
+        raise ValueError("rule result manifest provenance does not match the policy")
     if vector is None:
         raise ValueError("bound rule result requires its feature vector provenance")
     if type(vector) is not FeatureVector:
@@ -332,3 +324,10 @@ def _validate_rule_binding(
     expected_evidence = tuple(sorted({event.event_id, *vector.source_event_ids}))
     if any(hit.evidence_source_ids != expected_evidence for hit in result.hits):
         raise ValueError("rule hit evidence does not match the feature vector provenance")
+    supplied_mandatory = tuple(hit.reason for hit in result.hits if hit.mandatory)
+    unjustified = set(supplied_mandatory) - set(current_mandatory)
+    if unjustified:
+        raise ValueError("rule result contains an unjustified mandatory hit")
+    recomputed = RuleEngine(manifest).evaluate(event, vector)
+    if result != recomputed:
+        raise ValueError("rule result failed deterministic semantic re-evaluation")

@@ -15,7 +15,14 @@ from apar.contracts.decisions import Action
 from apar.contracts.events import EventKind, Rail
 from apar.defense.contracts import ObservedEvent, PolicyThresholds
 from apar.defense.policy import ActionPolicy, DefenseDecision, OperatingBudget
-from apar.defense.rules import DefenseReason, RuleEngine, RuleManifest, RuleResult
+from apar.defense.rules import (
+    DefenseReason,
+    RuleEngine,
+    RuleHit,
+    RuleManifest,
+    RuleResult,
+    RuleSeverity,
+)
 from apar.features.state import FeatureVector
 
 NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
@@ -68,6 +75,11 @@ def vector(
         catalog_digest=catalog_digest,
         values=values,
     )
+
+
+def bound_clear() -> tuple[RuleResult, FeatureVector]:
+    feature_vector = vector()
+    return RuleEngine.default().evaluate(event(), feature_vector), feature_vector
 
 
 def test_policy_has_the_closed_four_input_interface() -> None:
@@ -232,6 +244,16 @@ def test_unbound_neutral_sentinel_rejects_claimed_vector() -> None:
         )
 
 
+def test_unbound_neutral_sentinel_is_only_for_current_mandatory_reconstruction() -> None:
+    with pytest.raises(ValueError, match="only valid for mandatory reconstruction"):
+        ActionPolicy.default().choose(
+            event(),
+            RuleResult.clear(),
+            0.1,
+            PolicyThresholds(challenge=0.8, decline=0.95),
+        )
+
+
 def test_policy_binds_complete_manifest_not_only_same_version() -> None:
     custom_manifest = RuleManifest(actor_count_1m=3.0)
     feature_vector = vector(actor_count_1m=3.0)
@@ -244,7 +266,7 @@ def test_policy_binds_complete_manifest_not_only_same_version() -> None:
             PolicyThresholds(challenge=0.8, decline=0.95),
             vector=feature_vector,
         )
-    configured = ActionPolicy(rule_manifest_digest=result.manifest_digest)
+    configured = ActionPolicy(rule_manifest=custom_manifest)
     assert configured.choose(
         event(),
         result,
@@ -252,6 +274,110 @@ def test_policy_binds_complete_manifest_not_only_same_version() -> None:
         PolicyThresholds(challenge=0.8, decline=0.95),
         vector=feature_vector,
     ).action is Action.APPROVE
+
+
+def test_policy_rejects_fabricated_nonmandatory_hit_with_real_bindings() -> None:
+    feature_vector = vector()
+    legitimate = RuleEngine.default().evaluate(event(), feature_vector)
+    fabricated_hit = RuleHit(
+        reason=DefenseReason.ACTOR_VELOCITY,
+        score=0.95,
+        severity=RuleSeverity.DECLINE,
+        mandatory=False,
+        evidence_source_ids=("event-current", "source-1"),
+        rule_version="1.0.0",
+    )
+    fabricated = legitimate.model_copy(
+        update={"hits": (fabricated_hit,), "score": 0.95}
+    )
+    with pytest.raises(ValueError, match="semantic re-evaluation"):
+        ActionPolicy.default().choose(
+            event(),
+            fabricated,
+            0.1,
+            PolicyThresholds(challenge=0.8, decline=0.95),
+            vector=feature_vector,
+        )
+
+
+def test_policy_rejects_omitted_legitimate_engine_hit() -> None:
+    feature_vector = vector(actor_count_1m=4.0)
+    legitimate = RuleEngine.default().evaluate(event(), feature_vector)
+    omitted = legitimate.model_copy(update={"hits": (), "score": 0.0})
+    with pytest.raises(ValueError, match="semantic re-evaluation"):
+        ActionPolicy.default().choose(
+            event(),
+            omitted,
+            0.1,
+            PolicyThresholds(challenge=0.8, decline=0.95),
+            vector=feature_vector,
+        )
+
+
+def test_policy_rejects_altered_legitimate_hit_score() -> None:
+    feature_vector = vector(actor_count_1m=4.0)
+    legitimate = RuleEngine.default().evaluate(event(), feature_vector)
+    changed_hit = legitimate.hits[0].model_copy(update={"score": 0.7})
+    changed = legitimate.model_copy(update={"hits": (changed_hit,), "score": 0.7})
+    with pytest.raises(ValueError, match="semantic re-evaluation"):
+        ActionPolicy.default().choose(
+            event(),
+            changed,
+            0.1,
+            PolicyThresholds(challenge=0.8, decline=0.95),
+            vector=feature_vector,
+        )
+
+
+def test_policy_rejects_altered_legitimate_hit_reason() -> None:
+    feature_vector = vector(actor_count_1m=4.0)
+    legitimate = RuleEngine.default().evaluate(event(), feature_vector)
+    changed_hit = legitimate.hits[0].model_copy(
+        update={"reason": DefenseReason.GRAPH_FAN_IN}
+    )
+    changed = legitimate.model_copy(update={"hits": (changed_hit,)})
+    with pytest.raises(ValueError, match="semantic re-evaluation"):
+        ActionPolicy.default().choose(
+            event(),
+            changed,
+            0.1,
+            PolicyThresholds(challenge=0.8, decline=0.95),
+            vector=feature_vector,
+        )
+
+
+def test_policy_rejects_altered_legitimate_hit_evidence() -> None:
+    feature_vector = vector(actor_count_1m=4.0)
+    legitimate = RuleEngine.default().evaluate(event(), feature_vector)
+    changed_hit = legitimate.hits[0].model_copy(
+        update={"evidence_source_ids": ("event-current",)}
+    )
+    changed = legitimate.model_copy(update={"hits": (changed_hit,)})
+    with pytest.raises(ValueError, match="evidence"):
+        ActionPolicy.default().choose(
+            event(),
+            changed,
+            0.1,
+            PolicyThresholds(challenge=0.8, decline=0.95),
+            vector=feature_vector,
+        )
+
+
+def test_policy_rejects_manifest_version_change_with_unchanged_digest() -> None:
+    feature_vector = vector(actor_count_1m=4.0)
+    legitimate = RuleEngine.default().evaluate(event(), feature_vector)
+    changed_hit = legitimate.hits[0].model_copy(update={"rule_version": "9.9.9"})
+    changed = legitimate.model_copy(
+        update={"hits": (changed_hit,), "manifest_version": "9.9.9"}
+    )
+    with pytest.raises(ValueError, match="semantic re-evaluation"):
+        ActionPolicy.default().choose(
+            event(),
+            changed,
+            0.1,
+            PolicyThresholds(challenge=0.8, decline=0.95),
+            vector=feature_vector,
+        )
 
 
 @pytest.mark.parametrize("kind", ["integrity", "required"])
@@ -292,11 +418,13 @@ def test_model_threshold_edges_use_decline_before_challenge_and_greater_equal(
     score: float,
     expected: Action,
 ) -> None:
+    rule_result, feature_vector = bound_clear()
     decision = ActionPolicy.default().choose(
         event(),
-        RuleResult.clear(),
+        rule_result,
         calibrated_score=score,
         thresholds=PolicyThresholds(challenge=0.8, decline=0.95),
+        vector=feature_vector,
     )
     assert decision.action is expected
     assert decision.score == score
@@ -363,11 +491,13 @@ def test_model_failure_uses_rules_only_fallback_with_stable_audit(
 
 
 def test_model_failure_with_clear_rules_approves_but_remains_visible() -> None:
+    rule_result, feature_vector = bound_clear()
     decision = ActionPolicy.default().choose(
         event(),
-        RuleResult.clear(),
+        rule_result,
         calibrated_score=None,
         thresholds=None,
+        vector=feature_vector,
     )
     assert decision.action is Action.APPROVE
     assert decision.score == 0.0
@@ -408,11 +538,13 @@ def test_rules_only_decline_uses_exact_unsaturated_edge_and_ignores_model_thresh
 
 
 def test_high_calibrated_score_cannot_influence_missing_threshold_fallback() -> None:
+    rule_result, feature_vector = bound_clear()
     decision = ActionPolicy.default().choose(
         event(),
-        RuleResult.clear(),
+        rule_result,
         calibrated_score=0.99,
         thresholds=None,
+        vector=feature_vector,
     )
     assert decision.action is Action.APPROVE
     assert decision.score == 0.0
@@ -421,11 +553,13 @@ def test_high_calibrated_score_cannot_influence_missing_threshold_fallback() -> 
 
 
 def test_available_clear_score_has_clear_approve_without_fallback() -> None:
+    rule_result, feature_vector = bound_clear()
     decision = ActionPolicy.default().choose(
         event(),
-        RuleResult.clear(),
+        rule_result,
         calibrated_score=0.2,
         thresholds=PolicyThresholds(challenge=0.8, decline=0.95),
+        vector=feature_vector,
     )
     assert decision.action is Action.APPROVE
     assert decision.reason_codes == ()
@@ -435,24 +569,29 @@ def test_available_clear_score_has_clear_approve_without_fallback() -> None:
 
 @pytest.mark.parametrize("value", [-0.01, 1.01, math.nan, math.inf, -math.inf])
 def test_policy_rejects_invalid_calibrated_scores(value: float) -> None:
+    rule_result, feature_vector = bound_clear()
     with pytest.raises(ValueError, match="calibrated_score"):
         ActionPolicy.default().choose(
             event(),
-            RuleResult.clear(),
+            rule_result,
             calibrated_score=value,
             thresholds=PolicyThresholds(challenge=0.8, decline=0.95),
+            vector=feature_vector,
         )
 
 
 def test_policy_rejects_incoherent_model_state_and_wrong_event() -> None:
     policy = ActionPolicy.default()
+    rule_result, feature_vector = bound_clear()
     with pytest.raises(ValueError, match="model failure"):
         policy.choose(
             event(),
-            RuleResult.clear(),
+            rule_result,
             calibrated_score=0.5,
             thresholds=PolicyThresholds(challenge=0.8, decline=0.95),
             model_failure=DefenseReason.MODEL_TIMEOUT,
+            failed_component_version="catboost-v1",
+            vector=feature_vector,
         )
     tampered = RuleResult.clear().model_copy(update={"score": 0.5})
     with pytest.raises(ValidationError, match="aggregate risk"):
@@ -465,12 +604,14 @@ def test_policy_rejects_incoherent_model_state_and_wrong_event() -> None:
 
 
 def test_invalid_score_is_rejected_even_when_threshold_artifact_is_unavailable() -> None:
+    rule_result, feature_vector = bound_clear()
     with pytest.raises(ValueError, match="calibrated_score"):
         ActionPolicy.default().choose(
             event(),
-            RuleResult.clear(),
+            rule_result,
             calibrated_score=float("nan"),
             thresholds=None,
+            vector=feature_vector,
         )
 
 
@@ -486,14 +627,16 @@ def test_explicit_model_failure_requires_nonblank_component_identity(
     failure: DefenseReason,
     component: str | None,
 ) -> None:
+    rule_result, feature_vector = bound_clear()
     with pytest.raises(ValueError, match="failed component"):
         ActionPolicy.default().choose(
             event(),
-            RuleResult.clear(),
+            rule_result,
             calibrated_score=None,
             thresholds=None,
             model_failure=failure,
             failed_component_version=component,
+            vector=feature_vector,
         )
 
 
@@ -535,18 +678,26 @@ def test_operating_budget_rejects_invalid_rates(updates: dict[str, float]) -> No
 def test_policy_contracts_are_immutable_deterministic_and_json_safe() -> None:
     budget = OperatingBudget()
     policy = ActionPolicy.default()
+    rule_result, feature_vector = bound_clear()
     decision = policy.choose(
         event(),
-        RuleResult.clear(),
+        rule_result,
         calibrated_score=0.2,
         thresholds=PolicyThresholds(challenge=0.8, decline=0.95),
+        vector=feature_vector,
     )
     assert budget == OperatingBudget(
         challenge_rate_max=0.02,
         false_decline_rate_max=0.001,
         review_case_rate_max=0.01,
     )
+    assert policy.rule_manifest == RuleManifest.default()
+    assert policy.model_dump(mode="json")["rule_manifest"] == RuleManifest.default().model_dump(
+        mode="json"
+    )
     assert json.dumps(decision.model_dump(mode="json"), sort_keys=True, allow_nan=False)
+    with pytest.raises(ValidationError):
+        policy.rule_manifest.actor_count_1m = 99  # type: ignore[misc]
     with pytest.raises(ValidationError):
         decision.action = Action.DECLINE  # type: ignore[misc]
     with pytest.raises(ValidationError):
