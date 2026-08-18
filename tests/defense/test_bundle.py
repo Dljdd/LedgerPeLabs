@@ -536,6 +536,92 @@ def test_loaded_runtime_is_sealed_and_retains_no_evaluator_truth(
         loaded._snapshot.model_bytes = b"forged"
 
 
+@pytest.mark.parametrize("attack_kind", ("manifest", "model", "threshold"))
+def test_loaded_runtime_rejects_direct_reinitialization_without_state_change(
+    bundle_fixture: BundleFixture,
+    attack_kind: str,
+) -> None:
+    manifest, ref = bundle_fixture.publisher.freeze(**bundle_fixture.kwargs)
+    loaded = bundle_fixture.publisher.load(ref)
+    original_snapshot = loaded._snapshot
+    original_manifest_bytes = canonical_json_bytes(manifest.model_dump(mode="json"))
+    original_model_bytes = original_snapshot.model_bytes
+    original_threshold_bytes = original_snapshot.threshold_bytes
+    component_bytes = {
+        name: bundle_fixture.store.read(
+            bundle_fixture.store.resolve(manifest.component(name).sha256)
+        )
+        for name in bundle_module._COMPONENT_FIELD_MEDIA
+    }
+    attack_manifest = manifest
+    if attack_kind == "manifest":
+        attack_manifest = manifest.model_copy(
+            update={"bundle_id": "92345678-1234-5678-9234-567812345678"}
+        )
+    elif attack_kind == "model":
+        component_bytes["model"] = b"forged-native-model"
+    else:
+        component_bytes["threshold"] = b'{"forged":"threshold"}'
+
+    rejection_count = 0
+    for _ in range(2):
+        try:
+            loaded.__init__(manifest=attack_manifest, component_bytes=component_bytes)
+        except BundleContractError:
+            rejection_count += 1
+
+    if attack_kind == "manifest":
+        assert loaded.manifest.bundle_id == manifest.bundle_id
+    elif attack_kind == "model":
+        assert loaded._snapshot.model_bytes == original_model_bytes
+    else:
+        assert loaded._snapshot.threshold_bytes == original_threshold_bytes
+    assert rejection_count == 2
+    assert loaded._snapshot is original_snapshot
+    assert canonical_json_bytes(loaded.manifest.model_dump(mode="json")) == original_manifest_bytes
+    assert loaded._snapshot.model_bytes == original_model_bytes
+    assert loaded._snapshot.threshold_bytes == original_threshold_bytes
+    loaded.verify_reload()
+
+
+def test_loaded_runtime_failed_first_initialization_leaves_no_partial_snapshot(
+    bundle_fixture: BundleFixture,
+) -> None:
+    manifest, ref = bundle_fixture.publisher.freeze(**bundle_fixture.kwargs)
+    loaded = bundle_fixture.publisher.load(ref)
+    component_bytes = {
+        name: bundle_fixture.store.read(
+            bundle_fixture.store.resolve(manifest.component(name).sha256)
+        )
+        for name in bundle_module._COMPONENT_FIELD_MEDIA
+    }
+    uninitialized = object.__new__(type(loaded))
+
+    with pytest.raises(KeyError):
+        uninitialized.__init__(manifest=manifest, component_bytes={})
+    assert not hasattr(uninitialized, "_snapshot")
+
+    uninitialized.__init__(manifest=manifest, component_bytes=component_bytes)
+    initialized_snapshot = uninitialized._snapshot
+    with pytest.raises(BundleContractError, match="already initialized"):
+        uninitialized.__init__(manifest=manifest, component_bytes=component_bytes)
+    assert uninitialized._snapshot is initialized_snapshot
+
+
+def test_loaded_runtime_cannot_delete_one_shot_initialization_state(
+    bundle_fixture: BundleFixture,
+) -> None:
+    manifest, ref = bundle_fixture.publisher.freeze(**bundle_fixture.kwargs)
+    loaded = bundle_fixture.publisher.load(ref)
+    original_snapshot = loaded._snapshot
+
+    with pytest.raises(AttributeError, match="read-only"):
+        del loaded._snapshot
+
+    assert loaded._snapshot is original_snapshot
+    assert loaded.manifest == manifest
+
+
 def test_freeze_rederives_calibration_thresholds_and_enforces_split_roles(
     bundle_fixture: BundleFixture,
 ) -> None:

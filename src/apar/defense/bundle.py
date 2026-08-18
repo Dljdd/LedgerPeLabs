@@ -790,6 +790,12 @@ class LoadedDefenderBundle:
         manifest: DefenderBundleManifest,
         component_bytes: dict[str, bytes],
     ) -> None:
+        try:
+            object.__getattribute__(self, "_snapshot")
+        except AttributeError:
+            pass
+        else:
+            raise BundleContractError("loaded defender bundle is already initialized")
         snapshot = _LoadedSnapshot(
             manifest=manifest,
             model_bytes=bytes(component_bytes["model"]),
@@ -815,6 +821,9 @@ class LoadedDefenderBundle:
         object.__setattr__(self, "_snapshot", snapshot)
 
     def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError(f"{type(self).__name__} is read-only: {name}")
+
+    def __delattr__(self, name: str) -> None:
         raise AttributeError(f"{type(self).__name__} is read-only: {name}")
 
     @property
