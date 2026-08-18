@@ -8,6 +8,7 @@ import os
 import platform
 import sys
 import sysconfig
+from contextlib import suppress
 from dataclasses import FrozenInstanceError, dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -503,6 +504,11 @@ def test_loaded_runtime_is_sealed_and_retains_no_evaluator_truth(
         if id(value) in seen:
             continue
         seen.add(id(value))
+        if isinstance(value, bytes):
+            retained_bytes.append(value)
+            continue
+        if isinstance(value, tuple):
+            pending.extend(value)
         for base in type(value).__mro__:
             for name in cast(tuple[str, ...], getattr(base, "__slots__", ())):
                 slot_names.append(name)
@@ -620,6 +626,80 @@ def test_loaded_runtime_cannot_delete_one_shot_initialization_state(
 
     assert loaded._snapshot is original_snapshot
     assert loaded.manifest == manifest
+
+
+@pytest.mark.parametrize(
+    "attack_kind",
+    ("manifest", "model", "threshold", "training_matrix"),
+)
+def test_loaded_snapshot_direct_reinitialization_cannot_change_state(
+    bundle_fixture: BundleFixture,
+    attack_kind: str,
+) -> None:
+    manifest, ref = bundle_fixture.publisher.freeze(**bundle_fixture.kwargs)
+    loaded = bundle_fixture.publisher.load(ref)
+    snapshot = loaded._snapshot
+    field_names = (
+        tuple(snapshot._fields)
+        if hasattr(snapshot, "_fields")
+        else tuple(snapshot.__dataclass_fields__)
+    )
+    original_values = {name: getattr(snapshot, name) for name in field_names}
+    attack_values = dict(original_values)
+    if attack_kind == "manifest":
+        forged_manifest = manifest.model_copy(
+            update={"bundle_id": "a2345678-1234-5678-9234-567812345678"}
+        )
+        manifest_field = "manifest_bytes" if "manifest_bytes" in attack_values else "manifest"
+        attack_values[manifest_field] = (
+            canonical_json_bytes(forged_manifest.model_dump(mode="json"))
+            if manifest_field == "manifest_bytes"
+            else forged_manifest
+        )
+        attacked_field = manifest_field
+    elif attack_kind == "model":
+        attacked_field = "model_bytes"
+        attack_values[attacked_field] = b"snapshot-forged-native-model"
+    elif attack_kind == "threshold":
+        attacked_field = "threshold_bytes"
+        attack_values[attacked_field] = b'{"snapshot":"forged-threshold"}'
+    else:
+        attacked_field = "training_bytes"
+        attack_values[attacked_field] = b"snapshot-forged-training-parquet"
+
+    for _ in range(2):
+        with suppress(AttributeError, TypeError):
+            snapshot.__init__(**attack_values)
+
+    assert getattr(snapshot, attacked_field) == original_values[attacked_field]
+    assert loaded._snapshot is snapshot
+    assert loaded.manifest.bundle_id == manifest.bundle_id
+    assert snapshot.model_bytes == original_values["model_bytes"]
+    assert snapshot.threshold_bytes == original_values["threshold_bytes"]
+    assert snapshot.training_bytes == original_values["training_bytes"]
+    with pytest.raises((FrozenInstanceError, AttributeError, TypeError)):
+        setattr(snapshot, attacked_field, attack_values[attacked_field])
+    with pytest.raises((FrozenInstanceError, AttributeError, TypeError)):
+        delattr(snapshot, attacked_field)
+    loaded.verify_reload()
+
+
+def test_loaded_manifest_reinitialization_is_isolated_from_internal_snapshot(
+    bundle_fixture: BundleFixture,
+) -> None:
+    manifest, ref = bundle_fixture.publisher.freeze(**bundle_fixture.kwargs)
+    loaded = bundle_fixture.publisher.load(ref)
+    original_snapshot = loaded._snapshot
+    returned_manifest = loaded.manifest
+    forged_document = returned_manifest.model_dump(mode="python")
+    forged_document["bundle_id"] = "b2345678-1234-5678-9234-567812345678"
+
+    returned_manifest.__init__(**forged_document)
+
+    assert returned_manifest.bundle_id == "b2345678-1234-5678-9234-567812345678"
+    assert loaded.manifest.bundle_id == manifest.bundle_id
+    assert loaded._snapshot is original_snapshot
+    loaded.verify_reload()
 
 
 def test_freeze_rederives_calibration_thresholds_and_enforces_split_roles(

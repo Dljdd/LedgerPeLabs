@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path, PurePosixPath
-from typing import Literal, cast
+from typing import Literal, NamedTuple, cast
 from uuid import UUID
 
 import catboost  # type: ignore[import-untyped]
@@ -756,9 +756,8 @@ def _validated_base64(value: object, size: int, *, label: str) -> bytes:
     return decoded
 
 
-@dataclass(frozen=True, slots=True)
-class _LoadedSnapshot:
-    manifest: DefenderBundleManifest
+class _LoadedSnapshot(NamedTuple):
+    manifest_bytes: bytes
     model_bytes: bytes
     receipt_bytes: bytes
     catalog_bytes: bytes
@@ -797,7 +796,7 @@ class LoadedDefenderBundle:
         else:
             raise BundleContractError("loaded defender bundle is already initialized")
         snapshot = _LoadedSnapshot(
-            manifest=manifest,
+            manifest_bytes=canonical_json_bytes(manifest.model_dump(mode="json")),
             model_bytes=bytes(component_bytes["model"]),
             receipt_bytes=bytes(component_bytes["receipt"]),
             catalog_bytes=bytes(component_bytes["catalog"]),
@@ -828,7 +827,7 @@ class LoadedDefenderBundle:
 
     @property
     def manifest(self) -> DefenderBundleManifest:
-        return self._snapshot.manifest
+        return _manifest_from_document(strict_json_loads(self._snapshot.manifest_bytes))
 
     @property
     def scorer(self) -> CatBoostScorer:
