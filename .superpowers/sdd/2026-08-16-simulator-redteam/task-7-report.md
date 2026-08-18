@@ -604,6 +604,304 @@ $ .venv/bin/python scripts/run_task6_holdout.py --verify-postcommit \
 verified Task 6 v3.4 result-only commit chronology and raw evidence; confirmatory_valid=True
 ```
 
+## Final whole-branch fix wave
+
+This final wave addresses the last whole-branch review without changing or executing the
+Task 6 v3.4 experiment. It severs evaluator-only bytes from public run identity and policy
+randomness, removes the direct detailed-validity surface behind a one-shot runner-owned
+completion capability, and signs and revalidates an exact working-source/dependency
+inventory. The accepted Task 6 result remains frozen evidence only.
+
+### Hidden-derived run identity and policy randomness
+
+The first two-run regression changes only the evaluator-owned template document and the
+independent hidden corpus. Before production changes, the restricted artifact references
+fed the run digest, so the public identifier changed:
+
+```text
+$ .venv/bin/python -m pytest \
+    tests/redteam/test_run_boundary.py::test_restricted_bytes_do_not_influence_public_identity_or_policy_randomness -q
+F                                                                        [100%]
+E AssertionError: assert 'run-ae228feb20b7a406554d0c15421824b1' == \
+  'run-adc0924327f381eea8ee63b5f8905fae'
+1 failed in 7.83s
+```
+
+`run_id` is now derived from the public policy, population, and compiled-scenario
+artifact references plus the public signer identity under `public-run-v2`. It does not
+commit to provenance, restricted templates, hidden events, validity, or evaluation
+audit bytes. Proposal RNG uses a canonical `policy-proposal-v1` domain containing only
+the public scenario ID, scenario seed, replay random seed, threat-card reference,
+reviewed family, attacker mode, and generation. It never uses `run_id`, full input
+lineage, or a restricted reference. The fresh worker returns the exact received seed in
+its restricted proposal audit, and the parent rejects a mismatched seed.
+
+The final regression proves that substituting both restricted inputs leaves the worker
+seed sequence, candidate/search history, feedback bytes, production-event bytes, public
+run ID, and complete public API view identical. The two restricted references and the
+signed internal lineage still differ. The G2 fixture additionally pins the hand-derived
+three-generation sequence for seed 960 and proves all four policy kinds receive the same
+matched sequence.
+
+Adding the authenticated audit field first exposed the old exact G2 fixture:
+
+```text
+$ .venv/bin/python -m pytest tests/redteam tests/integration/test_g1_simulation.py \
+    tests/integration/test_g2_adaptation.py -q
+FAILED tests/integration/test_g2_adaptation.py::test_g2_disposable_policies_use_matched_budgets_and_seeded_bytes
+E At index 0 diff: proposal audit includes proposal_seed=6901151513865237155
+277 passed, 1 skipped, 1 failed in 125.93s
+```
+
+The replay-seed requirement was then written into the exact expected sequence before it
+was added to the production derivation:
+
+```text
+$ .venv/bin/python -m pytest \
+    tests/integration/test_g2_adaptation.py::test_g2_disposable_policies_use_matched_budgets_and_seeded_bytes -q
+F                                                                        [100%]
+E proposal_seed 6901151513865237155 != 7664614645859848164
+1 failed in 9.62s
+
+$ .venv/bin/python -m pytest \
+    tests/integration/test_g2_adaptation.py::test_g2_disposable_policies_use_matched_budgets_and_seeded_bytes \
+    tests/redteam/test_run_boundary.py::test_restricted_bytes_do_not_influence_public_identity_or_policy_randomness -q
+..                                                                       [100%]
+2 passed in 15.62s
+```
+
+The pinned matched sequence is
+`7664614645859848164, 6479548443684787591, 1839419232351933406`.
+
+### Runner-owned detailed validity completion capability
+
+The initial public-surface test was RED because the detailed model and direct completed
+run function remained importable from the submodule:
+
+```text
+$ .venv/bin/python -m pytest \
+    tests/redteam/test_run_boundary.py::test_detailed_validity_requires_the_exact_owning_completed_runner_capability -q
+F                                                                        [100%]
+E assert 'RestrictedValidityReport' not in \
+  ['HiddenValidityOracle', 'HiddenValidityResult', 'RestrictedValidityReport']
+1 failed
+```
+
+A second RED tightened forgery resistance by requiring the capability class and mutable
+state registry themselves not to exist as module attributes:
+
+```text
+$ <same command>
+F                                                                        [100%]
+E assert not hasattr(hidden_validity_module, '_CAPABILITY_STATES')
+1 failed in 1.06s
+```
+
+The detailed report is now a plain restricted artifact document, not a public model.
+The engine implementation, exact capability class, identity registry, and transition
+logic are captured inside deleted construction closures. The only public oracle method
+returns `HiddenValidityResult(valid: bool)`. A capability is bound by object identity to
+one exact `RunRunner`, cannot be copied, a forged instance is absent from the weak
+identity registry, cross-runner use fails, pre-completion release fails, and successful
+release is one-shot. `RunRunner.execute` marks completion only after selection and honest
+production replay have finished, then compares the public bit with the restricted
+document before freezing it. The worker and API never import or receive this channel.
+
+```text
+$ .venv/bin/python -m pytest \
+    tests/redteam/test_run_boundary.py::test_detailed_validity_requires_the_exact_owning_completed_runner_capability \
+    tests/redteam/test_hidden_validity.py -q
+...................                                                      [100%]
+19 passed in 2.24s
+```
+
+### Canonical signed executable-source provenance
+
+The source-provenance regression was first RED because the signed provenance contained
+only selected Task 6 files and the Git HEAD label:
+
+```text
+$ .venv/bin/python -m pytest \
+    tests/redteam/test_run_boundary.py::test_signed_provenance_inventories_and_revalidates_exact_execution_bytes -q
+F                                                                        [100%]
+E KeyError: 'execution_inventory'
+1 failed in 1.83s
+```
+
+The new canonical inventory contains every `src/apar/**/*.py` working file, plus
+`pyproject.toml`, `scripts/run_task6_holdout.py`, `scripts/verify_g0.py`, and
+`scripts/verify_g1_g2.py`. Each sorted entry binds its relative path, exact regular-file
+type, filesystem mode, byte size, SHA-256, Git stage-zero mode/blob when present, exact
+working Git-blob ID, and the tracked-blob/working-byte equality result. It also freezes a
+sorted installed-distribution name/version set and the Python implementation, exact
+version, platform, and byte order. A SHA-256 over the complete canonical inventory is
+stored inside the signed internal provenance artifact.
+
+Verification validates the inventory schema and its own digest, recomputes the exact
+current inventory through stable `O_NOFOLLOW` descriptor reads, and compares it during
+`verify_run`, `get`, and public-view authentication. The test fully re-signs the
+authorization receipt, completion link, and manifest after changing a source SHA,
+relabeling a path, omitting an entry, adding an entry, changing a dependency version, or
+changing only the inventory digest; every authenticated forgery is rejected. It also
+changes the recomputed current inventory and proves both direct verification and GET
+fail closed.
+
+```text
+$ <same command>
+.                                                                        [100%]
+1 passed in 3.62s
+```
+
+Self-review found that the first optional-Git implementation treated any Git command
+failure as if Git were absent. A real RED forced present-but-broken Git metadata to fail
+closed:
+
+```text
+$ .venv/bin/python -m pytest \
+    tests/redteam/test_run_boundary.py::test_git_source_relationship_fails_closed_but_inventory_supports_no_git_install -q
+F                                                                        [100%]
+E Failed: DID NOT RAISE RunExecutionError
+1 failed in 0.36s
+```
+
+The final implementation distinguishes an absent `.git` path from a present regular
+worktree pointer/directory. Present Git is mandatory and fail-closed. A source
+installation without Git remains self-contained: it uses content SHA-256 and installed
+distribution freeze, records `git-unavailable`, and binds the historical Task 6
+commit/mode/object/hash through constants contained in the inventoried runner bytes plus
+the verified current frozen result. No-Git behavior was itself RED while the provenance
+still called Git, then GREEN after the explicit embedded-pin path:
+
+```text
+$ <same command>
+F                                                                        [100%]
+E apar.runs.runner.RunExecutionError: broken Git metadata
+1 failed in 0.44s
+
+$ <same command>
+.                                                                        [100%]
+1 passed in 0.18s
+```
+
+Provenance remains an internal signed artifact. The public API allowlist still exposes
+only scenario, policy, population, feedback, and production events; no source hash,
+restricted hash, restricted size, lineage digest, or low-entropy evaluator identifier is
+returned.
+
+### Final focused, integration, and repository gates
+
+Compact final review regression set:
+
+```text
+$ .venv/bin/python -m pytest \
+    tests/redteam/test_run_boundary.py::test_restricted_bytes_do_not_influence_public_identity_or_policy_randomness \
+    tests/redteam/test_run_boundary.py::test_detailed_validity_requires_the_exact_owning_completed_runner_capability \
+    tests/redteam/test_run_boundary.py::test_signed_provenance_inventories_and_revalidates_exact_execution_bytes \
+    tests/redteam/test_run_boundary.py::test_git_source_relationship_fails_closed_but_inventory_supports_no_git_install \
+    tests/integration/test_g2_adaptation.py::test_g2_disposable_policies_use_matched_budgets_and_seeded_bytes -q
+.....                                                                    [100%]
+5 passed in 27.85s
+```
+
+Related API, hidden-validity, run-boundary, and G2 compatibility surface:
+
+```text
+$ .venv/bin/python -m pytest tests/redteam/test_run_boundary.py \
+    tests/redteam/test_hidden_validity.py tests/api/test_runs.py \
+    tests/integration/test_g2_adaptation.py -q
+64 passed in 57.65s
+```
+
+Required integration command:
+
+```text
+$ .venv/bin/python -m pytest tests/simulator tests/trust tests/generators \
+    tests/redteam tests/integration/test_g1_simulation.py \
+    tests/integration/test_g2_adaptation.py -q
+803 passed, 1 skipped in 208.75s (0:03:28)
+```
+
+Full repository:
+
+```text
+$ .venv/bin/python -m pytest -q
+917 passed, 1 skipped in 185.83s (0:03:05)
+```
+
+Static and foundation gates:
+
+```text
+$ .venv/bin/ruff check src tests scripts
+All checks passed!
+
+$ .venv/bin/mypy --strict <19 exact Task 7 source/test targets>
+Success: no issues found in 19 source files
+
+$ .venv/bin/mypy src
+Success: no issues found in 53 source files
+
+$ .venv/bin/python scripts/verify_g0.py
+G0 PASS: 20 threat cards, contracts, registry, compiler, API, and artifact store
+```
+
+From clean implementation commit `c476d8d`, the one-command G1/G2 gate performed the
+exact existing Task 6 postcommit verification-only recomputation:
+
+```text
+$ .venv/bin/python scripts/verify_g1_g2.py
+...                                                                      [100%]
+3 passed in 0.51s
+G1 PASS: card and A2A report/recovery conserve value; agentic 23-attack matrix fails closed with 2 controls
+......                                                                   [100%]
+6 passed in 13.55s
+verified Task 6 v3.4 result-only commit chronology and raw evidence; confirmatory_valid=True
+G2 PASS: 4 hidden families; fixed/random/adaptive/cached-LLM matched budgets; boolean-only validity; byte-identical seeded reruns; exact Task6 historical postcommit verification-only recomputation
+
+$ .venv/bin/python scripts/run_task6_holdout.py --verify-postcommit \
+    --approved-result-commit d6d3eecbfe2d871af8375e1455814cb5c48f2928 \
+    --approved-result-sha256 f82981a987651a7f7ebb10a9011df063b2dc54a56181cae5b838e31de5e658db
+verified Task 6 v3.4 result-only commit chronology and raw evidence; confirmatory_valid=True
+```
+
+`git diff --check`, the Task 6 frozen-path comparison to base
+`7534c0e38eaff568f390784113a0dd5992f8d048`, and the `validation_spike`
+comparison all exited zero. Historical result mode remains `100644 blob` at approved
+commit `d6d3eecbfe2d871af8375e1455814cb5c48f2928`. The ten pinned hashes remain exactly the
+values recorded in Fix Round 1; the first locale-inheriting `shasum` invocation exited 9
+before hashing, and the explicit `LC_ALL=C LANG=C` rerun produced every expected hash.
+
+### Files, self-review, commit, and residual scope
+
+Files changed in this final wave:
+
+- `src/apar/evaluation_hidden/validity.py`
+- `src/apar/runs/policy_worker.py`
+- `src/apar/runs/runner.py`
+- `tests/integration/test_g2_adaptation.py`
+- `tests/redteam/test_run_boundary.py`
+- this report
+
+The complete final-wave diff was reviewed for public/restricted artifact flow, every
+run-ID and RNG input, worker request/response schema symmetry, proposal seed
+authentication, deterministic reruns, matched policy randomness, capability construction
+and identity state exposure, copied/forged/cross-owner/pre-completion/consumed states,
+oracle public exports, source-path enumeration, descriptor races and symlinks, Git-present
+failure behavior, Git-less provenance, inventory canonicalization, dependency duplicates,
+receipt subject recomputation, read-time provenance verification, API redaction, and Task
+6/validation isolation. The review found and fixed the exposed capability registry, the
+missing replay seed in the proposal domain, and the present-but-broken Git fallback.
+
+Implementation commit: `c476d8d` (`fix: sever hidden lineage from public runs`). This
+report/evidence follow-up is the immediate child of that implementation commit; its exact
+hash is reported in the final handoff after Git creates it.
+
+Residual boundary: Python module-private capability plumbing is trusted evaluator code;
+untrusted attacker policy code remains in the isolated import-restricted worker and
+cannot import the hidden evaluator or runner. A Git-less installation authenticates
+exact content and embedded historical pins but, by definition, cannot query a live Git
+object database. The accepted frozen Task 6 result is synthetic evidence only and does
+not establish live-fraud effectiveness.
+
 ## Honest claim boundary and residual scope
 
 The accepted frozen v3.4 evidence reports matched budgets, zero cached-LLM network calls,
