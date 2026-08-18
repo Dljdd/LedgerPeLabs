@@ -349,10 +349,21 @@ def _build_split(
         },
         "row_families": row_families,
         "row_campaigns": row_campaigns,
+        "row_is_fraud": {
+            event_id: row_is_fraud[event_id] for event_id in sorted(row_is_fraud)
+        },
+        "row_net_settled_values": {
+            event_id: _canonical_decimal(row_net_settled_values[event_id])
+            for event_id in sorted(row_net_settled_values)
+        },
         "label_maturity_cutoff": config.train_end.isoformat(),
         "sample_counts": sample_counts,
-        "fraud_prevalence": {name: str(value) for name, value in prevalence.items()},
-        "net_settled_value_totals": {name: str(value) for name, value in values.items()},
+        "fraud_prevalence": {
+            name: _canonical_decimal(value) for name, value in prevalence.items()
+        },
+        "net_settled_value_totals": {
+            name: _canonical_decimal(value) for name, value in values.items()
+        },
         "held_out_evaluation_row_ids": held_out_evaluation_row_ids,
     }
     digest = hashlib.sha256(canonical_json_bytes(_json_tree(document))).hexdigest()
@@ -384,6 +395,17 @@ def _json_tree(value: object) -> object:
     if type(value) is dict:
         return {str(key): _json_tree(item) for key, item in value.items()}
     return value
+
+
+def _canonical_decimal(value: Decimal) -> str:
+    if not value.is_finite():
+        raise ValueError("split decimal values must be finite")
+    if value == 0:
+        return "0"
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
 
 
 __all__ = [

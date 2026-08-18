@@ -356,12 +356,18 @@ def _cold_id_remap(corpus: FrozenCorpus, spec: RegimeSpec) -> FrozenCorpus:
         for row in corpus.observations
         for identity in (row.actor_id, row.counterparty_id, *row.optional_refs.values())
     }
-    mapping = {
-        identity: str(uuid5(NAMESPACE_URL, f"apar:{spec.salt}:{identity}"))
-        for identity in sorted(identities)
-    }
-    if len(set(mapping.values())) != len(mapping):
-        raise ValueError("cold-ID remapping is not bijective")
+    mapping: dict[str, str] = {}
+    mapped_values: set[str] = set()
+    for identity in sorted(identities):
+        attempt = 0
+        while True:
+            suffix = "" if attempt == 0 else f":collision:{attempt}"
+            candidate = str(uuid5(NAMESPACE_URL, f"apar:{spec.salt}:{identity}{suffix}"))
+            if candidate not in identities and candidate not in mapped_values:
+                mapping[identity] = candidate
+                mapped_values.add(candidate)
+                break
+            attempt += 1
     observations = tuple(
         row.model_copy(
             update={

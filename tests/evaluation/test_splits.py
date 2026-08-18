@@ -228,6 +228,56 @@ def test_training_targets_require_labels_mature_by_train_end() -> None:
     assert split.training_row_ids == ("train-boundary",)
 
 
+def test_split_digest_binds_per_row_labels_and_values_not_only_aggregates() -> None:
+    corpus = _split_corpus()
+
+    def changed_truth(*, swap: bool) -> tuple[EvaluationTruthRow, ...]:
+        replacements = {
+            "dev-returning": (
+                swap,
+                Decimal("7.00") if swap else Decimal("3.00"),
+            ),
+            "dev-warm": (
+                not swap,
+                Decimal("3.00") if swap else Decimal("7.00"),
+            ),
+        }
+        return tuple(
+            row.model_copy(
+                update={
+                    "is_fraud": replacements[row.event_id][0],
+                    "net_settled_value": replacements[row.event_id][1],
+                }
+            )
+            if row.event_id in replacements
+            else row
+            for row in corpus.truth
+        )
+
+    left = make_evaluation_split(
+        FrozenCorpus(
+            observations=corpus.observations,
+            truth=changed_truth(swap=False),
+            manifest=corpus.manifest,
+        ),
+        _config(),
+    )
+    right = make_evaluation_split(
+        FrozenCorpus(
+            observations=corpus.observations,
+            truth=changed_truth(swap=True),
+            manifest=corpus.manifest,
+        ),
+        _config(),
+    )
+
+    assert left.fraud_prevalence == right.fraud_prevalence
+    assert left.net_settled_value_totals == right.net_settled_value_totals
+    assert left.row_is_fraud != right.row_is_fraud
+    assert left.row_net_settled_values != right.row_net_settled_values
+    assert left.split_digest != right.split_digest
+
+
 def test_entity_cohorts_are_ordered_multilabel_and_use_strictly_earlier_history() -> None:
     corpus = _split_corpus()
     equal_time = _observation(

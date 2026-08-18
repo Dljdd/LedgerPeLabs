@@ -6,6 +6,7 @@ import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 from pydantic import ValidationError
@@ -293,6 +294,9 @@ def test_cold_id_remap_is_bijective_and_preserves_cross_field_graph_structure() 
 
     by_id = {event.event_id: event for event in changed.observations}
     assert by_id["benign-open"].optional_refs["device_id"] == by_id["fraud-open"].actor_id
+    assert by_id["benign-open"].actor_id == str(
+        uuid5(NAMESPACE_URL, "apar:defense-v1-cold-remap:actor-a")
+    )
     originals = {
         value
         for event in corpus.observations
@@ -317,6 +321,51 @@ def test_cold_id_remap_is_bijective_and_preserves_cross_field_graph_structure() 
     assert changed == repeated
     assert manifest == repeated_manifest
     assert manifest.truth_bytes_unchanged is True
+
+
+def test_cold_id_remap_resolves_candidates_that_collide_with_parent_vocabulary() -> None:
+    corpus = _corpus()
+    salt = "defense-v1-cold-remap"
+    identity_a = "collision-source-a"
+    identity_b = str(uuid5(NAMESPACE_URL, f"apar:{salt}:{identity_a}"))
+    observations = (
+        corpus.observations[0].model_copy(
+            update={
+                "actor_id": identity_a,
+                "optional_refs": {"device_id": identity_a},
+            }
+        ),
+        corpus.observations[1].model_copy(update={"actor_id": identity_a}),
+        corpus.observations[2].model_copy(update={"actor_id": identity_b}),
+        corpus.observations[3].model_copy(update={"actor_id": identity_b}),
+    )
+    adversarial = FrozenCorpus(
+        observations=observations,
+        truth=corpus.truth,
+        manifest=corpus.manifest,
+    )
+
+    changed, manifest = derive_regime(adversarial, RegimeSpec.cold_id_remap(salt))
+    repeated, repeated_manifest = derive_regime(
+        adversarial, RegimeSpec.cold_id_remap(salt)
+    )
+
+    parent_identities = {
+        value
+        for row in adversarial.observations
+        for value in (row.actor_id, row.counterparty_id, *row.optional_refs.values())
+    }
+    derived_identities = {
+        value
+        for row in changed.observations
+        for value in (row.actor_id, row.counterparty_id, *row.optional_refs.values())
+    }
+    assert len(derived_identities) == len(parent_identities)
+    assert derived_identities.isdisjoint(parent_identities)
+    assert changed.observations[0].actor_id == changed.observations[0].optional_refs["device_id"]
+    assert changed.observations[0].actor_id == changed.observations[1].actor_id
+    assert changed == repeated
+    assert manifest.output_corpus_digest == repeated_manifest.output_corpus_digest
 
 
 def test_prevalence_dilution_requires_separate_all_benign_collision_free_controls() -> None:
