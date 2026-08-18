@@ -17,14 +17,22 @@ from apar.features.parity import (
 from tests.features.conftest import observation
 
 
+@pytest.fixture
+def clean_matrix(
+    observed_stream: tuple[ObservedEvent, ...],
+    feature_catalog: FeatureCatalog,
+) -> FeatureMatrix:
+    """Return the shared valid baseline for one-property audit corruptions."""
+    return build_feature_matrix(observed_stream, feature_catalog)
+
+
 def test_clean_matrix_passes_independent_catalog_and_provenance_audit(
     observed_stream: tuple[ObservedEvent, ...],
     feature_catalog: FeatureCatalog,
+    clean_matrix: FeatureMatrix,
 ) -> None:
     """Catches an audit that cannot validate a real causal matrix end to end."""
-    matrix = build_feature_matrix(observed_stream, feature_catalog)
-
-    report = audit_feature_matrix(observed_stream, matrix, feature_catalog)
+    report = audit_feature_matrix(observed_stream, clean_matrix, feature_catalog)
 
     assert report.passed
     assert report.catalog_valid
@@ -68,20 +76,56 @@ def test_audit_rejects_equal_time_historical_provenance(
         audit_feature_matrix((event,), invalid, feature_catalog)
 
 
-def test_audit_rejects_forged_catalog_digest_and_column_order(
+def test_audit_rejects_forged_matrix_catalog_digest(
     observed_stream: tuple[ObservedEvent, ...],
     feature_catalog: FeatureCatalog,
+    clean_matrix: FeatureMatrix,
 ) -> None:
-    """Catches accepting a matrix whose digest or ordered model contract was changed."""
-    matrix = build_feature_matrix(observed_stream, feature_catalog)
-    first = matrix.rows[0]
-    reordered_values = dict(reversed(tuple(first.values.items())))
-    invalid = FeatureMatrix(
-        events=matrix.events,
-        catalog=matrix.catalog,
-        catalog_digest="0" * 64,
-        rows=(first.model_copy(update={"values": reordered_values}), *matrix.rows[1:]),
+    """Catches removing the matrix-envelope catalog digest guard."""
+    invalid = clean_matrix.model_copy(update={"catalog_digest": "0" * 64})
+
+    with pytest.raises(FeatureLeakageError, match="catalog digest or feature order"):
+        audit_feature_matrix(observed_stream, invalid, feature_catalog)
+
+
+def test_audit_rejects_forged_row_catalog_digest(
+    observed_stream: tuple[ObservedEvent, ...],
+    feature_catalog: FeatureCatalog,
+    clean_matrix: FeatureMatrix,
+) -> None:
+    """Catches removing the per-row catalog digest guard."""
+    first = clean_matrix.rows[0].model_copy(update={"catalog_digest": "0" * 64})
+    invalid = clean_matrix.model_copy(update={"rows": (first, *clean_matrix.rows[1:])})
+
+    with pytest.raises(FeatureLeakageError, match="catalog digest or feature order"):
+        audit_feature_matrix(observed_stream, invalid, feature_catalog)
+
+
+def test_audit_rejects_matrix_catalog_equality_and_order_drift(
+    observed_stream: tuple[ObservedEvent, ...],
+    feature_catalog: FeatureCatalog,
+    clean_matrix: FeatureMatrix,
+) -> None:
+    """Catches removing the exact matrix-to-expected catalog equality guard."""
+    reordered_catalog = feature_catalog.model_copy(
+        update={"features": tuple(reversed(feature_catalog.features))}
     )
+    invalid = clean_matrix.model_copy(update={"catalog": reordered_catalog})
+
+    with pytest.raises(FeatureLeakageError, match="catalog digest or feature order"):
+        audit_feature_matrix(observed_stream, invalid, feature_catalog)
+
+
+def test_audit_rejects_row_value_insertion_order_drift(
+    observed_stream: tuple[ObservedEvent, ...],
+    feature_catalog: FeatureCatalog,
+    clean_matrix: FeatureMatrix,
+) -> None:
+    """Catches removing the ordered per-row model-column guard."""
+    first = clean_matrix.rows[0]
+    reordered_values = dict(reversed(tuple(first.values.items())))
+    reordered = first.model_copy(update={"values": reordered_values})
+    invalid = clean_matrix.model_copy(update={"rows": (reordered, *clean_matrix.rows[1:])})
 
     with pytest.raises(FeatureLeakageError, match="catalog digest or feature order"):
         audit_feature_matrix(observed_stream, invalid, feature_catalog)
