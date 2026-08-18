@@ -1,6 +1,6 @@
 # APAR Competition-Grade Defend Pipeline Design
 
-**Status:** Approved in chat on 2026-08-18; awaiting written-spec review
+**Status:** Written spec approved in chat on 2026-08-18; implementation planning authorized
 
 **Branch:** `codex/apar-defend`
 
@@ -115,8 +115,9 @@ The implementation plan may refine individual filenames, but it must preserve
 these ownership boundaries:
 
 ```text
-src/apar/defense/contracts.py       Corpus, observation, bundle, and scorecard contracts
-src/apar/defense/corpus.py          Verified run ingestion and evaluator-only labels
+src/apar/defense/contracts.py       Observation and decision-policy contracts
+src/apar/evaluation/contracts.py    Evaluator-only corpus, truth, split, and metric contracts
+src/apar/evaluation/corpus.py       Verified run ingestion and evaluator-only labels
 src/apar/features/catalog.py        Feature availability and forbidden-source policy
 src/apar/features/state.py          Knowledge-time causal state and checkpoints
 src/apar/features/builders.py       Transaction, temporal, entity, graph, and quality features
@@ -131,6 +132,7 @@ src/apar/evaluation/regimes.py      Declared lineage-preserving synthetic transf
 src/apar/evaluation/metrics.py      Detection, calibration, operations, value, and time metrics
 src/apar/evaluation/replay.py       Three-arm decision replay
 src/apar/evaluation/reporting.py    Scorecards, model/data cards, CSV, and Markdown
+src/apar/evaluation_hidden/defense_authority.py Frozen-only restricted-event release
 src/apar/api/routes/defense.py      Read-only evaluation and scorecard endpoints
 scripts/build_defense_corpus.py     Frozen competition-corpus builder
 scripts/train_defender.py           Frozen defender training command
