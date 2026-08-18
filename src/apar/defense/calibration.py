@@ -139,6 +139,16 @@ class CalibrationArtifact(ExternalContract):
                 raise ValueError("isotonic y thresholds must be nondecreasing")
             if any(not 0.0 <= value <= 1.0 for value in self.isotonic_y):
                 raise ValueError("isotonic y thresholds must be in [0, 1]")
+        expected_kind = (
+            CalibrationKind.ISOTONIC
+            if self.isotonic_candidate_brier is not None
+            and self.isotonic_candidate_brier < self.sigmoid_candidate_brier
+            else CalibrationKind.SIGMOID
+        )
+        if self.kind is not expected_kind:
+            raise ValueError(
+                "calibration kind must select the lower Brier candidate, with sigmoid on ties"
+            )
         if self.artifact_digest != _artifact_digest(self):
             raise ValueError("calibration artifact digest is inconsistent")
         return self
@@ -157,15 +167,14 @@ class ProbabilityCalibrator(ExternalContract):
             intercept = self.artifact.sigmoid_intercept
             assert coefficient is not None
             assert intercept is not None
-            linear = coefficient * _logit(checked) + intercept
-            predictions = _expit(linear)
+            predictions = _sigmoid_predict(checked, coefficient, intercept)
         else:
-            predictions = np.interp(
+            predictions = _isotonic_predict(
                 checked,
                 np.asarray(self.artifact.isotonic_x, dtype=np.float64),
                 np.asarray(self.artifact.isotonic_y, dtype=np.float64),
             )
-        return np.clip(predictions, _CLIP_EPSILON, 1.0 - _CLIP_EPSILON)
+        return predictions
 
     def to_json(self) -> bytes:
         """Return canonical non-executable JSON bytes."""
@@ -217,7 +226,9 @@ def select_calibrator(
         raise CalibrationContractError(
             "sigmoid fit is decreasing; calibrated probabilities must be nondecreasing"
         )
-    sigmoid_predictions = _expit(coefficient * _logit(selection_score_values) + intercept)
+    sigmoid_predictions = _sigmoid_predict(
+        selection_score_values, coefficient, intercept
+    )
     sigmoid_brier = _brier(selection_label_values, sigmoid_predictions)
 
     isotonic_x: tuple[float, ...] = ()
@@ -228,7 +239,7 @@ def select_calibrator(
         isotonic.fit(fit_score_values, fit_label_values)
         isotonic_x = tuple(float(value) for value in isotonic.X_thresholds_)
         isotonic_y = tuple(float(value) for value in isotonic.y_thresholds_)
-        isotonic_predictions = np.interp(
+        isotonic_predictions = _isotonic_predict(
             selection_score_values,
             np.asarray(isotonic_x, dtype=np.float64),
             np.asarray(isotonic_y, dtype=np.float64),
@@ -274,8 +285,10 @@ def _scores(values: object, *, label: str) -> NDArray[np.float64]:
     array = cast(NDArray[np.generic], values)
     if array.ndim != 1 or array.size == 0:
         raise CalibrationContractError(f"{label} must be a nonempty one-dimensional array")
-    if np.issubdtype(array.dtype, np.bool_) or not np.issubdtype(array.dtype, np.number):
-        raise CalibrationContractError(f"{label} must have a non-boolean numeric dtype")
+    if np.issubdtype(array.dtype, np.bool_) or not _is_real_numeric_dtype(array.dtype):
+        raise CalibrationContractError(
+            f"{label} must have a non-boolean real integer or floating dtype"
+        )
     result = np.asarray(array, dtype=np.float64).copy()
     if not np.isfinite(result).all():
         raise CalibrationContractError(f"{label} must be finite")
@@ -291,9 +304,11 @@ def _labels(values: object, *, label: str) -> NDArray[np.int64]:
     if array.ndim != 1 or array.size == 0:
         raise CalibrationContractError(f"{label} must be a nonempty one-dimensional array")
     if not (
-        np.issubdtype(array.dtype, np.number) or np.issubdtype(array.dtype, np.bool_)
+        _is_real_numeric_dtype(array.dtype) or np.issubdtype(array.dtype, np.bool_)
     ):
-        raise CalibrationContractError(f"{label} must have a numeric or boolean dtype")
+        raise CalibrationContractError(
+            f"{label} must have a real integer, floating, or boolean dtype"
+        )
     numeric = np.asarray(array, dtype=np.float64)
     if not np.isfinite(numeric).all() or not np.all((numeric == 0.0) | (numeric == 1.0)):
         raise CalibrationContractError(f"{label} must contain only binary labels")
@@ -312,6 +327,28 @@ def _expit(values: NDArray[np.float64]) -> NDArray[np.float64]:
     exponential = np.exp(values[~nonnegative])
     result[~nonnegative] = exponential / (1.0 + exponential)
     return result
+
+
+def _sigmoid_predict(
+    scores: NDArray[np.float64], coefficient: float, intercept: float
+) -> NDArray[np.float64]:
+    predictions = _expit(coefficient * _logit(scores) + intercept)
+    return np.clip(predictions, _CLIP_EPSILON, 1.0 - _CLIP_EPSILON)
+
+
+def _isotonic_predict(
+    scores: NDArray[np.float64],
+    x_thresholds: NDArray[np.float64],
+    y_thresholds: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    predictions = np.interp(scores, x_thresholds, y_thresholds)
+    return np.clip(predictions, _CLIP_EPSILON, 1.0 - _CLIP_EPSILON)
+
+
+def _is_real_numeric_dtype(dtype: np.dtype[np.generic]) -> bool:
+    return bool(
+        np.issubdtype(dtype, np.integer) or np.issubdtype(dtype, np.floating)
+    )
 
 
 def _brier(labels: NDArray[np.int64], predictions: NDArray[np.float64]) -> float:

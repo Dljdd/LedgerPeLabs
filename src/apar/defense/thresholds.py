@@ -20,6 +20,7 @@ from apar.runs.wire import WireContractError, canonical_json_bytes, strict_json_
 _SCORE_MIN = 1e-8
 _SCORE_MAX = 1.0 - 1e-8
 _SHA256_LENGTH = 64
+MAX_UNIQUE_OPERATING_SCORES = 4096
 
 
 class ThresholdContractError(ValueError):
@@ -41,6 +42,7 @@ class ThresholdReport(ExternalContract):
     false_intervention_count: int | None = Field(default=None, ge=0)
     review_case_count: int | None = Field(default=None, ge=0)
     candidate_count: int = Field(ge=1)
+    candidate_threshold_count: int = Field(ge=2)
     feasible_candidate_count: int = Field(ge=0)
     row_count: int = Field(ge=1)
     legitimate_count: int = Field(ge=1)
@@ -50,6 +52,7 @@ class ThresholdReport(ExternalContract):
     minimum_review_case_rate: float = Field(ge=0.0, le=1.0)
     reason: Literal["selected", "no_candidate_satisfies_operating_budget"]
     input_scores_digest: str
+    normalized_scores_digest: str
     input_labels_digest: str
     input_mandatory_actions_digest: str
     input_values_digest: str | None = None
@@ -58,6 +61,7 @@ class ThresholdReport(ExternalContract):
 
     @field_validator(
         "input_scores_digest",
+        "normalized_scores_digest",
         "input_labels_digest",
         "input_mandatory_actions_digest",
         "input_values_digest",
@@ -119,6 +123,12 @@ class ThresholdReport(ExternalContract):
                 raise ValueError("selected challenge rate exceeds its frozen budget")
             if self.calibration_review_case_rate > self.budget.review_case_rate_max:
                 raise ValueError("selected review-case rate exceeds its frozen budget")
+            if (
+                self.minimum_false_decline_rate > self.calibration_false_decline_rate
+                or self.minimum_challenge_rate > self.calibration_challenge_rate
+                or self.minimum_review_case_rate > self.calibration_review_case_rate
+            ):
+                raise ValueError("minimum rates cannot exceed selected realized rates")
         else:
             if self.thresholds is not None or any(value is not None for value in realized):
                 raise ValueError("infeasible report cannot claim thresholds or realized metrics")
@@ -128,6 +138,11 @@ class ThresholdReport(ExternalContract):
                 raise ValueError("infeasible report cannot count feasible candidates")
             if self.reason != "no_candidate_satisfies_operating_budget":
                 raise ValueError("infeasible report must declare the budget failure")
+        expected_candidate_count = (
+            self.candidate_threshold_count * (self.candidate_threshold_count + 1) // 2
+        )
+        if self.candidate_count != expected_candidate_count:
+            raise ValueError("candidate count must be triangular over all threshold candidates")
         if self.feasible_candidate_count > self.candidate_count:
             raise ValueError("feasible candidate count exceeds exhaustive candidate count")
         if self.legitimate_count + self.fraud_count != self.row_count:
@@ -139,6 +154,13 @@ class ThresholdReport(ExternalContract):
             raise ValueError("false intervention count exceeds legitimate rows")
         if self.review_case_count is not None and self.review_case_count > self.row_count:
             raise ValueError("review case count exceeds decision rows")
+        if self.objective_kind == "fraud_recall":
+            if self.input_values_digest is not None:
+                raise ValueError("recall objective cannot bind a values digest")
+            if self.objective_value is not None and self.objective_value > 1.0:
+                raise ValueError("recall objective must be in [0, 1]")
+        elif self.input_values_digest is None:
+            raise ValueError("fraud-value objective requires a values digest")
         if self.report_digest != _report_digest(self):
             raise ValueError("threshold report digest is inconsistent")
         return self
@@ -172,7 +194,8 @@ def select_policy_thresholds(
     ``review_case_counter`` is deliberately truth-blind: it receives only a fresh
     candidate action array. Task 10 supplies the production causal grouping adapter.
     """
-    score_values = _scores(scores)
+    raw_score_values = _raw_scores(scores)
+    score_values = _normalize_validated_scores(raw_score_values)
     label_values = _labels(labels)
     action_values = _mandatory_actions(mandatory_actions)
     value_values = _values(values) if values is not None else None
@@ -186,80 +209,124 @@ def select_policy_thresholds(
     budget = OperatingBudget.model_validate(budget)
     if not callable(review_case_counter):
         raise ThresholdContractError("review_case_counter must be callable")
+    unique_score_count = len(np.unique(raw_score_values))
+    if unique_score_count > MAX_UNIQUE_OPERATING_SCORES:
+        raise ThresholdContractError(
+            "unique operating scores exceed the frozen maximum of "
+            f"{MAX_UNIQUE_OPERATING_SCORES}"
+        )
 
     row_count = len(score_values)
-    legitimate = label_values == 0
-    fraud = label_values == 1
-    legitimate_count = int(legitimate.sum())
-    fraud_count = int(fraud.sum())
+    legitimate_count = int(np.sum(label_values == 0))
+    fraud_count = int(np.sum(label_values == 1))
     if legitimate_count == 0:
         raise ThresholdContractError("threshold selection requires legitimate rows")
     if fraud_count == 0:
         raise ThresholdContractError("threshold selection requires fraud rows")
 
-    candidates = sorted({0.0, 1.0, *(float(value) for value in score_values)})
-    candidate_count = len(candidates) * (len(candidates) + 1) // 2
+    candidates = tuple(sorted({0.0, 1.0, *(float(value) for value in score_values)}))
+    candidate_threshold_count = len(candidates)
+    candidate_count = candidate_threshold_count * (candidate_threshold_count + 1) // 2
+    (
+        nonmandatory_ge,
+        legitimate_nonmandatory_ge,
+        fraud_nonmandatory_ge,
+        fraud_value_nonmandatory_ge,
+        mandatory_legitimate_count,
+        mandatory_fraud_count,
+        mandatory_fraud_value,
+    ) = _cumulative_statistics(
+        score_values, label_values, action_values, value_values, candidates
+    )
+    false_decline_rates = tuple(
+        (mandatory_legitimate_count + legitimate_nonmandatory_ge[index])
+        / legitimate_count
+        for index in range(candidate_threshold_count)
+    )
+    first_false_decline_feasible = next(
+        (
+            index
+            for index, rate in enumerate(false_decline_rates)
+            if rate <= budget.false_decline_rate_max
+        ),
+        candidate_threshold_count,
+    )
     feasible_count = 0
-    minimum_false_decline = 1.0
-    minimum_challenge = 1.0
+    minimum_false_decline = false_decline_rates[-1]
+    minimum_challenge = 0.0
     minimum_review = 1.0
     selected: tuple[
         tuple[float, int, float, float],
-        PolicyThresholds,
-        NDArray[np.object_],
+        float,
+        float,
         float,
         float,
         float,
         int,
         int,
     ] | None = None
+    review_cache: dict[bytes, int] = {}
 
-    for decline in candidates:
-        for challenge in candidates:
-            if challenge > decline:
-                continue
-            actions = _apply_actions(score_values, action_values, challenge, decline)
-            review_cases = _review_cases(review_case_counter, actions)
-            false_declines = int(np.sum(legitimate & _is_action(actions, Action.DECLINE)))
-            challenges = int(np.sum(_is_action(actions, Action.CHALLENGE)))
-            false_interventions = int(
-                np.sum(legitimate & ~_is_action(actions, Action.APPROVE))
+    for challenge_index, challenge in enumerate(candidates):
+        review_cases = _review_cases_for_challenge(
+            review_case_counter,
+            score_values,
+            action_values,
+            challenge,
+            review_cache,
+        )
+        review_rate = review_cases / row_count
+        minimum_review = min(minimum_review, review_rate)
+        if review_rate > budget.review_case_rate_max:
+            continue
+        decline_start = max(challenge_index, first_false_decline_feasible)
+        decline_end = _last_challenge_feasible_decline(
+            nonmandatory_ge,
+            challenge_index,
+            row_count,
+            budget.challenge_rate_max,
+        )
+        if decline_start > decline_end:
+            continue
+        feasible_count += decline_end - decline_start + 1
+        decline = candidates[decline_end]
+        false_decline_rate = false_decline_rates[decline_end]
+        challenge_rate = (
+            nonmandatory_ge[challenge_index] - nonmandatory_ge[decline_end]
+        ) / row_count
+        false_interventions = (
+            mandatory_legitimate_count
+            + legitimate_nonmandatory_ge[challenge_index]
+        )
+        objective = (
+            math.fsum(
+                (
+                    mandatory_fraud_value,
+                    fraud_value_nonmandatory_ge[challenge_index],
+                )
             )
-            false_decline_rate = false_declines / legitimate_count
-            challenge_rate = challenges / row_count
-            review_rate = review_cases / row_count
-            minimum_false_decline = min(minimum_false_decline, false_decline_rate)
-            minimum_challenge = min(minimum_challenge, challenge_rate)
-            minimum_review = min(minimum_review, review_rate)
-            if (
-                false_decline_rate > budget.false_decline_rate_max
-                or challenge_rate > budget.challenge_rate_max
-                or review_rate > budget.review_case_rate_max
-            ):
-                continue
-            feasible_count += 1
-            intervened_fraud = fraud & ~_is_action(actions, Action.APPROVE)
-            objective = (
-                float(value_values[intervened_fraud].sum())
-                if value_values is not None
-                else float(np.sum(intervened_fraud) / fraud_count)
+            if value_values is not None
+            else (
+                mandatory_fraud_count + fraud_nonmandatory_ge[challenge_index]
             )
-            if not math.isfinite(objective):
-                raise ThresholdContractError("threshold objective must remain finite")
-            ranking = (objective, -false_interventions, decline, challenge)
-            thresholds = PolicyThresholds(challenge=challenge, decline=decline)
-            candidate = (
-                ranking,
-                thresholds,
-                actions,
-                false_decline_rate,
-                challenge_rate,
-                review_rate,
-                false_interventions,
-                review_cases,
-            )
-            if selected is None or ranking > selected[0]:
-                selected = candidate
+            / fraud_count
+        )
+        objective = float(objective)
+        if not math.isfinite(objective):
+            raise ThresholdContractError("threshold objective must remain finite")
+        ranking = (objective, -false_interventions, decline, challenge)
+        candidate = (
+            ranking,
+            challenge,
+            decline,
+            false_decline_rate,
+            challenge_rate,
+            review_rate,
+            false_interventions,
+            review_cases,
+        )
+        if selected is None or ranking > selected[0]:
+            selected = candidate
 
     base_document: dict[str, object] = {
         "schema_version": "1.0.0",
@@ -268,6 +335,7 @@ def select_policy_thresholds(
             "fraud_value_captured" if value_values is not None else "fraud_recall"
         ),
         "candidate_count": candidate_count,
+        "candidate_threshold_count": candidate_threshold_count,
         "feasible_candidate_count": feasible_count,
         "row_count": row_count,
         "legitimate_count": legitimate_count,
@@ -276,6 +344,7 @@ def select_policy_thresholds(
         "minimum_challenge_rate": minimum_challenge,
         "minimum_review_case_rate": minimum_review,
         "input_scores_digest": _array_digest(scores),
+        "normalized_scores_digest": _array_digest(score_values),
         "input_labels_digest": _array_digest(labels),
         "input_mandatory_actions_digest": _actions_digest(action_values),
         "input_values_digest": _array_digest(values) if values is not None else None,
@@ -298,14 +367,18 @@ def select_policy_thresholds(
     else:
         (
             ranking,
-            thresholds,
-            selected_actions,
+            challenge,
+            decline,
             false_decline_rate,
             challenge_rate,
             review_rate,
             false_interventions,
             review_cases,
         ) = selected
+        thresholds = PolicyThresholds(challenge=challenge, decline=decline)
+        selected_actions = _apply_actions(
+            score_values, action_values, challenge, decline
+        )
         base_document.update(
             {
                 "feasible": True,
@@ -324,20 +397,35 @@ def select_policy_thresholds(
     return ThresholdReport.model_validate(base_document)
 
 
-def _scores(values: object) -> NDArray[np.float64]:
+def normalize_operating_scores(scores: NDArray[np.generic]) -> NDArray[np.float64]:
+    """Map finite raw arm scores from [0, 1] into the frozen interior score band.
+
+    Task 12 must call this same function for every arm before action-policy replay,
+    preserving exact ``1.0`` as the disabled threshold sentinel.
+    """
+    return _normalize_validated_scores(_raw_scores(scores))
+
+
+def _raw_scores(values: object) -> NDArray[np.float64]:
     if type(values) is not np.ndarray:
         raise ThresholdContractError("scores must be an exact numpy array")
     array = cast(NDArray[np.generic], values)
     if array.ndim != 1 or array.size == 0:
         raise ThresholdContractError("scores must be a nonempty one-dimensional array")
-    if np.issubdtype(array.dtype, np.bool_) or not np.issubdtype(array.dtype, np.number):
-        raise ThresholdContractError("scores must have a non-boolean numeric dtype")
+    if np.issubdtype(array.dtype, np.bool_) or not _is_real_numeric_dtype(array.dtype):
+        raise ThresholdContractError(
+            "scores must have a non-boolean real integer or floating dtype"
+        )
     result = np.asarray(array, dtype=np.float64).copy()
     if not np.isfinite(result).all():
         raise ThresholdContractError("scores must be finite")
-    if np.any((result < _SCORE_MIN) | (result > _SCORE_MAX)):
-        raise ThresholdContractError("calibrated scores must be in [1e-8, 1 - 1e-8]")
+    if np.any((result < 0.0) | (result > 1.0)):
+        raise ThresholdContractError("raw operating scores must be in [0, 1]")
     return result
+
+
+def _normalize_validated_scores(scores: NDArray[np.float64]) -> NDArray[np.float64]:
+    return np.clip(scores, _SCORE_MIN, _SCORE_MAX)
 
 
 def _labels(values: object) -> NDArray[np.int64]:
@@ -347,9 +435,11 @@ def _labels(values: object) -> NDArray[np.int64]:
     if array.ndim != 1 or array.size == 0:
         raise ThresholdContractError("labels must be a nonempty one-dimensional array")
     if not (
-        np.issubdtype(array.dtype, np.number) or np.issubdtype(array.dtype, np.bool_)
+        _is_real_numeric_dtype(array.dtype) or np.issubdtype(array.dtype, np.bool_)
     ):
-        raise ThresholdContractError("labels must have a numeric or boolean dtype")
+        raise ThresholdContractError(
+            "labels must have a real integer, floating, or boolean dtype"
+        )
     numeric = np.asarray(array, dtype=np.float64)
     if not np.isfinite(numeric).all() or not np.all((numeric == 0.0) | (numeric == 1.0)):
         raise ThresholdContractError("labels must contain only binary values")
@@ -380,11 +470,113 @@ def _values(values: object) -> NDArray[np.float64]:
     array = cast(NDArray[np.generic], values)
     if array.ndim != 1 or array.size == 0:
         raise ThresholdContractError("values must be a nonempty one-dimensional array")
-    if np.issubdtype(array.dtype, np.bool_) or not np.issubdtype(array.dtype, np.number):
-        raise ThresholdContractError("values must have a non-boolean numeric dtype")
+    if np.issubdtype(array.dtype, np.bool_) or not _is_real_numeric_dtype(array.dtype):
+        raise ThresholdContractError(
+            "values must have a non-boolean real integer or floating dtype"
+        )
     result = np.asarray(array, dtype=np.float64).copy()
     if not np.isfinite(result).all() or np.any(result < 0.0):
         raise ThresholdContractError("values must be finite and nonnegative")
+    return result
+
+
+def _cumulative_statistics(
+    scores: NDArray[np.float64],
+    labels: NDArray[np.int64],
+    mandatory: NDArray[np.object_],
+    values: NDArray[np.float64] | None,
+    candidates: tuple[float, ...],
+) -> tuple[
+    tuple[int, ...],
+    tuple[int, ...],
+    tuple[int, ...],
+    tuple[float, ...],
+    int,
+    int,
+    float,
+]:
+    group_nonmandatory: dict[float, int] = {}
+    group_legitimate: dict[float, int] = {}
+    group_fraud: dict[float, int] = {}
+    group_fraud_values: dict[float, list[float]] = {}
+    mandatory_legitimate = 0
+    mandatory_fraud = 0
+    mandatory_fraud_values: list[float] = []
+    for index, (score, label, action) in enumerate(
+        zip(scores, labels, mandatory, strict=True)
+    ):
+        numeric_score = float(score)
+        if action is Action.DECLINE:
+            if label == 0:
+                mandatory_legitimate += 1
+            else:
+                mandatory_fraud += 1
+                if values is not None:
+                    mandatory_fraud_values.append(float(values[index]))
+            continue
+        group_nonmandatory[numeric_score] = group_nonmandatory.get(numeric_score, 0) + 1
+        if label == 0:
+            group_legitimate[numeric_score] = group_legitimate.get(numeric_score, 0) + 1
+        else:
+            group_fraud[numeric_score] = group_fraud.get(numeric_score, 0) + 1
+            if values is not None:
+                group_fraud_values.setdefault(numeric_score, []).append(
+                    float(values[index])
+                )
+
+    nonmandatory_ge = [0] * len(candidates)
+    legitimate_ge = [0] * len(candidates)
+    fraud_ge = [0] * len(candidates)
+    fraud_values_ge = [0.0] * len(candidates)
+    running_nonmandatory = 0
+    running_legitimate = 0
+    running_fraud = 0
+    running_fraud_value = 0.0
+    for index in range(len(candidates) - 1, -1, -1):
+        threshold = candidates[index]
+        running_nonmandatory += group_nonmandatory.get(threshold, 0)
+        running_legitimate += group_legitimate.get(threshold, 0)
+        running_fraud += group_fraud.get(threshold, 0)
+        running_fraud_value = math.fsum(
+            (
+                running_fraud_value,
+                math.fsum(group_fraud_values.get(threshold, ())),
+            )
+        )
+        nonmandatory_ge[index] = running_nonmandatory
+        legitimate_ge[index] = running_legitimate
+        fraud_ge[index] = running_fraud
+        fraud_values_ge[index] = running_fraud_value
+    return (
+        tuple(nonmandatory_ge),
+        tuple(legitimate_ge),
+        tuple(fraud_ge),
+        tuple(fraud_values_ge),
+        mandatory_legitimate,
+        mandatory_fraud,
+        math.fsum(mandatory_fraud_values),
+    )
+
+
+def _last_challenge_feasible_decline(
+    nonmandatory_ge: tuple[int, ...],
+    challenge_index: int,
+    row_count: int,
+    challenge_rate_max: float,
+) -> int:
+    low = challenge_index
+    high = len(nonmandatory_ge) - 1
+    result = challenge_index
+    while low <= high:
+        middle = (low + high) // 2
+        challenge_rate = (
+            nonmandatory_ge[challenge_index] - nonmandatory_ge[middle]
+        ) / row_count
+        if challenge_rate <= challenge_rate_max:
+            result = middle
+            low = middle + 1
+        else:
+            high = middle - 1
     return result
 
 
@@ -404,25 +596,51 @@ def _apply_actions(
     return result
 
 
-def _review_cases(
+def _review_cases_for_challenge(
+    callback: Callable[[NDArray[np.object_]], int],
+    scores: NDArray[np.float64],
+    mandatory: NDArray[np.object_],
+    challenge: float,
+    cache: dict[bytes, int],
+) -> int:
+    all_declined = _apply_actions(scores, mandatory, challenge, challenge)
+    intervention_mask = ~_is_action(all_declined, Action.APPROVE)
+    cache_key = intervention_mask.tobytes()
+    if cache_key in cache:
+        return cache[cache_key]
+    first = _call_review_case_counter(callback, all_declined)
+    repeated = _call_review_case_counter(callback, all_declined)
+    if first != repeated:
+        raise ThresholdContractError("review_case_counter must be deterministic")
+    challenged = _apply_actions(scores, mandatory, challenge, 1.0)
+    if not np.array_equal(
+        intervention_mask, ~_is_action(challenged, Action.APPROVE)
+    ):
+        raise AssertionError("severity variants must preserve the intervention mask")
+    changed_severity = _call_review_case_counter(callback, challenged)
+    if first != changed_severity:
+        raise ThresholdContractError(
+            "review_case_counter must be intervention-mask invariant when "
+            "CHALLENGE and DECLINE severities change"
+        )
+    cache[cache_key] = first
+    return first
+
+
+def _call_review_case_counter(
     callback: Callable[[NDArray[np.object_]], int], actions: NDArray[np.object_]
 ) -> int:
     interventions = int(np.sum(~_is_action(actions, Action.APPROVE)))
-    results: list[int] = []
-    for _ in range(2):
-        try:
-            result = callback(actions.copy())
-        except Exception as error:
-            raise ThresholdContractError("review_case_counter raised an exception") from error
-        if type(result) is not int or result < 0 or result > interventions:
-            raise ThresholdContractError(
-                "review_case_counter must return an exact nonnegative int no greater "
-                "than interventions"
-            )
-        results.append(result)
-    if results[0] != results[1]:
-        raise ThresholdContractError("review_case_counter must be deterministic")
-    return results[0]
+    try:
+        result = callback(actions.copy())
+    except Exception as error:
+        raise ThresholdContractError("review_case_counter raised an exception") from error
+    if type(result) is not int or result < 0 or result > interventions:
+        raise ThresholdContractError(
+            "review_case_counter must return an exact nonnegative int no greater "
+            "than interventions"
+        )
+    return result
 
 
 def _is_action(actions: NDArray[np.object_], action: Action) -> NDArray[np.bool_]:
@@ -430,6 +648,12 @@ def _is_action(actions: NDArray[np.object_], action: Action) -> NDArray[np.bool_
         (value is action for value in actions),
         dtype=np.bool_,
         count=len(actions),
+    )
+
+
+def _is_real_numeric_dtype(dtype: np.dtype[np.generic]) -> bool:
+    return bool(
+        np.issubdtype(dtype, np.integer) or np.issubdtype(dtype, np.floating)
     )
 
 

@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import time
 from collections.abc import Callable
 
 import numpy as np
 import pytest
 from pydantic import ValidationError
 
+import apar.defense.thresholds as threshold_module
 from apar.contracts.decisions import Action
 from apar.defense.policy import OperatingBudget
 from apar.defense.thresholds import (
@@ -17,6 +20,15 @@ from apar.defense.thresholds import (
     select_policy_thresholds,
 )
 from apar.runs.wire import canonical_json_bytes
+
+
+def _rechecksum_threshold_document(document: dict[str, object]) -> bytes:
+    without_digest = dict(document)
+    without_digest.pop("report_digest")
+    document["report_digest"] = hashlib.sha256(
+        canonical_json_bytes(without_digest)
+    ).hexdigest()
+    return canonical_json_bytes(document)
 
 
 def _actions(*values: Action) -> np.ndarray:
@@ -88,6 +100,29 @@ def test_threshold_one_is_disabled_while_mandatory_decline_has_precedence() -> N
     assert report.objective_value == 10.0
     assert report.calibration_false_decline_rate == 0.0
     assert report.false_intervention_count == 0
+
+
+def test_raw_zero_and_one_scores_are_normalized_and_both_digests_are_bound() -> None:
+    scores = np.array([0.0, 1.0], dtype=np.float64)
+    normalized = threshold_module.normalize_operating_scores(scores)
+    report = select_policy_thresholds(
+        scores,
+        np.array([0, 1], dtype=np.int8),
+        _actions(Action.APPROVE, Action.APPROVE),
+        _zero_cases,
+        OperatingBudget(
+            false_decline_rate_max=0.0,
+            challenge_rate_max=0.0,
+            review_case_rate_max=1.0,
+        ),
+    )
+
+    np.testing.assert_array_equal(normalized, np.array([1e-8, 1.0 - 1e-8]))
+    np.testing.assert_array_equal(scores, np.array([0.0, 1.0]))
+    assert report.thresholds is not None
+    assert report.thresholds.challenge == 1.0 - 1e-8
+    assert report.thresholds.decline == 1.0 - 1e-8
+    assert report.input_scores_digest != report.normalized_scores_digest
 
 
 def test_mandatory_decline_can_make_budget_infeasible_without_relaxation() -> None:
@@ -188,7 +223,25 @@ def test_callback_receives_fresh_isolated_arrays_and_is_checked_for_determinism(
         ),
     )
     assert report.candidate_count == 10
-    assert len(seen) == report.candidate_count * 2
+    assert len(seen) == 3 * (report.candidate_threshold_count - 1)
+
+
+def test_callback_must_be_invariant_to_challenge_decline_severity_for_same_mask() -> None:
+    def severity_sensitive(actions: np.ndarray) -> int:
+        return int(sum(action is Action.CHALLENGE for action in actions))
+
+    with pytest.raises(ThresholdContractError, match="intervention-mask invariant"):
+        select_policy_thresholds(
+            np.array([0.2, 0.8], dtype=np.float64),
+            np.array([0, 1], dtype=np.int8),
+            _actions(Action.APPROVE, Action.APPROVE),
+            severity_sensitive,
+            OperatingBudget(
+                false_decline_rate_max=1.0,
+                challenge_rate_max=1.0,
+                review_case_rate_max=1.0,
+            ),
+        )
 
 
 @pytest.mark.parametrize(
@@ -246,8 +299,6 @@ def test_nondeterministic_callback_fails_closed() -> None:
         ("scores", [0.2, 0.8]),
         ("scores", np.array([], dtype=np.float64)),
         ("scores", np.array([[0.2, 0.8]], dtype=np.float64)),
-        ("scores", np.array([0.0, 0.8], dtype=np.float64)),
-        ("scores", np.array([0.2, 1.0], dtype=np.float64)),
         ("scores", np.array([0.2, np.nan], dtype=np.float64)),
         ("labels", np.array([0, 2], dtype=np.int8)),
         ("mandatory_actions", np.array(["approve", "approve"], dtype=object)),
@@ -275,6 +326,25 @@ def test_threshold_selection_rejects_invalid_exact_inputs(argument: str, value: 
     }
     arguments[argument] = value
     with pytest.raises(ThresholdContractError):
+        select_policy_thresholds(**arguments)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("argument", ["scores", "labels", "values"])
+def test_threshold_selection_rejects_complex_dtype_before_conversion(argument: str) -> None:
+    arguments: dict[str, object] = {
+        "scores": np.array([0.2, 0.8], dtype=np.float64),
+        "labels": np.array([0, 1], dtype=np.int8),
+        "mandatory_actions": _actions(Action.APPROVE, Action.APPROVE),
+        "review_case_counter": _zero_cases,
+        "budget": OperatingBudget(
+            false_decline_rate_max=1.0,
+            challenge_rate_max=1.0,
+            review_case_rate_max=1.0,
+        ),
+        "values": np.array([0.0, 1.0], dtype=np.float64),
+    }
+    arguments[argument] = np.array([0.0 + 0.0j, 1.0 + 0.0j], dtype=np.complex128)
+    with pytest.raises(ThresholdContractError, match="real"):
         select_policy_thresholds(**arguments)  # type: ignore[arg-type]
 
 
@@ -347,6 +417,7 @@ def test_report_roundtrip_is_canonical_and_binds_inputs_actions_budget_and_count
     assert restored == report
     assert payload == canonical_json_bytes(json.loads(payload))
     assert report.input_scores_digest
+    assert report.normalized_scores_digest
     assert report.input_labels_digest
     assert report.input_mandatory_actions_digest
     assert report.input_values_digest
@@ -375,7 +446,9 @@ def test_report_rejects_noncanonical_extra_and_digest_tampering() -> None:
     )
     document = json.loads(report.to_json())
     document["candidate_count"] += 1
-    with pytest.raises((ThresholdContractError, ValidationError), match="digest"):
+    with pytest.raises(
+        (ThresholdContractError, ValidationError), match="digest|triangular"
+    ):
         ThresholdReport.from_json(canonical_json_bytes(document))
 
     document = json.loads(report.to_json())
@@ -404,3 +477,225 @@ def test_report_contract_rejects_inconsistent_feasible_fields() -> None:
     document["thresholds"] = None
     with pytest.raises(ValidationError, match="feasible report"):
         ThresholdReport.model_validate(document)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ({"objective_value": 2.0}, "recall objective"),
+        ({"candidate_count": 1}, "triangular"),
+        ({"input_values_digest": "0" * 64}, "values digest"),
+        (
+            {"objective_kind": "fraud_value_captured", "input_values_digest": None},
+            "values digest",
+        ),
+        ({"minimum_false_decline_rate": 0.5}, "minimum"),
+    ],
+)
+def test_rechecksummed_report_rejects_semantic_tampering(
+    mutation: dict[str, object], message: str
+) -> None:
+    report = select_policy_thresholds(
+        np.array([0.2, 0.8], dtype=np.float64),
+        np.array([0, 1], dtype=np.int8),
+        _actions(Action.APPROVE, Action.APPROVE),
+        _zero_cases,
+        OperatingBudget(
+            false_decline_rate_max=1.0,
+            challenge_rate_max=1.0,
+            review_case_rate_max=1.0,
+        ),
+    )
+    document = json.loads(report.to_json())
+    document.update(mutation)
+    with pytest.raises((ThresholdContractError, ValidationError), match=message):
+        ThresholdReport.from_json(_rechecksum_threshold_document(document))
+
+
+def test_rechecksummed_infeasible_report_rejects_claimed_realized_state() -> None:
+    report = select_policy_thresholds(
+        np.array([0.2, 0.8], dtype=np.float64),
+        np.array([0, 1], dtype=np.int8),
+        _actions(Action.DECLINE, Action.APPROVE),
+        _zero_cases,
+        OperatingBudget(
+            false_decline_rate_max=0.0,
+            challenge_rate_max=1.0,
+            review_case_rate_max=1.0,
+        ),
+    )
+    assert not report.feasible
+    document = json.loads(report.to_json())
+    document["objective_value"] = 0.0
+    with pytest.raises((ThresholdContractError, ValidationError), match="infeasible report"):
+        ThresholdReport.from_json(_rechecksum_threshold_document(document))
+
+
+def _brute_force_thresholds(
+    raw_scores: np.ndarray,
+    labels: np.ndarray,
+    mandatory: np.ndarray,
+    budget: OperatingBudget,
+    values: np.ndarray | None,
+) -> tuple[bool, tuple[float, float] | None, float | None, int | None, int]:
+    scores = np.clip(raw_scores, 1e-8, 1.0 - 1e-8)
+    candidates = sorted({0.0, 1.0, *(float(value) for value in scores)})
+    legitimate = labels == 0
+    fraud = labels == 1
+    selected: tuple[tuple[float, int, float, float], float, float, int] | None = None
+    for decline in candidates:
+        for challenge in candidates:
+            if challenge > decline:
+                continue
+            actions = _actions(*([Action.APPROVE] * len(scores)))
+            for index, score in enumerate(scores):
+                if mandatory[index] is Action.DECLINE or score >= decline:
+                    actions[index] = Action.DECLINE
+                elif score >= challenge:
+                    actions[index] = Action.CHALLENGE
+            false_declines = int(
+                sum(
+                    legitimate[index] and action is Action.DECLINE
+                    for index, action in enumerate(actions)
+                )
+            )
+            challenges = int(sum(action is Action.CHALLENGE for action in actions))
+            false_interventions = int(
+                sum(
+                    legitimate[index] and action is not Action.APPROVE
+                    for index, action in enumerate(actions)
+                )
+            )
+            if false_declines / int(legitimate.sum()) > budget.false_decline_rate_max:
+                continue
+            if challenges / len(scores) > budget.challenge_rate_max:
+                continue
+            intervened_fraud = np.array(
+                [
+                    fraud[index] and action is not Action.APPROVE
+                    for index, action in enumerate(actions)
+                ]
+            )
+            objective = (
+                float(values[intervened_fraud].sum())
+                if values is not None
+                else float(intervened_fraud.sum() / fraud.sum())
+            )
+            ranking = (objective, -false_interventions, decline, challenge)
+            if selected is None or ranking > selected[0]:
+                selected = (ranking, challenge, decline, false_interventions)
+    if selected is None:
+        return False, None, None, None, len(candidates) * (len(candidates) + 1) // 2
+    return (
+        True,
+        (selected[1], selected[2]),
+        selected[0][0],
+        selected[3],
+        len(candidates) * (len(candidates) + 1) // 2,
+    )
+
+
+def test_optimized_selector_matches_brute_force_randomized_hand_oracle() -> None:
+    rng = np.random.default_rng(260816)
+    score_choices = np.array([0.0, 0.1, 0.3, 0.7, 1.0])
+    for case in range(30):
+        raw_scores = rng.choice(score_choices, size=9).astype(np.float64)
+        labels = rng.integers(0, 2, size=9, dtype=np.int8)
+        labels[0] = 0
+        labels[1] = 1
+        mandatory = _actions(
+            *(
+                Action.DECLINE if value else Action.APPROVE
+                for value in rng.integers(0, 5, size=9) == 0
+            )
+        )
+        budget = OperatingBudget(
+            false_decline_rate_max=float(rng.choice([0.0, 0.25, 0.5, 1.0])),
+            challenge_rate_max=float(rng.choice([0.0, 0.25, 0.5, 1.0])),
+            review_case_rate_max=1.0,
+        )
+        values = (
+            rng.integers(0, 20, size=9).astype(np.float64) if case % 2 else None
+        )
+        expected = _brute_force_thresholds(raw_scores, labels, mandatory, budget, values)
+        actual = select_policy_thresholds(
+            raw_scores, labels, mandatory, _zero_cases, budget, values
+        )
+        assert actual.feasible == expected[0]
+        assert actual.candidate_count == expected[4]
+        if actual.feasible:
+            assert actual.thresholds is not None
+            assert (actual.thresholds.challenge, actual.thresholds.decline) == expected[1]
+            assert actual.objective_value == expected[2]
+            assert actual.false_intervention_count == expected[3]
+
+
+def test_callback_calls_scale_with_unique_challenge_masks_not_candidate_pairs() -> None:
+    calls: list[int] = []
+
+    def callback(actions: np.ndarray) -> int:
+        calls.append(len(actions))
+        return 0
+
+    scores = np.linspace(0.0, 1.0, 400, dtype=np.float64)
+    labels = np.tile(np.array([0, 1], dtype=np.int8), 200)
+    report = select_policy_thresholds(
+        scores,
+        labels,
+        _actions(*([Action.APPROVE] * len(scores))),
+        callback,
+        OperatingBudget(
+            false_decline_rate_max=1.0,
+            challenge_rate_max=1.0,
+            review_case_rate_max=1.0,
+        ),
+    )
+    assert report.candidate_count > 80_000
+    assert len(calls) == 3 * (report.candidate_threshold_count - 1)
+
+
+def test_threshold_selection_benchmark_scales_proportionately() -> None:
+    durations: dict[int, float] = {}
+    for size in (100, 200, 400):
+        scores = np.linspace(0.0, 1.0, size, dtype=np.float64)
+        labels = np.tile(np.array([0, 1], dtype=np.int8), size // 2)
+        started = time.perf_counter()
+        select_policy_thresholds(
+            scores,
+            labels,
+            _actions(*([Action.APPROVE] * size)),
+            _zero_cases,
+            OperatingBudget(
+                false_decline_rate_max=1.0,
+                challenge_rate_max=1.0,
+                review_case_rate_max=1.0,
+            ),
+        )
+        durations[size] = time.perf_counter() - started
+    assert durations[400] < 5.0
+    assert durations[400] <= 6.0 * max(durations[200], 0.01)
+
+
+def test_unique_score_cap_rejects_before_callback_or_quadratic_allocation() -> None:
+    assert threshold_module.MAX_UNIQUE_OPERATING_SCORES == 4096
+    callback_called = False
+
+    def callback(_actions: np.ndarray) -> int:
+        nonlocal callback_called
+        callback_called = True
+        return 0
+
+    size = threshold_module.MAX_UNIQUE_OPERATING_SCORES + 1
+    with pytest.raises(ThresholdContractError, match="4096"):
+        select_policy_thresholds(
+            np.linspace(0.0, 1.0, size, dtype=np.float64),
+            np.tile(np.array([0, 1], dtype=np.int8), size // 2 + 1)[:size],
+            _actions(*([Action.APPROVE] * size)),
+            callback,
+            OperatingBudget(
+                false_decline_rate_max=1.0,
+                challenge_rate_max=1.0,
+                review_case_rate_max=1.0,
+            ),
+        )
+    assert not callback_called

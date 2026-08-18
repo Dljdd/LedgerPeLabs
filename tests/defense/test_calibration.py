@@ -19,6 +19,17 @@ from apar.defense.calibration import (
 from apar.runs.wire import canonical_json_bytes
 
 
+def _rechecksum_calibration_document(document: dict[str, object]) -> bytes:
+    artifact = document["artifact"]
+    assert isinstance(artifact, dict)
+    artifact_without_digest = dict(artifact)
+    artifact_without_digest.pop("artifact_digest")
+    artifact["artifact_digest"] = hashlib.sha256(
+        canonical_json_bytes(artifact_without_digest)
+    ).hexdigest()
+    return canonical_json_bytes(document)
+
+
 def _fit_window(repeats: int = 30) -> tuple[np.ndarray, np.ndarray]:
     return (
         np.array([0.05, 0.2, 0.7, 0.9] * repeats, dtype=np.float64),
@@ -120,6 +131,62 @@ def test_exact_selection_brier_tie_chooses_sigmoid(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(module, "_brier", lambda _labels, _predictions: 0.25)
     calibrator = _calibrator()
     assert calibrator.artifact.kind is CalibrationKind.SIGMOID
+
+
+def test_brier_is_computed_from_exact_published_clipped_inference() -> None:
+    fit_scores = np.array([0.0, 1.0] * 100, dtype=np.float64)
+    fit_labels = np.array([0, 1] * 100, dtype=np.int8)
+    selection_scores = np.array([0.0, 1.0] * 4, dtype=np.float64)
+    selection_labels = np.array([0, 1] * 4, dtype=np.int8)
+    calibrator = select_calibrator(
+        fit_scores,
+        fit_labels,
+        selection_scores,
+        selection_labels,
+        min_class_count=10_000,
+    )
+
+    published = calibrator.predict(selection_scores)
+    expected_brier = float(np.mean(np.square(published - selection_labels)))
+    assert calibrator.artifact.selection_brier == expected_brier
+    assert calibrator.artifact.sigmoid_candidate_brier == expected_brier
+
+
+def test_recomputed_digest_cannot_select_worse_sigmoid_over_eligible_isotonic() -> None:
+    fit_scores = np.repeat(np.array([0.1, 0.2, 0.8, 0.9]), 60)
+    fit_labels = np.repeat(np.array([0, 0, 1, 1], dtype=np.int8), 60)
+    selection_scores = np.repeat(np.array([0.1, 0.2, 0.8, 0.9]), 30)
+    selection_labels = np.repeat(np.array([0, 0, 1, 1], dtype=np.int8), 30)
+    isotonic = select_calibrator(
+        fit_scores,
+        fit_labels,
+        selection_scores,
+        selection_labels,
+    )
+    sigmoid = select_calibrator(
+        fit_scores,
+        fit_labels,
+        selection_scores,
+        selection_labels,
+        min_class_count=10_000,
+    )
+    assert isotonic.artifact.kind is CalibrationKind.ISOTONIC
+    assert (
+        isotonic.artifact.isotonic_candidate_brier
+        < isotonic.artifact.sigmoid_candidate_brier
+    )
+    document = json.loads(isotonic.to_json())
+    artifact = document["artifact"]
+    assert isinstance(artifact, dict)
+    artifact["kind"] = "sigmoid"
+    artifact["selection_brier"] = artifact["sigmoid_candidate_brier"]
+    artifact["sigmoid_coefficient"] = sigmoid.artifact.sigmoid_coefficient
+    artifact["sigmoid_intercept"] = sigmoid.artifact.sigmoid_intercept
+    artifact["isotonic_x"] = []
+    artifact["isotonic_y"] = []
+
+    with pytest.raises((CalibrationContractError, ValidationError), match="lower Brier"):
+        ProbabilityCalibrator.from_json(_rechecksum_calibration_document(document))
 
 
 def test_fit_and_selection_window_content_digests_bind_all_bytes() -> None:
@@ -241,6 +308,22 @@ def test_calibration_rejects_invalid_exact_arrays(argument: str, value: object) 
     arguments[argument] = value
 
     with pytest.raises(CalibrationContractError):
+        select_calibrator(**arguments)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "argument",
+    ["fit_scores", "fit_labels", "selection_scores", "selection_labels"],
+)
+def test_calibration_rejects_complex_dtype_before_conversion(argument: str) -> None:
+    arguments: dict[str, object] = {
+        "fit_scores": np.array([0.1, 0.9], dtype=np.float64),
+        "fit_labels": np.array([0, 1], dtype=np.int8),
+        "selection_scores": np.array([0.2, 0.8], dtype=np.float64),
+        "selection_labels": np.array([0, 1], dtype=np.int8),
+    }
+    arguments[argument] = np.array([0.0 + 0.0j, 1.0 + 0.0j], dtype=np.complex128)
+    with pytest.raises(CalibrationContractError, match="real"):
         select_calibrator(**arguments)  # type: ignore[arg-type]
 
 
