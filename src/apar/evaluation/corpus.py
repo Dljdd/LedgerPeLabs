@@ -162,7 +162,8 @@ def _parse_public_artifacts(
         ],
         family,
     )
-    if _FAMILY_RAILS[family_literal] not in {event.rail for event in events}:
+    expected_rail = _FAMILY_RAILS[family_literal]
+    if any(event.rail is not expected_rail for event in events):
         raise CorpusVerificationError("run declared rail does not match its family")
     entities = population_document.get("entities")
     if type(entities) is not list:
@@ -178,6 +179,16 @@ def _parse_public_artifacts(
         if entity_id in population_truth:
             raise CorpusVerificationError("population contains duplicate entity IDs")
         population_truth[entity_id] = illicit
+    missing_entity_truth = sorted(
+        {
+            entity_id
+            for event in events
+            for entity_id in (event.actor_id, event.counterparty_id)
+            if entity_id not in population_truth
+        }
+    )
+    if missing_entity_truth:
+        raise CorpusVerificationError("population truth is missing a referenced entity")
     return events, population_truth, family
 
 
@@ -234,9 +245,7 @@ def _truth_row(
             "integrity_truth"
         )
     else:
-        is_fraud = population_truth.get(opening.actor_id, False) or population_truth.get(
-            opening.counterparty_id, False
-        )
+        is_fraud = population_truth[opening.actor_id] or population_truth[opening.counterparty_id]
         label_source = "population_truth"
     return EvaluationTruthRow(
         event_id=opening.event_id,

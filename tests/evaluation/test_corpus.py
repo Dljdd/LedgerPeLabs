@@ -25,10 +25,6 @@ from apar.runs import (
 from apar.storage.artifacts import ArtifactRef, ArtifactStore
 from tests.factories import NOW, make_payment_event, make_scenario_config, make_threat_card
 
-pytestmark = pytest.mark.filterwarnings(
-    "ignore:Implicit None on return values is deprecated.*:DeprecationWarning"
-)
-
 
 class RecordingArtifactStore(ArtifactStore):
     """Real artifact verification with a record of corpus-parser reads."""
@@ -82,6 +78,14 @@ def _wire_event(**updates: object) -> dict[str, object]:
         .model_copy(update=updates)
         .model_dump(mode="json")
     )
+
+
+def _population_entities() -> list[dict[str, object]]:
+    event = make_payment_event()
+    return [
+        {"entity_id": event.actor_id, "illicit": True},
+        {"entity_id": event.counterparty_id, "illicit": False},
+    ]
 
 
 def _completed_manifest(tmp_path: Path) -> tuple[ArtifactStore, RunRunner, RunManifest]:
@@ -157,7 +161,7 @@ def test_corpus_rejects_duplicate_event_ids_and_payment_openings(
     manifest = _manifest(
         store,
         events=[first, duplicate_event],
-        entities=[{"entity_id": make_payment_event().actor_id, "illicit": True}],
+        entities=_population_entities(),
     )
 
     with pytest.raises(CorpusVerificationError, match="duplicate event ID"):
@@ -170,7 +174,7 @@ def test_corpus_rejects_duplicate_event_ids_and_payment_openings(
     opening_manifest = _manifest(
         store,
         events=[first, second_opening],
-        entities=[{"entity_id": make_payment_event().actor_id, "illicit": True}],
+        entities=_population_entities(),
     )
     with pytest.raises(CorpusVerificationError, match="duplicate payment opening"):
         assemble_verified_corpus([opening_manifest], runner, store, CorpusProfile.fixture())
@@ -184,7 +188,7 @@ def test_corpus_rejects_payment_ids_reused_across_campaigns(
     first = _manifest(
         store,
         events=[_wire_event()],
-        entities=[{"entity_id": make_payment_event().actor_id, "illicit": True}],
+        entities=_population_entities(),
     )
     second_event = _wire_event(
         event_id="00000000-0000-4000-8000-000000000006",
@@ -193,7 +197,7 @@ def test_corpus_rejects_payment_ids_reused_across_campaigns(
     second = _manifest(
         store,
         events=[second_event],
-        entities=[{"entity_id": make_payment_event().actor_id, "illicit": True}],
+        entities=_population_entities(),
         run_id="run-fixture-2",
     )
 
@@ -214,7 +218,7 @@ def test_corpus_rejects_lifecycle_events_without_exactly_one_opening(
     manifest = _manifest(
         store,
         events=[lifecycle],
-        entities=[{"entity_id": make_payment_event().actor_id, "illicit": True}],
+        entities=_population_entities(),
     )
 
     with pytest.raises(CorpusVerificationError, match="exactly one opening"):
@@ -229,10 +233,49 @@ def test_corpus_rejects_non_synthetic_events(
     manifest = _manifest(
         store,
         events=[_wire_event(lineage={"synthetic": False})],
-        entities=[{"entity_id": make_payment_event().actor_id, "illicit": True}],
+        entities=_population_entities(),
     )
 
     with pytest.raises(CorpusVerificationError, match="synthetic"):
+        assemble_verified_corpus([manifest], runner, store, CorpusProfile.fixture())
+
+
+def test_corpus_rejects_missing_population_truth_for_a_referenced_entity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts")
+    runner = _fixture_runner(store, tmp_path, monkeypatch)
+    manifest = _manifest(
+        store,
+        events=[_wire_event()],
+        entities=[{"entity_id": make_payment_event().counterparty_id, "illicit": False}],
+    )
+
+    with pytest.raises(CorpusVerificationError, match="population truth"):
+        assemble_verified_corpus([manifest], runner, store, CorpusProfile.fixture())
+
+
+def test_corpus_rejects_mixed_rail_events_under_one_family(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts")
+    runner = _fixture_runner(store, tmp_path, monkeypatch)
+    a2a_event = _wire_event(
+        event_id="00000000-0000-4000-8000-000000000006",
+        rail=Rail.A2A,
+        event_type=EventKind.TRANSFER_INITIATED,
+        rail_data={"payment_id": "pay-2"},
+    )
+    manifest = _manifest(
+        store,
+        events=[_wire_event(), a2a_event],
+        entities=[
+            {"entity_id": make_payment_event().actor_id, "illicit": True},
+            {"entity_id": make_payment_event().counterparty_id, "illicit": False},
+        ],
+    )
+
+    with pytest.raises(CorpusVerificationError, match="declared rail"):
         assemble_verified_corpus([manifest], runner, store, CorpusProfile.fixture())
 
 
@@ -263,7 +306,7 @@ def test_corpus_derives_isolated_truth_from_lifecycle_and_label_delay(
     manifest = _manifest(
         store,
         events=[opening, settlement, refund],
-        entities=[{"entity_id": make_payment_event().actor_id, "illicit": True}],
+        entities=_population_entities(),
     )
 
     corpus = assemble_verified_corpus([manifest], runner, store, CorpusProfile.fixture())
