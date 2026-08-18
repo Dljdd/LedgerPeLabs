@@ -96,6 +96,7 @@ class CausalFeatureState:
         self._admitted_ids: set[str] = set()
         self._emitted_decision_ids: set[str] = set()
         self._late_event_ids: set[str] = set()
+        self._late_event_watermarks: dict[str, datetime] = {}
         self._opening_payment_ids: set[str] = set()
         self._watermark: datetime | None = None
         self._actor_history: dict[str, list[str]] = defaultdict(list)
@@ -121,8 +122,8 @@ class CausalFeatureState:
         for decision_at, grouped in groupby(decisions, key=attrgetter("decision_at")):
             if decision_at is None:
                 raise FeatureStateError("decision-point event must declare decision_at")
-            if self._watermark is not None and decision_at < self._watermark:
-                raise FeatureStateError("decision time precedes the processed watermark")
+            if self._watermark is not None and decision_at <= self._watermark:
+                raise FeatureStateError("decision belongs to a closed decision timestamp")
             batch = tuple(grouped)
             batch_ids = {event.event_id for event in batch}
             self._admit_sources_strictly_before(decision_at, excluding=batch_ids)
@@ -144,6 +145,10 @@ class CausalFeatureState:
             "admitted_event_ids": sorted(self._admitted_ids),
             "emitted_decision_ids": sorted(self._emitted_decision_ids),
             "late_event_ids": sorted(self._late_event_ids),
+            "late_event_watermarks": {
+                event_id: _timestamp(watermark)
+                for event_id, watermark in sorted(self._late_event_watermarks.items())
+            },
             "opening_payment_ids": sorted(self._opening_payment_ids),
             "histories": histories,
             "adjacency": adjacency,
@@ -187,10 +192,13 @@ class CausalFeatureState:
             admitted = set(_string_list(document, "admitted_event_ids"))
             emitted = set(_string_list(document, "emitted_decision_ids"))
             late = set(_string_list(document, "late_event_ids"))
+            late_watermarks = _timestamp_mapping(document, "late_event_watermarks")
             if not admitted <= state._known.keys() or not emitted <= state._known.keys():
                 raise ValueError("checkpoint references an unknown event")
             if not late <= state._known.keys():
                 raise ValueError("checkpoint late state references an unknown event")
+            if late != late_watermarks.keys():
+                raise ValueError("checkpoint late state has inconsistent provenance")
             for event in sorted(
                 (state._known[event_id] for event_id in admitted),
                 key=lambda item: (item.available_at, item.event_id),
@@ -198,6 +206,7 @@ class CausalFeatureState:
                 state._admit_event(event)
             state._emitted_decision_ids = emitted
             state._late_event_ids = late
+            state._late_event_watermarks = late_watermarks
             raw_watermark = document.get("watermark")
             if raw_watermark is not None and type(raw_watermark) is not str:
                 raise ValueError("invalid watermark")
@@ -219,6 +228,11 @@ class CausalFeatureState:
             )
             if state._watermark != expected_watermark:
                 raise ValueError("watermark does not match emitted decisions")
+            known_decision_ids = {
+                event.event_id for event in known_events if event.is_decision_point
+            }
+            if emitted != known_decision_ids:
+                raise ValueError("emitted state does not match known decisions")
             if state._watermark is None and admitted:
                 raise ValueError("admitted state requires a decision watermark")
             if state._watermark is not None and any(
@@ -226,6 +240,14 @@ class CausalFeatureState:
                 for event_id in admitted
             ):
                 raise ValueError("admitted state violates strict knowledge time")
+            if state._watermark is None and late:
+                raise ValueError("late state requires a decision watermark")
+            if state._watermark is not None and any(
+                state._known[event_id].available_at >= late_watermark
+                or late_watermark > state._watermark
+                for event_id, late_watermark in late_watermarks.items()
+            ):
+                raise ValueError("late state has impossible arrival timing")
         except (KeyError, TypeError, ValueError) as error:
             raise FeatureStateError(f"checkpoint state is invalid: {error}") from error
 
@@ -238,16 +260,28 @@ class CausalFeatureState:
         return state
 
     def _remember(self, events: Sequence[ObservedEvent]) -> None:
+        staged: dict[str, ObservedEvent] = {}
         for event in events:
             if type(event) is not ObservedEvent:
                 raise TypeError("events must contain exact ObservedEvent instances")
-            previous = self._known.get(event.event_id)
+            previous = self._known.get(event.event_id, staged.get(event.event_id))
             if previous is not None:
                 if previous != event:
                     raise FeatureStateError("duplicate event ID has conflicting observations")
                 continue
+            if event.is_decision_point and event.decision_at is None:
+                raise FeatureStateError("decision-point event must declare decision_at")
+            if (
+                event.is_decision_point
+                and self._watermark is not None
+                and cast(datetime, event.decision_at) <= self._watermark
+            ):
+                raise FeatureStateError("decision belongs to a closed decision timestamp")
+            staged[event.event_id] = event
+        for event in staged.values():
             if self._watermark is not None and event.available_at < self._watermark:
                 self._late_event_ids.add(event.event_id)
+                self._late_event_watermarks[event.event_id] = self._watermark
             self._known[event.event_id] = event
 
     def _admit_sources_strictly_before(
@@ -738,3 +772,17 @@ def _string_keyed_list(
     if type(value) is not list or (require_dicts and any(type(item) is not dict for item in value)):
         raise ValueError(f"{key} must be an object list")
     return tuple(cast(list[dict[str, object]], value))
+
+
+def _timestamp_mapping(document: Mapping[str, object], key: str) -> dict[str, datetime]:
+    value = document[key]
+    if type(value) is not dict or any(
+        type(item_key) is not str or type(item_value) is not str
+        for item_key, item_value in value.items()
+    ):
+        raise ValueError(f"{key} must map event IDs to timestamps")
+    raw = cast(dict[str, str], value)
+    return {
+        event_id: validate_utc_timestamp(datetime.fromisoformat(timestamp))
+        for event_id, timestamp in raw.items()
+    }

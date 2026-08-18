@@ -108,3 +108,95 @@ def observed_stream() -> tuple[ObservedEvent, ...]:
         observation(11, seconds=180, amount="60", counterparty="counterparty-e", payment=7),
         observation(12, seconds=210, actor="actor-d", amount="70", payment=8),
     )
+
+
+@pytest.fixture
+def feature_family_scenario() -> tuple[
+    tuple[ObservedEvent, ...], ObservedEvent, ObservedEvent
+]:
+    """History, late observation, and target with hand-computable feature families."""
+    history = (
+        observation(
+            101,
+            seconds=21_400,
+            actor="actor-a",
+            counterparty="node-n",
+            amount="10",
+            payment=101,
+        ),
+        observation(
+            102,
+            seconds=21_420,
+            actor="node-n",
+            counterparty="counterparty-x",
+            amount="20",
+            payment=102,
+        ),
+        observation(
+            103,
+            seconds=21_440,
+            actor="actor-a",
+            counterparty="counterparty-x",
+            amount="30",
+            event_type=EventKind.AUTHORIZATION_DECLINED,
+            payment=103,
+        ),
+        observation(
+            104,
+            seconds=21_450,
+            actor="actor-a",
+            counterparty="counterparty-x",
+            amount="30",
+            event_type=EventKind.TRANSFER_RETURNED,
+            decision=False,
+            payment=103,
+        ),
+        observation(
+            105,
+            seconds=21_460,
+            actor="actor-b",
+            counterparty="counterparty-x",
+            amount="40",
+            payment=105,
+        ),
+        observation(
+            106,
+            seconds=21_470,
+            actor="actor-b",
+            counterparty="counterparty-x",
+            amount="40",
+            event_type=EventKind.REFUND,
+            decision=False,
+            payment=105,
+        ),
+        observation(
+            107,
+            seconds=21_500,
+            actor="actor-a",
+            counterparty="counterparty-y",
+            amount="50",
+            payment=107,
+        ),
+    )
+    late = observation(
+        108,
+        seconds=21_480,
+        actor="actor-a",
+        counterparty="counterparty-x",
+        amount="30",
+        event_type=EventKind.AUTHENTICATION_CHALLENGE,
+        decision=False,
+        payment=103,
+    )
+    target = observation(
+        109,
+        seconds=21_600,
+        actor="actor-a",
+        counterparty="counterparty-x",
+        amount="70",
+        rail=Rail.AGENTIC,
+        integrity_status="pass",
+        optional_refs={"agent_id": "agent-1", "device_id": "device-1"},
+        payment=109,
+    )
+    return history, late, target
