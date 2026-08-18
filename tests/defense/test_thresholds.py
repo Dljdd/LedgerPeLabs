@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import time
 from collections.abc import Callable
 
@@ -72,6 +73,7 @@ def test_hand_oracle_exhaustive_candidate_count_inclusivity_and_tie_break() -> N
     assert report.thresholds.challenge == 0.8
     assert report.objective_value == 1.0
     assert report.false_intervention_count == 0
+    assert report.intervention_count == 2
     assert report.calibration_false_decline_rate == 0.0
     assert report.calibration_challenge_rate == 0.25
 
@@ -531,6 +533,88 @@ def test_rechecksummed_infeasible_report_rejects_claimed_realized_state() -> Non
         ThresholdReport.from_json(_rechecksum_threshold_document(document))
 
 
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            {"candidate_threshold_count": 2, "candidate_count": 3},
+            "candidate_threshold_count",
+        ),
+        (
+            {
+                "candidate_threshold_count": 4099,
+                "candidate_count": 4099 * 4100 // 2,
+            },
+            "candidate_threshold_count",
+        ),
+        (
+            {
+                "candidate_threshold_count": 100_000,
+                "candidate_count": 100_000 * 100_001 // 2,
+            },
+            "candidate_threshold_count",
+        ),
+        (
+            {"review_case_count": 1, "calibration_review_case_rate": 0.0},
+            "review-case rate",
+        ),
+        (
+            {
+                "false_intervention_count": 0,
+                "calibration_false_decline_rate": 1.0,
+            },
+            "false-decline count",
+        ),
+        ({"objective_value": 0.5}, "fraud-recall count"),
+    ],
+)
+def test_rechecksummed_report_rejects_impossible_counts_and_candidate_space(
+    mutation: dict[str, object], message: str
+) -> None:
+    report = select_policy_thresholds(
+        np.array([0.2, 0.8], dtype=np.float64),
+        np.array([0, 1], dtype=np.int8),
+        _actions(Action.APPROVE, Action.APPROVE),
+        _zero_cases,
+        OperatingBudget(
+            false_decline_rate_max=1.0,
+            challenge_rate_max=1.0,
+            review_case_rate_max=1.0,
+        ),
+    )
+    document = json.loads(report.to_json())
+    document.update(mutation)
+    with pytest.raises((ThresholdContractError, ValidationError), match=message):
+        ThresholdReport.from_json(_rechecksum_threshold_document(document))
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ({"objective_value": 2e-12}, "fraud-recall count"),
+        ({"minimum_challenge_rate": 1e-6}, "minimum challenge rate"),
+    ],
+)
+def test_rate_count_integrality_tolerance_rejects_material_near_integers(
+    mutation: dict[str, object], message: str
+) -> None:
+    report = select_policy_thresholds(
+        np.array([0.2, 0.8], dtype=np.float64),
+        np.array([0, 1], dtype=np.int8),
+        _actions(Action.APPROVE, Action.APPROVE),
+        _zero_cases,
+        OperatingBudget(
+            false_decline_rate_max=1.0,
+            challenge_rate_max=1.0,
+            review_case_rate_max=1.0,
+        ),
+    )
+    document = json.loads(report.to_json())
+    document.update(mutation)
+    with pytest.raises((ThresholdContractError, ValidationError), match=message):
+        ThresholdReport.from_json(_rechecksum_threshold_document(document))
+
+
 def _brute_force_thresholds(
     raw_scores: np.ndarray,
     labels: np.ndarray,
@@ -577,7 +661,7 @@ def _brute_force_thresholds(
                 ]
             )
             objective = (
-                float(values[intervened_fraud].sum())
+                math.fsum(float(value) for value in values[intervened_fraud])
                 if values is not None
                 else float(intervened_fraud.sum() / fraud.sum())
             )
@@ -593,6 +677,64 @@ def _brute_force_thresholds(
         selected[3],
         len(candidates) * (len(candidates) + 1) // 2,
     )
+
+
+def test_value_objective_matches_literal_exhaustive_adversarial_fixture() -> None:
+    scores = np.array([0.3, 0.5, 0.4, 0.5], dtype=np.float64)
+    labels = np.array([0, 1, 1, 1], dtype=np.int8)
+    values = np.array([0.1, 1.0, 0.2, 1e16], dtype=np.float64)
+    mandatory = _actions(*([Action.APPROVE] * 4))
+    budget = OperatingBudget(
+        challenge_rate_max=0.0,
+        false_decline_rate_max=1.0,
+        review_case_rate_max=1.0,
+    )
+
+    expected = _brute_force_thresholds(scores, labels, mandatory, budget, values)
+    report = select_policy_thresholds(
+        scores, labels, mandatory, _zero_cases, budget, values
+    )
+
+    assert expected[1] == (0.4, 0.4)
+    assert expected[2] == 1.0000000000000002e16
+    assert report.thresholds is not None
+    assert (report.thresholds.challenge, report.thresholds.decline) == expected[1]
+    assert report.objective_value == expected[2]
+
+
+def test_value_objective_matches_brute_force_for_mixed_significands_and_magnitudes() -> None:
+    rng = np.random.default_rng(8260816)
+    score_choices = np.array([0.0, 0.15, 0.35, 0.55, 0.75, 1.0])
+    significands = np.array([0.1, 0.2, 1.0, 1.5, 3.7, 9.9])
+    for _ in range(40):
+        scores = rng.choice(score_choices, size=14).astype(np.float64)
+        labels = rng.integers(0, 2, size=14, dtype=np.int8)
+        labels[0] = 0
+        labels[1] = 1
+        exponents = rng.integers(-12, 17, size=14)
+        values = rng.choice(significands, size=14) * np.power(10.0, exponents)
+        mandatory = _actions(
+            *(
+                Action.DECLINE if value else Action.APPROVE
+                for value in rng.integers(0, 7, size=14) == 0
+            )
+        )
+        budget = OperatingBudget(
+            challenge_rate_max=float(rng.choice([0.0, 0.25, 0.5, 1.0])),
+            false_decline_rate_max=float(rng.choice([0.0, 0.5, 1.0])),
+            review_case_rate_max=1.0,
+        )
+        expected = _brute_force_thresholds(scores, labels, mandatory, budget, values)
+        report = select_policy_thresholds(
+            scores, labels, mandatory, _zero_cases, budget, values
+        )
+        assert report.feasible == expected[0]
+        assert report.candidate_count == expected[4]
+        if report.feasible:
+            assert report.thresholds is not None
+            assert (report.thresholds.challenge, report.thresholds.decline) == expected[1]
+            assert report.objective_value == expected[2]
+            assert report.false_intervention_count == expected[3]
 
 
 def test_optimized_selector_matches_brute_force_randomized_hand_oracle() -> None:

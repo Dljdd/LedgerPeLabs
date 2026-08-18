@@ -21,6 +21,7 @@ _SCORE_MIN = 1e-8
 _SCORE_MAX = 1.0 - 1e-8
 _SHA256_LENGTH = 64
 MAX_UNIQUE_OPERATING_SCORES = 4096
+_COUNT_INTEGRAL_TOLERANCE = 1e-12
 
 
 class ThresholdContractError(ValueError):
@@ -40,9 +41,12 @@ class ThresholdReport(ExternalContract):
     calibration_challenge_rate: float | None = Field(default=None, ge=0.0, le=1.0)
     calibration_review_case_rate: float | None = Field(default=None, ge=0.0, le=1.0)
     false_intervention_count: int | None = Field(default=None, ge=0)
+    intervention_count: int | None = Field(default=None, ge=0)
     review_case_count: int | None = Field(default=None, ge=0)
     candidate_count: int = Field(ge=1)
-    candidate_threshold_count: int = Field(ge=2)
+    candidate_threshold_count: int = Field(
+        ge=3, le=MAX_UNIQUE_OPERATING_SCORES + 2
+    )
     feasible_candidate_count: int = Field(ge=0)
     row_count: int = Field(ge=1)
     legitimate_count: int = Field(ge=1)
@@ -105,6 +109,7 @@ class ThresholdReport(ExternalContract):
             self.calibration_challenge_rate,
             self.calibration_review_case_rate,
             self.false_intervention_count,
+            self.intervention_count,
             self.review_case_count,
         )
         if self.feasible:
@@ -147,6 +152,21 @@ class ThresholdReport(ExternalContract):
             raise ValueError("feasible candidate count exceeds exhaustive candidate count")
         if self.legitimate_count + self.fraud_count != self.row_count:
             raise ValueError("threshold report class counts must sum to row count")
+        _integral_count(
+            self.minimum_false_decline_rate,
+            self.legitimate_count,
+            label="minimum false-decline rate",
+        )
+        _integral_count(
+            self.minimum_challenge_rate,
+            self.row_count,
+            label="minimum challenge rate",
+        )
+        _integral_count(
+            self.minimum_review_case_rate,
+            self.row_count,
+            label="minimum review-case rate",
+        )
         if (
             self.false_intervention_count is not None
             and self.false_intervention_count > self.legitimate_count
@@ -154,13 +174,65 @@ class ThresholdReport(ExternalContract):
             raise ValueError("false intervention count exceeds legitimate rows")
         if self.review_case_count is not None and self.review_case_count > self.row_count:
             raise ValueError("review case count exceeds decision rows")
+        if self.intervention_count is not None and self.intervention_count > self.row_count:
+            raise ValueError("intervention count exceeds decision rows")
+        if self.feasible:
+            assert self.calibration_false_decline_rate is not None
+            assert self.calibration_challenge_rate is not None
+            assert self.calibration_review_case_rate is not None
+            assert self.false_intervention_count is not None
+            assert self.intervention_count is not None
+            assert self.review_case_count is not None
+            false_decline_count = _integral_count(
+                self.calibration_false_decline_rate,
+                self.legitimate_count,
+                label="false-decline rate",
+            )
+            challenge_count = _integral_count(
+                self.calibration_challenge_rate,
+                self.row_count,
+                label="challenge rate",
+            )
+            review_count = _integral_count(
+                self.calibration_review_case_rate,
+                self.row_count,
+                label="review-case rate",
+            )
+            if review_count != self.review_case_count:
+                raise ValueError("review-case rate does not match review_case_count")
+            if false_decline_count > self.false_intervention_count:
+                raise ValueError("false-decline count exceeds false interventions")
+            if self.false_intervention_count > self.intervention_count:
+                raise ValueError("false interventions exceed total interventions")
+            if challenge_count > self.intervention_count:
+                raise ValueError("challenge count exceeds total interventions")
+            if review_count > self.intervention_count:
+                raise ValueError("review-case count exceeds total interventions")
         if self.objective_kind == "fraud_recall":
             if self.input_values_digest is not None:
                 raise ValueError("recall objective cannot bind a values digest")
             if self.objective_value is not None and self.objective_value > 1.0:
                 raise ValueError("recall objective must be in [0, 1]")
+            if self.objective_value is not None:
+                fraud_intervention_count = _integral_count(
+                    self.objective_value,
+                    self.fraud_count,
+                    label="fraud-recall count",
+                )
+                assert self.false_intervention_count is not None
+                assert self.intervention_count is not None
+                if (
+                    self.false_intervention_count + fraud_intervention_count
+                    != self.intervention_count
+                ):
+                    raise ValueError(
+                        "fraud-recall count and false interventions must sum to interventions"
+                    )
         elif self.input_values_digest is None:
             raise ValueError("fraud-value objective requires a values digest")
+        elif self.intervention_count is not None and self.false_intervention_count is not None:
+            if self.intervention_count - self.false_intervention_count > self.fraud_count:
+                raise ValueError("fraud interventions exceed fraud rows")
         if self.report_digest != _report_digest(self):
             raise ValueError("threshold report digest is inconsistent")
         return self
@@ -231,12 +303,10 @@ def select_policy_thresholds(
         nonmandatory_ge,
         legitimate_nonmandatory_ge,
         fraud_nonmandatory_ge,
-        fraud_value_nonmandatory_ge,
         mandatory_legitimate_count,
         mandatory_fraud_count,
-        mandatory_fraud_value,
     ) = _cumulative_statistics(
-        score_values, label_values, action_values, value_values, candidates
+        score_values, label_values, action_values, candidates
     )
     false_decline_rates = tuple(
         (mandatory_legitimate_count + legitimate_nonmandatory_ge[index])
@@ -262,6 +332,7 @@ def select_policy_thresholds(
         float,
         float,
         float,
+        int,
         int,
         int,
     ] | None = None
@@ -298,12 +369,18 @@ def select_policy_thresholds(
             mandatory_legitimate_count
             + legitimate_nonmandatory_ge[challenge_index]
         )
+        intervention_count = (
+            false_interventions
+            + mandatory_fraud_count
+            + fraud_nonmandatory_ge[challenge_index]
+        )
         objective = (
-            math.fsum(
-                (
-                    mandatory_fraud_value,
-                    fraud_value_nonmandatory_ge[challenge_index],
-                )
+            _captured_fraud_value(
+                score_values,
+                label_values,
+                action_values,
+                value_values,
+                challenge,
             )
             if value_values is not None
             else (
@@ -323,6 +400,7 @@ def select_policy_thresholds(
             challenge_rate,
             review_rate,
             false_interventions,
+            intervention_count,
             review_cases,
         )
         if selected is None or ranking > selected[0]:
@@ -359,6 +437,7 @@ def select_policy_thresholds(
                 "calibration_challenge_rate": None,
                 "calibration_review_case_rate": None,
                 "false_intervention_count": None,
+                "intervention_count": None,
                 "review_case_count": None,
                 "reason": "no_candidate_satisfies_operating_budget",
                 "selected_actions_digest": None,
@@ -373,6 +452,7 @@ def select_policy_thresholds(
             challenge_rate,
             review_rate,
             false_interventions,
+            intervention_count,
             review_cases,
         ) = selected
         thresholds = PolicyThresholds(challenge=challenge, decline=decline)
@@ -388,6 +468,7 @@ def select_policy_thresholds(
                 "calibration_challenge_rate": challenge_rate,
                 "calibration_review_case_rate": review_rate,
                 "false_intervention_count": false_interventions,
+                "intervention_count": intervention_count,
                 "review_case_count": review_cases,
                 "reason": "selected",
                 "selected_actions_digest": _actions_digest(selected_actions),
@@ -484,77 +565,69 @@ def _cumulative_statistics(
     scores: NDArray[np.float64],
     labels: NDArray[np.int64],
     mandatory: NDArray[np.object_],
-    values: NDArray[np.float64] | None,
     candidates: tuple[float, ...],
 ) -> tuple[
     tuple[int, ...],
     tuple[int, ...],
     tuple[int, ...],
-    tuple[float, ...],
     int,
     int,
-    float,
 ]:
     group_nonmandatory: dict[float, int] = {}
     group_legitimate: dict[float, int] = {}
     group_fraud: dict[float, int] = {}
-    group_fraud_values: dict[float, list[float]] = {}
     mandatory_legitimate = 0
     mandatory_fraud = 0
-    mandatory_fraud_values: list[float] = []
-    for index, (score, label, action) in enumerate(
-        zip(scores, labels, mandatory, strict=True)
-    ):
+    for score, label, action in zip(scores, labels, mandatory, strict=True):
         numeric_score = float(score)
         if action is Action.DECLINE:
             if label == 0:
                 mandatory_legitimate += 1
             else:
                 mandatory_fraud += 1
-                if values is not None:
-                    mandatory_fraud_values.append(float(values[index]))
             continue
         group_nonmandatory[numeric_score] = group_nonmandatory.get(numeric_score, 0) + 1
         if label == 0:
             group_legitimate[numeric_score] = group_legitimate.get(numeric_score, 0) + 1
         else:
             group_fraud[numeric_score] = group_fraud.get(numeric_score, 0) + 1
-            if values is not None:
-                group_fraud_values.setdefault(numeric_score, []).append(
-                    float(values[index])
-                )
 
     nonmandatory_ge = [0] * len(candidates)
     legitimate_ge = [0] * len(candidates)
     fraud_ge = [0] * len(candidates)
-    fraud_values_ge = [0.0] * len(candidates)
     running_nonmandatory = 0
     running_legitimate = 0
     running_fraud = 0
-    running_fraud_value = 0.0
     for index in range(len(candidates) - 1, -1, -1):
         threshold = candidates[index]
         running_nonmandatory += group_nonmandatory.get(threshold, 0)
         running_legitimate += group_legitimate.get(threshold, 0)
         running_fraud += group_fraud.get(threshold, 0)
-        running_fraud_value = math.fsum(
-            (
-                running_fraud_value,
-                math.fsum(group_fraud_values.get(threshold, ())),
-            )
-        )
         nonmandatory_ge[index] = running_nonmandatory
         legitimate_ge[index] = running_legitimate
         fraud_ge[index] = running_fraud
-        fraud_values_ge[index] = running_fraud_value
     return (
         tuple(nonmandatory_ge),
         tuple(legitimate_ge),
         tuple(fraud_ge),
-        tuple(fraud_values_ge),
         mandatory_legitimate,
         mandatory_fraud,
-        math.fsum(mandatory_fraud_values),
+    )
+
+
+def _captured_fraud_value(
+    scores: NDArray[np.float64],
+    labels: NDArray[np.int64],
+    mandatory: NDArray[np.object_],
+    values: NDArray[np.float64],
+    challenge: float,
+) -> float:
+    return math.fsum(
+        float(value)
+        for score, label, action, value in zip(
+            scores, labels, mandatory, values, strict=True
+        )
+        if label == 1 and (action is Action.DECLINE or score >= challenge)
     )
 
 
@@ -655,6 +728,22 @@ def _is_real_numeric_dtype(dtype: np.dtype[np.generic]) -> bool:
     return bool(
         np.issubdtype(dtype, np.integer) or np.issubdtype(dtype, np.floating)
     )
+
+
+def _integral_count(rate: float, denominator: int, *, label: str) -> int:
+    """Recover an exact count from a generated count/denominator rate.
+
+    The absolute ``1e-12`` tolerance covers only floating arithmetic noise from
+    rates created by this module; it is intentionally too tight to legitimize
+    materially fractional counts.
+    """
+    scaled = rate * denominator
+    nearest = round(scaled)
+    if abs(scaled - nearest) > _COUNT_INTEGRAL_TOLERANCE:
+        raise ValueError(f"{label} must reconstruct an integer count")
+    if nearest < 0 or nearest > denominator:
+        raise ValueError(f"{label} reconstructs a count outside its denominator")
+    return nearest
 
 
 def _array_digest(array: NDArray[np.generic]) -> str:
