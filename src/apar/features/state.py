@@ -221,10 +221,11 @@ class CausalFeatureState:
                 for event in emitted_events
             ):
                 raise ValueError("emitted state references a non-decision event")
+            emitted_decision_times = {
+                cast(datetime, event.decision_at) for event in emitted_events
+            }
             expected_watermark = (
-                max(cast(datetime, event.decision_at) for event in emitted_events)
-                if emitted_events
-                else None
+                max(emitted_decision_times) if emitted_decision_times else None
             )
             if state._watermark != expected_watermark:
                 raise ValueError("watermark does not match emitted decisions")
@@ -245,6 +246,7 @@ class CausalFeatureState:
             if state._watermark is not None and any(
                 state._known[event_id].available_at >= late_watermark
                 or late_watermark > state._watermark
+                or late_watermark not in emitted_decision_times
                 for event_id, late_watermark in late_watermarks.items()
             ):
                 raise ValueError("late state has impossible arrival timing")

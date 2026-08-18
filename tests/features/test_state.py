@@ -214,6 +214,28 @@ def test_checkpoint_rejects_impossible_late_timing_with_valid_self_digest(
         CausalFeatureState.restore(_checkpoint_bytes(document), feature_catalog)
 
 
+def test_checkpoint_rejects_late_watermark_between_emitted_decisions(
+    feature_catalog: FeatureCatalog,
+) -> None:
+    """Catches accepting an arrival watermark that no represented decision established."""
+    first = observation(1, seconds=30)
+    late = observation(2, seconds=20, decision=False)
+    second = observation(3, seconds=60)
+    state = CausalFeatureState(feature_catalog)
+    state.process((first,))
+    state.process((late, second))
+    document = json.loads(state.checkpoint())
+    assert document["late_event_watermarks"] == {
+        late.event_id: first.decision_at.isoformat()
+    }
+    document["late_event_watermarks"] = {
+        late.event_id: (BASE_TIME + timedelta(seconds=45)).isoformat()
+    }
+
+    with pytest.raises(FeatureStateError, match="checkpoint state"):
+        CausalFeatureState.restore(_checkpoint_bytes(document), feature_catalog)
+
+
 def test_checkpoint_rejects_missing_emitted_decision_with_valid_self_digest(
     feature_catalog: FeatureCatalog,
 ) -> None:
