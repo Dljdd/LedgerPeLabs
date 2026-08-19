@@ -143,113 +143,25 @@ def _hidden_imports(tree: ast.AST) -> tuple[tuple[int, str], ...]:
                 continue
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             for assignment_target in targets:
-                if not isinstance(assignment_target, (ast.Name, ast.Attribute)):
-                    continue
-                alias_name = _call_name(assignment_target)
-                source_name = _call_name(node.value)
-                if (
-                    isinstance(node.value, ast.Subscript)
-                    and alias_name
-                    and alias_name not in subscript_callable_names
-                ):
-                    subscript_callable_names.add(alias_name)
-                    changed = True
-                if (
-                    alias_name
-                    and isinstance(node.value, ast.Attribute)
-                    and node.value.attr in retrieval_methods
-                    and alias_name not in retrieval_accessor_names
-                ):
-                    retrieval_accessor_names.add(alias_name)
-                    changed = True
-                if (
-                    alias_name
-                    and isinstance(node.value, ast.Call)
-                    and (
-                        _call_name(node.value.func) in retrieval_accessor_names
-                        or (
-                            isinstance(node.value.func, ast.Attribute)
-                            and node.value.func.attr in retrieval_methods
-                        )
-                        or (
-                            _call_name(node.value.func) in reflection_names
-                            and not _is_allowed_feature_dispatch(node.value)
-                        )
-                        or isinstance(node.value.func, (ast.Call, ast.Subscript))
+                for target_leaf in _assignment_target_leaves(assignment_target):
+                    alias_name = _call_name(target_leaf)
+                    source_name = _call_name(node.value)
+                    changed |= _propagate_assignment_provenance(
+                        alias_name=alias_name,
+                        source_name=source_name,
+                        value=node.value,
+                        importlib_names=importlib_names,
+                        builtins_names=builtins_names,
+                        dynamic_import_names=dynamic_import_names,
+                        reflection_names=reflection_names,
+                        code_execution_names=code_execution_names,
+                        namespace_reflection_names=namespace_reflection_names,
+                        import_mapping_names=import_mapping_names,
+                        subscript_callable_names=subscript_callable_names,
+                        retrieval_accessor_names=retrieval_accessor_names,
+                        dynamic_callable_names=dynamic_callable_names,
+                        retrieval_methods=retrieval_methods,
                     )
-                    and alias_name not in dynamic_callable_names
-                ):
-                    dynamic_callable_names.add(alias_name)
-                    changed = True
-                if (
-                    alias_name
-                    and source_name in retrieval_accessor_names
-                    and alias_name not in retrieval_accessor_names
-                ):
-                    retrieval_accessor_names.add(alias_name)
-                    changed = True
-                if (
-                    alias_name
-                    and source_name in dynamic_callable_names
-                    and alias_name not in dynamic_callable_names
-                ):
-                    dynamic_callable_names.add(alias_name)
-                    changed = True
-                if (
-                    isinstance(node.value, ast.Attribute)
-                    and node.value.attr == "__dict__"
-                    and _call_name(node.value.value)
-                    in importlib_names | builtins_names
-                    and alias_name
-                    and alias_name not in import_mapping_names
-                ):
-                    import_mapping_names.add(alias_name)
-                    changed = True
-                if (
-                    isinstance(node.value, ast.Subscript)
-                    and _call_name(node.value.value) in import_mapping_names
-                    and alias_name
-                    and alias_name not in dynamic_import_names
-                ):
-                    dynamic_import_names.add(alias_name)
-                    changed = True
-                if source_name in importlib_names and alias_name not in importlib_names:
-                    importlib_names.add(alias_name)
-                    dynamic_import_names.add(f"{alias_name}.import_module")
-                    changed = True
-                if source_name in builtins_names and alias_name not in builtins_names:
-                    builtins_names.add(alias_name)
-                    dynamic_import_names.add(f"{alias_name}.__import__")
-                    changed = True
-                if alias_name and (
-                    source_name in dynamic_import_names
-                    or _is_getattr_import(
-                        node.value, importlib_names, builtins_names, reflection_names
-                    )
-                ) and alias_name not in dynamic_import_names:
-                    dynamic_import_names.add(alias_name)
-                    changed = True
-                if (
-                    alias_name
-                    and source_name in reflection_names
-                    and alias_name not in reflection_names
-                ):
-                    reflection_names.add(alias_name)
-                    changed = True
-                if (
-                    alias_name
-                    and source_name in code_execution_names
-                    and alias_name not in code_execution_names
-                ):
-                    code_execution_names.add(alias_name)
-                    changed = True
-                if (
-                    alias_name
-                    and source_name in namespace_reflection_names
-                    and alias_name not in namespace_reflection_names
-                ):
-                    namespace_reflection_names.add(alias_name)
-                    changed = True
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -326,6 +238,98 @@ def _hidden_imports(tree: ast.AST) -> tuple[tuple[int, str], ...]:
         ):
             found.append((node.lineno, "<import-mapping-reflection>"))
     return tuple(sorted(set(found)))
+
+
+def _assignment_target_leaves(target: ast.expr) -> tuple[ast.expr, ...]:
+    """Return every bound name/attribute in arbitrarily nested unpacking."""
+    if isinstance(target, (ast.Name, ast.Attribute)):
+        return (target,)
+    if isinstance(target, ast.Starred):
+        return _assignment_target_leaves(target.value)
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return tuple(
+            leaf
+            for element in target.elts
+            for leaf in _assignment_target_leaves(element)
+        )
+    return ()
+
+
+def _propagate_assignment_provenance(
+    *,
+    alias_name: str,
+    source_name: str,
+    value: ast.expr,
+    importlib_names: set[str],
+    builtins_names: set[str],
+    dynamic_import_names: set[str],
+    reflection_names: set[str],
+    code_execution_names: set[str],
+    namespace_reflection_names: set[str],
+    import_mapping_names: set[str],
+    subscript_callable_names: set[str],
+    retrieval_accessor_names: set[str],
+    dynamic_callable_names: set[str],
+    retrieval_methods: set[str],
+) -> bool:
+    """Conservatively propagate executable provenance to one assignment leaf."""
+    changed = False
+
+    def add(target: set[str], name: str) -> None:
+        nonlocal changed
+        if name and name not in target:
+            target.add(name)
+            changed = True
+
+    if isinstance(value, ast.Subscript):
+        add(subscript_callable_names, alias_name)
+    if isinstance(value, ast.Attribute) and value.attr in retrieval_methods:
+        add(retrieval_accessor_names, alias_name)
+    if isinstance(value, ast.Call) and (
+        _call_name(value.func) in retrieval_accessor_names
+        or (
+            isinstance(value.func, ast.Attribute)
+            and value.func.attr in retrieval_methods
+        )
+        or (
+            _call_name(value.func) in reflection_names
+            and not _is_allowed_feature_dispatch(value)
+        )
+        or isinstance(value.func, (ast.Call, ast.Subscript))
+    ):
+        add(dynamic_callable_names, alias_name)
+    if source_name in retrieval_accessor_names:
+        add(retrieval_accessor_names, alias_name)
+    if source_name in dynamic_callable_names:
+        add(dynamic_callable_names, alias_name)
+    if (
+        isinstance(value, ast.Attribute)
+        and value.attr == "__dict__"
+        and _call_name(value.value) in importlib_names | builtins_names
+    ):
+        add(import_mapping_names, alias_name)
+    if (
+        isinstance(value, ast.Subscript)
+        and _call_name(value.value) in import_mapping_names
+    ):
+        add(dynamic_import_names, alias_name)
+    if source_name in importlib_names:
+        add(importlib_names, alias_name)
+        add(dynamic_import_names, f"{alias_name}.import_module" if alias_name else "")
+    if source_name in builtins_names:
+        add(builtins_names, alias_name)
+        add(dynamic_import_names, f"{alias_name}.__import__" if alias_name else "")
+    if source_name in dynamic_import_names or _is_getattr_import(
+        value, importlib_names, builtins_names, reflection_names
+    ):
+        add(dynamic_import_names, alias_name)
+    if source_name in reflection_names:
+        add(reflection_names, alias_name)
+    if source_name in code_execution_names:
+        add(code_execution_names, alias_name)
+    if source_name in namespace_reflection_names:
+        add(namespace_reflection_names, alias_name)
+    return changed
 
 
 def _dangerous_mapping_key(node: ast.expr) -> bool:

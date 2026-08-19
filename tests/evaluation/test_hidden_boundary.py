@@ -266,6 +266,14 @@ def test_defense_and_features_cannot_import_hidden_package(tmp_path: Path) -> No
         "    retrieve = getattr(mapping, 'get')\n"
         "    retrieve(key)('apar.evaluation_hidden.mapping_chain')\n"
     )
+    (apar_root / "defense" / "mapping_destructure.py").write_text(
+        "def invoke(mapping):\n"
+        "    (loader,) = mapping.values()\n"
+        "    loader('apar.evaluation_hidden.mapping_destructure')\n"
+        "def invoke_nested(mapping):\n"
+        "    [first, *rest] = mapping.values()\n"
+        "    first('apar.evaluation_hidden.mapping_nested')\n"
+    )
 
     result = audit_hidden_import_boundary(apar_root)
 
@@ -282,6 +290,7 @@ def test_defense_and_features_cannot_import_hidden_package(tmp_path: Path) -> No
     assert any("mapping_method_callable.py" in item for item in result.violations)
     assert any("mapping_method_alias.py" in item for item in result.violations)
     assert any("mapping_getattr_chain.py" in item for item in result.violations)
+    assert any("mapping_destructure.py" in item for item in result.violations)
 
 
 def test_hidden_authority_methods_are_bound_to_the_exact_instance(
