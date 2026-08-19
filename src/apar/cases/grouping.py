@@ -4,16 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 import numpy as np
 from numpy.typing import NDArray
-from pydantic import Field, ValidationError, field_validator, model_validator
+from pydantic import Field, PrivateAttr, ValidationError, field_validator, model_validator
 
 from apar.contracts._validation import ExternalContract, validate_utc_timestamp
 from apar.contracts.decisions import Action
@@ -28,6 +28,8 @@ _ESTIMATED_MINUTES = 20
 _VALUE_SCALE = 1_000.0
 _MAX_GROUPING_ROWS = 100_000
 _MAX_IDENTIFIER_LENGTH = 4_096
+_MAX_COUNTER_ROWS = 4_096
+_MAX_MASK_CACHE_ENTRIES = 8_192
 
 
 class CaseContractError(ValueError):
@@ -95,8 +97,7 @@ class CaseAlertEvidence(ExternalContract):
     @classmethod
     def sources_are_canonical(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         if (
-            not value
-            or any(
+            any(
                 type(item) is not str
                 or not item
                 or len(item) > _MAX_IDENTIFIER_LENGTH
@@ -109,8 +110,6 @@ class CaseAlertEvidence(ExternalContract):
 
     @model_validator(mode="after")
     def chronology_and_binding_are_causal(self) -> CaseAlertEvidence:
-        if self.event_id not in self.evidence_source_ids:
-            raise ValueError("case evidence must bind its alert event")
         if (
             self.latest_graph_evidence_at is not None
             and self.latest_graph_evidence_at >= self.decision_at
@@ -236,16 +235,50 @@ class _CaseState:
     alert_evidence: list[CaseAlertEvidence]
 
 
+@dataclass(frozen=True, slots=True)
+class _CaseView:
+    case_id: str
+    opened_at: datetime
+    actor_ids: frozenset[str]
+    counterparty_ids: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class _AlertPlan:
+    event_id: str
+    roots: frozenset[str]
+    selected_root: str | None
+    matching_case_ids: tuple[str, ...]
+    evidence: CaseAlertEvidence
+    priority: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class _CountRow:
+    actor_node: str
+    counterparty_node: str
+
+
+@dataclass(frozen=True, slots=True)
+class _CountTopology:
+    rows: tuple[_CountRow, ...]
+    batches: tuple[tuple[int, ...], ...]
+
+
 class ReviewCaseCounter(ExternalContract):
     """Frozen adapter from candidate action vectors to causal review-case counts."""
 
     observations: tuple[ObservedEvent, ...]
     decisions: tuple[DefenseDecision, ...]
     as_of: datetime
+    _topology: _CountTopology = PrivateAttr()
+    _mask_cache: dict[bytes, int] = PrivateAttr(default_factory=dict)
 
     @field_validator("observations", mode="before")
     @classmethod
     def observations_are_exact(cls, value: object) -> object:
+        if type(value) is tuple and len(value) > _MAX_COUNTER_ROWS:
+            raise ValueError("review-case counter exceeds the frozen 4096-row cap")
         if type(value) is not tuple or any(
             type(row) is not ObservedEvent for row in cast(tuple[object, ...], value)
         ):
@@ -289,7 +322,14 @@ class ReviewCaseCounter(ExternalContract):
             row.event_id for row in self.observations
         ):
             raise ValueError("review-case decisions must align with canonical observations")
+        if len(self.observations) > _MAX_COUNTER_ROWS:
+            raise ValueError("review-case counter exceeds the frozen 4096-row cap")
         return self
+
+    def model_post_init(self, __context: Any) -> None:
+        """Precompute truth-blind causal topology once at binding time."""
+        del __context
+        self._topology = _build_count_topology(self.observations)
 
     def __call__(self, actions: NDArray[np.object_]) -> int:
         """Count grouped interventions without observing labels or action severity."""
@@ -300,18 +340,20 @@ class ReviewCaseCounter(ExternalContract):
                 raise TypeError("actions must be a one-dimensional array with dtype object")
             if len(actions) != len(self.decisions):
                 raise ValueError("action vector length must equal bound decision rows")
-            candidate_actions: list[Action] = []
+            intervention_mask = bytearray(len(actions))
             for action in actions:
                 if type(action) is not Action:
                     raise TypeError("every action must be an exact Action")
-                candidate_actions.append(action)
-            return len(
-                _group_validated(
-                    self.observations,
-                    self.decisions,
-                    actions=tuple(candidate_actions),
-                )
-            )
+            for index, action in enumerate(actions):
+                intervention_mask[index] = int(action is not Action.APPROVE)
+            cache_key = bytes(intervention_mask)
+            cached = self._mask_cache.get(cache_key)
+            if cached is not None:
+                return cached
+            result = _count_intervention_cases(self._topology, cache_key)
+            if len(self._mask_cache) < _MAX_MASK_CACHE_ENTRIES:
+                self._mask_cache[cache_key] = result
+            return result
         except (ArithmeticError, MemoryError, OverflowError) as error:
             raise CaseContractError("case counting exceeded frozen resource bounds") from error
 
@@ -324,6 +366,10 @@ def bind_review_case_counter(
 ) -> ReviewCaseCounter:
     """Bind exact canonical decision rows for threshold selection."""
     try:
+        if type(observations) is tuple and len(observations) > _MAX_COUNTER_ROWS:
+            raise CaseContractError(
+                "review-case counter exceeds the frozen 4096-row cap"
+            )
         observation_rows, decision_rows = _validated_rows(observations, decisions, as_of)
         expected_observations = tuple(
             sorted(
@@ -357,14 +403,18 @@ def group_cases(
 
     The priority frozen when a case first opens is::
 
-        100 * (0.45 * max_score
-             + 0.30 * risk_amount / (risk_amount + 1000)
+        historical_risk_value = score * value visible strictly before the alert
+
+        100 * (0.45 * score
+             + 0.30 * historical_risk_value / (historical_risk_value + 1000)
              + 0.15 * min(max(entity_count - 2, 0) / 8, 1)
              + 0.10 * 1 / (1 + minutes_since_latest_graph_evidence))
 
-    The recency term is zero when there is no prior graph evidence. Later alerts
-    may extend or merge a case, but the canonical first-evidence ID and priority
-    of the earliest case remain unchanged.
+    Current-batch rows are admitted only after every decision at that exact time,
+    so self/peer amounts and edges cannot affect evidence or priority. The recency
+    term is zero when there is no prior graph evidence. Later alerts may extend or
+    merge a case, but the canonical first-evidence ID and priority of the earliest
+    case remain unchanged.
     """
     try:
         observation_rows, decision_rows = _validated_rows(observations, decisions, as_of)
@@ -615,6 +665,10 @@ class _IncrementalGraph:
         for root in self.canonical_roots(roots):
             self._components[root].case_ids = {case_id}
 
+    def attach_case(self, case_id: str, roots: set[str] | frozenset[str]) -> None:
+        for root in self.canonical_roots(roots):
+            self._components[root].case_ids.add(case_id)
+
     def case_ids(self, roots: set[str] | frozenset[str]) -> set[str]:
         result: set[str] = set()
         for root in self.canonical_roots(roots):
@@ -643,9 +697,9 @@ class _IncrementalGraph:
         return max(evidence)[0] if evidence else None
 
     def bounded_source_ids(
-        self, roots: set[str] | frozenset[str], *, event_id: str
+        self, roots: set[str] | frozenset[str]
     ) -> tuple[str, ...]:
-        sources = {event_id}
+        sources: set[str] = set()
         for root in self.canonical_roots(roots):
             component = self._components[root]
             if component.first_event_id is not None:
@@ -653,6 +707,163 @@ class _IncrementalGraph:
             if component.latest_evidence is not None:
                 sources.add(component.latest_evidence[1])
         return tuple(sorted(sources))
+
+
+class _CountGraph:
+    """Minimal causal graph used only for intervention-mask case counts."""
+
+    __slots__ = ("_case_ids", "_parent", "_size")
+
+    def __init__(self) -> None:
+        self._parent: dict[str, str] = {}
+        self._size: dict[str, int] = {}
+        self._case_ids: dict[str, set[int]] = {}
+
+    def _ensure(self, node: str) -> None:
+        if node not in self._parent:
+            self._parent[node] = node
+            self._size[node] = 1
+            self._case_ids[node] = set()
+
+    def find(self, node: str) -> str:
+        self._ensure(node)
+        root = node
+        while self._parent[root] != root:
+            root = self._parent[root]
+        while self._parent[node] != node:
+            parent = self._parent[node]
+            self._parent[node] = root
+            node = parent
+        return root
+
+    def _union(self, left: str, right: str) -> str:
+        left_root = self.find(left)
+        right_root = self.find(right)
+        if left_root == right_root:
+            return left_root
+        left_key = (self._size[left_root], left_root)
+        right_key = (self._size[right_root], right_root)
+        if left_key < right_key:
+            left_root, right_root = right_root, left_root
+        self._parent[right_root] = left_root
+        self._size[left_root] += self._size.pop(right_root)
+        self._case_ids[left_root].update(self._case_ids.pop(right_root))
+        return left_root
+
+    def roots_for(self, row: _CountRow) -> frozenset[str]:
+        return frozenset({self.find(row.actor_node), self.find(row.counterparty_node)})
+
+    def add_row(self, row: _CountRow) -> None:
+        self._union(row.actor_node, row.counterparty_node)
+
+    def cases_for_root(self, root: str) -> set[int]:
+        return set(self._case_ids[self.find(root)])
+
+    def bind_case(self, case_id: int, root: str) -> None:
+        self._case_ids[self.find(root)] = {case_id}
+
+    def attach_case(self, case_id: int, row: _CountRow) -> None:
+        for root in self.roots_for(row):
+            self._case_ids[root].add(case_id)
+
+
+def _build_count_topology(
+    observations: tuple[ObservedEvent, ...],
+) -> _CountTopology:
+    rows = tuple(
+        _CountRow(
+            actor_node=_actor(row.actor_id),
+            counterparty_node=_counterparty(row.counterparty_id),
+        )
+        for row in observations
+    )
+    batches: list[tuple[int, ...]] = []
+    position = 0
+    while position < len(observations):
+        decision_time = observations[position].decision_at
+        end = position + 1
+        while (
+            end < len(observations)
+            and observations[end].decision_at == decision_time
+        ):
+            end += 1
+        batches.append(tuple(range(position, end)))
+        position = end
+    return _CountTopology(rows=rows, batches=tuple(batches))
+
+
+def _count_intervention_cases(topology: _CountTopology, mask: bytes) -> int:
+    if len(mask) != len(topology.rows):
+        raise CaseContractError("intervention mask must align with count topology")
+    graph = _CountGraph()
+    active_cases: set[int] = set()
+    aliases: dict[int, int] = {}
+    next_case_id = 0
+
+    def resolve(case_id: int) -> int:
+        trail: list[int] = []
+        while case_id in aliases:
+            trail.append(case_id)
+            case_id = aliases[case_id]
+        for stale in trail:
+            aliases[stale] = case_id
+        return case_id
+
+    for batch in topology.batches:
+        plans: list[tuple[int, str | None, tuple[int, ...]]] = []
+        for index in batch:
+            if mask[index] == 0:
+                continue
+            roots = graph.roots_for(topology.rows[index])
+            candidates: list[tuple[tuple[int, str], str, tuple[int, ...]]] = []
+            for root in sorted(roots):
+                matching = tuple(
+                    sorted(
+                        {
+                            resolve(case_id)
+                            for case_id in graph.cases_for_root(root)
+                            if resolve(case_id) in active_cases
+                        }
+                    )
+                )
+                if matching:
+                    candidates.append(((matching[0], root), root, matching))
+            if candidates:
+                _, chosen_root, matching = min(candidates, key=lambda item: item[0])
+                plans.append((index, chosen_root, matching))
+            else:
+                plans.append((index, None, ()))
+
+        assignments: dict[int, int] = {}
+        for index, plan_root, matching in plans:
+            active_matching = tuple(
+                sorted(
+                    {
+                        resolve(case_id)
+                        for case_id in matching
+                        if resolve(case_id) in active_cases
+                    }
+                )
+            )
+            if active_matching:
+                anchor = active_matching[0]
+                for merged in active_matching[1:]:
+                    aliases[merged] = anchor
+                    active_cases.remove(merged)
+                assert plan_root is not None
+                graph.bind_case(anchor, plan_root)
+            else:
+                anchor = next_case_id
+                next_case_id += 1
+                active_cases.add(anchor)
+            assignments[index] = anchor
+
+        for index in batch:
+            graph.add_row(topology.rows[index])
+        for index, _, _ in plans:
+            graph.attach_case(resolve(assignments[index]), topology.rows[index])
+
+    return len(active_cases)
 
 
 def _group_validated(
@@ -671,21 +882,13 @@ def _group_validated(
         row.event_id: row.action if actions is None else actions[index]
         for index, row in enumerate(decisions)
     }
-    alerts = tuple(
+    decision_events = tuple(
         sorted(
-            (
-                (cast(datetime, observation_by_id[event_id].decision_at), event_id)
-                for event_id, action in action_by_id.items()
-                if action is not Action.APPROVE
-            )
+            (cast(datetime, observation_by_id[event_id].decision_at), event_id)
+            for event_id in action_by_id
         )
     )
-    if not alerts:
-        return ()
-
     graph = _IncrementalGraph()
-    edges = tuple(sorted(observations, key=lambda row: (row.available_at, row.event_id)))
-    edge_position = 0
     states: dict[str, _CaseState] = {}
     case_aliases: dict[str, str] = {}
 
@@ -699,105 +902,125 @@ def _group_validated(
         return case_id
 
     position = 0
-    while position < len(alerts):
-        decision_time = alerts[position][0]
-        while edge_position < len(edges) and edges[edge_position].available_at < decision_time:
-            graph.add_observation(edges[edge_position])
-            edge_position += 1
+    while position < len(decision_events):
+        decision_time = decision_events[position][0]
         end = position
-        while end < len(alerts) and alerts[end][0] == decision_time:
+        while end < len(decision_events) and decision_events[end][0] == decision_time:
             end += 1
-        batch_ids = tuple(event_id for _, event_id in alerts[position:end])
-        batch_roots = tuple(
-            graph.roots_for(observation_by_id[event_id]) for event_id in batch_ids
-        )
-        for members in _batch_components(batch_roots):
-            member_ids = tuple(sorted(batch_ids[index] for index in members))
-            member_roots: set[str] = set()
-            for index in members:
-                member_roots.update(batch_roots[index])
-            member_roots = set(graph.canonical_roots(member_roots))
-            matching_ids = {
-                resolve_case(case_id) for case_id in graph.case_ids(member_roots)
+        batch_ids = tuple(event_id for _, event_id in decision_events[position:end])
+        prebatch_views = {
+            case_id: _CaseView(
+                case_id=case_id,
+                opened_at=state.opened_at,
+                actor_ids=frozenset(state.actor_ids),
+                counterparty_ids=frozenset(state.counterparty_ids),
+            )
+            for case_id, state in states.items()
+        }
+        plans: list[_AlertPlan] = []
+        for event_id in batch_ids:
+            if action_by_id[event_id] is Action.APPROVE:
+                continue
+            row = observation_by_id[event_id]
+            roots = graph.roots_for(row)
+            selected_root, matching = _select_prebatch_matches(
+                graph,
+                roots,
+                prebatch_views,
+                resolve_case=resolve_case,
+            )
+            visible_value = graph.visible_value(roots)
+            latest_evidence_at = graph.latest_evidence_at(roots)
+            evidence = CaseAlertEvidence(
+                event_id=event_id,
+                decision_at=decision_time,
+                actor_id=row.actor_id,
+                counterparty_id=row.counterparty_id,
+                motif=_motif_for_alert(row, matching),
+                visible_value_before_alert=visible_value,
+                latest_graph_evidence_at=latest_evidence_at,
+                score=decision_by_id[event_id].score,
+                action=action_by_id[event_id],
+                evidence_source_ids=graph.bounded_source_ids(roots),
+            )
+            priority = (
+                None
+                if matching
+                else _priority(
+                    score=decision_by_id[event_id].score,
+                    visible_value_before_alert=visible_value,
+                    entity_count=graph.entity_count(roots),
+                    latest_graph_evidence_at=latest_evidence_at,
+                    decision_time=decision_time,
+                )
+            )
+            plans.append(
+                _AlertPlan(
+                    event_id=event_id,
+                    roots=roots,
+                    selected_root=selected_root,
+                    matching_case_ids=tuple(item.case_id for item in matching),
+                    evidence=evidence,
+                    priority=priority,
+                )
+            )
+
+        assignments: dict[str, str] = {}
+        for plan in plans:
+            row = observation_by_id[plan.event_id]
+            active_matching_ids = {
+                resolve_case(case_id) for case_id in plan.matching_case_ids
             }
-            matching = tuple(
+            matching_states = tuple(
                 sorted(
-                    (states[case_id] for case_id in matching_ids if case_id in states),
+                    (
+                        states[case_id]
+                        for case_id in active_matching_ids
+                        if case_id in states
+                    ),
                     key=lambda state: (state.opened_at, state.case_id),
                 )
             )
-            actor_counts: dict[str, int] = {}
-            counterparty_counts: dict[str, int] = {}
-            for event_id in member_ids:
-                row = observation_by_id[event_id]
-                actor_counts[row.actor_id] = actor_counts.get(row.actor_id, 0) + 1
-                counterparty_counts[row.counterparty_id] = (
-                    counterparty_counts.get(row.counterparty_id, 0) + 1
-                )
-            evidence_rows: list[CaseAlertEvidence] = []
-            for event_id in member_ids:
-                row = observation_by_id[event_id]
-                motif = _motif_for_alert(
-                    row,
-                    matching,
-                    actor_counts=actor_counts,
-                    counterparty_counts=counterparty_counts,
-                    connected_batch_size=len(member_ids),
-                )
-                row_roots = graph.roots_for(row)
-                evidence_rows.append(
-                    CaseAlertEvidence(
-                        event_id=event_id,
-                        decision_at=decision_time,
-                        actor_id=row.actor_id,
-                        counterparty_id=row.counterparty_id,
-                        motif=motif,
-                        visible_value_before_alert=graph.visible_value(row_roots),
-                        latest_graph_evidence_at=graph.latest_evidence_at(row_roots),
-                        score=decision_by_id[event_id].score,
-                        action=action_by_id[event_id],
-                        evidence_source_ids=graph.bounded_source_ids(
-                            row_roots, event_id=event_id
-                        ),
-                    )
-                )
-            if matching:
-                anchor = matching[0]
-                for merged in matching[1:]:
+            if matching_states:
+                anchor = matching_states[0]
+                for merged in matching_states[1:]:
                     anchor.event_ids.update(merged.event_ids)
                     anchor.actor_ids.update(merged.actor_ids)
                     anchor.counterparty_ids.update(merged.counterparty_ids)
                     anchor.alert_evidence.extend(merged.alert_evidence)
                     case_aliases[merged.case_id] = anchor.case_id
                     del states[merged.case_id]
-                anchor.event_ids.update(member_ids)
-                anchor.alert_evidence.extend(evidence_rows)
+                if plan.selected_root is not None:
+                    graph.bind_case(anchor.case_id, {plan.selected_root})
             else:
-                priority = _priority(
-                    member_ids,
-                    entity_count=graph.entity_count(member_roots),
-                    latest_graph_evidence_at=graph.latest_evidence_at(member_roots),
-                    observation_by_id=observation_by_id,
-                    decision_by_id=decision_by_id,
-                    decision_time=decision_time,
-                )
-                case_id = _case_id(member_ids)
+                assert plan.priority is not None
+                first_evidence = (plan.event_id,)
+                case_id = _case_id(first_evidence)
                 anchor = _CaseState(
                     case_id=case_id,
                     opened_at=decision_time,
-                    event_ids=set(member_ids),
+                    event_ids=set(),
                     actor_ids=set(),
                     counterparty_ids=set(),
-                    priority=priority,
-                    first_evidence_ids=member_ids,
-                    alert_evidence=evidence_rows,
+                    priority=plan.priority,
+                    first_evidence_ids=first_evidence,
+                    alert_evidence=[],
                 )
                 states[case_id] = anchor
-            for event_id in member_ids:
-                row = observation_by_id[event_id]
-                anchor.actor_ids.add(row.actor_id)
-                anchor.counterparty_ids.add(row.counterparty_id)
-            graph.bind_case(anchor.case_id, member_roots)
+            anchor.event_ids.add(plan.event_id)
+            anchor.actor_ids.add(row.actor_id)
+            anchor.counterparty_ids.add(row.counterparty_id)
+            anchor.alert_evidence.append(plan.evidence)
+            assignments[plan.event_id] = anchor.case_id
+
+        for event_id in batch_ids:
+            graph.add_observation(observation_by_id[event_id])
+        for plan in plans:
+            active_case_id = resolve_case(assignments[plan.event_id])
+            graph.attach_case(
+                active_case_id,
+                graph.roots_for(observation_by_id[plan.event_id]),
+            )
         position = end
 
     return tuple(
@@ -819,71 +1042,58 @@ def _group_validated(
     )
 
 
-def _batch_components(
-    root_sets: tuple[frozenset[str], ...],
-) -> tuple[tuple[int, ...], ...]:
-    parent = list(range(len(root_sets)))
-
-    def find(index: int) -> int:
-        while parent[index] != index:
-            parent[index] = parent[parent[index]]
-            index = parent[index]
-        return index
-
-    def union(left: int, right: int) -> None:
-        left_root = find(left)
-        right_root = find(right)
-        if left_root != right_root:
-            parent[max(left_root, right_root)] = min(left_root, right_root)
-
-    first_by_root: dict[str, int] = {}
-    for index, roots in enumerate(root_sets):
-        for root in roots:
-            if root in first_by_root:
-                union(index, first_by_root[root])
-            else:
-                first_by_root[root] = index
-    members: dict[int, list[int]] = {}
-    for index in range(len(root_sets)):
-        members.setdefault(find(index), []).append(index)
-    return tuple(tuple(group) for _, group in sorted(members.items()))
+def _select_prebatch_matches(
+    graph: _IncrementalGraph,
+    roots: frozenset[str],
+    views: dict[str, _CaseView],
+    *,
+    resolve_case: Callable[[str], str],
+) -> tuple[str | None, tuple[_CaseView, ...]]:
+    candidates: list[tuple[tuple[datetime, str, str], str, tuple[_CaseView, ...]]] = []
+    for root in sorted(graph.canonical_roots(roots)):
+        case_ids = {resolve_case(case_id) for case_id in graph.case_ids({root})}
+        matching = tuple(
+            sorted(
+                (views[case_id] for case_id in case_ids if case_id in views),
+                key=lambda item: (item.opened_at, item.case_id),
+            )
+        )
+        if matching:
+            candidates.append(
+                (
+                    (matching[0].opened_at, matching[0].case_id, root),
+                    root,
+                    matching,
+                )
+            )
+    if not candidates:
+        return None, ()
+    _, selected_root, matching = min(candidates, key=lambda item: item[0])
+    return selected_root, matching
 
 
 def _motif_for_alert(
     row: ObservedEvent,
-    matching: tuple[_CaseState, ...],
-    *,
-    actor_counts: dict[str, int],
-    counterparty_counts: dict[str, int],
-    connected_batch_size: int,
+    matching: tuple[_CaseView, ...],
 ) -> CaseMotif:
-    if any(row.actor_id in state.actor_ids for state in matching) or actor_counts.get(
-        row.actor_id, 0
-    ) > 1:
+    if any(row.actor_id in state.actor_ids for state in matching):
         return CaseMotif.SHARED_ACTOR
-    if any(
-        row.counterparty_id in state.counterparty_ids for state in matching
-    ) or counterparty_counts.get(row.counterparty_id, 0) > 1:
+    if any(row.counterparty_id in state.counterparty_ids for state in matching):
         return CaseMotif.SHARED_COUNTERPARTY
-    if matching or connected_batch_size > 1:
+    if matching:
         return CaseMotif.TRANSITIVE
     return CaseMotif.ISOLATED
 
 
 def _priority(
-    event_ids: tuple[str, ...],
     *,
+    score: float,
+    visible_value_before_alert: Decimal,
     entity_count: int,
     latest_graph_evidence_at: datetime | None,
-    observation_by_id: dict[str, ObservedEvent],
-    decision_by_id: dict[str, DefenseDecision],
     decision_time: datetime,
 ) -> float:
-    max_score = max(decision_by_id[event_id].score for event_id in event_ids)
-    risk_amount = math.fsum(
-        float(observation_by_id[event_id].amount) * decision_by_id[event_id].score
-        for event_id in event_ids
-    )
+    risk_amount = float(visible_value_before_alert) * score
     value_term = risk_amount / (risk_amount + _VALUE_SCALE) if risk_amount else 0.0
     coverage = min(max((entity_count - 2) / 8.0, 0.0), 1.0)
     if latest_graph_evidence_at is not None:
@@ -895,7 +1105,7 @@ def _priority(
     else:
         recency = 0.0
     priority = 100.0 * (
-        0.45 * max_score + 0.30 * value_term + 0.15 * coverage + 0.10 * recency
+        0.45 * score + 0.30 * value_term + 0.15 * coverage + 0.10 * recency
     )
     if not math.isfinite(priority):
         raise CaseContractError("case priority inputs must be finite")

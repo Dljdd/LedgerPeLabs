@@ -132,7 +132,7 @@ def test_future_extension_retains_first_evidence_id_and_priority() -> None:
     assert after[0].priority == before[0].priority
 
 
-def test_later_bridge_merges_only_the_later_view_into_earliest_case_identity() -> None:
+def test_later_bridge_merges_only_after_a_subsequent_decision() -> None:
     first = observation(
         "event-a", actor_id="actor-a", counterparty_id="merchant-a", decision_at=NOW
     )
@@ -157,10 +157,38 @@ def test_later_bridge_merges_only_the_later_view_into_earliest_case_identity() -
     anchor = min(before, key=lambda item: (item.opened_at, item.case_id))
 
     assert len(before) == 2
-    assert len(after) == 1
-    assert after[0].case_id == anchor.case_id
-    assert after[0].priority == anchor.priority
-    assert after[0].event_ids == ("event-a", "event-b", "event-bridge")
+    assert len(after) == 2
+    bridge_case = next(item for item in after if "event-bridge" in item.event_ids)
+    assert bridge_case.case_id == anchor.case_id
+    assert bridge_case.priority == anchor.priority
+
+    final_time = later + timedelta(minutes=1)
+    trigger = observation(
+        "event-trigger",
+        actor_id="actor-b",
+        counterparty_id="merchant-a",
+        decision_at=final_time,
+    )
+    final = group_cases(
+        (trigger, bridge, second, first),
+        (
+            decision("event-trigger"),
+            decision("event-bridge"),
+            decision("event-b"),
+            decision("event-a"),
+        ),
+        as_of=final_time,
+    )
+
+    assert len(final) == 1
+    assert final[0].case_id == anchor.case_id
+    assert final[0].priority == anchor.priority
+    assert final[0].event_ids == (
+        "event-a",
+        "event-b",
+        "event-bridge",
+        "event-trigger",
+    )
 
 
 def test_grouping_is_permutation_stable() -> None:
@@ -192,10 +220,118 @@ def test_equal_time_batch_is_symmetric_and_canonical() -> None:
     reverse = group_cases(tuple(reversed(observations)), tuple(reversed(decisions)), as_of=NOW)
 
     assert forward == reverse
-    assert forward[0].event_ids == ("a-event", "z-event")
+    assert tuple(item.event_ids for item in forward) == (("a-event",), ("z-event",))
 
 
-def test_equal_time_available_edge_is_excluded_from_graph() -> None:
+def test_current_alert_does_not_contribute_its_own_value_or_recency() -> None:
+    row = observation(
+        "current",
+        actor_id="actor",
+        counterparty_id="merchant",
+        amount="100.00",
+    )
+
+    grouped = group_cases((row,), (decision("current", score=0.8),), as_of=NOW)
+
+    evidence = grouped[0].alert_evidence[0]
+    assert evidence.visible_value_before_alert == Decimal("0")
+    assert evidence.latest_graph_evidence_at is None
+    assert evidence.evidence_source_ids == ()
+    assert grouped[0].priority == 36.0
+
+
+def test_same_decision_peer_cannot_rewrite_first_alert_evidence_or_identity() -> None:
+    first = observation(
+        "first",
+        actor_id="actor-a",
+        counterparty_id="shared",
+        amount="10.00",
+    )
+    peer = observation(
+        "peer",
+        actor_id="actor-b",
+        counterparty_id="shared",
+        amount="999.00",
+    )
+    before = group_cases((first,), (decision("first"),), as_of=NOW)
+    after = group_cases(
+        (peer, first),
+        (decision("peer"), decision("first")),
+        as_of=NOW,
+    )
+    first_after = next(item for item in after if "first" in item.event_ids)
+
+    assert len(after) == 2
+    assert first_after.case_id == before[0].case_id
+    assert first_after.priority == before[0].priority
+    assert canonical_json_bytes(
+        first_after.alert_evidence[0].model_dump(mode="json")
+    ) == canonical_json_bytes(before[0].alert_evidence[0].model_dump(mode="json"))
+
+
+def test_current_bridge_does_not_merge_prior_cases_until_a_later_decision() -> None:
+    bridge_at = NOW + timedelta(minutes=1)
+    later_at = NOW + timedelta(minutes=2)
+    first = observation(
+        "historical-a",
+        actor_id="actor-a",
+        counterparty_id="merchant-a",
+        amount="10.00",
+    )
+    second = observation(
+        "historical-b",
+        actor_id="actor-b",
+        counterparty_id="merchant-b",
+        amount="20.00",
+    )
+    bridge = observation(
+        "current-bridge",
+        actor_id="actor-a",
+        counterparty_id="merchant-b",
+        amount="999.00",
+        decision_at=bridge_at,
+    )
+    at_bridge = group_cases(
+        (first, second, bridge),
+        (decision("historical-a"), decision("historical-b"), decision("current-bridge")),
+        as_of=bridge_at,
+    )
+    bridge_case = next(item for item in at_bridge if "current-bridge" in item.event_ids)
+    bridge_evidence = next(
+        item for item in bridge_case.alert_evidence if item.event_id == "current-bridge"
+    )
+
+    assert len(at_bridge) == 2
+    assert bridge_evidence.visible_value_before_alert == Decimal("30.00")
+    assert bridge_evidence.latest_graph_evidence_at < bridge_at
+
+    later = observation(
+        "later",
+        actor_id="actor-b",
+        counterparty_id="merchant-a",
+        decision_at=later_at,
+    )
+    after = group_cases(
+        (later, bridge, second, first),
+        (
+            decision("later"),
+            decision("current-bridge"),
+            decision("historical-b"),
+            decision("historical-a"),
+        ),
+        as_of=later_at,
+    )
+
+    assert len(after) == 1
+    assert after[0].event_ids == (
+        "current-bridge",
+        "historical-a",
+        "historical-b",
+        "later",
+    )
+
+
+def test_current_batch_edge_is_excluded_regardless_of_early_availability() -> None:
     later = NOW + timedelta(minutes=1)
     first = observation(
         "alert-a", actor_id="actor-a", counterparty_id="merchant-x", decision_at=NOW
@@ -227,7 +363,7 @@ def test_equal_time_available_edge_is_excluded_from_graph() -> None:
     visible = group_cases((first, visible_bridge, second), decisions, as_of=later)
 
     assert len(boundary) == 2
-    assert len(visible) == 1
+    assert len(visible) == 2
     boundary_first = next(
         case for case in boundary if "alert-a" in case.event_ids
     ).alert_evidence[0]
@@ -373,7 +509,7 @@ def test_callback_requires_exact_object_action_vector_and_preserves_severity_mas
 
     challenges = np.asarray([Action.CHALLENGE, Action.CHALLENGE], dtype=object)
     declines = np.asarray([Action.DECLINE, Action.DECLINE], dtype=object)
-    assert callback(challenges) == callback(declines) == 1
+    assert callback(challenges) == callback(declines) == 2
     assert challenges.tolist() == [Action.CHALLENGE, Action.CHALLENGE]
     with pytest.raises(TypeError, match="exact numpy.ndarray"):
         callback(cast("object", [Action.CHALLENGE, Action.CHALLENGE]))
@@ -414,6 +550,7 @@ def test_threshold_selection_uses_causal_callback_with_all_frozen_budgets() -> N
             f"event-{index:04d}",
             actor_id=f"actor-{index:04d}",
             counterparty_id="shared-counterparty",
+            decision_at=NOW + timedelta(microseconds=index),
         )
         for index in range(row_count)
     )
@@ -421,7 +558,11 @@ def test_threshold_selection_uses_causal_callback_with_all_frozen_budgets() -> N
         decision(row.event_id, action=Action.APPROVE, score=0.1)
         for row in observations
     )
-    callback = bind_review_case_counter(observations, decisions, as_of=NOW)
+    callback = bind_review_case_counter(
+        observations,
+        decisions,
+        as_of=cast(datetime, observations[-1].decision_at),
+    )
     labels = np.zeros(row_count, dtype=np.int8)
     labels[:20] = 1
     scores = np.full(row_count, 0.1, dtype=np.float64)
@@ -528,7 +669,7 @@ def test_per_alert_evidence_freezes_causal_motif_chronology_and_value() -> None:
         shared_actor_at,
         transitive_at,
     )
-    assert evidence[-1].visible_value_before_alert == Decimal("100.00")
+    assert evidence[-1].visible_value_before_alert == Decimal("60.00")
     assert grouped[0].first_evidence_ids == ("isolated",)
 
 
@@ -678,3 +819,90 @@ def test_1500_isolated_grouping_meets_frozen_benchmark_ceiling() -> None:
 
     assert len(grouped) == row_count
     assert elapsed < 2.5
+
+
+def test_review_case_counter_random_masks_match_full_grouping() -> None:
+    row_count = 48
+    rows = tuple(
+        observation(
+            f"parity-{index:03d}",
+            actor_id=f"actor-{index % 12:02d}",
+            counterparty_id=f"merchant-{(index * 5) % 17:02d}",
+            decision_at=NOW + timedelta(seconds=index // 4),
+        )
+        for index in range(row_count)
+    )
+    templates = tuple(
+        decision(row.event_id, action=Action.APPROVE, score=(index + 1) / 50)
+        for index, row in enumerate(rows)
+    )
+    callback = bind_review_case_counter(rows, templates, as_of=rows[-1].decision_at)
+    generator = np.random.default_rng(260816)
+
+    for _ in range(64):
+        numeric = generator.integers(0, 3, size=row_count)
+        actions = np.asarray(
+            tuple((Action.APPROVE, Action.CHALLENGE, Action.DECLINE)[value] for value in numeric),
+            dtype=object,
+        )
+        candidates = tuple(
+            decision(row.event_id, action=cast(Action, action), score=templates[index].score)
+            for index, (row, action) in enumerate(zip(rows, actions, strict=True))
+        )
+        expected = len(group_cases(rows, candidates, as_of=rows[-1].decision_at))
+
+        assert callback(actions) == expected
+        assert callback(actions) == expected
+
+
+def test_high_cardinality_threshold_callback_meets_frozen_ceiling() -> None:
+    row_count = 300
+    rows = tuple(
+        observation(
+            f"threshold-{index:03d}",
+            actor_id=f"actor-{index:03d}",
+            counterparty_id=f"merchant-{index:03d}",
+        )
+        for index in range(row_count)
+    )
+    templates = tuple(
+        decision(row.event_id, action=Action.APPROVE, score=(index + 1) / (row_count + 1))
+        for index, row in enumerate(rows)
+    )
+    callback = bind_review_case_counter(rows, templates, as_of=NOW)
+    scores = np.linspace(0.001, 0.999, row_count, dtype=np.float64)
+    labels = np.zeros(row_count, dtype=np.int8)
+    labels[-30:] = 1
+    mandatory = np.empty(row_count, dtype=object)
+    mandatory[:] = [Action.APPROVE] * row_count
+
+    started = perf_counter()
+    report = select_policy_thresholds(
+        scores,
+        labels,
+        mandatory,
+        callback,
+        OperatingBudget(),
+    )
+    elapsed = perf_counter() - started
+
+    assert report.candidate_threshold_count == row_count + 2
+    assert elapsed < 3.0
+
+
+def test_review_case_counter_enforces_task8_maximum_before_binding() -> None:
+    row_count = 4_097
+    rows = tuple(
+        observation(
+            f"cap-{index:04d}",
+            actor_id=f"actor-{index:04d}",
+            counterparty_id=f"merchant-{index:04d}",
+        )
+        for index in range(row_count)
+    )
+    decisions = tuple(
+        decision(row.event_id, action=Action.APPROVE) for row in rows
+    )
+
+    with pytest.raises(CaseContractError, match="4096|cap"):
+        bind_review_case_counter(rows, decisions, as_of=NOW)

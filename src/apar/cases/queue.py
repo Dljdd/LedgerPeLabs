@@ -205,11 +205,25 @@ class QueueReport(ExternalContract):
             raise ValueError("peak backlog must match causal arrival/start evidence")
         if self.report_digest != _report_digest(self):
             raise ValueError("queue report digest is inconsistent")
+        try:
+            payload_size = len(_canonical_report_bytes(self))
+        except (ArithmeticError, MemoryError, OverflowError) as error:
+            raise ValueError("queue report payload exceeds frozen resource cap") from error
+        if payload_size > _MAX_QUEUE_PAYLOAD_BYTES:
+            raise ValueError("queue report payload exceeds frozen resource cap")
         return self
 
     def to_json(self) -> bytes:
         """Return canonical digest-bound queue evidence."""
-        return canonical_json_bytes(self.model_dump(mode="json"))
+        try:
+            payload = _canonical_report_bytes(self)
+        except (ArithmeticError, MemoryError, OverflowError) as error:
+            raise QueueContractError(
+                "queue report payload exceeds frozen resource cap"
+            ) from error
+        if len(payload) > _MAX_QUEUE_PAYLOAD_BYTES:
+            raise QueueContractError("queue report payload exceeds frozen resource cap")
+        return payload
 
     @classmethod
     def from_json(cls, payload: bytes) -> QueueReport:
@@ -289,18 +303,27 @@ def simulate_case_queue(
         "peak_backlog_count": peak_backlog_count,
         "sla_breach_count": sla_breach_count,
     }
-    digest_document = _json_document(document)
-    return QueueReport(
-        config=validated_config,
-        case_inputs=ordered,
-        snapshots=snapshot_rows,
-        arrival_count=len(ordered),
-        completed_count=len(ordered),
-        analyst_minutes=analyst_minutes,
-        peak_backlog_count=peak_backlog_count,
-        sla_breach_count=sla_breach_count,
-        report_digest=hashlib.sha256(canonical_json_bytes(digest_document)).hexdigest(),
-    )
+    try:
+        digest_document = _json_document(document)
+        return QueueReport(
+            config=validated_config,
+            case_inputs=ordered,
+            snapshots=snapshot_rows,
+            arrival_count=len(ordered),
+            completed_count=len(ordered),
+            analyst_minutes=analyst_minutes,
+            peak_backlog_count=peak_backlog_count,
+            sla_breach_count=sla_breach_count,
+            report_digest=hashlib.sha256(
+                canonical_json_bytes(digest_document)
+            ).hexdigest(),
+        )
+    except ValidationError as error:
+        raise QueueContractError(str(error)) from error
+    except (ArithmeticError, MemoryError, OverflowError) as error:
+        raise QueueContractError(
+            "queue report payload exceeds frozen resource cap"
+        ) from error
 
 
 def _allocate_snapshots(
@@ -431,3 +454,7 @@ def _json_document(value: object) -> object:
 def _report_digest(report: QueueReport) -> str:
     document = report.model_dump(mode="json", exclude={"report_digest"})
     return hashlib.sha256(canonical_json_bytes(document)).hexdigest()
+
+
+def _canonical_report_bytes(report: QueueReport) -> bytes:
+    return canonical_json_bytes(report.model_dump(mode="json"))

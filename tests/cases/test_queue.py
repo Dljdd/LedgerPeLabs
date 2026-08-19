@@ -344,3 +344,57 @@ def test_report_loader_rejects_payload_before_unbounded_json_parse(
 
     with pytest.raises(QueueContractError, match="payload|resource"):
         QueueReport.from_json(b"x" * 65)
+
+
+def test_simulation_and_loader_share_exact_canonical_payload_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows: list[InvestigationCase] = []
+    for index in range(6):
+        base = case(index)
+        actor = f"actor-{index}-" + "a" * (4_096 - len(f"actor-{index}-"))
+        counterparty = f"merchant-{index}-" + "b" * (
+            4_096 - len(f"merchant-{index}-")
+        )
+        evidence = base.alert_evidence[0].model_copy(
+            update={"actor_id": actor, "counterparty_id": counterparty}
+        )
+        rows.append(
+            InvestigationCase.model_validate(
+                {
+                    **base.model_dump(mode="python"),
+                    "actor_ids": (actor,),
+                    "counterparty_ids": (counterparty,),
+                    "alert_evidence": (evidence,),
+                }
+            )
+        )
+    cases = tuple(rows)
+    baseline = simulate_case_queue(cases, QueueConfig())
+    exact_size = len(baseline.to_json())
+    from apar.cases import queue
+
+    monkeypatch.setattr(queue, "_MAX_QUEUE_PAYLOAD_BYTES", exact_size)
+    at_cap = simulate_case_queue(cases, QueueConfig())
+    assert len(at_cap.to_json()) == exact_size
+    assert QueueReport.from_json(at_cap.to_json()) == at_cap
+
+    monkeypatch.setattr(queue, "_MAX_QUEUE_PAYLOAD_BYTES", exact_size - 1)
+    with pytest.raises(QueueContractError, match="payload|resource"):
+        simulate_case_queue(cases, QueueConfig())
+    with pytest.raises(QueueContractError, match="payload|resource"):
+        baseline.to_json()
+
+
+def test_simulation_normalizes_serialization_resource_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from apar.cases import queue
+
+    def exhausted(_value: object) -> object:
+        raise MemoryError("synthetic exhaustion")
+
+    monkeypatch.setattr(queue, "_json_document", exhausted)
+
+    with pytest.raises(QueueContractError, match="payload|resource"):
+        simulate_case_queue((case(1),), QueueConfig())
