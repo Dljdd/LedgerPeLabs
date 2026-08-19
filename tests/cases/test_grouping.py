@@ -1257,6 +1257,108 @@ def test_review_case_counter_is_intrinsically_immutable_across_copy_and_pickle()
     assert pickle.loads(pickle.dumps(callback))(actions) == 2
 
 
+def _shared_actor_callback() -> tuple[ReviewCaseCounter, np.ndarray]:
+    rows = (
+        observation("immutable-first", actor_id="shared", counterparty_id="merchant-a"),
+        observation(
+            "immutable-second",
+            actor_id="shared",
+            counterparty_id="merchant-b",
+            decision_at=NOW + timedelta(seconds=1),
+        ),
+    )
+    callback = bind_review_case_counter(
+        rows,
+        tuple(decision(row.event_id) for row in rows),
+        as_of=NOW + timedelta(seconds=1),
+    )
+    return callback, np.asarray([Action.CHALLENGE, Action.CHALLENGE], dtype=object)
+
+
+def test_low_level_copy_topology_mutation_cannot_change_original_result() -> None:
+    callback, actions = _shared_actor_callback()
+    copied = copy.copy(callback)
+
+    assert callback(actions) == copied(actions) == 1
+    component = copied._topology.batches[1].alerts[0].components[0]
+    with pytest.raises((AttributeError, TypeError)):
+        object.__setattr__(component, "members", 0)
+
+    assert callback(actions) == copied(actions) == 1
+
+
+def test_callback_reachable_state_is_only_intrinsically_immutable_values() -> None:
+    from apar.cases import grouping
+
+    callback, actions = _shared_actor_callback()
+    record_types = (
+        grouping._CausalTopology,
+        grouping._CausalBatch,
+        grouping._CausalAlert,
+        grouping._ComponentSnapshot,
+        grouping._CausalRow,
+    )
+    atomic_types = (
+        type(None),
+        bool,
+        int,
+        float,
+        str,
+        bytes,
+        Decimal,
+        datetime,
+    )
+
+    def audit(value: object) -> None:
+        assert not hasattr(value, "__dict__")
+        assert not hasattr(value, "__pydantic_private__")
+        assert not isinstance(value, (bytearray, memoryview, list, dict, set, np.ndarray))
+        if type(value) in record_types:
+            assert isinstance(value, tuple)
+            assert hasattr(value, "_fields")
+            for child in value:
+                audit(child)
+            return
+        if type(value) is tuple or type(value) is ReviewCaseCounter:
+            for child in cast(tuple[object, ...], value):
+                audit(child)
+            return
+        assert type(value) in atomic_types
+
+    for clone in (
+        callback,
+        copy.copy(callback),
+        copy.deepcopy(callback),
+        pickle.loads(pickle.dumps(callback)),
+    ):
+        audit(clone)
+        records: list[object] = []
+
+        def collect(value: object, found: list[object]) -> None:
+            if type(value) in record_types:
+                found.append(value)
+            if isinstance(value, tuple):
+                for child in value:
+                    collect(child, found)
+
+        collect(clone, records)
+        for record in records:
+            fields = cast(tuple[str, ...], record._fields)  # type: ignore[attr-defined]
+            for field in fields:
+                with pytest.raises((AttributeError, TypeError)):
+                    object.__setattr__(record, field, getattr(record, field))
+                replaced = record._replace(  # type: ignore[attr-defined]
+                    **{field: getattr(record, field)}
+                )
+                assert replaced is not record
+                with pytest.raises((AttributeError, TypeError)):
+                    object.__setattr__(replaced, field, getattr(replaced, field))
+                replaced.__init__()
+            record.__init__()
+        clone.__init__()
+        assert callback(actions) == clone(actions) == 1
+
+
 def _early_available_future_decision_chain(
     row_count: int,
 ) -> tuple[tuple[ObservedEvent, ...], tuple[DefenseDecision, ...], datetime]:

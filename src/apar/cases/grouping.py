@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import Any, Literal, cast
+from typing import Any, Literal, NamedTuple, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -253,8 +253,7 @@ class _MemberTree:
     right: _MemberTree | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class _CausalRow:
+class _CausalRow(NamedTuple):
     event_id: str
     actor_id: str
     counterparty_id: str
@@ -264,8 +263,7 @@ class _CausalRow:
     available_at: datetime
 
 
-@dataclass(frozen=True, slots=True)
-class _ComponentSnapshot:
+class _ComponentSnapshot(NamedTuple):
     root: str
     members: int | tuple[int, ...]
     entity_count: int
@@ -274,25 +272,20 @@ class _ComponentSnapshot:
     latest_evidence: tuple[datetime, str] | None
 
 
-@dataclass(frozen=True, slots=True)
-class _CausalAlert:
+class _CausalAlert(NamedTuple):
     decision_position: int
     row_position: int
     event_id: str
     score: float
-    base_action: Action
-    evidence_source_ids: tuple[str, ...]
     components: tuple[_ComponentSnapshot, ...]
 
 
-@dataclass(frozen=True, slots=True)
-class _CausalBatch:
+class _CausalBatch(NamedTuple):
     decision_at: datetime
     alerts: tuple[_CausalAlert, ...]
 
 
-@dataclass(frozen=True, slots=True)
-class _CausalTopology:
+class _CausalTopology(NamedTuple):
     rows: tuple[_CausalRow, ...]
     batches: tuple[_CausalBatch, ...]
     decision_count: int
@@ -516,7 +509,6 @@ def _build_causal_topology(
     )
     row_position_by_id = {row.event_id: index for index, row in enumerate(rows)}
     observation_by_id = {row.event_id: row for row in observations}
-    decision_by_id = {row.event_id: row for row in decisions}
     ordered_decisions = tuple(
         sorted(
             decisions,
@@ -658,8 +650,6 @@ def _build_causal_topology(
                             row_position=row_position,
                             event_id=decision_row.event_id,
                             score=decision_row.score,
-                            base_action=decision_by_id[decision_row.event_id].action,
-                            evidence_source_ids=decision_row.evidence_source_ids,
                             components=tuple(sorted(components, key=lambda item: item.root)),
                         )
                     )
@@ -1159,7 +1149,7 @@ def _run_case_engine(
             if intervention_mask[alert.decision_position] == 0:
                 continue
             action = (
-                alert.base_action
+                Action.CHALLENGE
                 if actions_by_event_id is None
                 else actions_by_event_id[alert.event_id]
             )
