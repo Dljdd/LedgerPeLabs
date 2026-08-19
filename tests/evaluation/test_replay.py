@@ -7,6 +7,7 @@ import json
 from datetime import UTC, datetime
 from decimal import Decimal
 
+import numpy as np
 import pytest
 
 from apar.contracts.decisions import Action
@@ -15,6 +16,7 @@ from apar.defense.contracts import PolicyThresholds
 from apar.defense.policy import ActionPolicy
 from apar.defense.rules import DefenseReason, RuleEngine
 from apar.evaluation.contracts import EvaluationTruthRow
+from apar.evaluation.defender_attestation import DefenderBundleVerifier
 from apar.evaluation.gates import EvaluationDescriptor, EvaluationKind
 from apar.evaluation.metrics import LatencySample, SliceAssignment, SliceManifest
 from apar.evaluation.replay import (
@@ -30,12 +32,17 @@ from apar.evaluation.replay import (
     replay_defense_arms,
 )
 from apar.evaluation.splits import EntityCohort
+from apar.evaluation_hidden.defense_authority import (
+    HIDDEN_CONTEXT_MEDIA_TYPE,
+    HiddenEvaluationAuthority,
+)
 from apar.runs.wire import canonical_json_bytes
 from tests.defense.test_bundle import BundleFixture
 
 pytest_plugins = ("tests.defense.test_bundle",)
 
 AS_OF = datetime(2026, 9, 30, tzinfo=UTC)
+ISSUED_AT = datetime(2026, 8, 19, 12, tzinfo=UTC)
 FAMILIES = (
     "agentic_intent_abuse",
     "app_scam_mule",
@@ -117,6 +124,50 @@ def _loaded(fixture: BundleFixture):
     return fixture.publisher.load(ref), manifest
 
 
+def _attestation(fixture: BundleFixture):
+    _, ref = fixture.publisher.freeze(**fixture.kwargs)
+    verifier = DefenderBundleVerifier(
+        fixture.store,
+        signer_key_id=fixture.signer.key_id,
+        public_key_base64=fixture.signer.public_key_base64,
+    )
+    return verifier.attest(ref)
+
+
+def _selection_evidence(
+    fixture: BundleFixture, loaded: object
+) -> tuple[np.ndarray, np.ndarray]:
+    matrix = loaded.threshold_matrix
+    labels = np.asarray(
+        [int(fixture.split.row_is_fraud[row.event_id]) for row in matrix.rows],
+        dtype=np.int64,
+    )
+    values = np.asarray(
+        [float(fixture.split.row_net_settled_values[row.event_id]) for row in matrix.rows],
+        dtype=np.float64,
+    )
+    return labels, values
+
+
+def _thresholds(
+    fixture: BundleFixture,
+    loaded: object,
+    binding: ReplayCaseCounterBinding,
+) -> ReplayThresholdSet:
+    labels, values = _selection_evidence(fixture, loaded)
+    return ReplayThresholdSet.from_selection(
+        loaded, binding, labels=labels, values=values
+    )
+
+
+def _selection_binding(loaded: object) -> ReplayCaseCounterBinding:
+    return bind_replay_case_counter(
+        loaded.threshold_matrix.events,
+        tuple(row.event_id for row in loaded.threshold_matrix.rows),
+        as_of=AS_OF,
+    )
+
+
 def _replay(fixture: BundleFixture, *, flip_truth: bool = False, model_failure=None):
     loaded, _ = _loaded(fixture)
     case_binding = bind_replay_case_counter(
@@ -124,14 +175,11 @@ def _replay(fixture: BundleFixture, *, flip_truth: bool = False, model_failure=N
         tuple(row.event_id for row in fixture.reload_matrix.rows),
         as_of=AS_OF,
     )
-    thresholds = ReplayThresholdSet.from_reports(
-        loaded,
-        case_binding,
-        {arm: loaded.threshold_report for arm in DefenseArm},
-    )
+    thresholds = _thresholds(fixture, loaded, _selection_binding(loaded))
     return replay_defense_arms(
         matrix=fixture.reload_matrix,
         defender=loaded,
+        defender_attestation=_attestation(fixture),
         thresholds=thresholds,
         case_counter=case_binding,
         evaluation=_context(fixture, flip_truth=flip_truth),
@@ -218,8 +266,8 @@ def test_threshold_bundle_callback_and_row_lineage_mismatches_fail_closed(
     binding = bind_replay_case_counter(
         bundle_fixture.reload_matrix.events, event_ids, as_of=AS_OF
     )
-    thresholds = ReplayThresholdSet.from_reports(
-        loaded, binding, {arm: loaded.threshold_report for arm in DefenseArm}
+    thresholds = _thresholds(
+        bundle_fixture, loaded, _selection_binding(loaded)
     )
     other_binding = bind_replay_case_counter(
         bundle_fixture.reload_matrix.events,
@@ -231,6 +279,7 @@ def test_threshold_bundle_callback_and_row_lineage_mismatches_fail_closed(
         replay_defense_arms(
             matrix=bundle_fixture.reload_matrix,
             defender=loaded,
+            defender_attestation=_attestation(bundle_fixture),
             thresholds=thresholds,
             case_counter=other_binding,
             evaluation=_context(bundle_fixture),
@@ -241,6 +290,7 @@ def test_threshold_bundle_callback_and_row_lineage_mismatches_fail_closed(
                 update={"rows": tuple(reversed(bundle_fixture.reload_matrix.rows))}
             ),
             defender=loaded,
+            defender_attestation=_attestation(bundle_fixture),
             thresholds=thresholds,
             case_counter=binding,
             evaluation=_context(bundle_fixture),
@@ -251,11 +301,7 @@ def test_threshold_set_binds_signed_selection_rows_and_rejects_cross_arm_lineage
     bundle_fixture: BundleFixture,
 ) -> None:
     loaded, _ = _loaded(bundle_fixture)
-    binding = bind_replay_case_counter(
-        bundle_fixture.reload_matrix.events,
-        tuple(row.event_id for row in bundle_fixture.reload_matrix.rows),
-        as_of=AS_OF,
-    )
+    binding = _selection_binding(loaded)
     report_document = json.loads(loaded.threshold_report.to_json())
     report_document["input_labels_digest"] = "e" * 64
     report_document["report_digest"] = hashlib.sha256(
@@ -271,7 +317,7 @@ def test_threshold_set_binds_signed_selection_rows_and_rejects_cross_arm_lineage
         canonical_json_bytes(report_document)
     )
 
-    with pytest.raises(ReplayContractError, match="selection lineage"):
+    with pytest.raises(ReplayContractError, match="rederived selection evidence"):
         ReplayThresholdSet.from_reports(
             loaded,
             binding,
@@ -282,16 +328,22 @@ def test_threshold_set_binds_signed_selection_rows_and_rejects_cross_arm_lineage
             },
         )
 
-    threshold_set = ReplayThresholdSet.from_reports(
-        loaded,
-        binding,
-        {arm: loaded.threshold_report for arm in DefenseArm},
-    )
+    threshold_set = _thresholds(bundle_fixture, loaded, binding)
     assert (
         threshold_set.selection_row_ids_digest
         == loaded.threshold_binding.row_ids_digest
     )
-    assert ReplayThresholdSet.from_json(threshold_set.to_json()) == threshold_set
+    labels, values = _selection_evidence(bundle_fixture, loaded)
+    assert (
+        ReplayThresholdSet.from_json(
+            threshold_set.to_json(),
+            defender=loaded,
+            case_counter=binding,
+            labels=labels,
+            values=values,
+        )
+        == threshold_set
+    )
 
     threshold_document = json.loads(threshold_set.to_json())
     threshold_document["selection_row_ids_digest"] = "f" * 64
@@ -304,15 +356,71 @@ def test_threshold_set_binds_signed_selection_rows_and_rejects_cross_arm_lineage
             }
         )
     ).hexdigest()
-    substituted = ReplayThresholdSet.from_json(
-        canonical_json_bytes(threshold_document)
-    )
-    with pytest.raises(ReplayContractError, match="threshold selection lineage"):
-        replay_defense_arms(
-            matrix=bundle_fixture.reload_matrix,
+    with pytest.raises(ReplayContractError, match="rederived selection evidence"):
+        ReplayThresholdSet.from_json(
+            canonical_json_bytes(threshold_document),
             defender=loaded,
-            thresholds=substituted,
             case_counter=binding,
+            labels=labels,
+            values=values,
+        )
+
+
+def test_forged_rules_threshold_report_with_recomputed_digest_is_rejected(
+    bundle_fixture: BundleFixture,
+) -> None:
+    loaded, _ = _loaded(bundle_fixture)
+    binding = bind_replay_case_counter(
+        loaded.threshold_matrix.events,
+        tuple(row.event_id for row in loaded.threshold_matrix.rows),
+        as_of=AS_OF,
+    )
+    document = json.loads(loaded.threshold_report.to_json())
+    document["thresholds"] = {"challenge": 0.25, "decline": 0.75}
+    document["report_digest"] = hashlib.sha256(
+        canonical_json_bytes(
+            {key: value for key, value in document.items() if key != "report_digest"}
+        )
+    ).hexdigest()
+    forged = type(loaded.threshold_report).from_json(canonical_json_bytes(document))
+
+    with pytest.raises(ReplayContractError, match="rederived selection evidence"):
+        ReplayThresholdSet.from_reports(
+            loaded,
+            binding,
+            {
+                DefenseArm.RULES_ONLY: forged,
+                DefenseArm.GBDT_ONLY: loaded.threshold_report,
+                DefenseArm.LAYERED_HYBRID: loaded.threshold_report,
+            },
+        )
+
+    legitimate = _thresholds(bundle_fixture, loaded, binding)
+    threshold_document = json.loads(legitimate.to_json())
+    threshold_document["reports"][0]["report"] = document
+    threshold_document["threshold_set_digest"] = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                key: value
+                for key, value in threshold_document.items()
+                if key != "threshold_set_digest"
+            }
+        )
+    ).hexdigest()
+    threshold_document["reports"] = tuple(threshold_document["reports"])
+    forged_set = ReplayThresholdSet.model_validate(threshold_document)
+    replay_binding = bind_replay_case_counter(
+        loaded.reload_matrix.events,
+        tuple(row.event_id for row in loaded.reload_matrix.rows),
+        as_of=AS_OF,
+    )
+    with pytest.raises(ReplayContractError, match="exact rederived selection evidence"):
+        replay_defense_arms(
+            matrix=loaded.reload_matrix,
+            defender=loaded,
+            defender_attestation=_attestation(bundle_fixture),
+            thresholds=forged_set,
+            case_counter=replay_binding,
             evaluation=_context(bundle_fixture),
         )
 
@@ -326,9 +434,7 @@ def test_campaign_with_two_fraud_family_owners_cannot_publish_lofo_evidence(
         tuple(row.event_id for row in bundle_fixture.reload_matrix.rows),
         as_of=AS_OF,
     )
-    thresholds = ReplayThresholdSet.from_reports(
-        loaded, binding, {arm: loaded.threshold_report for arm in DefenseArm}
-    )
+    thresholds = _thresholds(bundle_fixture, loaded, _selection_binding(loaded))
     context = _context(bundle_fixture)
     truth = list(context.truth)
     truth[0] = truth[0].model_copy(
@@ -338,13 +444,242 @@ def test_campaign_with_two_fraud_family_owners_cannot_publish_lofo_evidence(
         update={"campaign_id": "mixed", "is_fraud": True}
     )
 
-    with pytest.raises(ReplayContractError, match="one fraud family"):
+    with pytest.raises(ReplayContractError, match="one family owner"):
         replay_defense_arms(
             matrix=bundle_fixture.reload_matrix,
             defender=loaded,
+            defender_attestation=_attestation(bundle_fixture),
             thresholds=thresholds,
             case_counter=binding,
             evaluation=context.model_copy(update={"truth": tuple(truth)}),
+        )
+
+
+def test_campaign_family_owner_includes_benign_rows(
+    bundle_fixture: BundleFixture,
+) -> None:
+    loaded, _ = _loaded(bundle_fixture)
+    binding = bind_replay_case_counter(
+        bundle_fixture.reload_matrix.events,
+        tuple(row.event_id for row in bundle_fixture.reload_matrix.rows),
+        as_of=AS_OF,
+    )
+    thresholds = _thresholds(bundle_fixture, loaded, _selection_binding(loaded))
+    context = _context(bundle_fixture)
+    truth = list(context.truth)
+    truth[0] = truth[0].model_copy(
+        update={"campaign_id": "mixed-benign", "is_fraud": True}
+    )
+    truth[1] = truth[1].model_copy(
+        update={"campaign_id": "mixed-benign", "is_fraud": False}
+    )
+
+    with pytest.raises(ReplayContractError, match="one family owner"):
+        replay_defense_arms(
+            matrix=bundle_fixture.reload_matrix,
+            defender=loaded,
+            defender_attestation=_attestation(bundle_fixture),
+            thresholds=thresholds,
+            case_counter=binding,
+            evaluation=context.model_copy(update={"truth": tuple(truth)}),
+        )
+
+
+def test_hidden_descriptor_rejects_arbitrary_digest_without_authority_receipt(
+    bundle_fixture: BundleFixture,
+) -> None:
+    loaded, _ = _loaded(bundle_fixture)
+    binding = bind_replay_case_counter(
+        bundle_fixture.reload_matrix.events,
+        tuple(row.event_id for row in bundle_fixture.reload_matrix.rows),
+        as_of=AS_OF,
+    )
+    thresholds = _thresholds(bundle_fixture, loaded, _selection_binding(loaded))
+    ordinary = _context(bundle_fixture)
+    relabelled = ReplayEvaluationContext(
+        **{
+            **ordinary.model_dump(mode="python"),
+            "evaluation": EvaluationDescriptor(
+                kind=EvaluationKind.HIDDEN, value="hidden"
+            ),
+        }
+    )
+
+    with pytest.raises(ReplayContractError, match="sealed hidden release receipt"):
+        replay_defense_arms(
+            matrix=bundle_fixture.reload_matrix,
+            defender=loaded,
+            defender_attestation=_attestation(bundle_fixture),
+            thresholds=thresholds,
+            case_counter=binding,
+            evaluation=relabelled,
+        )
+
+
+def test_hidden_truth_resolves_only_after_all_three_arm_decisions_are_frozen(
+    bundle_fixture: BundleFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import apar.evaluation.replay as replay_module
+
+    loaded, _ = _loaded(bundle_fixture)
+    attestation = _attestation(bundle_fixture)
+    verifier = DefenderBundleVerifier(
+        bundle_fixture.store,
+        signer_key_id=bundle_fixture.signer.key_id,
+        public_key_base64=bundle_fixture.signer.public_key_base64,
+    )
+    authority = HiddenEvaluationAuthority(verifier, bundle_fixture.store)
+    capability = authority.freeze_and_issue(attestation, issued_at=ISSUED_AT)
+    poison_ref = bundle_fixture.store.put_bytes(
+        b'{"poison":true}', HIDDEN_CONTEXT_MEDIA_TYPE
+    )
+    request = authority.prepare_release(
+        capability, poison_ref, released_at=ISSUED_AT
+    )
+    binding = bind_replay_case_counter(
+        loaded.reload_matrix.events,
+        tuple(row.event_id for row in loaded.reload_matrix.rows),
+        as_of=AS_OF,
+    )
+    thresholds = _thresholds(bundle_fixture, loaded, _selection_binding(loaded))
+    completed_arms: list[DefenseArm] = []
+    original = replay_module._arm_decisions
+
+    def record_frozen_arm(**kwargs):
+        completed_arms.append(kwargs["arm"])
+        return original(**kwargs)
+
+    monkeypatch.setattr(replay_module, "_arm_decisions", record_frozen_arm)
+
+    with pytest.raises(ReplayContractError, match="evaluation context"):
+        replay_defense_arms(
+            matrix=loaded.reload_matrix,
+            defender=loaded,
+            defender_attestation=attestation,
+            thresholds=thresholds,
+            case_counter=binding,
+            hidden_release=request,
+        )
+
+    assert tuple(completed_arms) == tuple(DefenseArm)
+
+
+def test_hidden_replay_seals_exact_receipt_without_public_truth_or_reference(
+    bundle_fixture: BundleFixture,
+) -> None:
+    loaded, _ = _loaded(bundle_fixture)
+    attestation = _attestation(bundle_fixture)
+    verifier = DefenderBundleVerifier(
+        bundle_fixture.store,
+        signer_key_id=bundle_fixture.signer.key_id,
+        public_key_base64=bundle_fixture.signer.public_key_base64,
+    )
+    authority = HiddenEvaluationAuthority(verifier, bundle_fixture.store)
+    capability = authority.freeze_and_issue(attestation, issued_at=ISSUED_AT)
+    ordinary = _context(bundle_fixture)
+    hidden_context = ReplayEvaluationContext(
+        **{
+            **ordinary.model_dump(mode="python"),
+            "evaluation": EvaluationDescriptor(
+                kind=EvaluationKind.HIDDEN, value="hidden"
+            ),
+            "truth": tuple(
+                row.model_copy(
+                    update={"viewpoint": "hidden", "label_source": "hidden_truth"}
+                )
+                for row in ordinary.truth
+            ),
+        }
+    )
+    restricted_ref = bundle_fixture.store.put_bytes(
+        hidden_context.to_json(), HIDDEN_CONTEXT_MEDIA_TYPE
+    )
+    request = authority.prepare_release(
+        capability, restricted_ref, released_at=ISSUED_AT
+    )
+    binding = bind_replay_case_counter(
+        loaded.reload_matrix.events,
+        tuple(row.event_id for row in loaded.reload_matrix.rows),
+        as_of=AS_OF,
+    )
+
+    results = replay_defense_arms(
+        matrix=loaded.reload_matrix,
+        defender=loaded,
+        defender_attestation=attestation,
+        thresholds=_thresholds(
+            bundle_fixture, loaded, _selection_binding(loaded)
+        ),
+        case_counter=binding,
+        hidden_release=request,
+    )
+
+    receipts = {row.hidden_release_receipt_digest for row in results}
+    assert len(receipts) == 1
+    assert None not in receipts
+    assert all(row.assurance.hidden_access_clean for row in results)
+    public = b"".join(row.to_json() for row in results)
+    assert restricted_ref.sha256.encode() not in public
+    assert b"hidden_truth" not in public
+
+
+def test_hidden_receipt_rejects_defender_bundle_substitution(
+    bundle_fixture: BundleFixture,
+) -> None:
+    loaded, _ = _loaded(bundle_fixture)
+    replay_attestation = _attestation(bundle_fixture)
+    substituted_kwargs = {
+        **bundle_fixture.kwargs,
+        "bundle_id": "32345678-1234-5678-9234-567812345678",
+        "frozen_at": datetime(2026, 8, 19, 11, tzinfo=UTC),
+    }
+    _, substituted_ref = bundle_fixture.publisher.freeze(**substituted_kwargs)
+    verifier = DefenderBundleVerifier(
+        bundle_fixture.store,
+        signer_key_id=bundle_fixture.signer.key_id,
+        public_key_base64=bundle_fixture.signer.public_key_base64,
+    )
+    substituted_attestation = verifier.attest(substituted_ref)
+    authority = HiddenEvaluationAuthority(verifier, bundle_fixture.store)
+    capability = authority.freeze_and_issue(
+        substituted_attestation, issued_at=ISSUED_AT
+    )
+    ordinary = _context(bundle_fixture)
+    hidden_context = ordinary.model_copy(
+        update={
+            "evaluation": EvaluationDescriptor(
+                kind=EvaluationKind.HIDDEN, value="hidden"
+            ),
+            "truth": tuple(
+                row.model_copy(
+                    update={"viewpoint": "hidden", "label_source": "hidden_truth"}
+                )
+                for row in ordinary.truth
+            ),
+        }
+    )
+    hidden_ref = bundle_fixture.store.put_bytes(
+        hidden_context.to_json(), HIDDEN_CONTEXT_MEDIA_TYPE
+    )
+    request = authority.prepare_release(
+        capability, hidden_ref, released_at=ISSUED_AT
+    )
+    binding = bind_replay_case_counter(
+        loaded.reload_matrix.events,
+        tuple(row.event_id for row in loaded.reload_matrix.rows),
+        as_of=AS_OF,
+    )
+
+    with pytest.raises(ReplayContractError, match="receipt failed verification"):
+        replay_defense_arms(
+            matrix=loaded.reload_matrix,
+            defender=loaded,
+            defender_attestation=replay_attestation,
+            thresholds=_thresholds(
+                bundle_fixture, loaded, _selection_binding(loaded)
+            ),
+            case_counter=binding,
+            hidden_release=request,
         )
 
 
@@ -364,14 +699,13 @@ def test_mandatory_integrity_decision_is_identical_and_prior_to_all_arm_threshol
     binding = bind_replay_case_counter(
         events, tuple(row.event_id for row in matrix.rows), as_of=AS_OF
     )
-    thresholds = ReplayThresholdSet.from_reports(
-        loaded, binding, {arm: loaded.threshold_report for arm in DefenseArm}
-    )
+    thresholds = _thresholds(bundle_fixture, loaded, _selection_binding(loaded))
     context = _context(bundle_fixture).model_copy(update={"observations": events})
 
     results = replay_defense_arms(
         matrix=matrix,
         defender=loaded,
+        defender_attestation=_attestation(bundle_fixture),
         thresholds=thresholds,
         case_counter=binding,
         evaluation=context,
@@ -418,3 +752,5 @@ def test_case_binding_constructor_and_reinitialization_cannot_replace_production
             as_of=AS_OF,
             callback_digest="0" * 64,
         )
+    with pytest.raises((TypeError, AttributeError)):
+        object.__setattr__(binding, "_counter", lambda actions: 0)

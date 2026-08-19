@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from decimal import Decimal, getcontext
 
 import pytest
 
+from apar.contracts.events import Rail
 from apar.evaluation.gates import (
     AssuranceEvidence,
     ChampionStatus,
@@ -37,6 +39,10 @@ def _sha(character: str) -> str:
     return character * 64
 
 
+def _row_digest(ids: tuple[str, ...]) -> str:
+    return hashlib.sha256(canonical_json_bytes(list(ids))).hexdigest()
+
+
 def _metrics(
     *,
     value: str,
@@ -49,9 +55,17 @@ def _metrics(
     slices = tuple(
         SlicePerformance(kind="family", value=family, recall=family_recall)
         for family in FAMILIES
-    ) + (
-        SlicePerformance(kind="rail", value="card", recall=slice_recall),
+    ) + tuple(
+        SlicePerformance(kind="rail", value=rail.value, recall=slice_recall)
+        for rail in Rail
+    ) + tuple(
+        SlicePerformance(kind="regime", value=regime, recall=slice_recall)
+        for regime in ("baseline", *(item.value for item in RegimeKind))
+    ) + tuple(
+        SlicePerformance(kind="entity_cohort", value=cohort.value, recall=slice_recall)
+        for cohort in EntityCohort
     )
+    slices = tuple(sorted(slices, key=lambda item: (item.kind, item.value)))
     return PromotionMetrics(
         row_count=1000,
         recall=0.80,
@@ -109,7 +123,7 @@ def _results(
                     arm=arm,
                     evaluation=descriptor,
                     decision_event_ids=DECISION_IDS,
-                    decision_rows_digest=_sha("1"),
+                    decision_rows_digest=_row_digest(DECISION_IDS),
                     common_integrity_digest=_sha("2"),
                     action_digest=_sha("3"),
                     score_digest=_sha("4"),
@@ -117,6 +131,12 @@ def _results(
                     threshold_set_digest=_sha("6"),
                     bundle_manifest_digest=_sha("7"),
                     case_callback_digest=_sha("8"),
+                    evaluation_context_digest=_sha("a"),
+                    hidden_release_receipt_digest=(
+                        _sha("b")
+                        if descriptor.kind is EvaluationKind.HIDDEN
+                        else None
+                    ),
                     metric_report_digest=_sha("9"),
                     metrics=_metrics(value=value, review_cases=cases),
                     assurance=AssuranceEvidence.passing(),
@@ -180,7 +200,10 @@ def test_each_assurance_failure_is_a_non_averageable_hard_blocker(
 ) -> None:
     def weaken(row: ReplayResult) -> ReplayResult:
         assurance = row.assurance.model_copy(update={field: value})
-        return row.rebuild(assurance=assurance)
+        updates: dict[str, object] = {"assurance": assurance}
+        if field == "hidden_access_clean" and row.evaluation.kind is EvaluationKind.HIDDEN:
+            updates["hidden_release_receipt_digest"] = None
+        return row.rebuild(**updates)
 
     changed = _replace(
         _results(), arm=DefenseArm.LAYERED_HYBRID, transform=weaken
@@ -335,3 +358,79 @@ def test_decimal_champion_selection_is_independent_of_ambient_context() -> None:
         getcontext().rounding = original.rounding
 
     assert changed == baseline
+
+
+def test_gate_rejects_reversed_decision_rows_in_one_arm() -> None:
+    changed = _replace(
+        _results(),
+        arm=DefenseArm.GBDT_ONLY,
+        kind=EvaluationKind.CHRONOLOGICAL,
+        transform=lambda row: row.rebuild(
+            decision_event_ids=tuple(reversed(row.decision_event_ids)),
+            decision_rows_digest=_row_digest(
+                tuple(reversed(row.decision_event_ids))
+            ),
+        ),
+    )
+
+    decision = evaluate_promotion_gates(changed, GateConfig.competition())
+
+    assert decision.status is ChampionStatus.NO_PROMOTION
+    assert "EVALUATION_LINEAGE" in decision.failed_gate_codes
+
+
+@pytest.mark.parametrize(
+    "updates",
+    (
+        {"common_integrity_digest": _sha("c")},
+        {"bundle_manifest_digest": _sha("d")},
+        {"threshold_set_digest": _sha("e")},
+        {"case_callback_digest": _sha("f")},
+        {"evaluation_context_digest": _sha("0")},
+        {"threshold_report_digest": _sha("a")},
+    ),
+)
+def test_gate_rejects_each_cross_arm_lineage_substitution(
+    updates: dict[str, object],
+) -> None:
+    changed = _replace(
+        _results(),
+        arm=DefenseArm.GBDT_ONLY,
+        kind=EvaluationKind.CHRONOLOGICAL,
+        transform=lambda row: row.rebuild(**updates),
+    )
+
+    decision = evaluate_promotion_gates(changed, GateConfig.competition())
+
+    assert decision.status is ChampionStatus.NO_PROMOTION
+    assert "EVALUATION_LINEAGE" in decision.failed_gate_codes
+
+
+def test_gate_rejects_hidden_receipt_substitution_in_one_arm() -> None:
+    changed = _replace(
+        _results(),
+        arm=DefenseArm.GBDT_ONLY,
+        kind=EvaluationKind.HIDDEN,
+        transform=lambda row: row.rebuild(
+            hidden_release_receipt_digest=_sha("c")
+        ),
+    )
+
+    decision = evaluate_promotion_gates(changed, GateConfig.competition())
+
+    assert decision.status is ChampionStatus.NO_PROMOTION
+    assert "EVALUATION_LINEAGE" in decision.failed_gate_codes
+
+
+def test_promotion_metrics_reject_omitted_closed_slice_vocabulary() -> None:
+    metrics = _metrics(value="80.00", review_cases=20)
+    incomplete = tuple(
+        item
+        for item in metrics.slice_performance
+        if not (item.kind == "rail" and item.value == Rail.AGENTIC.value)
+    )
+
+    with pytest.raises(ValueError, match="slice vocabulary"):
+        PromotionMetrics.model_validate(
+            {**metrics.model_dump(mode="python"), "slice_performance": incomplete}
+        )

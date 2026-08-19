@@ -11,6 +11,7 @@ from typing import Any, Literal, cast
 from pydantic import Field, ValidationError, field_validator, model_validator
 
 from apar.contracts._validation import ExternalContract
+from apar.contracts.events import Rail
 from apar.evaluation.contracts import Family
 from apar.evaluation.regimes import RegimeKind
 from apar.evaluation.splits import EntityCohort
@@ -214,11 +215,26 @@ class PromotionMetrics(ExternalContract):
         keys = tuple((item.kind, item.value) for item in self.slice_performance)
         if keys != tuple(sorted(keys)) or len(keys) != len(set(keys)):
             raise ValueError("slice performance must be sorted and unique")
-        family_values = tuple(
-            item.value for item in self.slice_performance if item.kind == "family"
+        expected_keys = tuple(
+            sorted(
+                (
+                    *(("family", family) for family in _FAMILIES),
+                    *(("rail", rail.value) for rail in Rail),
+                    *(
+                        ("regime", value)
+                        for value in sorted(
+                            ("baseline", *(item.value for item in RegimeKind))
+                        )
+                    ),
+                    *(
+                        ("entity_cohort", cohort.value)
+                        for cohort in EntityCohort
+                    ),
+                )
+            )
         )
-        if family_values != _FAMILIES:
-            raise ValueError("promotion metrics require all strategic family slices")
+        if keys != expected_keys:
+            raise ValueError("promotion metrics require the complete closed slice vocabulary")
         return self
 
 
@@ -251,6 +267,8 @@ class ReplayResult(ExternalContract):
     threshold_set_digest: str
     bundle_manifest_digest: str
     case_callback_digest: str
+    evaluation_context_digest: str
+    hidden_release_receipt_digest: str | None
     metric_report_digest: str
     metrics: PromotionMetrics
     assurance: AssuranceEvidence
@@ -284,12 +302,15 @@ class ReplayResult(ExternalContract):
         "threshold_set_digest",
         "bundle_manifest_digest",
         "case_callback_digest",
+        "evaluation_context_digest",
+        "hidden_release_receipt_digest",
         "metric_report_digest",
         "result_digest",
     )
     @classmethod
-    def digests_are_sha256(cls, value: str) -> str:
-        _validate_digest(value)
+    def digests_are_sha256(cls, value: str | None) -> str | None:
+        if value is not None:
+            _validate_digest(value)
         return value
 
     @field_validator("fallback_count", "mandatory_decline_count", mode="before")
@@ -303,12 +324,21 @@ class ReplayResult(ExternalContract):
     def result_is_self_consistent(self) -> ReplayResult:
         if self.metrics.row_count != len(self.decision_event_ids):
             raise ValueError("replay metrics and decision rows differ")
+        if self.decision_rows_digest != _digest_document(list(self.decision_event_ids)):
+            raise ValueError("decision row digest does not match exact ordered IDs")
         if max(self.fallback_count, self.mandatory_decline_count) > self.metrics.row_count:
             raise ValueError("replay counts exceed decision rows")
         if self.failure is not None and self.arm is not DefenseArm.GBDT_ONLY:
             raise ValueError("only GBDT-only may expose an audited model failure")
         if self.failure is not None and self.fallback_count:
             raise ValueError("failed GBDT-only replay cannot claim fallback")
+        if self.evaluation.kind is EvaluationKind.HIDDEN:
+            if self.assurance.hidden_access_clean != (
+                self.hidden_release_receipt_digest is not None
+            ):
+                raise ValueError("hidden access evidence must bind an exact receipt")
+        elif self.hidden_release_receipt_digest is not None:
+            raise ValueError("non-hidden replay cannot claim hidden receipt evidence")
         expected = _digest_document(self.model_dump(mode="json", exclude={"result_digest"}))
         if self.result_digest != expected:
             raise ValueError("replay result digest is inconsistent")
@@ -520,6 +550,9 @@ def evaluate_promotion_gates(
         arm: _hard_failure_codes(arm_rows, checked_config)
         for arm, arm_rows in by_arm.items()
     }
+    if not _evaluation_lineage_is_exact(rows):
+        for codes in arm_codes.values():
+            codes.add("EVALUATION_LINEAGE")
     _apply_slice_regression(arm_codes, by_arm, checked_config)
     passing = {arm for arm in DefenseArm if not arm_codes[arm]}
     primary = {
@@ -665,6 +698,44 @@ def _hard_failure_codes(
         ):
             codes.add("PER_FAMILY_RECALL")
     return codes
+
+
+def _evaluation_lineage_is_exact(rows: tuple[ReplayResult, ...]) -> bool:
+    if len({row.bundle_manifest_digest for row in rows}) != 1:
+        return False
+    if len({row.threshold_set_digest for row in rows}) != 1:
+        return False
+    for arm in DefenseArm:
+        arm_rows = tuple(row for row in rows if row.arm is arm)
+        if len({row.threshold_report_digest for row in arm_rows}) > 1:
+            return False
+    descriptor_keys = {
+        (row.evaluation.kind, row.evaluation.value) for row in rows
+    }
+    for key in descriptor_keys:
+        descriptor_rows = tuple(
+            row
+            for row in rows
+            if (row.evaluation.kind, row.evaluation.value) == key
+        )
+        if {row.arm for row in descriptor_rows} != set(DefenseArm):
+            continue
+        lineage = {
+            (
+                row.decision_event_ids,
+                row.decision_rows_digest,
+                row.common_integrity_digest,
+                row.bundle_manifest_digest,
+                row.threshold_set_digest,
+                row.case_callback_digest,
+                row.evaluation_context_digest,
+                row.hidden_release_receipt_digest,
+            )
+            for row in descriptor_rows
+        }
+        if len(lineage) != 1:
+            return False
+    return True
 
 
 def _apply_slice_regression(
