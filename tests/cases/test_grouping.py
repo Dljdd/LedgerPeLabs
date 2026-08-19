@@ -4,13 +4,21 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from time import perf_counter
 from typing import cast
 
 import numpy as np
 import pytest
 from pydantic import ValidationError
 
-from apar.cases import ReviewCaseCounter, bind_review_case_counter, group_cases
+from apar.cases import (
+    CaseContractError,
+    CaseMotif,
+    ReviewCaseCounter,
+    bind_review_case_counter,
+    group_cases,
+)
 from apar.contracts.decisions import Action
 from apar.defense.policy import DefenseDecision, OperatingBudget
 from apar.defense.thresholds import select_policy_thresholds
@@ -424,3 +432,174 @@ def test_threshold_selection_uses_causal_callback_with_all_frozen_budgets() -> N
     assert report.calibration_challenge_rate <= budget.challenge_rate_max
     assert report.calibration_review_case_rate <= budget.review_case_rate_max
     assert math.isfinite(cast(float, report.objective_value))
+
+
+def test_grouping_revalidates_model_constructed_decision_action() -> None:
+    row = observation("forged", actor_id="actor", counterparty_id="merchant")
+    valid = decision("forged", action=Action.APPROVE, score=0.1)
+    forged = DefenseDecision.model_construct(
+        **{**valid.model_dump(mode="python"), "action": "approve"}
+    )
+
+    with pytest.raises(CaseContractError, match="DefenseDecision|Action|semantic"):
+        group_cases((row,), (forged,), as_of=NOW)
+
+
+def test_grouping_revalidates_model_constructed_observation_and_numeric_decision() -> None:
+    valid_row = observation("forged", actor_id="actor", counterparty_id="merchant")
+    forged_row = type(valid_row).model_construct(
+        **{**valid_row.model_dump(mode="python"), "amount": "100.00"}
+    )
+    valid_decision = decision("forged")
+    forged_decision = DefenseDecision.model_construct(
+        **{**valid_decision.model_dump(mode="python"), "score": 1}
+    )
+
+    with pytest.raises(CaseContractError, match="ObservedEvent|exact|semantic"):
+        group_cases((forged_row,), (valid_decision,), as_of=NOW)
+    with pytest.raises(CaseContractError, match="DefenseDecision|exact|semantic"):
+        group_cases((valid_row,), (forged_decision,), as_of=NOW)
+
+
+def test_per_alert_evidence_freezes_causal_motif_chronology_and_value() -> None:
+    shared_actor_at = NOW + timedelta(minutes=1)
+    bridge_at = NOW + timedelta(minutes=2)
+    transitive_at = NOW + timedelta(minutes=3)
+    rows = (
+        observation(
+            "isolated",
+            actor_id="actor-a",
+            counterparty_id="merchant-a",
+            amount="10.00",
+        ),
+        observation(
+            "shared-actor",
+            actor_id="actor-a",
+            counterparty_id="merchant-b",
+            amount="20.00",
+            decision_at=shared_actor_at,
+        ),
+        observation(
+            "bridge",
+            actor_id="actor-b",
+            counterparty_id="merchant-b",
+            amount="30.00",
+            decision_at=bridge_at,
+        ),
+        observation(
+            "transitive",
+            actor_id="actor-b",
+            counterparty_id="merchant-c",
+            amount="40.00",
+            decision_at=transitive_at,
+        ),
+    )
+    decisions = (
+        decision("isolated"),
+        decision("shared-actor"),
+        decision("bridge", action=Action.APPROVE, score=0.1),
+        decision("transitive"),
+    )
+
+    grouped = group_cases(rows, decisions, as_of=transitive_at)
+
+    assert len(grouped) == 1
+    evidence = grouped[0].alert_evidence
+    assert tuple(item.event_id for item in evidence) == (
+        "isolated",
+        "shared-actor",
+        "transitive",
+    )
+    assert tuple(item.motif for item in evidence) == (
+        CaseMotif.ISOLATED,
+        CaseMotif.SHARED_ACTOR,
+        CaseMotif.TRANSITIVE,
+    )
+    assert tuple(item.decision_at for item in evidence) == (
+        NOW,
+        shared_actor_at,
+        transitive_at,
+    )
+    assert evidence[-1].visible_value_before_alert == Decimal("100.00")
+    assert grouped[0].first_evidence_ids == ("isolated",)
+
+
+def test_shared_counterparty_motif_is_stable_without_future_rejoin() -> None:
+    later = NOW + timedelta(minutes=1)
+    future = NOW + timedelta(hours=1)
+    first = observation("first", actor_id="actor-a", counterparty_id="shared")
+    second = observation(
+        "second",
+        actor_id="actor-b",
+        counterparty_id="shared",
+        decision_at=later,
+    )
+    before = group_cases(
+        (first, second),
+        (decision("first"), decision("second")),
+        as_of=later,
+    )
+    future_row = observation(
+        "future",
+        actor_id="actor-c",
+        counterparty_id="shared",
+        decision_at=future,
+        amount="999999.00",
+    )
+    after = group_cases(
+        (future_row, second, first),
+        (decision("future"), decision("second"), decision("first")),
+        as_of=future,
+    )
+
+    assert before[0].alert_evidence[1].motif is CaseMotif.SHARED_COUNTERPARTY
+    assert after[0].alert_evidence[:2] == before[0].alert_evidence
+    assert after[0].first_evidence_ids == before[0].first_evidence_ids
+
+
+def test_grouping_visits_each_graph_observation_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    from apar.cases import grouping
+
+    row_count = 400
+    rows = tuple(
+        observation(
+            f"event-{index:04d}",
+            actor_id=f"actor-{index:04d}",
+            counterparty_id=f"merchant-{index:04d}",
+            decision_at=NOW + timedelta(microseconds=index),
+        )
+        for index in range(row_count)
+    )
+    decisions = tuple(decision(row.event_id) for row in rows)
+    visits = 0
+    original = grouping._IncrementalGraph.add_observation
+
+    def counted(graph: object, row: object) -> None:
+        nonlocal visits
+        visits += 1
+        original(graph, row)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(grouping._IncrementalGraph, "add_observation", counted)
+
+    assert len(group_cases(rows, decisions, as_of=rows[-1].decision_at)) == row_count
+    assert visits == row_count
+
+
+def test_1500_isolated_grouping_meets_frozen_benchmark_ceiling() -> None:
+    row_count = 1_500
+    rows = tuple(
+        observation(
+            f"event-{index:04d}",
+            actor_id=f"actor-{index:04d}",
+            counterparty_id=f"merchant-{index:04d}",
+        )
+        for index in range(row_count)
+    )
+    decisions = tuple(decision(row.event_id) for row in rows)
+
+    started = perf_counter()
+    grouped = group_cases(rows, decisions, as_of=NOW)
+    elapsed = perf_counter() - started
+
+    assert len(grouped) == row_count
+    assert elapsed < 2.5

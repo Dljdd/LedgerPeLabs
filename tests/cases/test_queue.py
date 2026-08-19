@@ -6,12 +6,15 @@ import hashlib
 import json
 import math
 from datetime import datetime, timedelta
+from time import perf_counter
 from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
 from apar.cases import (
+    CaseAlertEvidence,
+    CaseMotif,
     CaseSnapshot,
     InvestigationCase,
     QueueConfig,
@@ -19,6 +22,7 @@ from apar.cases import (
     QueueReport,
     simulate_case_queue,
 )
+from apar.contracts.decisions import Action
 from apar.runs.wire import canonical_json_bytes
 from tests.cases.conftest import NOW
 
@@ -31,15 +35,36 @@ def case(
     estimated_minutes: int = 20,
     **updates: Any,
 ) -> InvestigationCase:
+    event_id = f"event-{index}"
+    case_id = "case-" + hashlib.sha256(
+        canonical_json_bytes(
+            {"domain": "apar-investigation-case-v1", "first_evidence": [event_id]}
+        )
+    ).hexdigest()
     values: dict[str, Any] = {
-        "case_id": f"case-{index:064x}",
+        "case_id": case_id,
         "opened_at": opened_at,
-        "event_ids": (f"event-{index}",),
+        "event_ids": (event_id,),
         "actor_ids": (f"actor-{index}",),
         "counterparty_ids": (f"counterparty-{index}",),
         "first_alert_at": opened_at,
         "priority": priority,
         "estimated_minutes": estimated_minutes,
+        "first_evidence_ids": (event_id,),
+        "alert_evidence": (
+            CaseAlertEvidence(
+                event_id=event_id,
+                decision_at=opened_at,
+                actor_id=f"actor-{index}",
+                counterparty_id=f"counterparty-{index}",
+                motif=CaseMotif.ISOLATED,
+                visible_value_before_alert="100.00",
+                latest_graph_evidence_at=opened_at - timedelta(seconds=1),
+                score=0.8,
+                action=Action.CHALLENGE,
+                evidence_source_ids=(event_id,),
+            ),
+        ),
     }
     values.update(updates)
     return InvestigationCase(**values)
@@ -82,9 +107,9 @@ def test_same_time_priority_orders_work_and_case_id_breaks_ties() -> None:
     )
     report = simulate_case_queue(cases, QueueConfig(analyst_count=1))
     assert tuple(snapshot.case_id for snapshot in report.snapshots) == (
-        f"case-{1:064x}",
-        f"case-{2:064x}",
-        f"case-{3:064x}",
+        case(1).case_id,
+        case(2).case_id,
+        case(3).case_id,
     )
 
 
@@ -229,3 +254,82 @@ def test_case_and_snapshot_contracts_reject_nonfinite_or_incoherent_values() -> 
             analyst_minutes=20,
             priority=50.0,
         )
+
+
+def test_report_rejects_redigested_impossible_simultaneous_starts() -> None:
+    report = simulate_case_queue(
+        (case(1), case(2)),
+        QueueConfig(analyst_count=1, service_minutes_per_case=20),
+    )
+    document = report.model_dump(mode="json")
+    snapshots = list(document["snapshots"])
+    snapshots[1]["started_at"] = snapshots[0]["started_at"]
+    snapshots[1]["completed_at"] = snapshots[0]["completed_at"]
+    snapshots[1]["wait_minutes"] = snapshots[0]["wait_minutes"]
+    document["snapshots"] = snapshots
+    document["peak_backlog_count"] = 0
+    document["report_digest"] = hashlib.sha256(
+        canonical_json_bytes(
+            {key: value for key, value in document.items() if key != "report_digest"}
+        )
+    ).hexdigest()
+    payload = json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+
+    with pytest.raises(QueueContractError, match="schedule|reconstruct|snapshot"):
+        QueueReport.from_json(payload)
+
+
+def test_report_binds_case_arrivals_and_snapshot_identifiers() -> None:
+    report = simulate_case_queue((case(1),), QueueConfig())
+    assert report.case_inputs == (case(1),)
+    document = report.model_dump(mode="json")
+    document["snapshots"][0]["case_id"] = f"case-{9:064x}"
+    document["report_digest"] = hashlib.sha256(
+        canonical_json_bytes(
+            {key: value for key, value in document.items() if key != "report_digest"}
+        )
+    ).hexdigest()
+
+    with pytest.raises(ValidationError, match="case|snapshot|schedule"):
+        QueueReport.model_validate(document)
+
+
+def test_queue_revalidates_model_constructed_case_and_config() -> None:
+    valid_case = case(1)
+    forged_case = InvestigationCase.model_construct(
+        **{**valid_case.model_dump(mode="python"), "priority": math.nan}
+    )
+    forged_config = QueueConfig.model_construct(
+        analyst_count=True,
+        service_minutes_per_case=20,
+        sla_minutes=240,
+        bucket_minutes=60,
+    )
+
+    with pytest.raises(QueueContractError, match="InvestigationCase|semantic|priority"):
+        simulate_case_queue((forged_case,), QueueConfig())
+    with pytest.raises(QueueContractError, match="QueueConfig|semantic|integer"):
+        simulate_case_queue((valid_case,), forged_config)
+
+
+def test_sweep_line_backlog_meets_frozen_benchmark_ceiling() -> None:
+    row_count = 3_000
+    rows = tuple(
+        case(index, opened_at=NOW + timedelta(seconds=index))
+        for index in range(row_count)
+    )
+
+    started = perf_counter()
+    report = simulate_case_queue(rows, QueueConfig(analyst_count=2))
+    elapsed = perf_counter() - started
+
+    assert report.arrival_count == row_count
+    assert elapsed < 2.5
+
+
+def test_queue_normalizes_datetime_overflow_and_bounds_configuration() -> None:
+    near_limit = datetime(9999, 12, 31, 23, 59, tzinfo=NOW.tzinfo)
+    with pytest.raises(QueueContractError, match="resource|bounds|overflow"):
+        simulate_case_queue((case(1, opened_at=near_limit),), QueueConfig())
+    with pytest.raises(ValidationError, match="less than or equal"):
+        QueueConfig(analyst_count=100_001)

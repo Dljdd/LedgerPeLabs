@@ -1,7 +1,9 @@
 """Past-only defense case grouping and synthetic review workload."""
 
 from apar.cases.grouping import (
+    CaseAlertEvidence,
     CaseContractError,
+    CaseMotif,
     InvestigationCase,
     ReviewCaseCounter,
     bind_review_case_counter,
@@ -16,7 +18,9 @@ from apar.cases.queue import (
 )
 
 __all__ = [
+    "CaseAlertEvidence",
     "CaseContractError",
+    "CaseMotif",
     "CaseSnapshot",
     "InvestigationCase",
     "QueueConfig",

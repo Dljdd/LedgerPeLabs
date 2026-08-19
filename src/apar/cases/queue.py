@@ -19,14 +19,19 @@ class QueueContractError(ValueError):
     """Queue inputs or serialized evidence violate the closed contract."""
 
 
+_MAX_QUEUE_ROWS = 100_000
+_MAX_ANALYST_COUNT = 100_000
+_MAX_MINUTES = 1_000_000
+
+
 class QueueConfig(ExternalContract):
     """Frozen synthetic analyst-capacity assumptions."""
 
     schema_version: Literal["1.0.0"] = "1.0.0"
-    analyst_count: int = Field(default=2, ge=1)
-    service_minutes_per_case: int = Field(default=20, ge=1)
-    sla_minutes: int = Field(default=240, ge=1)
-    bucket_minutes: int = Field(default=60, ge=1)
+    analyst_count: int = Field(default=2, ge=1, le=_MAX_ANALYST_COUNT)
+    service_minutes_per_case: int = Field(default=20, ge=1, le=_MAX_MINUTES)
+    sla_minutes: int = Field(default=240, ge=1, le=_MAX_MINUTES)
+    bucket_minutes: int = Field(default=60, ge=1, le=_MAX_MINUTES)
 
     @field_validator(
         "analyst_count",
@@ -63,6 +68,25 @@ class CaseSnapshot(ExternalContract):
     analyst_minutes: int = Field(ge=1)
     priority: float = Field(ge=0.0, le=100.0)
 
+    @field_validator("case_id")
+    @classmethod
+    def case_id_is_bounded_sha256(cls, value: str) -> str:
+        digest = value.removeprefix("case-")
+        if (
+            type(value) is not str
+            or not value.startswith("case-")
+            or len(digest) != 64
+            or digest != digest.lower()
+        ):
+            raise ValueError("snapshot case_id must contain a lowercase SHA-256 digest")
+        try:
+            int(digest, 16)
+        except ValueError as error:
+            raise ValueError(
+                "snapshot case_id must contain a lowercase SHA-256 digest"
+            ) from error
+        return value
+
     @field_validator("opened_at", "started_at", "completed_at")
     @classmethod
     def timestamps_are_utc(cls, value: datetime) -> datetime:
@@ -71,8 +95,15 @@ class CaseSnapshot(ExternalContract):
     @field_validator("wait_minutes", "priority")
     @classmethod
     def metrics_are_finite(cls, value: float) -> float:
-        if not math.isfinite(value):
+        if type(value) is not float or not math.isfinite(value):
             raise ValueError("queue snapshot metrics must be finite")
+        return value
+
+    @field_validator("analyst_minutes", mode="before")
+    @classmethod
+    def analyst_minutes_is_bounded_exact_int(cls, value: object) -> object:
+        if type(value) is not int or not 1 <= value <= _MAX_MINUTES:
+            raise ValueError("snapshot analyst minutes must be a bounded exact integer")
         return value
 
     @model_validator(mode="after")
@@ -92,6 +123,7 @@ class QueueReport(ExternalContract):
 
     schema_version: Literal["1.0.0"] = "1.0.0"
     config: QueueConfig
+    case_inputs: tuple[InvestigationCase, ...]
     snapshots: tuple[CaseSnapshot, ...]
     arrival_count: int = Field(ge=0)
     completed_count: int = Field(ge=0)
@@ -99,6 +131,20 @@ class QueueReport(ExternalContract):
     peak_backlog_count: int = Field(ge=0)
     sla_breach_count: int = Field(ge=0)
     report_digest: str
+
+    @field_validator(
+        "arrival_count",
+        "completed_count",
+        "analyst_minutes",
+        "peak_backlog_count",
+        "sla_breach_count",
+        mode="before",
+    )
+    @classmethod
+    def aggregates_are_bounded_exact_integers(cls, value: object) -> object:
+        if type(value) is not int or not 0 <= value <= 100_000_000_000:
+            raise ValueError("queue aggregates must be bounded exact integers")
+        return value
 
     @field_validator("report_digest")
     @classmethod
@@ -113,17 +159,29 @@ class QueueReport(ExternalContract):
 
     @model_validator(mode="after")
     def evidence_is_consistent(self) -> QueueReport:
-        case_ids = tuple(item.case_id for item in self.snapshots)
-        if len(set(case_ids)) != len(case_ids):
-            raise ValueError("queue snapshot case IDs must be unique")
-        expected_order = tuple(
+        if len(self.case_inputs) > _MAX_QUEUE_ROWS:
+            raise ValueError("queue case count exceeds frozen resource cap")
+        expected_inputs = tuple(
             sorted(
-                self.snapshots,
+                self.case_inputs,
                 key=lambda item: (item.opened_at, -item.priority, item.case_id),
             )
         )
-        if self.snapshots != expected_order:
-            raise ValueError("queue snapshots must use canonical causal order")
+        if self.case_inputs != expected_inputs:
+            raise ValueError("queue case inputs must use canonical causal order")
+        if len({item.case_id for item in self.case_inputs}) != len(self.case_inputs):
+            raise ValueError("queue case input IDs must be unique")
+        case_ids = tuple(item.case_id for item in self.snapshots)
+        if len(set(case_ids)) != len(case_ids):
+            raise ValueError("queue snapshot case IDs must be unique")
+        try:
+            expected_snapshots = _allocate_snapshots(self.case_inputs, self.config)
+        except (ArithmeticError, MemoryError, OverflowError) as error:
+            raise ValueError("queue schedule exceeds frozen resource bounds") from error
+        if self.snapshots != expected_snapshots:
+            raise ValueError(
+                "queue snapshots must match the canonical reconstructed online schedule"
+            )
         if any(
             item.analyst_minutes != self.config.service_minutes_per_case
             for item in self.snapshots
@@ -159,8 +217,16 @@ class QueueReport(ExternalContract):
             document = strict_json_loads(payload)
             if type(document) is not dict:
                 raise QueueContractError("queue report JSON must contain an object")
+            if payload != canonical_json_bytes(document):
+                raise QueueContractError("queue report JSON must use canonical encoding")
             return cls.model_validate(document)
-        except (WireContractError, ValidationError) as error:
+        except (
+            ArithmeticError,
+            MemoryError,
+            OverflowError,
+            WireContractError,
+            ValidationError,
+        ) as error:
             raise QueueContractError(str(error)) from error
 
 
@@ -174,22 +240,67 @@ def simulate_case_queue(
     arrivals never reorder earlier backlog, so appending future cases preserves
     every already-emitted snapshot.
     """
-    if not isinstance(cases, (tuple, list)):
-        raise TypeError("cases must be an exact row sequence")
+    if type(cases) is not tuple:
+        raise TypeError("cases must be an exact tuple")
     if type(config) is not QueueConfig:
         raise TypeError("config must be an exact QueueConfig")
-    rows = tuple(cases)
-    for row in rows:
-        if type(row) is not InvestigationCase:
-            raise TypeError("cases must contain exact InvestigationCase rows")
-        if row.estimated_minutes != config.service_minutes_per_case:
-            raise QueueContractError(
-                "case estimated_minutes must equal the frozen service fixture"
-            )
-    identifiers = tuple(row.case_id for row in rows)
-    if len(set(identifiers)) != len(identifiers):
-        raise QueueContractError("duplicate case_id in queue input")
-    ordered = tuple(sorted(rows, key=lambda row: (row.opened_at, -row.priority, row.case_id)))
+    try:
+        validated_config = _revalidate_config(config)
+        if len(cases) > _MAX_QUEUE_ROWS:
+            raise QueueContractError("queue case count exceeds frozen resource cap")
+        rows: list[InvestigationCase] = []
+        for row in cases:
+            if type(row) is not InvestigationCase:
+                raise TypeError("cases must contain exact InvestigationCase rows")
+            validated = _revalidate_case(row)
+            if validated.estimated_minutes != validated_config.service_minutes_per_case:
+                raise QueueContractError(
+                    "case estimated_minutes must equal the frozen service fixture"
+                )
+            rows.append(validated)
+        identifiers = tuple(row.case_id for row in rows)
+        if len(set(identifiers)) != len(identifiers):
+            raise QueueContractError("duplicate case_id in queue input")
+        ordered = tuple(
+            sorted(rows, key=lambda row: (row.opened_at, -row.priority, row.case_id))
+        )
+        snapshot_rows = _allocate_snapshots(ordered, validated_config)
+        analyst_minutes = len(ordered) * validated_config.service_minutes_per_case
+        peak_backlog_count = _peak_backlog(snapshot_rows)
+        sla_breach_count = sum(item.sla_breached for item in snapshot_rows)
+    except QueueContractError:
+        raise
+    except (ArithmeticError, MemoryError, OverflowError) as error:
+        raise QueueContractError("queue simulation exceeded frozen resource bounds") from error
+
+    document = {
+        "schema_version": "1.0.0",
+        "config": validated_config,
+        "case_inputs": ordered,
+        "snapshots": snapshot_rows,
+        "arrival_count": len(ordered),
+        "completed_count": len(ordered),
+        "analyst_minutes": analyst_minutes,
+        "peak_backlog_count": peak_backlog_count,
+        "sla_breach_count": sla_breach_count,
+    }
+    digest_document = _json_document(document)
+    return QueueReport(
+        config=validated_config,
+        case_inputs=ordered,
+        snapshots=snapshot_rows,
+        arrival_count=len(ordered),
+        completed_count=len(ordered),
+        analyst_minutes=analyst_minutes,
+        peak_backlog_count=peak_backlog_count,
+        sla_breach_count=sla_breach_count,
+        report_digest=hashlib.sha256(canonical_json_bytes(digest_document)).hexdigest(),
+    )
+
+
+def _allocate_snapshots(
+    ordered: tuple[InvestigationCase, ...], config: QueueConfig
+) -> tuple[CaseSnapshot, ...]:
     snapshots: list[CaseSnapshot] = []
     last_slot: datetime | None = None
     slot_uses = 0
@@ -225,31 +336,7 @@ def simulate_case_queue(
                 priority=row.priority,
             )
         )
-    snapshot_rows = tuple(snapshots)
-    analyst_minutes = len(rows) * config.service_minutes_per_case
-    peak_backlog_count = _peak_backlog(snapshot_rows)
-    sla_breach_count = sum(item.sla_breached for item in snapshot_rows)
-    document = {
-        "schema_version": "1.0.0",
-        "config": config,
-        "snapshots": snapshot_rows,
-        "arrival_count": len(rows),
-        "completed_count": len(rows),
-        "analyst_minutes": analyst_minutes,
-        "peak_backlog_count": peak_backlog_count,
-        "sla_breach_count": sla_breach_count,
-    }
-    digest_document = _json_document(document)
-    return QueueReport(
-        config=config,
-        snapshots=snapshot_rows,
-        arrival_count=len(rows),
-        completed_count=len(rows),
-        analyst_minutes=analyst_minutes,
-        peak_backlog_count=peak_backlog_count,
-        sla_breach_count=sla_breach_count,
-        report_digest=hashlib.sha256(canonical_json_bytes(digest_document)).hexdigest(),
-    )
+    return tuple(snapshots)
 
 
 def _first_slot_at_or_after(opened_at: datetime, config: QueueConfig) -> datetime:
@@ -276,12 +363,54 @@ def _first_slot_at_or_after(opened_at: datetime, config: QueueConfig) -> datetim
 def _peak_backlog(snapshots: tuple[CaseSnapshot, ...]) -> int:
     if not snapshots:
         return 0
-    openings = sorted({item.opened_at for item in snapshots})
-    return max(
-        sum(item.opened_at <= instant for item in snapshots)
-        - sum(item.started_at <= instant for item in snapshots)
-        for instant in openings
-    )
+    openings = sorted(item.opened_at for item in snapshots)
+    starts = sorted(item.started_at for item in snapshots)
+    peak = 0
+    arrival_position = 0
+    start_position = 0
+    while arrival_position < len(openings):
+        instant = openings[arrival_position]
+        while arrival_position < len(openings) and openings[arrival_position] == instant:
+            arrival_position += 1
+        while start_position < len(starts) and starts[start_position] <= instant:
+            start_position += 1
+        peak = max(peak, arrival_position - start_position)
+    return peak
+
+
+def _revalidate_config(config: QueueConfig) -> QueueConfig:
+    try:
+        return QueueConfig.model_validate(
+            config.model_dump(mode="python", warnings=False), strict=True
+        )
+    except (AttributeError, TypeError, ValidationError, ValueError) as error:
+        raise QueueContractError(
+            "QueueConfig failed deterministic semantic revalidation"
+        ) from error
+
+
+def _revalidate_case(row: InvestigationCase) -> InvestigationCase:
+    if (
+        type(row.case_id) is not str
+        or type(row.opened_at) is not datetime
+        or type(row.event_ids) is not tuple
+        or type(row.actor_ids) is not tuple
+        or type(row.counterparty_ids) is not tuple
+        or type(row.first_alert_at) is not datetime
+        or type(row.priority) is not float
+        or type(row.estimated_minutes) is not int
+        or type(row.first_evidence_ids) is not tuple
+        or type(row.alert_evidence) is not tuple
+    ):
+        raise QueueContractError("InvestigationCase contains non-exact field values")
+    try:
+        return InvestigationCase.model_validate(
+            row.model_dump(mode="python", warnings=False), strict=True
+        )
+    except (AttributeError, TypeError, ValidationError, ValueError) as error:
+        raise QueueContractError(
+            "InvestigationCase failed deterministic semantic revalidation"
+        ) from error
 
 
 def _json_document(value: object) -> object:
