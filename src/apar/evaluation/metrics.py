@@ -53,6 +53,11 @@ _DECIMAL128_CONTEXT = Context(
 )
 _CALIBRATION_BINS = 10
 _LOGIT_EPSILON = 1e-8
+_RESTRICTED_PRIVACY_CLASSIFICATION = "restricted_evaluation_evidence"
+_METRIC_EVIDENCE_MEDIA_TYPE = "application/vnd.apar.metric-derivation-evidence+json"
+_BOOTSTRAP_EVIDENCE_MEDIA_TYPE = (
+    "application/vnd.apar.bootstrap-derivation-evidence+json"
+)
 _SETTLEMENT_EVENTS = frozenset({EventKind.SETTLEMENT, EventKind.TRANSFER_POSTED})
 _REVERSING_EVENTS = frozenset(
     {
@@ -70,7 +75,8 @@ _FAMILIES = (
     "synthetic_merchant_refund",
 )
 _REGIME_VALUES = tuple(sorted(("baseline", *(kind.value for kind in RegimeKind))))
-_ENTITY_COHORT_VALUES = tuple(sorted(cohort.value for cohort in EntityCohort))
+_ENTITY_COHORT_VALUES = tuple(cohort.value for cohort in EntityCohort)
+_ENTITY_COHORT_ORDER = {cohort: index for index, cohort in enumerate(EntityCohort)}
 _LIMITATIONS = (
     "Results use authorized synthetic APAR fixtures only.",
     "Campaign-clustered intervals describe variation in this synthetic corpus, "
@@ -165,25 +171,37 @@ class DecimalMetricValue(ExternalContract):
 
 
 class SliceAssignment(ExternalContract):
-    """Evaluator-owned optional regime and entity-cohort labels for one opening."""
+    """Evaluator-owned regime and ordered Task5 entity cohorts for one opening."""
 
     event_id: str
     regime: str
-    entity_cohort: str
+    entity_cohorts: tuple[EntityCohort, ...]
 
-    @field_validator("event_id", "regime", "entity_cohort")
+    @field_validator("event_id", "regime")
     @classmethod
     def labels_are_bounded_exact_text(cls, value: str) -> str:
         if type(value) is not str or not value or len(value) > _MAX_IDENTIFIER_LENGTH:
             raise ValueError("slice labels must be bounded nonempty text")
         return value
 
+    @field_validator("entity_cohorts", mode="before")
+    @classmethod
+    def cohorts_are_an_exact_tuple(cls, value: object) -> object:
+        if type(value) is not tuple or not value:
+            raise ValueError("slice entity cohorts must be a nonempty exact tuple")
+        if any(type(item) is not EntityCohort for item in value):
+            raise ValueError("slice entity cohorts must contain exact EntityCohort values")
+        return value
+
     @model_validator(mode="after")
     def labels_use_closed_competition_vocabularies(self) -> SliceAssignment:
         if self.regime not in _REGIME_VALUES:
             raise ValueError("slice regime is outside the closed manifest vocabulary")
-        if self.entity_cohort not in _ENTITY_COHORT_VALUES:
-            raise ValueError("slice entity cohort is outside the closed manifest vocabulary")
+        expected = tuple(
+            sorted(set(self.entity_cohorts), key=_ENTITY_COHORT_ORDER.__getitem__)
+        )
+        if self.entity_cohorts != expected:
+            raise ValueError("slice entity cohorts must be canonical and unique")
         return self
 
 
@@ -206,7 +224,7 @@ class SliceManifest(ExternalContract):
         if self.regimes != _REGIME_VALUES:
             raise ValueError("slice manifest regimes must be complete and sorted")
         if self.entity_cohorts != _ENTITY_COHORT_VALUES:
-            raise ValueError("slice manifest entity cohorts must be complete and sorted")
+            raise ValueError("slice manifest entity cohorts must be complete and canonical")
         return self
 
     @classmethod
@@ -333,7 +351,19 @@ class ClassificationMetrics(ExternalContract):
         rail_values = tuple(item.value for item in self.slices if item.kind == "rail")
         if rail_values != tuple(sorted(rail.value for rail in Rail)):
             raise ValueError("classification rail slices must be complete and exact")
-        for kind in ("family", "rail", "regime", "entity_cohort"):
+        regime_values = tuple(
+            item.value for item in self.slices if item.kind == "regime"
+        )
+        if regime_values != _REGIME_VALUES:
+            raise ValueError("classification regime slices must be complete and exact")
+        entity_cohort_values = tuple(
+            item.value for item in self.slices if item.kind == "entity_cohort"
+        )
+        if entity_cohort_values != _ENTITY_COHORT_VALUES:
+            raise ValueError(
+                "classification entity cohort slices must be complete and exact"
+            )
+        for kind in ("family", "rail", "regime"):
             selected = tuple(item for item in self.slices if item.kind == kind)
             if selected:
                 _validate_slice_rollup(self, selected, kind=kind)
@@ -899,15 +929,99 @@ class MetricReportInputs(ExternalContract):
         return validate_utc_timestamp(value)
 
 
-class MetricDerivationEvidence(ExternalContract):
-    """Exact truth-bearing evaluator inputs used to rederive every report section."""
+class _RestrictedEvidence(bytes):
+    """Intrinsically immutable canonical restricted evidence bytes."""
 
-    schema_version: Literal["1.0.0"] = "1.0.0"
-    inputs: MetricReportInputs
+    __slots__ = ()
+
+    def __init__(self, source: object) -> None:
+        del source
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise TypeError("restricted evaluation evidence is immutable")
+
+    def __delattr__(self, name: str) -> None:
+        del name
+        raise TypeError("restricted evaluation evidence is immutable")
+
+    @property
+    def evidence_digest(self) -> str:
+        return hashlib.sha256(self.to_bytes()).hexdigest()
+
+    @property
+    def privacy_classification(self) -> Literal["restricted_evaluation_evidence"]:
+        return "restricted_evaluation_evidence"
+
+    def to_bytes(self) -> bytes:
+        """Return an immutable base-bytes copy for restricted storage."""
+        return bytes(memoryview(self))
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(privacy_classification="
+            f"{self.privacy_classification!r}, evidence_digest={self.evidence_digest!r})"
+        )
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+class MetricDerivationEvidence(_RestrictedEvidence):
+    """Sealed canonical truth-bearing inputs for restricted metric re-derivation."""
+
+    __slots__ = ()
+
+    def __new__(
+        cls, source: MetricReportInputs | bytes
+    ) -> MetricDerivationEvidence:
+        if type(source) is MetricReportInputs:
+            payload = _metric_evidence_payload(source)
+        elif type(source) is bytes:
+            payload = source
+            _metric_inputs_from_evidence_bytes(payload)
+        else:
+            raise MetricContractError(
+                "restricted metric evidence requires exact inputs or bytes"
+            )
+        if len(payload) > MAX_METRIC_PAYLOAD_BYTES:
+            raise MetricContractError("restricted metric evidence exceeds resource cap")
+        return bytes.__new__(cls, payload)
+
+    @classmethod
+    def from_inputs(cls, inputs: MetricReportInputs) -> MetricDerivationEvidence:
+        """Seal validated evaluator inputs as restricted canonical bytes."""
+        return cls(inputs)
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> MetricDerivationEvidence:
+        """Load bounded canonical restricted metric evidence."""
+        return cls(payload)
+
+    @property
+    def media_type(self) -> Literal[
+        "application/vnd.apar.metric-derivation-evidence+json"
+    ]:
+        return "application/vnd.apar.metric-derivation-evidence+json"
+
+    @property
+    def evaluator_input_digest(self) -> str:
+        return cast(
+            str,
+            _metric_evidence_document(self.to_bytes())["evaluator_input_digest"],
+        )
+
+    @property
+    def inputs(self) -> MetricReportInputs:
+        """Return a freshly validated copy of the restricted evaluator inputs."""
+        return _metric_inputs_from_evidence_bytes(self.to_bytes())
+
+    def __reduce__(self) -> tuple[object, tuple[bytes]]:
+        return MetricDerivationEvidence.from_bytes, (self.to_bytes(),)
 
 
 class MetricReport(ExternalContract):
-    """Canonical truth-bearing evaluator evidence requiring redaction for publication."""
+    """Canonical aggregate-only public synthetic defense metrics."""
 
     schema_version: Literal["1.0.0"] = "1.0.0"
     evaluator_as_of: datetime
@@ -918,7 +1032,7 @@ class MetricReport(ExternalContract):
     alerts: AlertMetrics
     operations: OperationalMetrics
     engineering: EngineeringMetrics
-    derivation_evidence: MetricDerivationEvidence
+    derivation_evidence_digest: str
     synthetic_only: Literal[True] = True
     external_validity_claimed: Literal[False] = False
     limitations: tuple[str, ...] = _LIMITATIONS
@@ -929,7 +1043,9 @@ class MetricReport(ExternalContract):
     def as_of_is_utc(cls, value: datetime) -> datetime:
         return validate_utc_timestamp(value)
 
-    @field_validator("evaluator_input_digest", "report_digest")
+    @field_validator(
+        "evaluator_input_digest", "derivation_evidence_digest", "report_digest"
+    )
     @classmethod
     def digests_are_sha256(cls, value: str) -> str:
         _validate_sha256(value)
@@ -962,25 +1078,6 @@ class MetricReport(ExternalContract):
             raise ValueError("value and operations analyst minutes differ")
         if self.engineering.end_to_end_ms.sample_count != self.classification.row_count:
             raise ValueError("latency and classification row counts differ")
-        try:
-            derived = _derive_metric_sections(self.derivation_evidence.inputs)
-        except (ArithmeticError, MemoryError, OverflowError, TypeError, ValueError) as error:
-            raise ValueError("metric report derivation evidence is invalid") from error
-        if self.evaluator_as_of != derived.inputs.as_of:
-            raise ValueError("metric report derivation as_of differs")
-        expected_input_digest = _input_digest(derived.inputs)
-        if self.evaluator_input_digest != expected_input_digest:
-            raise ValueError("metric report derivation input digest differs")
-        for label, actual, expected_section in (
-            ("classification", self.classification, derived.classification),
-            ("calibration", self.calibration, derived.calibration),
-            ("value", self.value, derived.value),
-            ("alerts", self.alerts, derived.alerts),
-            ("operations", self.operations, derived.operations),
-            ("engineering", self.engineering, derived.engineering),
-        ):
-            if actual != expected_section:
-                raise ValueError(f"metric report derivation differs for {label}")
         return self
 
     def to_json(self) -> bytes:
@@ -1004,15 +1101,20 @@ class MetricReport(ExternalContract):
             ValueError,
         ) as error:
             raise MetricContractError(
-                "metric report failed semantic revalidation or derivation recheck"
+                "metric report failed semantic revalidation"
             ) from error
         if len(payload) > MAX_METRIC_PAYLOAD_BYTES:
             raise MetricContractError("metric report payload exceeds resource cap")
         return payload
 
     @classmethod
-    def from_json(cls, payload: bytes) -> MetricReport:
-        """Load only bounded canonical JSON with complete semantic validation."""
+    def from_json(
+        cls,
+        payload: bytes,
+        *,
+        evidence: MetricDerivationEvidence | None = None,
+    ) -> MetricReport:
+        """Load public aggregates only against exact restricted evaluator evidence."""
         if type(payload) is not bytes:
             raise MetricContractError("metric report payload must be exact bytes")
         if len(payload) > MAX_METRIC_PAYLOAD_BYTES:
@@ -1021,8 +1123,20 @@ class MetricReport(ExternalContract):
             document = strict_json_loads(payload)
             if type(document) is not dict:
                 raise MetricContractError("metric report JSON must contain an object")
-            _restore_metric_report_json_tuples(document)
-            return cls.model_validate(document)
+            report = cls.model_validate(document)
+            if report.classification.row_count:
+                if type(evidence) is not MetricDerivationEvidence:
+                    raise MetricContractError(
+                        "nonempty public report requires exact restricted metric evidence"
+                    )
+                _validate_metric_report_evidence(report, evidence)
+            elif evidence is not None:
+                if type(evidence) is not MetricDerivationEvidence:
+                    raise MetricContractError(
+                        "metric evidence must use the exact restricted contract"
+                    )
+                _validate_metric_report_evidence(report, evidence)
+            return report
         except MetricContractError:
             raise
         except (
@@ -1144,8 +1258,60 @@ class CampaignBootstrapContribution(ExternalContract):
         return self
 
 
+class BootstrapDerivationEvidence(_RestrictedEvidence):
+    """Sealed restricted whole-campaign contributions for exact CI replay."""
+
+    __slots__ = ()
+
+    def __new__(
+        cls, source: MetricReportInputs | bytes
+    ) -> BootstrapDerivationEvidence:
+        if type(source) is MetricReportInputs:
+            payload = _bootstrap_evidence_payload(source)
+        elif type(source) is bytes:
+            payload = source
+            _bootstrap_evidence_values(payload)
+        else:
+            raise MetricContractError(
+                "restricted bootstrap evidence requires exact inputs or bytes"
+            )
+        if len(payload) > MAX_METRIC_PAYLOAD_BYTES:
+            raise MetricContractError("restricted bootstrap evidence exceeds resource cap")
+        return bytes.__new__(cls, payload)
+
+    @classmethod
+    def from_inputs(cls, inputs: MetricReportInputs) -> BootstrapDerivationEvidence:
+        """Derive and seal exact campaign contributions from evaluator inputs."""
+        return cls(inputs)
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> BootstrapDerivationEvidence:
+        """Load bounded canonical restricted bootstrap evidence."""
+        return cls(payload)
+
+    @property
+    def media_type(self) -> Literal[
+        "application/vnd.apar.bootstrap-derivation-evidence+json"
+    ]:
+        return "application/vnd.apar.bootstrap-derivation-evidence+json"
+
+    @property
+    def evaluator_input_digest(self) -> str:
+        document, _ = _bootstrap_evidence_values(self.to_bytes())
+        return cast(str, document["evaluator_input_digest"])
+
+    @property
+    def contributions(self) -> tuple[CampaignBootstrapContribution, ...]:
+        """Return fresh validated contribution objects for deterministic replay."""
+        _, contributions = _bootstrap_evidence_values(self.to_bytes())
+        return contributions
+
+    def __reduce__(self) -> tuple[object, tuple[bytes]]:
+        return BootstrapDerivationEvidence.from_bytes, (self.to_bytes(),)
+
+
 class ConfidenceIntervals(ExternalContract):
-    """Canonical frozen campaign-clustered uncertainty evidence."""
+    """Canonical aggregate-only public campaign-clustered uncertainty metrics."""
 
     schema_version: Literal["1.0.0"] = "1.0.0"
     resampling_unit: Literal["campaign"] = "campaign"
@@ -1156,12 +1322,14 @@ class ConfidenceIntervals(ExternalContract):
     replicates: Literal[1000] = 1000
     evaluator_input_digest: str
     intervals: tuple[ConfidenceInterval, ...]
-    campaign_contributions: tuple[CampaignBootstrapContribution, ...]
+    derivation_evidence_digest: str
     synthetic_only: Literal[True] = True
     external_validity_claimed: Literal[False] = False
     intervals_digest: str
 
-    @field_validator("evaluator_input_digest", "intervals_digest")
+    @field_validator(
+        "evaluator_input_digest", "derivation_evidence_digest", "intervals_digest"
+    )
     @classmethod
     def digests_are_sha256(cls, value: str) -> str:
         _validate_sha256(value)
@@ -1174,25 +1342,6 @@ class ConfidenceIntervals(ExternalContract):
         names = tuple(item.metric_name for item in self.intervals)
         if names != _BOOTSTRAP_METRICS:
             raise ValueError("confidence intervals must be complete, sorted, and unique")
-        campaign_ids = tuple(item.campaign_id for item in self.campaign_contributions)
-        if campaign_ids != tuple(sorted(campaign_ids)) or len(set(campaign_ids)) != len(
-            campaign_ids
-        ):
-            raise ValueError("bootstrap campaign contributions must be sorted and unique")
-        if len(campaign_ids) > MAX_METRIC_CAMPAIGNS:
-            raise ValueError("bootstrap campaign contribution count exceeds resource cap")
-        if len(campaign_ids) * self.replicates > MAX_BOOTSTRAP_WORK:
-            raise ValueError("bootstrap contribution replay exceeds frozen work cap")
-        try:
-            expected_intervals = _bootstrap_intervals(
-                self.campaign_contributions,
-                seed=self.seed,
-                replicates=self.replicates,
-            )
-        except (ArithmeticError, MemoryError, OverflowError, TypeError, ValueError) as error:
-            raise ValueError("bootstrap derivation evidence is invalid") from error
-        if self.intervals != expected_intervals:
-            raise ValueError("bootstrap derivation differs from stored intervals")
         expected = _digest_document(self.model_dump(mode="json", exclude={"intervals_digest"}))
         if self.intervals_digest != expected:
             raise ValueError("confidence interval digest is inconsistent")
@@ -1222,8 +1371,13 @@ class ConfidenceIntervals(ExternalContract):
         return payload
 
     @classmethod
-    def from_json(cls, payload: bytes) -> ConfidenceIntervals:
-        """Load bounded canonical confidence-interval evidence."""
+    def from_json(
+        cls,
+        payload: bytes,
+        *,
+        evidence: BootstrapDerivationEvidence | None = None,
+    ) -> ConfidenceIntervals:
+        """Load public intervals only against exact restricted replay evidence."""
         if type(payload) is not bytes:
             raise MetricContractError("confidence payload must be exact bytes")
         if len(payload) > MAX_METRIC_PAYLOAD_BYTES:
@@ -1232,7 +1386,13 @@ class ConfidenceIntervals(ExternalContract):
             document = strict_json_loads(payload)
             if type(document) is not dict:
                 raise MetricContractError("confidence JSON must contain an object")
-            return cls.model_validate(document)
+            confidence = cls.model_validate(document)
+            if type(evidence) is not BootstrapDerivationEvidence:
+                raise MetricContractError(
+                    "nonempty confidence intervals require exact restricted bootstrap evidence"
+                )
+            _validate_confidence_evidence(confidence, evidence)
+            return confidence
         except MetricContractError:
             raise
         except (
@@ -1313,7 +1473,7 @@ def compute_metric_report(report_inputs: MetricReportInputs) -> MetricReport:
         raise MetricContractError("report_inputs must be an exact MetricReportInputs")
     try:
         derived = _derive_metric_sections(report_inputs)
-        evidence = MetricDerivationEvidence(inputs=derived.inputs)
+        evidence = MetricDerivationEvidence.from_inputs(derived.inputs)
         input_digest = _input_digest(derived.inputs)
         document: dict[str, object] = {
             "schema_version": "1.0.0",
@@ -1325,7 +1485,7 @@ def compute_metric_report(report_inputs: MetricReportInputs) -> MetricReport:
             "alerts": derived.alerts,
             "operations": derived.operations,
             "engineering": derived.engineering,
-            "derivation_evidence": evidence,
+            "derivation_evidence_digest": evidence.evidence_digest,
             "synthetic_only": True,
             "external_validity_claimed": False,
             "limitations": _LIMITATIONS,
@@ -1340,7 +1500,7 @@ def compute_metric_report(report_inputs: MetricReportInputs) -> MetricReport:
             alerts=derived.alerts,
             operations=derived.operations,
             engineering=derived.engineering,
-            derivation_evidence=evidence,
+            derivation_evidence_digest=evidence.evidence_digest,
             limitations=_LIMITATIONS,
             report_digest=digest,
         )
@@ -1399,17 +1559,8 @@ def campaign_bootstrap(
     if type(replicates) is not int or replicates != BOOTSTRAP_REPLICATES:
         raise MetricContractError("campaign bootstrap replicate count must equal 1000")
     try:
-        validated = _validate_inputs(report_inputs)
-        campaign_groups = validated.campaign_index.groups
-        campaign_ids = tuple(group.campaign_id for group in campaign_groups)
-        if len(campaign_ids) > MAX_METRIC_CAMPAIGNS:
-            raise MetricContractError("campaign count exceeds metric resource cap")
-        if len(campaign_ids) * replicates > MAX_BOOTSTRAP_WORK:
-            raise MetricContractError("campaign bootstrap exceeds frozen work cap")
-        contributions = tuple(
-            _campaign_bootstrap_contribution(group.campaign_id, group.rows)
-            for group in campaign_groups
-        )
+        evidence = BootstrapDerivationEvidence.from_inputs(report_inputs)
+        contributions = evidence.contributions
         intervals = _bootstrap_intervals(
             contributions,
             seed=seed,
@@ -1423,16 +1574,16 @@ def campaign_bootstrap(
             "confidence_level": 0.95,
             "seed": seed,
             "replicates": replicates,
-            "evaluator_input_digest": _input_digest(validated.inputs),
+            "evaluator_input_digest": evidence.evaluator_input_digest,
             "intervals": intervals,
-            "campaign_contributions": contributions,
+            "derivation_evidence_digest": evidence.evidence_digest,
             "synthetic_only": True,
             "external_validity_claimed": False,
         }
         return ConfidenceIntervals(
             evaluator_input_digest=cast(str, document["evaluator_input_digest"]),
             intervals=intervals,
-            campaign_contributions=contributions,
+            derivation_evidence_digest=evidence.evidence_digest,
             intervals_digest=_digest_document(_json_tree(document)),
         )
     except MetricContractError:
@@ -1616,30 +1767,30 @@ def _classification_metrics(validated: _ValidatedInputs) -> ClassificationMetric
         if assignments:
             assignment = assignments[row.event_id]
             regime_rows[assignment.regime].append(row)
-            cohort_rows[assignment.entity_cohort].append(row)
+            for cohort in assignment.entity_cohorts:
+                cohort_rows[cohort.value].append(row)
     slices: list[ClassificationSlice] = []
     for family in _FAMILIES:
         slices.append(_classification_slice("family", family, tuple(family_rows[family])))
     for rail in Rail:
         slices.append(_classification_slice("rail", rail.value, tuple(rail_rows[rail.value])))
-    manifest = validated.inputs.slice_manifest
-    if assignments and manifest is not None:
-        for regime in manifest.regimes:
-            slices.append(
-                _classification_slice(
-                    "regime",
-                    regime,
-                    tuple(regime_rows[regime]),
-                )
+    manifest = validated.inputs.slice_manifest or SliceManifest.closed()
+    for regime in manifest.regimes:
+        slices.append(
+            _classification_slice(
+                "regime",
+                regime,
+                tuple(regime_rows[regime]),
             )
-        for cohort in manifest.entity_cohorts:
-            slices.append(
-                _classification_slice(
-                    "entity_cohort",
-                    cohort,
-                    tuple(cohort_rows[cohort]),
-                )
+        )
+    for cohort_label in manifest.entity_cohorts:
+        slices.append(
+            _classification_slice(
+                "entity_cohort",
+                cohort_label,
+                tuple(cohort_rows[cohort_label]),
             )
+        )
     return ClassificationMetrics(
         **counts,
         decline_true_positives=sum(
@@ -2375,7 +2526,11 @@ def _validate_slice_assignments(
         raise MetricContractError("slice assignments must align bijectively with truth rows")
     if any(row.regime not in manifest.regimes for row in assignments):
         raise MetricContractError("slice assignment regime is absent from its manifest")
-    if any(row.entity_cohort not in manifest.entity_cohorts for row in assignments):
+    if any(
+        cohort.value not in manifest.entity_cohorts
+        for row in assignments
+        for cohort in row.entity_cohorts
+    ):
         raise MetricContractError("slice assignment entity cohort is absent from its manifest")
 
 
@@ -2897,6 +3052,9 @@ def _validate_slice_rollup(
 
 def _slice_key(row: ClassificationSlice) -> tuple[int, str]:
     order = {"family": 0, "rail": 1, "regime": 2, "entity_cohort": 3}
+    if row.kind == "entity_cohort":
+        cohort = EntityCohort(row.value)
+        return order[row.kind], f"{_ENTITY_COHORT_ORDER[cohort]:04d}"
     return order[row.kind], row.value
 
 
@@ -2926,15 +3084,88 @@ def _input_digest(inputs: MetricReportInputs) -> str:
     return _digest_document(_json_tree(document))
 
 
-def _restore_metric_report_json_tuples(document: dict[str, object]) -> None:
-    """Restore only public exact-tuple fields represented as canonical JSON arrays."""
-    evidence = document.get("derivation_evidence")
-    if type(evidence) is not dict:
-        return
-    inputs = cast(dict[str, object], evidence).get("inputs")
-    if type(inputs) is not dict:
-        return
-    input_document = cast(dict[str, object], inputs)
+def _metric_evidence_payload(inputs: MetricReportInputs) -> bytes:
+    if type(inputs) is not MetricReportInputs:
+        raise MetricContractError("metric evidence inputs must use the exact contract")
+    validated_inputs = _validate_inputs(inputs).inputs
+    return canonical_json_bytes(_metric_evidence_document_for_inputs(validated_inputs))
+
+
+def _metric_evidence_document_for_inputs(
+    inputs: MetricReportInputs,
+) -> dict[str, object]:
+    return cast(
+        dict[str, object],
+        _json_tree(
+            {
+                "schema_version": "1.0.0",
+                "media_type": _METRIC_EVIDENCE_MEDIA_TYPE,
+                "privacy_classification": _RESTRICTED_PRIVACY_CLASSIFICATION,
+                "evaluator_input_digest": _input_digest(inputs),
+                "inputs": inputs,
+            }
+        ),
+    )
+
+
+def _metric_evidence_document(payload: bytes) -> dict[str, object]:
+    if type(payload) is not bytes:
+        raise MetricContractError("restricted metric evidence must be exact bytes")
+    if len(payload) > MAX_METRIC_PAYLOAD_BYTES:
+        raise MetricContractError("restricted metric evidence exceeds resource cap")
+    try:
+        document = strict_json_loads(payload)
+    except WireContractError as error:
+        raise MetricContractError(str(error)) from error
+    if type(document) is not dict or set(document) != {
+        "schema_version",
+        "media_type",
+        "privacy_classification",
+        "evaluator_input_digest",
+        "inputs",
+    }:
+        raise MetricContractError("restricted metric evidence envelope is not exact")
+    typed_document = cast(dict[str, object], document)
+    if typed_document["schema_version"] != "1.0.0":
+        raise MetricContractError("restricted metric evidence schema is unsupported")
+    if typed_document["media_type"] != _METRIC_EVIDENCE_MEDIA_TYPE:
+        raise MetricContractError("restricted metric evidence media type differs")
+    if (
+        typed_document["privacy_classification"]
+        != _RESTRICTED_PRIVACY_CLASSIFICATION
+    ):
+        raise MetricContractError("restricted metric evidence classification differs")
+    digest = typed_document["evaluator_input_digest"]
+    try:
+        _validate_sha256(cast(str, digest))
+    except (TypeError, ValueError) as error:
+        raise MetricContractError("restricted metric evaluator digest is invalid") from error
+    if type(typed_document["inputs"]) is not dict:
+        raise MetricContractError("restricted metric evidence inputs must be an object")
+    return typed_document
+
+
+def _metric_inputs_from_evidence_bytes(payload: bytes) -> MetricReportInputs:
+    document = _metric_evidence_document(payload)
+    input_document = cast(dict[str, object], document["inputs"])
+    _restore_metric_inputs_json_tuples(input_document)
+    try:
+        inputs = MetricReportInputs.model_validate(input_document)
+    except (TypeError, ValidationError, ValueError) as error:
+        raise MetricContractError("restricted metric inputs are invalid") from error
+    validated_inputs = _validate_inputs(inputs).inputs
+    if document["evaluator_input_digest"] != _input_digest(validated_inputs):
+        raise MetricContractError("restricted metric evaluator input digest differs")
+    expected = canonical_json_bytes(
+        _metric_evidence_document_for_inputs(validated_inputs)
+    )
+    if payload != expected:
+        raise MetricContractError("restricted metric evidence is not canonicalized")
+    return validated_inputs
+
+
+def _restore_metric_inputs_json_tuples(input_document: dict[str, object]) -> None:
+    """Restore exact tuple and enum fields represented as restricted JSON arrays."""
     for field_name in (
         "truth",
         "observations",
@@ -2954,6 +3185,173 @@ def _restore_metric_report_json_tuples(document: dict[str, object]) -> None:
         value = manifest_document.get(field_name)
         if type(value) is list:
             manifest_document[field_name] = tuple(cast(list[object], value))
+    assignments = input_document.get("slice_assignments")
+    if type(assignments) is not tuple:
+        return
+    for assignment in cast(tuple[object, ...], assignments):
+        if type(assignment) is not dict:
+            continue
+        assignment_document = cast(dict[str, object], assignment)
+        cohorts = assignment_document.get("entity_cohorts")
+        if type(cohorts) is list:
+            try:
+                if any(type(item) is not str for item in cohorts):
+                    raise ValueError("entity cohorts must be strings")
+                assignment_document["entity_cohorts"] = tuple(
+                    EntityCohort(cast(str, item)) for item in cohorts
+                )
+            except (TypeError, ValueError) as error:
+                raise MetricContractError(
+                    "restricted metric entity cohorts are invalid"
+                ) from error
+
+
+def _validate_metric_report_evidence(
+    report: MetricReport, evidence: MetricDerivationEvidence
+) -> None:
+    if report.derivation_evidence_digest != evidence.evidence_digest:
+        raise MetricContractError("restricted metric evidence digest differs")
+    inputs = evidence.inputs
+    derived = _derive_metric_sections(inputs)
+    if report.evaluator_input_digest != evidence.evaluator_input_digest:
+        raise MetricContractError("metric report derivation input digest differs")
+    if report.evaluator_as_of != derived.inputs.as_of:
+        raise MetricContractError("metric report derivation as_of differs")
+    for label, actual, expected_section in (
+        ("classification", report.classification, derived.classification),
+        ("calibration", report.calibration, derived.calibration),
+        ("value", report.value, derived.value),
+        ("alerts", report.alerts, derived.alerts),
+        ("operations", report.operations, derived.operations),
+        ("engineering", report.engineering, derived.engineering),
+    ):
+        if actual != expected_section:
+            raise MetricContractError(f"metric report derivation differs for {label}")
+
+
+def _bootstrap_evidence_payload(inputs: MetricReportInputs) -> bytes:
+    if type(inputs) is not MetricReportInputs:
+        raise MetricContractError("bootstrap evidence inputs must use the exact contract")
+    validated = _validate_inputs(inputs)
+    contributions = tuple(
+        _campaign_bootstrap_contribution(group.campaign_id, group.rows)
+        for group in validated.campaign_index.groups
+    )
+    return canonical_json_bytes(
+        _bootstrap_evidence_document_for_values(
+            _input_digest(validated.inputs), contributions
+        )
+    )
+
+
+def _bootstrap_evidence_document_for_values(
+    evaluator_input_digest: str,
+    contributions: tuple[CampaignBootstrapContribution, ...],
+) -> dict[str, object]:
+    return cast(
+        dict[str, object],
+        _json_tree(
+            {
+                "schema_version": "1.0.0",
+                "media_type": _BOOTSTRAP_EVIDENCE_MEDIA_TYPE,
+                "privacy_classification": _RESTRICTED_PRIVACY_CLASSIFICATION,
+                "evaluator_input_digest": evaluator_input_digest,
+                "campaign_contributions": contributions,
+            }
+        ),
+    )
+
+
+def _bootstrap_evidence_values(
+    payload: bytes,
+) -> tuple[dict[str, object], tuple[CampaignBootstrapContribution, ...]]:
+    if type(payload) is not bytes:
+        raise MetricContractError("restricted bootstrap evidence must be exact bytes")
+    if len(payload) > MAX_METRIC_PAYLOAD_BYTES:
+        raise MetricContractError("restricted bootstrap evidence exceeds resource cap")
+    try:
+        document = strict_json_loads(payload)
+    except WireContractError as error:
+        raise MetricContractError(str(error)) from error
+    if type(document) is not dict or set(document) != {
+        "schema_version",
+        "media_type",
+        "privacy_classification",
+        "evaluator_input_digest",
+        "campaign_contributions",
+    }:
+        raise MetricContractError("restricted bootstrap evidence envelope is not exact")
+    typed_document = cast(dict[str, object], document)
+    if typed_document["schema_version"] != "1.0.0":
+        raise MetricContractError("restricted bootstrap evidence schema is unsupported")
+    if typed_document["media_type"] != _BOOTSTRAP_EVIDENCE_MEDIA_TYPE:
+        raise MetricContractError("restricted bootstrap evidence media type differs")
+    if (
+        typed_document["privacy_classification"]
+        != _RESTRICTED_PRIVACY_CLASSIFICATION
+    ):
+        raise MetricContractError("restricted bootstrap evidence classification differs")
+    evaluator_input_digest = typed_document["evaluator_input_digest"]
+    try:
+        _validate_sha256(cast(str, evaluator_input_digest))
+    except (TypeError, ValueError) as error:
+        raise MetricContractError(
+            "restricted bootstrap evaluator input digest is invalid"
+        ) from error
+    contribution_documents = typed_document["campaign_contributions"]
+    if type(contribution_documents) is not list:
+        raise MetricContractError(
+            "restricted bootstrap campaign contributions must be an array"
+        )
+    if len(contribution_documents) > MAX_METRIC_CAMPAIGNS:
+        raise MetricContractError(
+            "restricted bootstrap campaign contribution count exceeds resource cap"
+        )
+    if len(contribution_documents) * BOOTSTRAP_REPLICATES > MAX_BOOTSTRAP_WORK:
+        raise MetricContractError("restricted bootstrap replay exceeds frozen work cap")
+    try:
+        contributions = tuple(
+            CampaignBootstrapContribution.model_validate(item)
+            for item in cast(list[object], contribution_documents)
+        )
+    except (TypeError, ValidationError, ValueError) as error:
+        raise MetricContractError(
+            "restricted bootstrap campaign contributions are invalid"
+        ) from error
+    campaign_ids = tuple(item.campaign_id for item in contributions)
+    if campaign_ids != tuple(sorted(campaign_ids)) or len(set(campaign_ids)) != len(
+        campaign_ids
+    ):
+        raise MetricContractError(
+            "restricted bootstrap campaign contributions must be sorted and unique"
+        )
+    expected = canonical_json_bytes(
+        _bootstrap_evidence_document_for_values(
+            cast(str, evaluator_input_digest), contributions
+        )
+    )
+    if payload != expected:
+        raise MetricContractError("restricted bootstrap evidence is not canonicalized")
+    return typed_document, contributions
+
+
+def _validate_confidence_evidence(
+    confidence: ConfidenceIntervals, evidence: BootstrapDerivationEvidence
+) -> None:
+    if confidence.derivation_evidence_digest != evidence.evidence_digest:
+        raise MetricContractError("restricted bootstrap evidence digest differs")
+    if confidence.evaluator_input_digest != evidence.evaluator_input_digest:
+        raise MetricContractError("confidence evaluator input digest differs")
+    try:
+        expected_intervals = _bootstrap_intervals(
+            evidence.contributions,
+            seed=confidence.seed,
+            replicates=confidence.replicates,
+        )
+    except (ArithmeticError, MemoryError, OverflowError, TypeError, ValueError) as error:
+        raise MetricContractError("restricted bootstrap evidence is invalid") from error
+    if confidence.intervals != expected_intervals:
+        raise MetricContractError("bootstrap derivation differs from stored intervals")
 
 
 def _json_tree(value: object) -> object:

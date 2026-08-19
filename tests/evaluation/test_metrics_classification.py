@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
+import pickle
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
 from pydantic import ValidationError
 
+import apar.evaluation.metrics as metric_module
 from apar.cases import QueueConfig, group_cases, simulate_case_queue
 from apar.contracts.decisions import Action
 from apar.contracts.events import EventKind, Rail
@@ -17,8 +20,10 @@ from apar.defense.contracts import ObservedEvent
 from apar.defense.policy import DefenseDecision
 from apar.evaluation.contracts import EvaluationTruthRow
 from apar.evaluation.metrics import (
+    ClassificationMetrics,
     LatencySample,
     MetricContractError,
+    MetricDerivationEvidence,
     MetricReport,
     MetricReportInputs,
     MetricValue,
@@ -26,7 +31,10 @@ from apar.evaluation.metrics import (
     SliceManifest,
     compute_metric_report,
 )
+from apar.evaluation.splits import EntityCohort, make_evaluation_split
 from apar.runs.wire import canonical_json_bytes
+from tests.evaluation.test_splits import _config as split_config
+from tests.evaluation.test_splits import _split_corpus
 
 NOW = datetime(2026, 8, 18, 12, 0, tzinfo=UTC)
 AS_OF = NOW + timedelta(days=30)
@@ -156,7 +164,7 @@ def make_inputs(
             SliceAssignment(
                 event_id=row.event_id,
                 regime="baseline",
-                entity_cohort="cold_actor",
+                entity_cohorts=(EntityCohort.COLD_ACTOR,),
             )
             for row in truth_rows
         )
@@ -197,7 +205,11 @@ def four_row_inputs() -> MetricReportInputs:
         SliceAssignment(
             event_id=event_id,
             regime="baseline" if index < 3 else "availability_delay",
-            entity_cohort="cold_actor" if index % 2 == 0 else "returning_prior_campaign",
+            entity_cohorts=(
+                EntityCohort.COLD_ACTOR
+                if index % 2 == 0
+                else EntityCohort.RETURNING_PRIOR_CAMPAIGN,
+            ),
         )
         for index, event_id in enumerate(event_ids)
     )
@@ -393,6 +405,86 @@ def test_slice_manifest_is_complete_and_emits_zero_row_extended_slices() -> None
     assert cold_actor.roc_auc.value == 1.0
 
 
+def test_classification_contract_rejects_omitted_declared_slice() -> None:
+    document = compute_metric_report(four_row_inputs()).classification.model_dump(
+        mode="python"
+    )
+    document["slices"] = tuple(
+        row
+        for row in document["slices"]
+        if not (
+            row["kind"] == "entity_cohort"
+            and row["value"] == "returning_prior_campaign"
+        )
+    )
+    with pytest.raises(ValidationError, match="entity cohort slices must be complete"):
+        ClassificationMetrics.model_validate(document)
+
+
+def test_task5_multilabel_entity_cohorts_emit_overlapping_membership_slices() -> None:
+    corpus = _split_corpus()
+    split = make_evaluation_split(corpus, split_config())
+    truth_rows = tuple(
+        row.model_copy(update={"net_settled_value": Decimal("0.00")})
+        for row in corpus.truth
+    )
+    decisions = tuple(
+        decision(row.event_id, action=Action.APPROVE, score=0.1)
+        for row in corpus.truth
+    )
+    assignments = tuple(
+        SliceAssignment(
+            event_id=row.event_id,
+            regime="baseline",
+            entity_cohorts=split.entity_cohorts[row.event_id],
+        )
+        for row in corpus.truth
+    )
+
+    report = compute_metric_report(
+        make_inputs(
+            truth_rows,
+            corpus.observations,
+            decisions,
+            slice_assignments=assignments,
+        )
+    )
+    cohort_counts = {
+        item.value: item.row_count
+        for item in report.classification.slices
+        if item.kind == "entity_cohort"
+    }
+    assert cohort_counts == {
+        "cold_actor": 5,
+        "cold_counterparty": 5,
+        "cold_pair": 6,
+        "warm_within_campaign": 1,
+        "returning_prior_campaign": 3,
+    }
+    assert sum(cohort_counts.values()) == 20
+    assert report.classification.row_count == 7
+
+
+@pytest.mark.parametrize(
+    "cohorts",
+    [
+        (),
+        (EntityCohort.COLD_PAIR, EntityCohort.COLD_ACTOR),
+        (EntityCohort.COLD_ACTOR, EntityCohort.COLD_ACTOR),
+        ("cold_actor",),
+    ],
+)
+def test_slice_assignment_requires_exact_canonical_task5_cohorts(
+    cohorts: tuple[object, ...],
+) -> None:
+    with pytest.raises(ValidationError, match="entity cohorts"):
+        SliceAssignment(
+            event_id="event",
+            regime="baseline",
+            entity_cohorts=cohorts,  # type: ignore[arg-type]
+        )
+
+
 def test_nonempty_metric_inputs_require_the_exact_closed_slice_manifest() -> None:
     inputs = four_row_inputs()
     with pytest.raises(MetricContractError, match="slice manifest"):
@@ -495,9 +587,11 @@ def test_model_construct_integer_decision_numerics_are_not_silently_coerced() ->
 
 
 def test_report_json_is_canonical_digest_bound_and_rejects_recomputed_semantic_tamper() -> None:
-    report = compute_metric_report(four_row_inputs())
+    inputs = four_row_inputs()
+    evidence = MetricDerivationEvidence.from_inputs(inputs)
+    report = compute_metric_report(inputs)
     payload = report.to_json()
-    assert MetricReport.from_json(payload) == report
+    assert MetricReport.from_json(payload, evidence=evidence) == report
     assert hashlib.sha256(payload).hexdigest() == report.canonical_digest
     document = json.loads(payload)
     document["classification"]["precision"]["value"] = 0.25
@@ -505,6 +599,75 @@ def test_report_json_is_canonical_digest_bound_and_rejects_recomputed_semantic_t
     document["report_digest"] = hashlib.sha256(canonical_json_bytes(unsigned)).hexdigest()
     with pytest.raises(MetricContractError, match="precision"):
         MetricReport.from_json(canonical_json_bytes(document))
+
+
+def test_public_metric_json_is_aggregate_only_and_requires_restricted_evidence() -> None:
+    inputs = four_row_inputs()
+    evidence = MetricDerivationEvidence.from_inputs(inputs)
+    report = compute_metric_report(inputs)
+    payload = report.to_json()
+    document = json.loads(payload)
+
+    assert "derivation_evidence" not in document
+    assert document["derivation_evidence_digest"] == evidence.evidence_digest
+    assert not hasattr(report, "derivation_evidence")
+    for restricted_token in (
+        b'"truth"',
+        b'"observations"',
+        b'"lifecycle_event_ids"',
+        b'"payment-event-a"',
+        b'"event-a"',
+    ):
+        assert restricted_token not in payload
+    with pytest.raises(MetricContractError, match="restricted metric evidence"):
+        MetricReport.from_json(payload)
+    assert MetricReport.from_json(payload, evidence=evidence) == report
+
+
+def test_restricted_metric_evidence_is_intrinsically_immutable_and_copy_on_access() -> None:
+    inputs = four_row_inputs()
+    observation = inputs.observations[0].model_copy(
+        update={"optional_refs": {"token": "original"}}
+    )
+    inputs = inputs.model_copy(
+        update={"observations": (observation,) + inputs.observations[1:]}
+    )
+    evidence = MetricDerivationEvidence.from_inputs(inputs)
+    report = compute_metric_report(inputs)
+    payload = report.to_json()
+    sealed = evidence.to_bytes()
+
+    assert "event-a" not in str(evidence)
+    assert "payment-event-a" not in repr(evidence)
+    observation.optional_refs["token"] = "mutated"
+    evidence.__init__(b'{"attacker":"reinitialize"}')
+    assert not hasattr(evidence, "__dict__")
+    with pytest.raises((AttributeError, TypeError)):
+        object.__setattr__(evidence, "payload", b"changed")
+
+    for clone in (
+        evidence,
+        copy.copy(evidence),
+        copy.deepcopy(evidence),
+        pickle.loads(pickle.dumps(evidence)),
+    ):
+        assert type(clone) is MetricDerivationEvidence
+        assert clone.to_bytes() == sealed
+        accessed = clone.inputs
+        accessed.observations[0].optional_refs["token"] = "copy-mutated"
+        assert clone.inputs.observations[0].optional_refs["token"] == "original"
+        assert MetricReport.from_json(payload, evidence=clone) == report
+        assert report.to_json() == payload
+
+
+def test_restricted_metric_evidence_from_inputs_enforces_payload_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs = four_row_inputs()
+    sealed_size = len(MetricDerivationEvidence.from_inputs(inputs).to_bytes())
+    monkeypatch.setattr(metric_module, "MAX_METRIC_PAYLOAD_BYTES", sealed_size - 1)
+    with pytest.raises(MetricContractError, match="resource cap"):
+        MetricDerivationEvidence.from_inputs(inputs)
 
 
 def test_recomputed_report_checksum_cannot_hide_calibration_ratio_tamper() -> None:
@@ -714,7 +877,9 @@ def test_recomputed_report_checksum_cannot_hide_invalid_reliability_range() -> N
 
 
 def test_report_rederives_every_section_after_a_recomputed_self_digest() -> None:
-    complete = json.loads(compute_metric_report(four_row_inputs()).to_json())
+    inputs = four_row_inputs()
+    evidence = MetricDerivationEvidence.from_inputs(inputs)
+    complete = json.loads(compute_metric_report(inputs).to_json())
     mutations = []
 
     brier = json.loads(json.dumps(complete))
@@ -753,21 +918,32 @@ def test_report_rederives_every_section_after_a_recomputed_self_digest() -> None
         with pytest.raises(
             MetricContractError, match="derivation|quantiles|review cases"
         ):
-            MetricReport.from_json(canonical_json_bytes(document))
+            MetricReport.from_json(canonical_json_bytes(document), evidence=evidence)
 
 
 def test_report_rederives_its_exact_evaluator_input_digest() -> None:
-    document = json.loads(compute_metric_report(four_row_inputs()).to_json())
+    inputs = four_row_inputs()
+    evidence = MetricDerivationEvidence.from_inputs(inputs)
+    document = json.loads(compute_metric_report(inputs).to_json())
     document["evaluator_input_digest"] = "0" * 64
     unsigned = {key: value for key, value in document.items() if key != "report_digest"}
     document["report_digest"] = hashlib.sha256(
         canonical_json_bytes(unsigned)
     ).hexdigest()
     with pytest.raises(MetricContractError, match="input digest"):
-        MetricReport.from_json(canonical_json_bytes(document))
+        MetricReport.from_json(canonical_json_bytes(document), evidence=evidence)
+
+    report = json.loads(compute_metric_report(inputs).to_json())
+    report["derivation_evidence_digest"] = "0" * 64
+    unsigned = {key: value for key, value in report.items() if key != "report_digest"}
+    report["report_digest"] = hashlib.sha256(
+        canonical_json_bytes(unsigned)
+    ).hexdigest()
+    with pytest.raises(MetricContractError, match="evidence digest"):
+        MetricReport.from_json(canonical_json_bytes(report), evidence=evidence)
 
 
-def test_model_construct_report_tamper_is_rederived_before_serialization() -> None:
+def test_model_construct_report_tamper_is_rejected_before_serialization() -> None:
     report = compute_metric_report(four_row_inputs())
     brier = report.calibration.brier_score.model_copy(
         update={"value": 0.1, "numerator": 0.4}
@@ -776,7 +952,7 @@ def test_model_construct_report_tamper_is_rederived_before_serialization() -> No
     poisoned = MetricReport.model_construct(
         **{**report.model_dump(mode="python"), "calibration": calibration}
     )
-    with pytest.raises(MetricContractError, match="derivation"):
+    with pytest.raises(MetricContractError, match="semantic revalidation"):
         poisoned.to_json()
 
 
@@ -868,10 +1044,12 @@ def test_nonempty_metric_inputs_require_complete_slice_assignments() -> None:
 
 
 def test_report_from_json_rejects_noncanonical_and_oversized_payloads() -> None:
-    report = compute_metric_report(four_row_inputs())
+    inputs = four_row_inputs()
+    evidence = MetricDerivationEvidence.from_inputs(inputs)
+    report = compute_metric_report(inputs)
     pretty = json.dumps(json.loads(report.to_json()), indent=2).encode()
     with pytest.raises(MetricContractError, match="canonical"):
-        MetricReport.from_json(pretty)
+        MetricReport.from_json(pretty, evidence=evidence)
     with pytest.raises(MetricContractError, match="resource cap"):
         MetricReport.from_json(b" " * (64 * 1024 * 1024 + 1))
 

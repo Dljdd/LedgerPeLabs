@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
+import pickle
 from datetime import timedelta
 from decimal import Decimal
 
@@ -18,6 +20,7 @@ from apar.evaluation.metrics import (
     BOOTSTRAP_REPLICATES,
     BOOTSTRAP_SEED,
     AlertMetrics,
+    BootstrapDerivationEvidence,
     ConfidenceIntervals,
     MetricContractError,
     MetricReportInputs,
@@ -300,7 +303,8 @@ def test_campaign_bootstrap_is_clustered_frozen_and_repeatable() -> None:
     first = campaign_bootstrap(four_row_inputs())
     second = campaign_bootstrap(four_row_inputs())
     assert first == second
-    assert ConfidenceIntervals.from_json(first.to_json()) == first
+    evidence = BootstrapDerivationEvidence.from_inputs(four_row_inputs())
+    assert ConfidenceIntervals.from_json(first.to_json(), evidence=evidence) == first
     assert first.seed == BOOTSTRAP_SEED
     assert first.replicates == BOOTSTRAP_REPLICATES
     assert {item.metric_name for item in first.intervals} == {
@@ -317,6 +321,101 @@ def test_campaign_bootstrap_is_clustered_frozen_and_repeatable() -> None:
         item.valid_replicates + item.undefined_replicates == 1000
         for item in first.intervals
     )
+
+
+def test_public_confidence_json_is_aggregate_only_and_requires_restricted_evidence() -> None:
+    inputs = four_row_inputs()
+    evidence = BootstrapDerivationEvidence.from_inputs(inputs)
+    confidence = campaign_bootstrap(inputs)
+    payload = confidence.to_json()
+    document = json.loads(payload)
+
+    assert "campaign_contributions" not in document
+    assert document["derivation_evidence_digest"] == evidence.evidence_digest
+    assert not hasattr(confidence, "campaign_contributions")
+    for restricted_token in (
+        b'"campaign-a"',
+        b'"event-a"',
+        b'"true_positives"',
+        b'"fraudulent_value"',
+    ):
+        assert restricted_token not in payload
+    with pytest.raises(MetricContractError, match="restricted bootstrap evidence"):
+        ConfidenceIntervals.from_json(payload)
+    assert ConfidenceIntervals.from_json(payload, evidence=evidence) == confidence
+
+
+def test_confidence_evidence_is_bound_to_exact_evaluator_input_digest() -> None:
+    inputs = four_row_inputs()
+    evidence = BootstrapDerivationEvidence.from_inputs(inputs)
+    document = json.loads(campaign_bootstrap(inputs).to_json())
+    document["evaluator_input_digest"] = "0" * 64
+    unsigned = {key: value for key, value in document.items() if key != "intervals_digest"}
+    document["intervals_digest"] = hashlib.sha256(
+        canonical_json_bytes(unsigned)
+    ).hexdigest()
+
+    with pytest.raises(MetricContractError, match="evaluator input digest"):
+        ConfidenceIntervals.from_json(canonical_json_bytes(document), evidence=evidence)
+
+    confidence = json.loads(campaign_bootstrap(inputs).to_json())
+    confidence["derivation_evidence_digest"] = "0" * 64
+    unsigned = {
+        key: value for key, value in confidence.items() if key != "intervals_digest"
+    }
+    confidence["intervals_digest"] = hashlib.sha256(
+        canonical_json_bytes(unsigned)
+    ).hexdigest()
+    with pytest.raises(MetricContractError, match="evidence digest"):
+        ConfidenceIntervals.from_json(
+            canonical_json_bytes(confidence), evidence=evidence
+        )
+
+
+def test_restricted_bootstrap_evidence_is_immutable_and_copy_on_access() -> None:
+    inputs = four_row_inputs()
+    evidence = BootstrapDerivationEvidence.from_inputs(inputs)
+    confidence = campaign_bootstrap(inputs)
+    public_payload = confidence.to_json()
+    sealed = evidence.to_bytes()
+
+    assert "campaign-a" not in str(evidence)
+    assert "campaign-a" not in repr(evidence)
+    evidence.__init__(b'{"attacker":"reinitialize"}')
+    assert evidence.privacy_classification == "restricted_evaluation_evidence"
+    assert evidence.media_type == (
+        "application/vnd.apar.bootstrap-derivation-evidence+json"
+    )
+    assert not hasattr(evidence, "__dict__")
+    with pytest.raises((AttributeError, TypeError)):
+        object.__setattr__(evidence, "payload", b"changed")
+
+    for clone in (
+        evidence,
+        copy.copy(evidence),
+        copy.deepcopy(evidence),
+        pickle.loads(pickle.dumps(evidence)),
+    ):
+        assert clone.to_bytes() == sealed
+        first = clone.contributions
+        second = clone.contributions
+        assert first == second
+        assert first is not second
+        if first:
+            assert first[0] is not second[0]
+        assert ConfidenceIntervals.from_json(
+            public_payload, evidence=clone
+        ) == confidence
+
+
+def test_restricted_bootstrap_evidence_from_inputs_enforces_payload_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs = four_row_inputs()
+    sealed_size = len(BootstrapDerivationEvidence.from_inputs(inputs).to_bytes())
+    monkeypatch.setattr(metric_module, "MAX_METRIC_PAYLOAD_BYTES", sealed_size - 1)
+    with pytest.raises(MetricContractError, match="resource cap"):
+        BootstrapDerivationEvidence.from_inputs(inputs)
 
 
 def test_recomputed_confidence_checksum_cannot_hide_invalid_interval() -> None:
@@ -356,7 +455,9 @@ def test_recomputed_confidence_checksum_cannot_hide_out_of_domain_bounds() -> No
 
 
 def test_bootstrap_intervals_are_rederived_from_campaign_contributions() -> None:
-    document = json.loads(campaign_bootstrap(four_row_inputs()).to_json())
+    inputs = four_row_inputs()
+    evidence = BootstrapDerivationEvidence.from_inputs(inputs)
+    document = json.loads(campaign_bootstrap(inputs).to_json())
     precision = next(
         item for item in document["intervals"] if item["metric_name"] == "precision"
     )
@@ -366,10 +467,12 @@ def test_bootstrap_intervals_are_rederived_from_campaign_contributions() -> None
         canonical_json_bytes(unsigned)
     ).hexdigest()
     with pytest.raises(MetricContractError, match="bootstrap derivation"):
-        ConfidenceIntervals.from_json(canonical_json_bytes(document))
+        ConfidenceIntervals.from_json(
+            canonical_json_bytes(document), evidence=evidence
+        )
 
 
-def test_model_construct_confidence_tamper_is_rederived_before_serialization() -> None:
+def test_model_construct_confidence_tamper_is_rejected_before_serialization() -> None:
     confidence = campaign_bootstrap(four_row_inputs())
     changed = confidence.intervals[0].model_copy(
         update={"lower": 0.25, "median": 0.25, "upper": 0.25}
