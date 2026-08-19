@@ -5,12 +5,15 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import timedelta
+from decimal import Decimal
 
 import numpy as np
 import pytest
 
+import apar.evaluation.metrics as metric_module
 from apar.cases import QueueConfig, simulate_case_queue
 from apar.contracts.decisions import Action
+from apar.contracts.events import Rail
 from apar.evaluation.metrics import (
     BOOTSTRAP_REPLICATES,
     BOOTSTRAP_SEED,
@@ -49,6 +52,68 @@ def test_workload_queue_fallback_and_latency_metrics_are_hand_calculated() -> No
     assert report.operations.fallback_rate.value == 0.25
     assert report.engineering.end_to_end_ms.p50.value == 10.0
     assert report.engineering.end_to_end_ms.p99.value == 10.0
+
+
+def test_metric_contracts_reject_reversed_quantiles_and_impossible_queue_counts() -> None:
+    alert_document = AlertMetrics(
+        campaign_count=20,
+        detected_campaigns=20,
+        undetected_campaigns=0,
+        p50_seconds=MetricValue(value=4.0, numerator=20.0, denominator=1.0),
+        p90_seconds=MetricValue(value=5.0, numerator=20.0, denominator=10.0),
+        p95_seconds=MetricValue(value=6.0, numerator=20.0, denominator=20.0),
+        p99_seconds=MetricValue(
+            value=None,
+            numerator=20.0,
+            denominator=100.0,
+            undefined_reason="insufficient_detected_campaigns",
+        ),
+    ).model_dump(mode="python")
+    alert_document["p50_seconds"]["value"] = 10.0
+    with pytest.raises(ValueError, match="quantiles.*ordered"):
+        AlertMetrics.model_validate(alert_document)
+
+    report = compute_metric_report(four_row_inputs())
+    latency_document = report.engineering.end_to_end_ms.model_dump(mode="python")
+    latency_document["p50"].update({"value": 11.0, "numerator": 44.0})
+    with pytest.raises(ValueError, match="quantiles.*ordered"):
+        type(report.engineering.end_to_end_ms).model_validate(latency_document)
+
+    for field_name in ("peak_backlog_count", "sla_breaches"):
+        operations_document = report.operations.model_dump(mode="python")
+        operations_document[field_name] = report.operations.review_case_count + 1
+        with pytest.raises(ValueError, match="review cases"):
+            type(report.operations).model_validate(operations_document)
+
+
+def test_entities_per_case_uses_actor_counterparty_union() -> None:
+    same = make_inputs(
+        (truth("same", is_fraud=True),),
+        (observed("same", actor_id="entity", counterparty_id="entity"),),
+        (decision("same", action=Action.CHALLENGE, score=0.9),),
+    )
+    same_report = compute_metric_report(same)
+    assert same_report.operations.case_entity_count == 1
+    assert same_report.operations.entities_per_case.value == 1.0
+
+    mixed = make_inputs(
+        (
+            truth("same", is_fraud=True, campaign_id="campaign-a"),
+            truth("distinct", is_fraud=True, campaign_id="campaign-b"),
+        ),
+        (
+            observed("same", actor_id="entity", counterparty_id="entity"),
+            observed("distinct", actor_id="actor-b", counterparty_id="counterparty-b"),
+        ),
+        (
+            decision("same", action=Action.CHALLENGE, score=0.9),
+            decision("distinct", action=Action.CHALLENGE, score=0.9),
+        ),
+    )
+    mixed_report = compute_metric_report(mixed)
+    assert mixed_report.operations.review_case_count == 2
+    assert mixed_report.operations.case_entity_count == 3
+    assert mixed_report.operations.entities_per_case.value == 1.5
 
 
 def test_empty_report_keeps_denominator_and_latency_quantiles_undefined() -> None:
@@ -146,6 +211,46 @@ def test_time_to_alert_uses_later_nonapprove_and_linear_percentiles() -> None:
     assert report.alerts.p50_seconds.value == 4.5
     assert report.alerts.p90_seconds.value == pytest.approx(8.1)
     assert report.alerts.p95_seconds.undefined_reason == "insufficient_detected_campaigns"
+
+
+def test_campaign_alert_preparation_comparisons_scale_linearly() -> None:
+    class CountingCampaignId(str):
+        comparisons = 0
+
+        def __eq__(self, other: object) -> bool:
+            type(self).comparisons += 1
+            return super().__eq__(other)
+
+        def __lt__(self, other: str) -> bool:
+            type(self).comparisons += 1
+            return super().__lt__(other)
+
+        __hash__ = str.__hash__
+
+    previous: int | None = None
+    for size in (1_000, 2_000, 4_000):
+        CountingCampaignId.comparisons = 0
+        rows = tuple(
+            metric_module._MetricRow(  # type: ignore[attr-defined]
+                event_id=f"event-{index:04d}",
+                campaign_id=CountingCampaignId(f"campaign-{index:04d}"),
+                family="card_testing_cnp",
+                rail=Rail.CARD,
+                is_fraud=True,
+                action=Action.APPROVE,
+                score=0.1,
+                decision_at=NOW + timedelta(seconds=index),
+                net_value=Decimal("0.00"),
+                first_settlement_at=None,
+            )
+            for index in range(size)
+        )
+        metric_module._campaign_alert_times(rows)  # type: ignore[attr-defined]
+        comparisons = CountingCampaignId.comparisons
+        assert comparisons > 0
+        if previous is not None:
+            assert comparisons <= previous * 3
+        previous = comparisons
 
 
 def test_undetected_campaign_remains_right_censored_without_artificial_duration() -> None:
@@ -248,6 +353,35 @@ def test_recomputed_confidence_checksum_cannot_hide_out_of_domain_bounds() -> No
     ).hexdigest()
     with pytest.raises(MetricContractError, match=r"\[0, 1\]"):
         ConfidenceIntervals.from_json(canonical_json_bytes(document))
+
+
+def test_bootstrap_intervals_are_rederived_from_campaign_contributions() -> None:
+    document = json.loads(campaign_bootstrap(four_row_inputs()).to_json())
+    precision = next(
+        item for item in document["intervals"] if item["metric_name"] == "precision"
+    )
+    precision.update({"lower": 0.25, "median": 0.25, "upper": 0.25})
+    unsigned = {key: value for key, value in document.items() if key != "intervals_digest"}
+    document["intervals_digest"] = hashlib.sha256(
+        canonical_json_bytes(unsigned)
+    ).hexdigest()
+    with pytest.raises(MetricContractError, match="bootstrap derivation"):
+        ConfidenceIntervals.from_json(canonical_json_bytes(document))
+
+
+def test_model_construct_confidence_tamper_is_rederived_before_serialization() -> None:
+    confidence = campaign_bootstrap(four_row_inputs())
+    changed = confidence.intervals[0].model_copy(
+        update={"lower": 0.25, "median": 0.25, "upper": 0.25}
+    )
+    poisoned = ConfidenceIntervals.model_construct(
+        **{
+            **confidence.model_dump(mode="python"),
+            "intervals": (changed,) + confidence.intervals[1:],
+        }
+    )
+    with pytest.raises(MetricContractError, match="semantic revalidation"):
+        poisoned.to_json()
 
 
 def test_campaign_bootstrap_small_oracle_matches_independent_pcg64_sampling() -> None:

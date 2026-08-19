@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
-from decimal import Decimal
+from decimal import ROUND_CEILING, ROUND_DOWN, Decimal, getcontext, setcontext
 
 import pytest
 
@@ -222,3 +222,72 @@ def test_extreme_decimal_is_normalized_to_metric_contract_error() -> None:
                 update={"observations": (inputs.observations[0], huge) + inputs.observations[2:]}
             )
         )
+
+
+def test_money_uses_a_frozen_decimal128_context_independent_of_ambient_state() -> None:
+    opening = observed("open", amount="12345.67")
+    settlement = observed(
+        "settle",
+        payment_id=opening.payment_id,
+        event_type=EventKind.SETTLEMENT,
+        amount="12345.67",
+        event_time=NOW + timedelta(seconds=10),
+        available_at=NOW + timedelta(seconds=10),
+        decision_at=None,
+        is_decision_point=False,
+    )
+    inputs = make_inputs(
+        (
+            truth(
+                "open",
+                is_fraud=True,
+                payment_id=opening.payment_id,
+                first_settlement_at=NOW + timedelta(seconds=10),
+                net_settled_value="12345.67",
+                lifecycle_event_ids=("open", "settle"),
+            ),
+        ),
+        (opening, settlement),
+        (decision("open", action=Action.DECLINE, score=0.9),),
+    )
+    original = getcontext().copy()
+    try:
+        getcontext().prec = 6
+        getcontext().rounding = ROUND_DOWN
+        low_precision = compute_metric_report(inputs).to_json()
+        getcontext().prec = 28
+        getcontext().rounding = ROUND_CEILING
+        high_precision = compute_metric_report(inputs).to_json()
+    finally:
+        setcontext(original)
+    assert low_precision == high_precision
+
+
+def test_currency_amounts_reject_more_than_two_fractional_digits() -> None:
+    opening = observed("open", amount="1.001")
+    settlement = observed(
+        "settle",
+        payment_id=opening.payment_id,
+        event_type=EventKind.SETTLEMENT,
+        amount="1.001",
+        event_time=NOW + timedelta(seconds=10),
+        available_at=NOW + timedelta(seconds=10),
+        decision_at=None,
+        is_decision_point=False,
+    )
+    inputs = make_inputs(
+        (
+            truth(
+                "open",
+                is_fraud=True,
+                payment_id=opening.payment_id,
+                first_settlement_at=NOW + timedelta(seconds=10),
+                net_settled_value="1.001",
+                lifecycle_event_ids=("open", "settle"),
+            ),
+        ),
+        (opening, settlement),
+        (decision("open", action=Action.APPROVE, score=0.1),),
+    )
+    with pytest.raises(MetricContractError, match="at most two fractional digits"):
+        compute_metric_report(inputs)

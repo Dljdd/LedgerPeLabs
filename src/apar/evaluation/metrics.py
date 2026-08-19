@@ -9,10 +9,10 @@ from __future__ import annotations
 import hashlib
 import math
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_EVEN, Context, Decimal, DecimalException, localcontext
 from typing import Literal, cast
 
 import numpy as np
@@ -28,6 +28,8 @@ from apar.contracts.events import EventKind, Rail
 from apar.defense.contracts import ObservedEvent
 from apar.defense.policy import DefenseDecision
 from apar.evaluation.contracts import EvaluationTruthRow
+from apar.evaluation.regimes import RegimeKind
+from apar.evaluation.splits import EntityCohort
 from apar.runs.wire import WireContractError, canonical_json_bytes, strict_json_loads
 
 BOOTSTRAP_SEED = 260816
@@ -40,6 +42,15 @@ MAX_METRIC_PAYLOAD_BYTES = 64 * 1024 * 1024
 
 _MAX_IDENTIFIER_LENGTH = 4_096
 _MAX_DECIMAL_ADJUSTED = 308
+_MONEY_QUANTUM = Decimal("0.01")
+_DECIMAL128_CONTEXT = Context(
+    prec=34,
+    rounding=ROUND_HALF_EVEN,
+    Emin=-6143,
+    Emax=6144,
+    capitals=1,
+    clamp=1,
+)
 _CALIBRATION_BINS = 10
 _LOGIT_EPSILON = 1e-8
 _SETTLEMENT_EVENTS = frozenset({EventKind.SETTLEMENT, EventKind.TRANSFER_POSTED})
@@ -58,12 +69,16 @@ _FAMILIES = (
     "card_testing_cnp",
     "synthetic_merchant_refund",
 )
+_REGIME_VALUES = tuple(sorted(("baseline", *(kind.value for kind in RegimeKind))))
+_ENTITY_COHORT_VALUES = tuple(sorted(cohort.value for cohort in EntityCohort))
 _LIMITATIONS = (
     "Results use authorized synthetic APAR fixtures only.",
     "Campaign-clustered intervals describe variation in this synthetic corpus, "
     "not real populations.",
     "Operating thresholds and workload assumptions are competition evidence, "
     "not production advice.",
+    "Value evidence uses one synthetic currency, cent-denominated inputs, and a "
+    "frozen Decimal128-style arithmetic context.",
 )
 
 MetricName = Literal[
@@ -129,8 +144,8 @@ class DecimalMetricValue(ExternalContract):
     @field_validator("value", "numerator", "denominator")
     @classmethod
     def decimals_are_finite(cls, value: Decimal | None) -> Decimal | None:
-        if value is not None and not value.is_finite():
-            raise ValueError("Decimal metric values must be finite")
+        if value is not None:
+            _validate_decimal128_number(value, label="Decimal metric value")
         return value
 
     @model_validator(mode="after")
@@ -144,7 +159,7 @@ class DecimalMetricValue(ExternalContract):
         if self.value is not None:
             if self.denominator == 0:
                 raise ValueError("defined Decimal metric requires a positive denominator")
-            if self.value != self.numerator / self.denominator:
+            if self.value != _decimal_divide(self.numerator, self.denominator):
                 raise ValueError("Decimal metric value must equal numerator / denominator")
         return self
 
@@ -163,6 +178,42 @@ class SliceAssignment(ExternalContract):
             raise ValueError("slice labels must be bounded nonempty text")
         return value
 
+    @model_validator(mode="after")
+    def labels_use_closed_competition_vocabularies(self) -> SliceAssignment:
+        if self.regime not in _REGIME_VALUES:
+            raise ValueError("slice regime is outside the closed manifest vocabulary")
+        if self.entity_cohort not in _ENTITY_COHORT_VALUES:
+            raise ValueError("slice entity cohort is outside the closed manifest vocabulary")
+        return self
+
+
+class SliceManifest(ExternalContract):
+    """Complete closed evaluator slice vocabularies for one metric report."""
+
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    regimes: tuple[str, ...] = _REGIME_VALUES
+    entity_cohorts: tuple[str, ...] = _ENTITY_COHORT_VALUES
+
+    @field_validator("regimes", "entity_cohorts", mode="before")
+    @classmethod
+    def vocabularies_are_exact_tuples(cls, value: object) -> object:
+        if type(value) is not tuple:
+            raise ValueError("slice manifest vocabularies must be exact tuples")
+        return value
+
+    @model_validator(mode="after")
+    def vocabularies_are_complete(self) -> SliceManifest:
+        if self.regimes != _REGIME_VALUES:
+            raise ValueError("slice manifest regimes must be complete and sorted")
+        if self.entity_cohorts != _ENTITY_COHORT_VALUES:
+            raise ValueError("slice manifest entity cohorts must be complete and sorted")
+        return self
+
+    @classmethod
+    def closed(cls) -> SliceManifest:
+        """Return the frozen competition slice vocabulary."""
+        return cls()
+
 
 class ClassificationSlice(ExternalContract):
     """Promotion-gate classification evidence for one exact slice."""
@@ -176,10 +227,19 @@ class ClassificationSlice(ExternalContract):
     false_positives: int = Field(ge=0)
     false_negatives: int = Field(ge=0)
     true_negatives: int = Field(ge=0)
+    decline_true_positives: int = Field(ge=0)
+    decline_false_positives: int = Field(ge=0)
+    fraud_campaigns: int = Field(ge=0)
+    detected_fraud_campaigns: int = Field(ge=0)
     precision: MetricValue
     recall: MetricValue
     f1: MetricValue
     false_positive_rate: MetricValue
+    decline_precision: MetricValue
+    decline_recall: MetricValue
+    campaign_recall: MetricValue
+    pr_auc: MetricValue
+    roc_auc: MetricValue
 
     @field_validator("value")
     @classmethod
@@ -196,6 +256,10 @@ class ClassificationSlice(ExternalContract):
         "false_positives",
         "false_negatives",
         "true_negatives",
+        "decline_true_positives",
+        "decline_false_positives",
+        "fraud_campaigns",
+        "detected_fraud_campaigns",
         mode="before",
     )
     @classmethod
@@ -205,6 +269,7 @@ class ClassificationSlice(ExternalContract):
     @model_validator(mode="after")
     def counts_and_rates_are_exact(self) -> ClassificationSlice:
         _validate_confusion_fields(self, label="slice")
+        _validate_extended_classification_fields(self, label="slice")
         return self
 
 
@@ -254,58 +319,7 @@ class ClassificationMetrics(ExternalContract):
     @model_validator(mode="after")
     def counts_and_rates_are_exact(self) -> ClassificationMetrics:
         _validate_confusion_fields(self, label="classification")
-        _assert_metric(
-            self.decline_precision,
-            self.decline_true_positives,
-            self.decline_true_positives + self.decline_false_positives,
-            "no_declines",
-            label="decline precision",
-        )
-        _assert_metric(
-            self.decline_recall,
-            self.decline_true_positives,
-            self.fraud_count,
-            "absent_positive_class",
-            label="decline recall",
-        )
-        _assert_metric(
-            self.campaign_recall,
-            self.detected_fraud_campaigns,
-            self.fraud_campaigns,
-            "absent_fraud_campaigns",
-            label="campaign recall",
-        )
-        if self.detected_fraud_campaigns > self.fraud_campaigns:
-            raise ValueError("detected campaigns exceed fraud campaigns")
-        for label, metric in (("PR-AUC", self.pr_auc), ("ROC-AUC", self.roc_auc)):
-            if metric.value is not None and not 0.0 <= metric.value <= 1.0:
-                raise ValueError(f"{label} must be in [0, 1]")
-            if metric.denominator != float(self.row_count):
-                raise ValueError(f"{label} denominator must equal row count")
-            if self.fraud_count == 0:
-                if (
-                    metric.value is not None
-                    or metric.numerator != 0.0
-                    or metric.undefined_reason != "absent_positive_class"
-                ):
-                    raise ValueError(f"{label} must expose the absent positive class")
-            elif self.legitimate_count == 0:
-                if (
-                    metric.value is not None
-                    or metric.numerator != float(self.fraud_count)
-                    or metric.undefined_reason != "absent_negative_class"
-                ):
-                    raise ValueError(f"{label} must expose the absent negative class")
-            elif (
-                metric.value is None
-                or metric.undefined_reason is not None
-                or not math.isclose(
-                    metric.numerator,
-                    metric.value * self.row_count,
-                    abs_tol=1e-12,
-                )
-            ):
-                raise ValueError(f"{label} numerator must bind its value and row count")
+        _validate_extended_classification_fields(self, label="classification")
         expected = tuple(sorted(self.slices, key=_slice_key))
         if self.slices != expected or len(set(_slice_key(item) for item in self.slices)) != len(
             self.slices
@@ -510,8 +524,7 @@ class ValueMetrics(ExternalContract):
     )
     @classmethod
     def money_is_finite(cls, value: Decimal) -> Decimal:
-        if not value.is_finite():
-            raise ValueError("value metrics must contain finite Decimals")
+        _validate_cent_amount(value, label="value metric amount")
         return value
 
     @model_validator(mode="after")
@@ -528,8 +541,8 @@ class ValueMetrics(ExternalContract):
             raise ValueError("value metrics must be nonnegative")
         if self.preventable_settled_value > self.fraudulent_net_settled_value:
             raise ValueError("preventable value exceeds fraudulent net settled value")
-        if self.value_escaped != (
-            self.fraudulent_net_settled_value - self.preventable_settled_value
+        if self.value_escaped != _money_subtract(
+            self.fraudulent_net_settled_value, self.preventable_settled_value
         ):
             raise ValueError("value escaped must equal total less prevented")
         if self.challenge_credited_as_prevented != 0:
@@ -543,7 +556,7 @@ class ValueMetrics(ExternalContract):
         )
         _assert_decimal_metric(
             self.captured_value_per_analyst_hour,
-            self.preventable_settled_value * Decimal(60),
+            _decimal_multiply(self.preventable_settled_value, Decimal(60)),
             Decimal(self.analyst_minutes),
             "no_analyst_minutes",
             label="captured value per analyst hour",
@@ -588,6 +601,21 @@ class AlertMetrics(ExternalContract):
                     raise ValueError(f"alert {label} must be explicitly ineligible")
             elif metric.value is None or metric.value < 0.0:
                 raise ValueError(f"eligible alert {label} must be nonnegative")
+        defined_quantiles = tuple(
+            metric.value
+            for metric in (
+                self.p50_seconds,
+                self.p90_seconds,
+                self.p95_seconds,
+                self.p99_seconds,
+            )
+            if metric.value is not None
+        )
+        if any(
+            left > right
+            for left, right in zip(defined_quantiles, defined_quantiles[1:], strict=False)
+        ):
+            raise ValueError("alert quantiles must be ordered")
         return self
 
 
@@ -646,6 +674,22 @@ class OperationalMetrics(ExternalContract):
             raise ValueError("challenges exceed decisions")
         if self.fallback_count > self.decision_count:
             raise ValueError("fallbacks exceed decisions")
+        if self.peak_backlog_count > self.review_case_count:
+            raise ValueError("peak backlog exceeds review cases")
+        if self.sla_breaches > self.review_case_count:
+            raise ValueError("SLA breaches exceed review cases")
+        if self.review_case_count == 0 and any(
+            (
+                self.case_transaction_count,
+                self.case_entity_count,
+                self.analyst_minutes,
+                self.peak_backlog_count,
+                self.sla_breaches,
+            )
+        ):
+            raise ValueError("empty review workload must have zero direct counts")
+        if self.review_case_count and self.case_transaction_count < self.review_case_count:
+            raise ValueError("case transactions cannot be fewer than review cases")
         _assert_scaled_metric(
             self.false_interventions_per_10k,
             self.false_intervention_count,
@@ -786,6 +830,13 @@ class LatencyQuantiles(ExternalContract):
                 or metric.denominator != float(self.sample_count)
             ):
                 raise ValueError(f"latency {label} must bind its sample count")
+        if self.sample_count and not (
+            cast(float, self.p50.value)
+            <= cast(float, self.p90.value)
+            <= cast(float, self.p95.value)
+            <= cast(float, self.p99.value)
+        ):
+            raise ValueError("latency quantiles must be ordered")
         return self
 
 
@@ -812,8 +863,51 @@ class EngineeringMetrics(ExternalContract):
         return self
 
 
+class MetricReportInputs(ExternalContract):
+    """Closed evaluator inputs retained as canonical metric derivation evidence."""
+
+    truth: tuple[EvaluationTruthRow, ...]
+    observations: tuple[ObservedEvent, ...]
+    decisions: tuple[DefenseDecision, ...]
+    cases: tuple[InvestigationCase, ...]
+    queue_report: QueueReport
+    latency_samples: tuple[LatencySample, ...]
+    as_of: datetime
+    slice_assignments: tuple[SliceAssignment, ...] = ()
+    slice_manifest: SliceManifest | None = None
+
+    @field_validator(
+        "truth",
+        "observations",
+        "decisions",
+        "cases",
+        "latency_samples",
+        "slice_assignments",
+        mode="before",
+    )
+    @classmethod
+    def containers_are_exact_tuples(cls, value: object) -> object:
+        if type(value) is not tuple:
+            raise ValueError("metric input collections must be exact tuples")
+        return value
+
+    @field_validator("as_of")
+    @classmethod
+    def as_of_is_utc(cls, value: datetime) -> datetime:
+        if type(value) is not datetime:
+            raise ValueError("metric as_of must be an exact datetime")
+        return validate_utc_timestamp(value)
+
+
+class MetricDerivationEvidence(ExternalContract):
+    """Exact truth-bearing evaluator inputs used to rederive every report section."""
+
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    inputs: MetricReportInputs
+
+
 class MetricReport(ExternalContract):
-    """Canonical, checksum-bound judge-facing synthetic defense evidence."""
+    """Canonical truth-bearing evaluator evidence requiring redaction for publication."""
 
     schema_version: Literal["1.0.0"] = "1.0.0"
     evaluator_as_of: datetime
@@ -824,6 +918,7 @@ class MetricReport(ExternalContract):
     alerts: AlertMetrics
     operations: OperationalMetrics
     engineering: EngineeringMetrics
+    derivation_evidence: MetricDerivationEvidence
     synthetic_only: Literal[True] = True
     external_validity_claimed: Literal[False] = False
     limitations: tuple[str, ...] = _LIMITATIONS
@@ -867,6 +962,25 @@ class MetricReport(ExternalContract):
             raise ValueError("value and operations analyst minutes differ")
         if self.engineering.end_to_end_ms.sample_count != self.classification.row_count:
             raise ValueError("latency and classification row counts differ")
+        try:
+            derived = _derive_metric_sections(self.derivation_evidence.inputs)
+        except (ArithmeticError, MemoryError, OverflowError, TypeError, ValueError) as error:
+            raise ValueError("metric report derivation evidence is invalid") from error
+        if self.evaluator_as_of != derived.inputs.as_of:
+            raise ValueError("metric report derivation as_of differs")
+        expected_input_digest = _input_digest(derived.inputs)
+        if self.evaluator_input_digest != expected_input_digest:
+            raise ValueError("metric report derivation input digest differs")
+        for label, actual, expected_section in (
+            ("classification", self.classification, derived.classification),
+            ("calibration", self.calibration, derived.calibration),
+            ("value", self.value, derived.value),
+            ("alerts", self.alerts, derived.alerts),
+            ("operations", self.operations, derived.operations),
+            ("engineering", self.engineering, derived.engineering),
+        ):
+            if actual != expected_section:
+                raise ValueError(f"metric report derivation differs for {label}")
         return self
 
     def to_json(self) -> bytes:
@@ -889,7 +1003,9 @@ class MetricReport(ExternalContract):
             ValidationError,
             ValueError,
         ) as error:
-            raise MetricContractError("metric report failed semantic revalidation") from error
+            raise MetricContractError(
+                "metric report failed semantic revalidation or derivation recheck"
+            ) from error
         if len(payload) > MAX_METRIC_PAYLOAD_BYTES:
             raise MetricContractError("metric report payload exceeds resource cap")
         return payload
@@ -905,6 +1021,7 @@ class MetricReport(ExternalContract):
             document = strict_json_loads(payload)
             if type(document) is not dict:
                 raise MetricContractError("metric report JSON must contain an object")
+            _restore_metric_report_json_tuples(document)
             return cls.model_validate(document)
         except MetricContractError:
             raise
@@ -979,6 +1096,54 @@ class ConfidenceInterval(ExternalContract):
         return self
 
 
+class CampaignBootstrapContribution(ExternalContract):
+    """Compact exact contribution for one whole-campaign bootstrap unit."""
+
+    campaign_id: str
+    true_positives: int = Field(ge=0)
+    false_positives: int = Field(ge=0)
+    false_negatives: int = Field(ge=0)
+    true_negatives: int = Field(ge=0)
+    fraud_campaign: int = Field(ge=0, le=1)
+    detected_campaign: int = Field(ge=0, le=1)
+    fraudulent_value: Decimal
+    preventable_value: Decimal
+
+    @field_validator("campaign_id")
+    @classmethod
+    def campaign_id_is_bounded_text(cls, value: str) -> str:
+        if type(value) is not str or not value or len(value) > _MAX_IDENTIFIER_LENGTH:
+            raise ValueError("bootstrap campaign ID must be bounded nonempty text")
+        return value
+
+    @field_validator(
+        "true_positives",
+        "false_positives",
+        "false_negatives",
+        "true_negatives",
+        "fraud_campaign",
+        "detected_campaign",
+        mode="before",
+    )
+    @classmethod
+    def counts_are_exact_integers(cls, value: object) -> object:
+        return _exact_integer(value)
+
+    @field_validator("fraudulent_value", "preventable_value")
+    @classmethod
+    def values_are_cent_denominated(cls, value: Decimal) -> Decimal:
+        _validate_cent_amount(value, label="bootstrap campaign value")
+        return value
+
+    @model_validator(mode="after")
+    def contribution_is_coherent(self) -> CampaignBootstrapContribution:
+        if self.detected_campaign > self.fraud_campaign:
+            raise ValueError("detected bootstrap campaign must be fraudulent")
+        if self.preventable_value > self.fraudulent_value:
+            raise ValueError("preventable bootstrap value exceeds fraudulent value")
+        return self
+
+
 class ConfidenceIntervals(ExternalContract):
     """Canonical frozen campaign-clustered uncertainty evidence."""
 
@@ -991,6 +1156,7 @@ class ConfidenceIntervals(ExternalContract):
     replicates: Literal[1000] = 1000
     evaluator_input_digest: str
     intervals: tuple[ConfidenceInterval, ...]
+    campaign_contributions: tuple[CampaignBootstrapContribution, ...]
     synthetic_only: Literal[True] = True
     external_validity_claimed: Literal[False] = False
     intervals_digest: str
@@ -1008,6 +1174,25 @@ class ConfidenceIntervals(ExternalContract):
         names = tuple(item.metric_name for item in self.intervals)
         if names != _BOOTSTRAP_METRICS:
             raise ValueError("confidence intervals must be complete, sorted, and unique")
+        campaign_ids = tuple(item.campaign_id for item in self.campaign_contributions)
+        if campaign_ids != tuple(sorted(campaign_ids)) or len(set(campaign_ids)) != len(
+            campaign_ids
+        ):
+            raise ValueError("bootstrap campaign contributions must be sorted and unique")
+        if len(campaign_ids) > MAX_METRIC_CAMPAIGNS:
+            raise ValueError("bootstrap campaign contribution count exceeds resource cap")
+        if len(campaign_ids) * self.replicates > MAX_BOOTSTRAP_WORK:
+            raise ValueError("bootstrap contribution replay exceeds frozen work cap")
+        try:
+            expected_intervals = _bootstrap_intervals(
+                self.campaign_contributions,
+                seed=self.seed,
+                replicates=self.replicates,
+            )
+        except (ArithmeticError, MemoryError, OverflowError, TypeError, ValueError) as error:
+            raise ValueError("bootstrap derivation evidence is invalid") from error
+        if self.intervals != expected_intervals:
+            raise ValueError("bootstrap derivation differs from stored intervals")
         expected = _digest_document(self.model_dump(mode="json", exclude={"intervals_digest"}))
         if self.intervals_digest != expected:
             raise ValueError("confidence interval digest is inconsistent")
@@ -1060,41 +1245,6 @@ class ConfidenceIntervals(ExternalContract):
             raise MetricContractError(str(error)) from error
 
 
-class MetricReportInputs(ExternalContract):
-    """Closed evaluator inputs for one mature synthetic metric report."""
-
-    truth: tuple[EvaluationTruthRow, ...]
-    observations: tuple[ObservedEvent, ...]
-    decisions: tuple[DefenseDecision, ...]
-    cases: tuple[InvestigationCase, ...]
-    queue_report: QueueReport
-    latency_samples: tuple[LatencySample, ...]
-    as_of: datetime
-    slice_assignments: tuple[SliceAssignment, ...] = ()
-
-    @field_validator(
-        "truth",
-        "observations",
-        "decisions",
-        "cases",
-        "latency_samples",
-        "slice_assignments",
-        mode="before",
-    )
-    @classmethod
-    def containers_are_exact_tuples(cls, value: object) -> object:
-        if type(value) is not tuple:
-            raise ValueError("metric input collections must be exact tuples")
-        return value
-
-    @field_validator("as_of")
-    @classmethod
-    def as_of_is_utc(cls, value: datetime) -> datetime:
-        if type(value) is not datetime:
-            raise ValueError("metric as_of must be an exact datetime")
-        return validate_utc_timestamp(value)
-
-
 @dataclass(frozen=True, slots=True)
 class _MetricRow:
     event_id: str
@@ -1110,13 +1260,39 @@ class _MetricRow:
 
 
 @dataclass(frozen=True, slots=True)
+class _CampaignGroup:
+    campaign_id: str
+    rows: tuple[_MetricRow, ...]
+    fraud_rows: tuple[_MetricRow, ...]
+    fraud_anchor_at: datetime | None
+    alert_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class _CampaignIndex:
+    groups: tuple[_CampaignGroup, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _ValidatedInputs:
     inputs: MetricReportInputs
     rows: tuple[_MetricRow, ...]
+    campaign_index: _CampaignIndex
     observation_by_id: dict[str, ObservedEvent]
     truth_by_id: dict[str, EvaluationTruthRow]
     decision_by_id: dict[str, DefenseDecision]
     currency: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _DerivedMetricSections:
+    inputs: MetricReportInputs
+    classification: ClassificationMetrics
+    calibration: CalibrationMetrics
+    value: ValueMetrics
+    alerts: AlertMetrics
+    operations: OperationalMetrics
+    engineering: EngineeringMetrics
 
 
 @dataclass(frozen=True, slots=True)
@@ -1136,38 +1312,35 @@ def compute_metric_report(report_inputs: MetricReportInputs) -> MetricReport:
     if type(report_inputs) is not MetricReportInputs:
         raise MetricContractError("report_inputs must be an exact MetricReportInputs")
     try:
-        validated = _validate_inputs(report_inputs)
-        classification = _classification_metrics(validated)
-        calibration = _calibration_metrics(validated.rows)
-        alerts, alert_times = _alert_metrics(validated.rows)
-        value = _value_metrics(validated, alert_times)
-        operations = _operational_metrics(validated)
-        engineering = _engineering_metrics(validated.inputs.latency_samples)
-        input_digest = _input_digest(validated.inputs)
+        derived = _derive_metric_sections(report_inputs)
+        evidence = MetricDerivationEvidence(inputs=derived.inputs)
+        input_digest = _input_digest(derived.inputs)
         document: dict[str, object] = {
             "schema_version": "1.0.0",
-            "evaluator_as_of": validated.inputs.as_of,
+            "evaluator_as_of": derived.inputs.as_of,
             "evaluator_input_digest": input_digest,
-            "classification": classification,
-            "calibration": calibration,
-            "value": value,
-            "alerts": alerts,
-            "operations": operations,
-            "engineering": engineering,
+            "classification": derived.classification,
+            "calibration": derived.calibration,
+            "value": derived.value,
+            "alerts": derived.alerts,
+            "operations": derived.operations,
+            "engineering": derived.engineering,
+            "derivation_evidence": evidence,
             "synthetic_only": True,
             "external_validity_claimed": False,
             "limitations": _LIMITATIONS,
         }
         digest = _digest_document(_json_tree(document))
         report = MetricReport(
-            evaluator_as_of=validated.inputs.as_of,
+            evaluator_as_of=derived.inputs.as_of,
             evaluator_input_digest=input_digest,
-            classification=classification,
-            calibration=calibration,
-            value=value,
-            alerts=alerts,
-            operations=operations,
-            engineering=engineering,
+            classification=derived.classification,
+            calibration=derived.calibration,
+            value=derived.value,
+            alerts=derived.alerts,
+            operations=derived.operations,
+            engineering=derived.engineering,
+            derivation_evidence=evidence,
             limitations=_LIMITATIONS,
             report_digest=digest,
         )
@@ -1186,6 +1359,25 @@ def compute_metric_report(report_inputs: MetricReportInputs) -> MetricReport:
         ValueError,
     ) as error:
         raise MetricContractError("metric computation failed deterministically") from error
+
+
+def _derive_metric_sections(report_inputs: MetricReportInputs) -> _DerivedMetricSections:
+    validated = _validate_inputs(report_inputs)
+    classification = _classification_metrics(validated)
+    calibration = _calibration_metrics(validated.rows)
+    alerts, alert_times = _alert_metrics(validated.campaign_index)
+    value = _value_metrics(validated, alert_times)
+    operations = _operational_metrics(validated)
+    engineering = _engineering_metrics(validated.inputs.latency_samples)
+    return _DerivedMetricSections(
+        inputs=validated.inputs,
+        classification=classification,
+        calibration=calibration,
+        value=value,
+        alerts=alerts,
+        operations=operations,
+        engineering=engineering,
+    )
 
 
 def campaign_bootstrap(
@@ -1208,66 +1400,20 @@ def campaign_bootstrap(
         raise MetricContractError("campaign bootstrap replicate count must equal 1000")
     try:
         validated = _validate_inputs(report_inputs)
-        campaign_ids = tuple(sorted({row.campaign_id for row in validated.rows}))
+        campaign_groups = validated.campaign_index.groups
+        campaign_ids = tuple(group.campaign_id for group in campaign_groups)
         if len(campaign_ids) > MAX_METRIC_CAMPAIGNS:
             raise MetricContractError("campaign count exceeds metric resource cap")
         if len(campaign_ids) * replicates > MAX_BOOTSTRAP_WORK:
             raise MetricContractError("campaign bootstrap exceeds frozen work cap")
-        rows_by_campaign: dict[str, list[_MetricRow]] = defaultdict(list)
-        for row in validated.rows:
-            rows_by_campaign[row.campaign_id].append(row)
-        units = tuple(
-            _bootstrap_unit(tuple(rows_by_campaign[campaign_id]))
-            for campaign_id in campaign_ids
+        contributions = tuple(
+            _campaign_bootstrap_contribution(group.campaign_id, group.rows)
+            for group in campaign_groups
         )
-        values: dict[MetricName, list[float]] = {
-            name: [] for name in _BOOTSTRAP_METRICS
-        }
-        generator = np.random.Generator(np.random.PCG64(seed))
-        for _ in range(replicates):
-            selected = (
-                generator.integers(0, len(units), size=len(units), endpoint=False)
-                if units
-                else np.asarray([], dtype=np.int64)
-            )
-            totals = _sum_bootstrap_units(tuple(units[int(index)] for index in selected))
-            _append_ratio(
-                values["precision"],
-                totals.true_positives,
-                totals.true_positives + totals.false_positives,
-            )
-            _append_ratio(
-                values["recall"],
-                totals.true_positives,
-                totals.true_positives + totals.false_negatives,
-            )
-            _append_ratio(
-                values["f1"],
-                2 * totals.true_positives,
-                2 * totals.true_positives + totals.false_positives + totals.false_negatives,
-            )
-            _append_ratio(
-                values["false_positive_rate"],
-                totals.false_positives,
-                totals.false_positives + totals.true_negatives,
-            )
-            _append_ratio(
-                values["campaign_recall"],
-                totals.detected_campaign,
-                totals.fraud_campaign,
-            )
-            values["fraudulent_net_settled_value"].append(
-                _finite_decimal_float(totals.fraudulent_value)
-            )
-            values["preventable_settled_value"].append(
-                _finite_decimal_float(totals.preventable_value)
-            )
-            values["value_escaped"].append(
-                _finite_decimal_float(totals.fraudulent_value - totals.preventable_value)
-            )
-        intervals = tuple(
-            _confidence_interval(name, values[name], replicates)
-            for name in sorted(values)
+        intervals = _bootstrap_intervals(
+            contributions,
+            seed=seed,
+            replicates=replicates,
         )
         document: dict[str, object] = {
             "schema_version": "1.0.0",
@@ -1279,12 +1425,14 @@ def campaign_bootstrap(
             "replicates": replicates,
             "evaluator_input_digest": _input_digest(validated.inputs),
             "intervals": intervals,
+            "campaign_contributions": contributions,
             "synthetic_only": True,
             "external_validity_claimed": False,
         }
         return ConfidenceIntervals(
             evaluator_input_digest=cast(str, document["evaluator_input_digest"]),
             intervals=intervals,
+            campaign_contributions=contributions,
             intervals_digest=_digest_document(_json_tree(document)),
         )
     except MetricContractError:
@@ -1355,17 +1503,31 @@ def _validate_inputs(inputs: MetricReportInputs) -> _ValidatedInputs:
     slice_rows = _revalidate_rows(
         inputs.slice_assignments, SliceAssignment, label="SliceAssignment"
     )
+    if inputs.slice_manifest is None:
+        slice_manifest = None
+    elif type(inputs.slice_manifest) is not SliceManifest:
+        raise MetricContractError("slice manifest must be an exact SliceManifest")
+    else:
+        try:
+            slice_manifest = SliceManifest.model_validate(
+                inputs.slice_manifest.model_dump(mode="python", warnings=False),
+                strict=True,
+            )
+        except (AttributeError, TypeError, ValidationError, ValueError) as error:
+            raise MetricContractError("slice manifest failed semantic revalidation") from error
     if type(inputs.queue_report) is not QueueReport:
         raise MetricContractError("queue report must be an exact QueueReport")
     try:
         queue_report = QueueReport.from_json(inputs.queue_report.to_json())
     except (AttributeError, TypeError, ValueError) as error:
         raise MetricContractError("queue report failed semantic revalidation") from error
-    if case_rows != queue_report.case_inputs:
+    if tuple(sorted(case_rows, key=lambda row: row.case_id)) != tuple(
+        sorted(queue_report.case_inputs, key=lambda row: row.case_id)
+    ):
         raise MetricContractError("supplied cases must exactly match queue case inputs")
 
     truth_ids = _unique_ids(truth_rows, label="truth")
-    observation_ids = _unique_ids(observation_rows, label="observation")
+    _unique_ids(observation_rows, label="observation")
     decision_ids = _unique_ids(decision_rows, label="decision")
     latency_ids = _unique_ids(latency_rows, label="latency")
     truth_by_id = {row.event_id: row for row in truth_rows}
@@ -1387,10 +1549,11 @@ def _validate_inputs(inputs: MetricReportInputs) -> _ValidatedInputs:
         opening = observation_by_id[row.event_id]
         if opening.payment_id != row.payment_id:
             raise MetricContractError("truth opening payment binding differs")
-    _validate_slice_assignments(slice_rows, truth_ids)
-    currency = _validate_lifecycles(truth_rows, observation_by_id, observation_ids)
+    _validate_slice_assignments(slice_rows, truth_ids, slice_manifest)
+    currency = _validate_lifecycles(truth_rows, observation_by_id)
     try:
-        causal_cases = group_cases(observation_rows, decision_rows, as_of=as_of)
+        with localcontext(_DECIMAL128_CONTEXT):
+            causal_cases = group_cases(observation_rows, decision_rows, as_of=as_of)
     except (ArithmeticError, MemoryError, OverflowError, TypeError, ValueError) as error:
         raise MetricContractError("causal case reconstruction failed") from error
     if tuple(sorted(case_rows, key=lambda row: row.case_id)) != tuple(
@@ -1414,18 +1577,20 @@ def _validate_inputs(inputs: MetricReportInputs) -> _ValidatedInputs:
         for event_id in sorted(truth_ids)
     )
     checked_inputs = MetricReportInputs(
-        truth=truth_rows,
-        observations=observation_rows,
-        decisions=decision_rows,
-        cases=case_rows,
+        truth=tuple(sorted(truth_rows, key=lambda row: row.event_id)),
+        observations=tuple(sorted(observation_rows, key=lambda row: row.event_id)),
+        decisions=tuple(sorted(decision_rows, key=lambda row: row.event_id)),
+        cases=tuple(sorted(case_rows, key=lambda row: row.case_id)),
         queue_report=queue_report,
-        latency_samples=latency_rows,
+        latency_samples=tuple(sorted(latency_rows, key=lambda row: row.event_id)),
         as_of=as_of,
-        slice_assignments=slice_rows,
+        slice_assignments=tuple(sorted(slice_rows, key=lambda row: row.event_id)),
+        slice_manifest=slice_manifest,
     )
     return _ValidatedInputs(
         inputs=checked_inputs,
         rows=metric_rows,
+        campaign_index=_prepare_campaign_index(metric_rows),
         observation_by_id=observation_by_id,
         truth_by_id=truth_by_id,
         decision_by_id=decision_by_id,
@@ -1436,7 +1601,7 @@ def _validate_inputs(inputs: MetricReportInputs) -> _ValidatedInputs:
 def _classification_metrics(validated: _ValidatedInputs) -> ClassificationMetrics:
     rows = validated.rows
     counts = _confusion_counts(rows)
-    fraud_campaigns, alert_times = _campaign_alert_times(rows)
+    fraud_campaigns, alert_times = _campaign_alert_times(validated.campaign_index)
     labels = np.asarray([int(row.is_fraud) for row in rows], dtype=np.int8)
     scores = np.asarray([row.score for row in rows], dtype=np.float64)
     pr_auc, roc_auc = _auc_metrics(labels, scores)
@@ -1457,8 +1622,9 @@ def _classification_metrics(validated: _ValidatedInputs) -> ClassificationMetric
         slices.append(_classification_slice("family", family, tuple(family_rows[family])))
     for rail in Rail:
         slices.append(_classification_slice("rail", rail.value, tuple(rail_rows[rail.value])))
-    if assignments:
-        for regime in sorted(regime_rows):
+    manifest = validated.inputs.slice_manifest
+    if assignments and manifest is not None:
+        for regime in manifest.regimes:
             slices.append(
                 _classification_slice(
                     "regime",
@@ -1466,7 +1632,7 @@ def _classification_metrics(validated: _ValidatedInputs) -> ClassificationMetric
                     tuple(regime_rows[regime]),
                 )
             )
-        for cohort in sorted(cohort_rows):
+        for cohort in manifest.entity_cohorts:
             slices.append(
                 _classification_slice(
                     "entity_cohort",
@@ -1589,16 +1755,13 @@ def _calibration_metrics(rows: tuple[_MetricRow, ...]) -> CalibrationMetrics:
 
 
 def _alert_metrics(
-    rows: tuple[_MetricRow, ...],
+    campaign_index: _CampaignIndex,
 ) -> tuple[AlertMetrics, dict[str, datetime]]:
-    fraud_campaigns, alert_times = _campaign_alert_times(rows)
+    fraud_campaigns, alert_times = _campaign_alert_times(campaign_index)
     anchors = {
-        campaign_id: min(
-            row.decision_at
-            for row in rows
-            if row.campaign_id == campaign_id and row.is_fraud
-        )
-        for campaign_id in fraud_campaigns
+        group.campaign_id: group.fraud_anchor_at
+        for group in campaign_index.groups
+        if group.fraud_anchor_at is not None
     }
     durations = tuple(
         sorted(
@@ -1624,30 +1787,28 @@ def _alert_metrics(
 def _value_metrics(
     validated: _ValidatedInputs, alert_times: dict[str, datetime]
 ) -> ValueMetrics:
-    fraudulent_total = sum(
-        (row.net_value for row in validated.rows if row.is_fraud), Decimal(0)
+    fraudulent_total = _money_sum(
+        row.net_value for row in validated.rows if row.is_fraud
     )
-    prevented = sum(
-        (
-            row.net_value
-            for row in validated.rows
-            if row.is_fraud
-            and row.action is Action.DECLINE
-            and row.first_settlement_at is not None
-            and row.decision_at < row.first_settlement_at
-        ),
-        Decimal(0),
+    prevented = _money_sum(
+        row.net_value
+        for row in validated.rows
+        if row.is_fraud
+        and row.action is Action.DECLINE
+        and row.first_settlement_at is not None
+        and row.decision_at < row.first_settlement_at
     )
-    value_before_alert = Decimal(0)
-    remaining_at_alert = Decimal(0)
-    fraud_by_campaign: dict[str, list[_MetricRow]] = defaultdict(list)
-    for row in validated.rows:
-        if row.is_fraud:
-            fraud_by_campaign[row.campaign_id].append(row)
+    value_before_alert = Decimal("0.00")
+    remaining_at_alert = Decimal("0.00")
+    fraud_groups = {
+        group.campaign_id: group.fraud_rows
+        for group in validated.campaign_index.groups
+        if group.fraud_rows
+    }
     for campaign_id, alert_at in alert_times.items():
-        campaign_rows = fraud_by_campaign[campaign_id]
-        campaign_total = sum((row.net_value for row in campaign_rows), Decimal(0))
-        before = Decimal(0)
+        campaign_rows = fraud_groups[campaign_id]
+        campaign_total = _money_sum(row.net_value for row in campaign_rows)
+        before = Decimal("0.00")
         for row in campaign_rows:
             truth = validated.truth_by_id[row.event_id]
             for lifecycle_id in truth.lifecycle_event_ids:
@@ -1655,28 +1816,36 @@ def _value_metrics(
                 if event.event_time >= alert_at:
                     continue
                 if event.event_type in _SETTLEMENT_EVENTS:
-                    before += event.amount
+                    before = _money_add(before, event.amount)
                 elif event.event_type in _REVERSING_EVENTS:
-                    before -= event.amount
-        value_before_alert += max(before, Decimal(0))
-        remaining_at_alert += max(campaign_total - before, Decimal(0))
+                    before = _money_subtract(before, event.amount, allow_negative=True)
+        value_before_alert = _money_add(
+            value_before_alert, max(before, Decimal("0.00"))
+        )
+        remaining_at_alert = _money_add(
+            remaining_at_alert,
+            max(
+                _money_subtract(campaign_total, before, allow_negative=True),
+                Decimal("0.00"),
+            ),
+        )
     case_count = len(validated.inputs.cases)
     analyst_minutes = validated.inputs.queue_report.analyst_minutes
     return ValueMetrics(
         currency=validated.currency,
         fraudulent_net_settled_value=fraudulent_total,
         preventable_settled_value=prevented,
-        value_escaped=fraudulent_total - prevented,
+        value_escaped=_money_subtract(fraudulent_total, prevented),
         value_before_first_alert=value_before_alert,
         remaining_preventable_at_alert=remaining_at_alert,
-        challenge_credited_as_prevented=Decimal(0),
+        challenge_credited_as_prevented=Decimal("0.00"),
         review_case_count=case_count,
         analyst_minutes=analyst_minutes,
         captured_value_per_review_case=_decimal_ratio(
             prevented, Decimal(case_count), "no_review_cases"
         ),
         captured_value_per_analyst_hour=_decimal_ratio(
-            prevented * Decimal(60),
+            _decimal_multiply(prevented, Decimal(60)),
             Decimal(analyst_minutes),
             "no_analyst_minutes",
         ),
@@ -1693,7 +1862,9 @@ def _operational_metrics(validated: _ValidatedInputs) -> OperationalMetrics:
     cases = validated.inputs.cases
     case_count = len(cases)
     case_transactions = sum(len(row.event_ids) for row in cases)
-    case_entities = sum(len(row.actor_ids) + len(row.counterparty_ids) for row in cases)
+    case_entities = sum(
+        len(set(row.actor_ids) | set(row.counterparty_ids)) for row in cases
+    )
     fallback_count = sum(row.fallback_used for row in validated.inputs.decisions)
     return OperationalMetrics(
         decision_count=len(rows),
@@ -1795,10 +1966,24 @@ def _classification_slice(
     selected: tuple[_MetricRow, ...],
 ) -> ClassificationSlice:
     counts = _confusion_counts(selected)
+    decline_true_positives = sum(
+        row.is_fraud and row.action is Action.DECLINE for row in selected
+    )
+    decline_false_positives = sum(
+        not row.is_fraud and row.action is Action.DECLINE for row in selected
+    )
+    fraud_campaigns, alert_times = _campaign_alert_times(selected)
+    labels = np.asarray([int(row.is_fraud) for row in selected], dtype=np.int8)
+    scores = np.asarray([row.score for row in selected], dtype=np.float64)
+    pr_auc, roc_auc = _auc_metrics(labels, scores)
     return ClassificationSlice(
         kind=kind,
         value=value,
         **counts,
+        decline_true_positives=decline_true_positives,
+        decline_false_positives=decline_false_positives,
+        fraud_campaigns=len(fraud_campaigns),
+        detected_fraud_campaigns=len(alert_times),
         precision=_ratio(
             counts["true_positives"],
             counts["true_positives"] + counts["false_positives"],
@@ -1819,6 +2004,21 @@ def _classification_slice(
             counts["legitimate_count"],
             "absent_legitimate_class",
         ),
+        decline_precision=_ratio(
+            decline_true_positives,
+            decline_true_positives + decline_false_positives,
+            "no_declines",
+        ),
+        decline_recall=_ratio(
+            decline_true_positives,
+            counts["fraud_count"],
+            "absent_positive_class",
+        ),
+        campaign_recall=_ratio(
+            len(alert_times), len(fraud_campaigns), "absent_fraud_campaigns"
+        ),
+        pr_auc=pr_auc,
+        roc_auc=roc_auc,
     )
 
 
@@ -1937,26 +2137,57 @@ def _undefined_fit(count: int, reason: str) -> tuple[MetricValue, MetricValue]:
     )
 
 
+def _prepare_campaign_index(rows: tuple[_MetricRow, ...]) -> _CampaignIndex:
+    grouped: dict[str, list[_MetricRow]] = defaultdict(list)
+    for row in rows:
+        grouped[row.campaign_id].append(row)
+    groups: list[_CampaignGroup] = []
+    for campaign_id in sorted(grouped):
+        campaign_rows = tuple(
+            sorted(grouped[campaign_id], key=lambda row: (row.decision_at, row.event_id))
+        )
+        fraud_rows = tuple(row for row in campaign_rows if row.is_fraud)
+        fraud_anchor_at = fraud_rows[0].decision_at if fraud_rows else None
+        eligible_alerts = (
+            tuple(
+                row.decision_at
+                for row in campaign_rows
+                if row.decision_at >= fraud_anchor_at
+                and row.action is not Action.APPROVE
+            )
+            if fraud_anchor_at is not None
+            else ()
+        )
+        groups.append(
+            _CampaignGroup(
+                campaign_id=campaign_id,
+                rows=campaign_rows,
+                fraud_rows=fraud_rows,
+                fraud_anchor_at=fraud_anchor_at,
+                alert_at=eligible_alerts[0] if eligible_alerts else None,
+            )
+        )
+    return _CampaignIndex(groups=tuple(groups))
+
+
 def _campaign_alert_times(
-    rows: tuple[_MetricRow, ...],
+    rows_or_index: tuple[_MetricRow, ...] | _CampaignIndex,
 ) -> tuple[tuple[str, ...], dict[str, datetime]]:
-    fraud_campaigns = tuple(sorted({row.campaign_id for row in rows if row.is_fraud}))
-    alerts: dict[str, datetime] = {}
-    for campaign_id in fraud_campaigns:
-        anchor = min(
-            row.decision_at
-            for row in rows
-            if row.campaign_id == campaign_id and row.is_fraud
-        )
-        eligible = tuple(
-            row.decision_at
-            for row in rows
-            if row.campaign_id == campaign_id
-            and row.decision_at >= anchor
-            and row.action is not Action.APPROVE
-        )
-        if eligible:
-            alerts[campaign_id] = min(eligible)
+    campaign_index = (
+        rows_or_index
+        if isinstance(rows_or_index, _CampaignIndex)
+        else _prepare_campaign_index(rows_or_index)
+    )
+    fraud_campaigns = tuple(
+        group.campaign_id
+        for group in campaign_index.groups
+        if group.fraud_anchor_at is not None
+    )
+    alerts = {
+        group.campaign_id: group.alert_at
+        for group in campaign_index.groups
+        if group.fraud_anchor_at is not None and group.alert_at is not None
+    }
     return fraud_campaigns, alerts
 
 
@@ -2005,10 +2236,7 @@ def _validate_observation(row: ObservedEvent, as_of: datetime) -> None:
             raise MetricContractError("observation decision time is outside its causal window")
     elif row.decision_at is not None:
         raise MetricContractError("contextual observation cannot declare decision_at")
-    if type(row.amount) is not Decimal or not row.amount.is_finite() or row.amount < 0:
-        raise MetricContractError("observation amount must be an exact finite nonnegative Decimal")
-    if row.amount and row.amount.adjusted() > _MAX_DECIMAL_ADJUSTED:
-        raise MetricContractError("observation amount exceeds numeric resource bounds")
+    _validate_cent_amount(row.amount, label="observation amount")
     for label, identifier in (
         ("event_id", row.event_id),
         ("payment_id", row.payment_id),
@@ -2057,14 +2285,7 @@ def _validate_truth(row: EvaluationTruthRow, as_of: datetime) -> None:
         raise MetricContractError("truth first settlement occurs after evaluation as_of")
     if type(row.is_fraud) is not bool:
         raise MetricContractError("truth is_fraud must be an exact bool")
-    if (
-        type(row.net_settled_value) is not Decimal
-        or not row.net_settled_value.is_finite()
-        or row.net_settled_value < 0
-    ):
-        raise MetricContractError("truth net settlement must be a finite nonnegative Decimal")
-    if row.net_settled_value and row.net_settled_value.adjusted() > _MAX_DECIMAL_ADJUSTED:
-        raise MetricContractError("truth net settlement exceeds numeric resource bounds")
+    _validate_cent_amount(row.net_settled_value, label="truth net settlement")
     if type(row.lifecycle_event_ids) is not tuple or not row.lifecycle_event_ids:
         raise MetricContractError("truth lifecycle IDs must be a nonempty exact tuple")
     if (
@@ -2083,21 +2304,28 @@ def _validate_truth(row: EvaluationTruthRow, as_of: datetime) -> None:
 def _validate_lifecycles(
     truth_rows: tuple[EvaluationTruthRow, ...],
     observation_by_id: dict[str, ObservedEvent],
-    observation_ids: set[str],
 ) -> str | None:
-    claimed: set[str] = set()
+    payment_ids = tuple(row.payment_id for row in truth_rows)
+    if len(set(payment_ids)) != len(payment_ids):
+        raise MetricContractError("truth payment IDs must be unique")
+    observations_by_payment: dict[str, list[ObservedEvent]] = defaultdict(list)
+    for observation in observation_by_id.values():
+        observations_by_payment[observation.payment_id].append(observation)
     currencies: set[str] = set()
     for truth in truth_rows:
-        lifecycle_ids = set(truth.lifecycle_event_ids)
-        if not lifecycle_ids <= observation_ids:
-            raise MetricContractError("truth lifecycle references a missing observation")
-        overlap = claimed & lifecycle_ids
-        if overlap:
-            raise MetricContractError("truth lifecycle event IDs overlap across openings")
-        claimed.update(lifecycle_ids)
-        lifecycle = tuple(observation_by_id[event_id] for event_id in truth.lifecycle_event_ids)
-        if any(event.payment_id != truth.payment_id for event in lifecycle):
-            raise MetricContractError("truth lifecycle payment binding differs")
+        lifecycle = tuple(
+            sorted(
+                observations_by_payment[truth.payment_id],
+                key=lambda event: (event.event_time, event.event_id),
+            )
+        )
+        expected_ids = tuple(event.event_id for event in lifecycle)
+        if set(truth.lifecycle_event_ids) != set(expected_ids):
+            raise MetricContractError(
+                "truth lifecycle IDs must exactly cover every observation for its payment"
+            )
+        if truth.lifecycle_event_ids != expected_ids:
+            raise MetricContractError("truth lifecycle IDs must use canonical lifecycle order")
         lifecycle_currencies = {event.currency for event in lifecycle}
         if len(lifecycle_currencies) != 1:
             raise MetricContractError("mixed currency within a payment lifecycle")
@@ -2111,16 +2339,17 @@ def _validate_lifecycles(
         first_settlement = settlements[0].event_time if settlements else None
         if first_settlement != truth.first_settlement_at:
             raise MetricContractError("truth first settlement does not match lifecycle evidence")
-        net = sum((event.amount for event in settlements), Decimal(0)) - sum(
-            (
+        net = _money_subtract(
+            _money_sum(event.amount for event in settlements),
+            _money_sum(
                 event.amount
                 for event in lifecycle
                 if event.event_type in _REVERSING_EVENTS
             ),
-            Decimal(0),
+            allow_negative=True,
         )
-        if not net.is_finite() or (net and net.adjusted() > _MAX_DECIMAL_ADJUSTED):
-            raise MetricContractError("lifecycle net settlement exceeds numeric resource bounds")
+        if net < 0:
+            raise MetricContractError("lifecycle net settlement must be nonnegative")
         if net != truth.net_settled_value:
             raise MetricContractError("truth net settlement does not match lifecycle evidence")
     if len(currencies) > 1:
@@ -2129,13 +2358,25 @@ def _validate_lifecycles(
 
 
 def _validate_slice_assignments(
-    assignments: tuple[SliceAssignment, ...], truth_ids: set[str]
+    assignments: tuple[SliceAssignment, ...],
+    truth_ids: set[str],
+    manifest: SliceManifest | None,
 ) -> None:
-    if not assignments:
+    if not truth_ids:
+        if assignments:
+            raise MetricContractError("empty metric inputs cannot contain slice assignments")
         return
+    if manifest is None:
+        raise MetricContractError("nonempty metric inputs require a slice manifest")
+    if not assignments:
+        raise MetricContractError("slice assignments are required for nonempty metric inputs")
     identifiers = tuple(row.event_id for row in assignments)
     if len(set(identifiers)) != len(identifiers) or set(identifiers) != truth_ids:
         raise MetricContractError("slice assignments must align bijectively with truth rows")
+    if any(row.regime not in manifest.regimes for row in assignments):
+        raise MetricContractError("slice assignment regime is absent from its manifest")
+    if any(row.entity_cohort not in manifest.entity_cohorts for row in assignments):
+        raise MetricContractError("slice assignment entity cohort is absent from its manifest")
 
 
 def _revalidate_rows[T: ExternalContract](
@@ -2174,19 +2415,14 @@ def _unique_ids(rows: Sequence[object], *, label: str) -> set[str]:
 def _bootstrap_unit(rows: tuple[_MetricRow, ...]) -> _CampaignBootstrapUnit:
     counts = _confusion_counts(rows)
     fraud_campaigns, alerts = _campaign_alert_times(rows)
-    fraudulent_value = sum(
-        (row.net_value for row in rows if row.is_fraud), Decimal(0)
-    )
-    preventable_value = sum(
-        (
-            row.net_value
-            for row in rows
-            if row.is_fraud
-            and row.action is Action.DECLINE
-            and row.first_settlement_at is not None
-            and row.decision_at < row.first_settlement_at
-        ),
-        Decimal(0),
+    fraudulent_value = _money_sum(row.net_value for row in rows if row.is_fraud)
+    preventable_value = _money_sum(
+        row.net_value
+        for row in rows
+        if row.is_fraud
+        and row.action is Action.DECLINE
+        and row.first_settlement_at is not None
+        and row.decision_at < row.first_settlement_at
     )
     return _CampaignBootstrapUnit(
         true_positives=counts["true_positives"],
@@ -2200,6 +2436,99 @@ def _bootstrap_unit(rows: tuple[_MetricRow, ...]) -> _CampaignBootstrapUnit:
     )
 
 
+def _campaign_bootstrap_contribution(
+    campaign_id: str, rows: tuple[_MetricRow, ...]
+) -> CampaignBootstrapContribution:
+    unit = _bootstrap_unit(rows)
+    return CampaignBootstrapContribution(
+        campaign_id=campaign_id,
+        true_positives=unit.true_positives,
+        false_positives=unit.false_positives,
+        false_negatives=unit.false_negatives,
+        true_negatives=unit.true_negatives,
+        fraud_campaign=unit.fraud_campaign,
+        detected_campaign=unit.detected_campaign,
+        fraudulent_value=unit.fraudulent_value,
+        preventable_value=unit.preventable_value,
+    )
+
+
+def _bootstrap_intervals(
+    contributions: tuple[CampaignBootstrapContribution, ...],
+    *,
+    seed: int,
+    replicates: int,
+) -> tuple[ConfidenceInterval, ...]:
+    if len(contributions) > MAX_METRIC_CAMPAIGNS:
+        raise MetricContractError("campaign count exceeds metric resource cap")
+    if len(contributions) * replicates > MAX_BOOTSTRAP_WORK:
+        raise MetricContractError("campaign bootstrap exceeds frozen work cap")
+    units = tuple(
+        _CampaignBootstrapUnit(
+            true_positives=row.true_positives,
+            false_positives=row.false_positives,
+            false_negatives=row.false_negatives,
+            true_negatives=row.true_negatives,
+            fraud_campaign=row.fraud_campaign,
+            detected_campaign=row.detected_campaign,
+            fraudulent_value=row.fraudulent_value,
+            preventable_value=row.preventable_value,
+        )
+        for row in contributions
+    )
+    values: dict[MetricName, list[float]] = {
+        name: [] for name in _BOOTSTRAP_METRICS
+    }
+    generator = np.random.Generator(np.random.PCG64(seed))
+    for _ in range(replicates):
+        selected = (
+            generator.integers(0, len(units), size=len(units), endpoint=False)
+            if units
+            else np.asarray([], dtype=np.int64)
+        )
+        totals = _sum_bootstrap_units(tuple(units[int(index)] for index in selected))
+        _append_ratio(
+            values["precision"],
+            totals.true_positives,
+            totals.true_positives + totals.false_positives,
+        )
+        _append_ratio(
+            values["recall"],
+            totals.true_positives,
+            totals.true_positives + totals.false_negatives,
+        )
+        _append_ratio(
+            values["f1"],
+            2 * totals.true_positives,
+            2 * totals.true_positives + totals.false_positives + totals.false_negatives,
+        )
+        _append_ratio(
+            values["false_positive_rate"],
+            totals.false_positives,
+            totals.false_positives + totals.true_negatives,
+        )
+        _append_ratio(
+            values["campaign_recall"],
+            totals.detected_campaign,
+            totals.fraud_campaign,
+        )
+        values["fraudulent_net_settled_value"].append(
+            _finite_decimal_float(totals.fraudulent_value)
+        )
+        values["preventable_settled_value"].append(
+            _finite_decimal_float(totals.preventable_value)
+        )
+        values["value_escaped"].append(
+            _finite_decimal_float(
+                _money_subtract(totals.fraudulent_value, totals.preventable_value)
+            )
+        )
+    return tuple(
+        _confidence_interval(name, values[name], replicates)
+        for name in _BOOTSTRAP_METRICS
+    )
+
+
 def _sum_bootstrap_units(
     units: tuple[_CampaignBootstrapUnit, ...],
 ) -> _CampaignBootstrapUnit:
@@ -2210,8 +2539,8 @@ def _sum_bootstrap_units(
         true_negatives=sum(row.true_negatives for row in units),
         fraud_campaign=sum(row.fraud_campaign for row in units),
         detected_campaign=sum(row.detected_campaign for row in units),
-        fraudulent_value=sum((row.fraudulent_value for row in units), Decimal(0)),
-        preventable_value=sum((row.preventable_value for row in units), Decimal(0)),
+        fraudulent_value=_money_sum(row.fraudulent_value for row in units),
+        preventable_value=_money_sum(row.preventable_value for row in units),
     )
 
 
@@ -2277,6 +2606,84 @@ def _scaled_ratio(
     )
 
 
+def _validate_decimal128_number(value: Decimal, *, label: str) -> None:
+    if type(value) is not Decimal or not value.is_finite():
+        raise MetricContractError(f"{label} must be an exact finite Decimal")
+    if value and value.adjusted() > _MAX_DECIMAL_ADJUSTED:
+        raise MetricContractError(f"{label} exceeds numeric resource bounds")
+    try:
+        with localcontext(_DECIMAL128_CONTEXT) as context:
+            context.plus(value)
+    except DecimalException as error:
+        raise MetricContractError(f"{label} exceeds Decimal128 bounds") from error
+
+
+def _validate_cent_amount(value: Decimal, *, label: str) -> None:
+    _validate_decimal128_number(value, label=label)
+    if value < 0:
+        raise MetricContractError(f"{label} must be nonnegative")
+    exponent = value.as_tuple().exponent
+    if type(exponent) is not int or exponent < -2:
+        raise MetricContractError(f"{label} must have at most two fractional digits")
+    try:
+        with localcontext(_DECIMAL128_CONTEXT) as context:
+            quantized = value.quantize(_MONEY_QUANTUM, context=context)
+    except DecimalException as error:
+        raise MetricContractError(f"{label} exceeds Decimal128 bounds") from error
+    if quantized != value:
+        raise MetricContractError(f"{label} must have at most two fractional digits")
+
+
+def _money_add(left: Decimal, right: Decimal) -> Decimal:
+    try:
+        with localcontext(_DECIMAL128_CONTEXT) as context:
+            return context.add(left, right).quantize(_MONEY_QUANTUM, context=context)
+    except DecimalException as error:
+        raise MetricContractError("money arithmetic exceeds Decimal128 bounds") from error
+
+
+def _money_subtract(
+    left: Decimal, right: Decimal, *, allow_negative: bool = False
+) -> Decimal:
+    try:
+        with localcontext(_DECIMAL128_CONTEXT) as context:
+            result = context.subtract(left, right).quantize(
+                _MONEY_QUANTUM, context=context
+            )
+    except DecimalException as error:
+        raise MetricContractError("money arithmetic exceeds Decimal128 bounds") from error
+    if result < 0 and not allow_negative:
+        raise MetricContractError("money subtraction produced a negative result")
+    return result
+
+
+def _money_sum(values: Iterable[Decimal]) -> Decimal:
+    result = Decimal("0.00")
+    for value in values:
+        result = _money_add(result, value)
+    return result
+
+
+def _decimal_multiply(left: Decimal, right: Decimal) -> Decimal:
+    try:
+        with localcontext(_DECIMAL128_CONTEXT) as context:
+            result = context.multiply(left, right)
+    except DecimalException as error:
+        raise MetricContractError("Decimal ratio arithmetic exceeds Decimal128 bounds") from error
+    _validate_decimal128_number(result, label="Decimal ratio result")
+    return result
+
+
+def _decimal_divide(numerator: Decimal, denominator: Decimal) -> Decimal:
+    try:
+        with localcontext(_DECIMAL128_CONTEXT) as context:
+            result = context.divide(numerator, denominator)
+    except DecimalException as error:
+        raise MetricContractError("Decimal ratio arithmetic exceeds Decimal128 bounds") from error
+    _validate_decimal128_number(result, label="Decimal ratio result")
+    return result
+
+
 def _decimal_ratio(
     numerator: Decimal, denominator: Decimal, reason: str
 ) -> DecimalMetricValue:
@@ -2288,7 +2695,7 @@ def _decimal_ratio(
             undefined_reason=reason,
         )
     return DecimalMetricValue(
-        value=numerator / denominator,
+        value=_decimal_divide(numerator, denominator),
         numerator=numerator,
         denominator=denominator,
     )
@@ -2350,7 +2757,10 @@ def _assert_decimal_metric(
     if denominator == 0:
         if metric.value is not None or metric.undefined_reason != reason:
             raise ValueError(f"{label} must be explicitly undefined")
-    elif metric.value != numerator / denominator or metric.undefined_reason is not None:
+    elif (
+        metric.value != _decimal_divide(numerator, denominator)
+        or metric.undefined_reason is not None
+    ):
         raise ValueError(f"{label} value differs from its exact ratio")
 
 
@@ -2401,6 +2811,69 @@ def _validate_confusion_fields(
     )
 
 
+def _validate_extended_classification_fields(
+    value: ClassificationMetrics | ClassificationSlice, *, label: str
+) -> None:
+    _assert_metric(
+        value.decline_precision,
+        value.decline_true_positives,
+        value.decline_true_positives + value.decline_false_positives,
+        "no_declines",
+        label=f"{label} decline precision",
+    )
+    _assert_metric(
+        value.decline_recall,
+        value.decline_true_positives,
+        value.fraud_count,
+        "absent_positive_class",
+        label=f"{label} decline recall",
+    )
+    _assert_metric(
+        value.campaign_recall,
+        value.detected_fraud_campaigns,
+        value.fraud_campaigns,
+        "absent_fraud_campaigns",
+        label=f"{label} campaign recall",
+    )
+    if value.detected_fraud_campaigns > value.fraud_campaigns:
+        raise ValueError(f"{label} detected campaigns exceed fraud campaigns")
+    for auc_label, metric in (("PR-AUC", value.pr_auc), ("ROC-AUC", value.roc_auc)):
+        if metric.value is not None and not 0.0 <= metric.value <= 1.0:
+            raise ValueError(f"{label} {auc_label} must be in [0, 1]")
+        if metric.denominator != float(value.row_count):
+            raise ValueError(f"{label} {auc_label} denominator must equal row count")
+        if value.fraud_count == 0:
+            if (
+                metric.value is not None
+                or metric.numerator != 0.0
+                or metric.undefined_reason != "absent_positive_class"
+            ):
+                raise ValueError(
+                    f"{label} {auc_label} must expose the absent positive class"
+                )
+        elif value.legitimate_count == 0:
+            if (
+                metric.value is not None
+                or metric.numerator != float(value.fraud_count)
+                or metric.undefined_reason != "absent_negative_class"
+            ):
+                raise ValueError(
+                    f"{label} {auc_label} must expose the absent negative class"
+                )
+        elif (
+            metric.value is None
+            or metric.undefined_reason is not None
+            or not math.isclose(
+                metric.numerator,
+                metric.value * value.row_count,
+                abs_tol=1e-12,
+            )
+        ):
+            raise ValueError(
+                f"{label} {auc_label} numerator must bind its value and row count"
+            )
+
+
 def _validate_slice_rollup(
     classification: ClassificationMetrics,
     slices: tuple[ClassificationSlice, ...],
@@ -2448,8 +2921,39 @@ def _input_digest(inputs: MetricReportInputs) -> str:
         "slice_assignments": tuple(
             sorted(inputs.slice_assignments, key=lambda row: row.event_id)
         ),
+        "slice_manifest": inputs.slice_manifest,
     }
     return _digest_document(_json_tree(document))
+
+
+def _restore_metric_report_json_tuples(document: dict[str, object]) -> None:
+    """Restore only public exact-tuple fields represented as canonical JSON arrays."""
+    evidence = document.get("derivation_evidence")
+    if type(evidence) is not dict:
+        return
+    inputs = cast(dict[str, object], evidence).get("inputs")
+    if type(inputs) is not dict:
+        return
+    input_document = cast(dict[str, object], inputs)
+    for field_name in (
+        "truth",
+        "observations",
+        "decisions",
+        "cases",
+        "latency_samples",
+        "slice_assignments",
+    ):
+        value = input_document.get(field_name)
+        if type(value) is list:
+            input_document[field_name] = tuple(cast(list[object], value))
+    manifest = input_document.get("slice_manifest")
+    if type(manifest) is not dict:
+        return
+    manifest_document = cast(dict[str, object], manifest)
+    for field_name in ("regimes", "entity_cohorts"):
+        value = manifest_document.get(field_name)
+        if type(value) is list:
+            manifest_document[field_name] = tuple(cast(list[object], value))
 
 
 def _json_tree(value: object) -> object:

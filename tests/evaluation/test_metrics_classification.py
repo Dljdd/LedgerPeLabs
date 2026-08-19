@@ -23,6 +23,7 @@ from apar.evaluation.metrics import (
     MetricReportInputs,
     MetricValue,
     SliceAssignment,
+    SliceManifest,
     compute_metric_report,
 )
 from apar.runs.wire import canonical_json_bytes
@@ -145,11 +146,23 @@ def make_inputs(
     decisions: tuple[DefenseDecision, ...],
     *,
     as_of: datetime = AS_OF,
-    slice_assignments: tuple[SliceAssignment, ...] = (),
+    slice_assignments: tuple[SliceAssignment, ...] | None = None,
     latency_samples: tuple[LatencySample, ...] | None = None,
 ) -> MetricReportInputs:
     causal_cases = group_cases(observations, decisions, as_of=as_of)
     queue_report = simulate_case_queue(causal_cases, QueueConfig())
+    assignments = (
+        tuple(
+            SliceAssignment(
+                event_id=row.event_id,
+                regime="baseline",
+                entity_cohort="cold_actor",
+            )
+            for row in truth_rows
+        )
+        if slice_assignments is None
+        else slice_assignments
+    )
     return MetricReportInputs(
         truth=truth_rows,
         observations=observations,
@@ -159,7 +172,8 @@ def make_inputs(
         latency_samples=latency_samples
         or tuple(latency(row.event_id) for row in decisions),
         as_of=as_of,
-        slice_assignments=slice_assignments,
+        slice_assignments=assignments,
+        slice_manifest=SliceManifest.closed() if truth_rows else None,
     )
 
 
@@ -182,8 +196,8 @@ def four_row_inputs() -> MetricReportInputs:
     assignments = tuple(
         SliceAssignment(
             event_id=event_id,
-            regime="baseline" if index < 3 else "shifted",
-            entity_cohort="cold" if index % 2 == 0 else "returning",
+            regime="baseline" if index < 3 else "availability_delay",
+            entity_cohort="cold_actor" if index % 2 == 0 else "returning_prior_campaign",
         )
         for index, event_id in enumerate(event_ids)
     )
@@ -340,14 +354,51 @@ def test_family_rail_regime_and_entity_cohort_slices_are_frozen() -> None:
     assert {("family", family) for family in FAMILIES} <= slice_keys
     assert {("rail", rail.value) for rail in Rail} <= slice_keys
     assert ("regime", "baseline") in slice_keys
-    assert ("entity_cohort", "cold") in slice_keys
+    assert ("entity_cohort", "cold_actor") in slice_keys
     cold = next(
         item
         for item in report.classification.slices
-        if item.kind == "entity_cohort" and item.value == "cold"
+        if item.kind == "entity_cohort" and item.value == "cold_actor"
     )
     assert cold.row_count == 2
     assert cold.precision.value == 0.5
+
+
+def test_slice_manifest_is_complete_and_emits_zero_row_extended_slices() -> None:
+    report = compute_metric_report(four_row_inputs())
+    regime_slices = tuple(
+        item for item in report.classification.slices if item.kind == "regime"
+    )
+    cohort_slices = tuple(
+        item for item in report.classification.slices if item.kind == "entity_cohort"
+    )
+    assert tuple(item.value for item in regime_slices) == SliceManifest.closed().regimes
+    assert tuple(item.value for item in cohort_slices) == (
+        SliceManifest.closed().entity_cohorts
+    )
+    missing_optional = next(
+        item for item in regime_slices if item.value == "missing_optional"
+    )
+    assert missing_optional.row_count == 0
+    assert missing_optional.pr_auc.undefined_reason == "absent_positive_class"
+    assert missing_optional.campaign_recall.undefined_reason == "absent_fraud_campaigns"
+
+    cold_actor = next(
+        item for item in cohort_slices if item.value == "cold_actor"
+    )
+    assert cold_actor.decline_precision.value == 0.0
+    assert cold_actor.decline_recall.value == 0.0
+    assert cold_actor.campaign_recall.value == 1.0
+    assert cold_actor.pr_auc.value == 1.0
+    assert cold_actor.roc_auc.value == 1.0
+
+
+def test_nonempty_metric_inputs_require_the_exact_closed_slice_manifest() -> None:
+    inputs = four_row_inputs()
+    with pytest.raises(MetricContractError, match="slice manifest"):
+        compute_metric_report(inputs.model_copy(update={"slice_manifest": None}))
+    with pytest.raises(ValidationError, match="regimes must be complete"):
+        SliceManifest(regimes=SliceManifest.closed().regimes[:-1])
 
 
 def test_score_not_optional_calibrated_metadata_drives_auc_and_is_permutation_stable() -> None:
@@ -406,7 +457,7 @@ def test_contextual_nondecision_observation_is_allowed_but_lifecycle_overlap_is_
     overlapping = inputs.truth[1].model_copy(
         update={"lifecycle_event_ids": (inputs.truth[1].event_id, inputs.truth[0].event_id)}
     )
-    with pytest.raises(MetricContractError, match="lifecycle.*overlap"):
+    with pytest.raises(MetricContractError, match="lifecycle IDs must exactly cover"):
         compute_metric_report(
             inputs.model_copy(
                 update={"truth": (inputs.truth[0], overlapping) + inputs.truth[2:]}
@@ -514,6 +565,10 @@ def test_recomputed_report_checksum_cannot_hide_incomplete_or_unbalanced_slices(
             "false_positives": 0,
             "false_negatives": 0,
             "true_negatives": 0,
+            "decline_true_positives": 0,
+            "decline_false_positives": 0,
+            "fraud_campaigns": 0,
+            "detected_fraud_campaigns": 0,
             "precision": {
                 "value": None,
                 "numerator": 0.0,
@@ -537,6 +592,36 @@ def test_recomputed_report_checksum_cannot_hide_incomplete_or_unbalanced_slices(
                 "numerator": 0.0,
                 "denominator": 0.0,
                 "undefined_reason": "absent_legitimate_class",
+            },
+            "decline_precision": {
+                "value": None,
+                "numerator": 0.0,
+                "denominator": 0.0,
+                "undefined_reason": "no_declines",
+            },
+            "decline_recall": {
+                "value": None,
+                "numerator": 0.0,
+                "denominator": 0.0,
+                "undefined_reason": "absent_positive_class",
+            },
+            "campaign_recall": {
+                "value": None,
+                "numerator": 0.0,
+                "denominator": 0.0,
+                "undefined_reason": "absent_fraud_campaigns",
+            },
+            "pr_auc": {
+                "value": None,
+                "numerator": 0.0,
+                "denominator": 0.0,
+                "undefined_reason": "absent_positive_class",
+            },
+            "roc_auc": {
+                "value": None,
+                "numerator": 0.0,
+                "denominator": 0.0,
+                "undefined_reason": "absent_positive_class",
             },
         }
     )
@@ -626,6 +711,160 @@ def test_recomputed_report_checksum_cannot_hide_invalid_reliability_range() -> N
     document["report_digest"] = hashlib.sha256(canonical_json_bytes(unsigned)).hexdigest()
     with pytest.raises(MetricContractError, match="mean prediction"):
         MetricReport.from_json(canonical_json_bytes(document))
+
+
+def test_report_rederives_every_section_after_a_recomputed_self_digest() -> None:
+    complete = json.loads(compute_metric_report(four_row_inputs()).to_json())
+    mutations = []
+
+    brier = json.loads(json.dumps(complete))
+    brier["calibration"]["brier_score"].update({"value": 0.1, "numerator": 0.4})
+    mutations.append(brier)
+
+    slope = json.loads(json.dumps(complete))
+    slope["calibration"]["slope"].update({"value": 2.0, "numerator": 2.0})
+    mutations.append(slope)
+
+    intercept = json.loads(json.dumps(complete))
+    intercept["calibration"]["intercept"].update(
+        {"value": 2.0, "numerator": 2.0}
+    )
+    mutations.append(intercept)
+
+    latency_p50 = json.loads(json.dumps(complete))
+    latency_p50["engineering"]["end_to_end_ms"]["p50"].update(
+        {"value": 999.0, "numerator": 3996.0}
+    )
+    mutations.append(latency_p50)
+
+    alert_p50 = json.loads(json.dumps(complete))
+    alert_p50["alerts"]["p50_seconds"]["value"] = 999.0
+    mutations.append(alert_p50)
+
+    backlog = json.loads(json.dumps(complete))
+    backlog["operations"]["peak_backlog_count"] = 999
+    mutations.append(backlog)
+
+    for document in mutations:
+        unsigned = {key: value for key, value in document.items() if key != "report_digest"}
+        document["report_digest"] = hashlib.sha256(
+            canonical_json_bytes(unsigned)
+        ).hexdigest()
+        with pytest.raises(
+            MetricContractError, match="derivation|quantiles|review cases"
+        ):
+            MetricReport.from_json(canonical_json_bytes(document))
+
+
+def test_report_rederives_its_exact_evaluator_input_digest() -> None:
+    document = json.loads(compute_metric_report(four_row_inputs()).to_json())
+    document["evaluator_input_digest"] = "0" * 64
+    unsigned = {key: value for key, value in document.items() if key != "report_digest"}
+    document["report_digest"] = hashlib.sha256(
+        canonical_json_bytes(unsigned)
+    ).hexdigest()
+    with pytest.raises(MetricContractError, match="input digest"):
+        MetricReport.from_json(canonical_json_bytes(document))
+
+
+def test_model_construct_report_tamper_is_rederived_before_serialization() -> None:
+    report = compute_metric_report(four_row_inputs())
+    brier = report.calibration.brier_score.model_copy(
+        update={"value": 0.1, "numerator": 0.4}
+    )
+    calibration = report.calibration.model_copy(update={"brier_score": brier})
+    poisoned = MetricReport.model_construct(
+        **{**report.model_dump(mode="python"), "calibration": calibration}
+    )
+    with pytest.raises(MetricContractError, match="derivation"):
+        poisoned.to_json()
+
+
+def test_duplicate_truth_payments_and_incomplete_or_noncanonical_lifecycles_fail_closed() -> None:
+    first = observed("event-a", payment_id="shared-payment")
+    second = observed("event-b", payment_id="shared-payment")
+    duplicate_payment_inputs = make_inputs(
+        (
+            truth(
+                "event-a",
+                is_fraud=False,
+                payment_id="shared-payment",
+                lifecycle_event_ids=("event-a",),
+            ),
+            truth(
+                "event-b",
+                is_fraud=False,
+                payment_id="shared-payment",
+                lifecycle_event_ids=("event-b",),
+            ),
+        ),
+        (first, second),
+        (
+            decision("event-a", action=Action.APPROVE, score=0.1),
+            decision("event-b", action=Action.APPROVE, score=0.1),
+        ),
+    )
+    with pytest.raises(MetricContractError, match="payment IDs must be unique"):
+        compute_metric_report(duplicate_payment_inputs)
+
+    opening = observed("open", payment_id="payment")
+    settlement = observed(
+        "settlement",
+        payment_id="payment",
+        event_type=EventKind.SETTLEMENT,
+        amount="100.00",
+        event_time=NOW + timedelta(seconds=10),
+        available_at=NOW + timedelta(seconds=10),
+        decision_at=None,
+        is_decision_point=False,
+    )
+    recovery = observed(
+        "recovery",
+        payment_id="payment",
+        event_type=EventKind.RECOVERY,
+        amount="90.00",
+        event_time=NOW + timedelta(seconds=20),
+        available_at=NOW + timedelta(seconds=20),
+        decision_at=None,
+        is_decision_point=False,
+    )
+    incomplete = make_inputs(
+        (
+            truth(
+                "open",
+                is_fraud=True,
+                payment_id="payment",
+                first_settlement_at=NOW + timedelta(seconds=10),
+                net_settled_value="100.00",
+                lifecycle_event_ids=("open", "settlement"),
+            ),
+        ),
+        (opening, settlement, recovery),
+        (decision("open", action=Action.APPROVE, score=0.1),),
+    )
+    with pytest.raises(MetricContractError, match="exactly cover"):
+        compute_metric_report(incomplete)
+
+    noncanonical = incomplete.model_copy(
+        update={
+            "truth": (
+                incomplete.truth[0].model_copy(
+                    update={
+                        "net_settled_value": Decimal("10.00"),
+                        "lifecycle_event_ids": ("recovery", "settlement", "open"),
+                    }
+                ),
+            )
+        }
+    )
+    with pytest.raises(MetricContractError, match="canonical lifecycle order"):
+        compute_metric_report(noncanonical)
+
+
+def test_nonempty_metric_inputs_require_complete_slice_assignments() -> None:
+    inputs = four_row_inputs().model_copy(update={"slice_assignments": ()})
+    with pytest.raises(MetricContractError, match="slice assignments.*required"):
+        compute_metric_report(inputs)
 
 
 def test_report_from_json_rejects_noncanonical_and_oversized_payloads() -> None:
