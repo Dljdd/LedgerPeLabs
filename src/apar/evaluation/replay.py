@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import hashlib
-import weakref
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from typing import Literal, cast
+from typing import Any, Literal, NamedTuple, cast
 
 import numpy as np
+from numpy.typing import NDArray
 from pydantic import Field, ValidationError, field_validator, model_validator
 
 from apar.cases import (
@@ -27,17 +28,21 @@ from apar.defense.policy import ActionPolicy, DefenseDecision
 from apar.defense.rules import DefenseReason, RuleEngine, RuleManifest, RuleResult
 from apar.defense.thresholds import (
     ThresholdReport,
-    normalize_operating_scores,
     select_policy_thresholds,
 )
-from apar.evaluation.contracts import EvaluationTruthRow
-from apar.evaluation.defender_attestation import VerifiedDefenderAttestation
+from apar.evaluation.contracts import EvaluationTruthRow, Family, FrozenCorpus
+from apar.evaluation.defender_attestation import (
+    DefenderBundleVerifier,
+    VerifiedDefenderAttestation,
+)
 from apar.evaluation.gates import (
     AssuranceEvidence,
     DefenseArm,
     EvaluationDescriptor,
     EvaluationKind,
+    EvaluationLineage,
     PromotionMetrics,
+    RateEvidence,
     ReplayFailure,
     ReplayResult,
     SlicePerformance,
@@ -51,25 +56,30 @@ from apar.evaluation.metrics import (
     SliceManifest,
     compute_metric_report,
 )
-from apar.evaluation.splits import EntityCohort
+from apar.evaluation.regimes import (
+    DerivedRegimeManifest,
+    RegimeSpec,
+    derive_regime,
+    frozen_corpus_digest,
+)
+from apar.evaluation.splits import EntityCohort, EvaluationSplit
 from apar.evaluation_hidden.defense_authority import (
     HiddenArmEvidenceBinding,
-    HiddenReleaseRequest,
-    ResolvedHiddenEvaluation,
-    resolve_hidden_release,
-    seal_hidden_evaluation,
-    verify_hidden_receipt,
+    HiddenDecisionBinding,
+    HiddenDecisionFreezeReceipt,
+    HiddenEvaluationAuthority,
+    HiddenEvaluationCapability,
+    HiddenEvaluationReceipt,
 )
 from apar.features.builders import FeatureMatrix
 from apar.features.parity import audit_feature_matrix
 from apar.features.state import FeatureVector
 from apar.runs.wire import WireContractError, canonical_json_bytes, strict_json_loads
+from apar.storage.artifacts import ArtifactRef
 
 _MAX_REPLAY_ROWS = 100_000
 _MAX_REPLAY_BYTES = 32_000_000
 _MODEL_FAILURES = {DefenseReason.MODEL_UNAVAILABLE, DefenseReason.MODEL_TIMEOUT}
-_CASE_BINDING_TOKEN = object()
-_THRESHOLD_SETS: dict[int, weakref.ReferenceType[ReplayThresholdSet]] = {}
 
 
 class ReplayContractError(ValueError):
@@ -80,6 +90,50 @@ class ReplayContractError(ValueError):
 class _EvaluatedArm:
     result: ReplayResult
     hidden_evidence: HiddenArmEvidenceBinding
+
+
+class _HiddenReplayInvocation(NamedTuple):
+    matrix: FeatureMatrix
+    defender: LoadedDefenderBundle
+    defender_verifier: DefenderBundleVerifier
+    defender_attestation: VerifiedDefenderAttestation
+    thresholds: ReplayThresholdSet
+    threshold_labels: np.ndarray
+    threshold_values: np.ndarray | None
+    case_counter: ReplayCaseCounterBinding
+    model_failure: ModelFailure | None
+
+
+class _FrozenDefenseReplay(NamedTuple):
+    matrix: FeatureMatrix
+    defender: LoadedDefenderBundle
+    defender_verifier: DefenderBundleVerifier
+    defender_attestation: VerifiedDefenderAttestation
+    threshold_set: ReplayThresholdSet
+    case_counter: ReplayCaseCounterBinding
+    rows: tuple[FeatureVector, ...]
+    events: tuple[ObservedEvent, ...]
+    event_ids: tuple[str, ...]
+    mandatory: tuple[bool, ...]
+    decisions_by_arm: dict[DefenseArm, tuple[DefenseDecision, ...]]
+    arm_scores: dict[DefenseArm, np.ndarray]
+    feature_audit_passed: bool
+    actual_failure: ModelFailure | None
+    manifest_digest: str
+
+
+class _HiddenEvaluationProduct(NamedTuple):
+    evaluated: tuple[_EvaluatedArm, ...]
+    evaluator_context_digest: str
+    evaluation_lineage_digest: str
+    evaluator_as_of: datetime
+
+
+class HiddenReplayOutcome(NamedTuple):
+    """Aggregate-only hidden replay product and its signed authority receipt."""
+
+    results: tuple[ReplayResult, ...]
+    receipt: HiddenEvaluationReceipt
 
 
 class ModelFailure(ExternalContract):
@@ -125,6 +179,82 @@ class ReplayFeatureAssurance(ExternalContract):
         _validate_digest(value)
         return value
 
+
+class ReplayRegimeEvidence(ExternalContract):
+    """Evaluator-owned, re-derived proof of one exact robustness corpus."""
+
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    parent_corpus: FrozenCorpus
+    derived_corpus: FrozenCorpus
+    spec: RegimeSpec
+    manifest: DerivedRegimeManifest
+    control_corpus: FrozenCorpus | None = None
+    evidence_digest: str
+
+    @field_validator("evidence_digest")
+    @classmethod
+    def evidence_is_sha256(cls, value: str) -> str:
+        _validate_digest(value)
+        return value
+
+    @model_validator(mode="after")
+    def derivation_is_exact(self) -> ReplayRegimeEvidence:
+        if (
+            type(self.parent_corpus) is not FrozenCorpus
+            or type(self.derived_corpus) is not FrozenCorpus
+            or type(self.spec) is not RegimeSpec
+            or type(self.manifest) is not DerivedRegimeManifest
+            or (
+                self.control_corpus is not None
+                and type(self.control_corpus) is not FrozenCorpus
+            )
+        ):
+            raise ValueError("regime evidence components must have exact types")
+        derived, manifest = derive_regime(
+            self.parent_corpus,
+            self.spec,
+            control_corpus=self.control_corpus,
+        )
+        if derived != self.derived_corpus or manifest != self.manifest:
+            raise ValueError("regime evidence differs from exact upstream derivation")
+        if (
+            self.manifest.parent_corpus_digest
+            != frozen_corpus_digest(self.parent_corpus)
+            or self.manifest.output_corpus_digest
+            != frozen_corpus_digest(self.derived_corpus)
+        ):
+            raise ValueError("regime manifest corpus digests are inconsistent")
+        expected = _digest_document(
+            self.model_dump(mode="json", exclude={"evidence_digest"})
+        )
+        if self.evidence_digest != expected:
+            raise ValueError("regime evidence digest is inconsistent")
+        return self
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        parent_corpus: FrozenCorpus,
+        derived_corpus: FrozenCorpus,
+        spec: RegimeSpec,
+        manifest: DerivedRegimeManifest,
+        control_corpus: FrozenCorpus | None = None,
+    ) -> ReplayRegimeEvidence:
+        fields: dict[str, object] = {
+            "parent_corpus": parent_corpus,
+            "derived_corpus": derived_corpus,
+            "spec": spec,
+            "manifest": manifest,
+            "control_corpus": control_corpus,
+        }
+        provisional = cast(Any, cls).model_construct(
+            **fields, evidence_digest="0" * 64
+        )
+        digest = _digest_document(
+            provisional.model_dump(mode="json", exclude={"evidence_digest"})
+        )
+        return cls.model_validate({**fields, "evidence_digest": digest})
 
 class ReplayLatencySamples(ExternalContract):
     """Observational per-arm latency evidence kept outside core score lineage."""
@@ -224,6 +354,7 @@ class ReplayThresholdSet(ExternalContract):
     bundle_manifest_digest: str
     case_callback_digest: str
     selection_row_ids_digest: str
+    selection_as_of: datetime
     reports: tuple[ArmThresholdEvidence, ...]
     threshold_set_digest: str
 
@@ -244,6 +375,13 @@ class ReplayThresholdSet(ExternalContract):
         if type(value) is not tuple:
             raise ValueError("arm threshold reports must be an exact tuple")
         return value
+
+    @field_validator("selection_as_of")
+    @classmethod
+    def selection_time_is_exact_utc(cls, value: datetime) -> datetime:
+        if type(value) is not datetime:
+            raise ValueError("threshold selection time must be exact")
+        return validate_utc_timestamp(value)
 
     @model_validator(mode="after")
     def threshold_evidence_is_complete(self) -> ReplayThresholdSet:
@@ -308,7 +446,9 @@ class ReplayThresholdSet(ExternalContract):
         matrix = defender.threshold_matrix
         rows, events = _validated_replay_rows(matrix, defender)
         row_ids = tuple(row.event_id for row in rows)
-        case_counter.validate_context(matrix.events, row_ids, case_counter.as_of)
+        selection_counter = case_counter.reconstruct(
+            matrix.events, row_ids, case_counter.as_of
+        )
         binding = defender.threshold_binding
         if _digest_document(row_ids) != binding.row_ids_digest:
             raise ReplayContractError("threshold selection row IDs differ from signed lineage")
@@ -366,7 +506,7 @@ class ReplayThresholdSet(ExternalContract):
                     raw_by_arm[arm],
                     labels,
                     mandatory_actions,
-                    case_counter,
+                    cast(Callable[[NDArray[np.object_]], int], selection_counter),
                     signed_report.budget,
                     values,
                 ),
@@ -383,6 +523,7 @@ class ReplayThresholdSet(ExternalContract):
             "bundle_manifest_digest": _manifest_digest(defender.manifest),
             "case_callback_digest": case_counter.callback_digest,
             "selection_row_ids_digest": binding.row_ids_digest,
+            "selection_as_of": case_counter.as_of,
             "reports": checked,
         }
         digest_fields = {
@@ -390,13 +531,12 @@ class ReplayThresholdSet(ExternalContract):
             "bundle_manifest_digest": fields["bundle_manifest_digest"],
             "case_callback_digest": fields["case_callback_digest"],
             "selection_row_ids_digest": fields["selection_row_ids_digest"],
+            "selection_as_of": case_counter.as_of.isoformat().replace("+00:00", "Z"),
             "reports": [item.model_dump(mode="json") for item in checked],
         }
-        value = cls.model_validate(
+        return cls.model_validate(
             {**fields, "threshold_set_digest": _digest_document(digest_fields)}
         )
-        _register_threshold_set(value)
-        return value
 
     def report_for(self, arm: DefenseArm) -> ThresholdReport:
         """Return one freshly validated arm report."""
@@ -444,97 +584,58 @@ class ReplayThresholdSet(ExternalContract):
             raise ReplayContractError(str(error)) from error
 
 
-@dataclass(frozen=True, slots=True)
-class _CaseBindingState:
-    counter: ReviewCaseCounter
+class ReplayCaseCounterBinding(ExternalContract):
+    """Serializable recipe that always rebuilds the production Task10 callback."""
+
+    schema_version: Literal["1.0.0"] = "1.0.0"
     event_ids: tuple[str, ...]
     rows_digest: str
     as_of: datetime
     callback_digest: str
 
+    @field_validator("event_ids", mode="before")
+    @classmethod
+    def event_ids_are_exact_tuple(cls, value: object) -> object:
+        if type(value) is not tuple:
+            raise ValueError("case callback event IDs must be an exact tuple")
+        return value
 
-_CASE_BINDINGS: dict[
-    int,
-    tuple[
-        weakref.ReferenceType[ReplayCaseCounterBinding],
-        _CaseBindingState,
-    ],
-] = {}
+    @field_validator("event_ids")
+    @classmethod
+    def event_ids_are_nonempty_unique(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if not value or any(type(item) is not str or not item for item in value):
+            raise ValueError("case callback event IDs must be nonempty exact text")
+        if len(value) != len(set(value)):
+            raise ValueError("case callback event IDs must be unique")
+        return value
 
+    @field_validator("rows_digest", "callback_digest")
+    @classmethod
+    def callback_digests_are_sha256(cls, value: str) -> str:
+        _validate_digest(value)
+        return value
 
-class ReplayCaseCounterBinding:
-    """Immutable lineage wrapper around the production Task10 callback."""
+    @field_validator("as_of")
+    @classmethod
+    def callback_time_is_exact_utc(cls, value: datetime) -> datetime:
+        if type(value) is not datetime:
+            raise ValueError("case callback time must be exact")
+        return validate_utc_timestamp(value)
 
-    __slots__ = ("__weakref__",)
-
-    def __init__(
-        self,
-        *,
-        counter: ReviewCaseCounter,
-        event_ids: tuple[str, ...],
-        rows_digest: str,
-        as_of: datetime,
-        callback_digest: str,
-        _token: object = None,
-    ) -> None:
-        if _token is not _CASE_BINDING_TOKEN:
-            raise ReplayContractError(
-                "case callback bindings must come from the production factory"
-            )
-        if id(self) in _CASE_BINDINGS:
-            raise ReplayContractError("case callback binding is already initialized")
-        if type(counter) is not ReviewCaseCounter:
-            raise ReplayContractError("case callback must be the exact production adapter")
-        _validate_digest(rows_digest)
-        _validate_digest(callback_digest)
-        state = _CaseBindingState(
-            counter=counter,
-            event_ids=event_ids,
-            rows_digest=rows_digest,
-            as_of=as_of,
-            callback_digest=callback_digest,
-        )
-        identity = id(self)
-
-        def cleanup(reference: weakref.ReferenceType[ReplayCaseCounterBinding]) -> None:
-            current = _CASE_BINDINGS.get(identity)
-            if current is not None and current[0] is reference:
-                _CASE_BINDINGS.pop(identity, None)
-
-        reference = weakref.ref(self, cleanup)
-        _CASE_BINDINGS[identity] = (reference, state)
-
-    def __setattr__(self, name: str, value: object) -> None:
-        del name, value
-        raise TypeError("replay case callback binding is immutable")
-
-    def __delattr__(self, name: str) -> None:
-        del name
-        raise TypeError("replay case callback binding is immutable")
-
-    @property
-    def callback_digest(self) -> str:
-        return _case_binding_state(self).callback_digest
-
-    @property
-    def as_of(self) -> datetime:
-        return _case_binding_state(self).as_of
-
-    def __call__(self, actions: np.ndarray) -> int:
-        return _case_binding_state(self).counter(actions)
-
-    def validate_context(
+    def reconstruct(
         self,
         observations: tuple[ObservedEvent, ...],
         event_ids: tuple[str, ...],
         as_of: datetime,
-    ) -> None:
-        state = _case_binding_state(self)
+    ) -> ReviewCaseCounter:
+        """Validate the recipe and rebuild Task10 from concrete rows every time."""
+        if type(self) is not ReplayCaseCounterBinding:
+            raise ReplayContractError("case callback binding must have its exact type")
         document = _case_binding_document(observations, event_ids, as_of)
         if (
-            event_ids != state.event_ids
-            or as_of != state.as_of
-            or _digest_document(document) != state.rows_digest
+            event_ids != self.event_ids
+            or as_of != self.as_of
+            or _digest_document(document) != self.rows_digest
         ):
             raise ReplayContractError("case callback lineage does not match replay rows")
         expected_callback_digest = _digest_document(
@@ -542,6 +643,33 @@ class ReplayCaseCounterBinding:
         )
         if expected_callback_digest != self.callback_digest:
             raise ReplayContractError("case callback lineage digest is inconsistent")
+        observation_by_id = {row.event_id: row for row in observations}
+        canonical_ids = tuple(
+            sorted(
+                event_ids,
+                key=lambda event_id: (
+                    cast(datetime, observation_by_id[event_id].decision_at), event_id
+                ),
+            )
+        )
+        placeholder = tuple(_placeholder_decision(event_id) for event_id in canonical_ids)
+        ordered_observations = tuple(
+            sorted(observations, key=lambda row: (row.available_at, row.event_id))
+        )
+        try:
+            return bind_review_case_counter(
+                ordered_observations, placeholder, as_of=as_of
+            )
+        except Exception as error:
+            raise ReplayContractError("production case callback reconstruction failed") from error
+
+    def validate_context(
+        self,
+        observations: tuple[ObservedEvent, ...],
+        event_ids: tuple[str, ...],
+        as_of: datetime,
+    ) -> None:
+        self.reconstruct(observations, event_ids, as_of)
 
 
 def bind_replay_case_counter(
@@ -571,28 +699,12 @@ def bind_replay_case_counter(
             ),
         )
     )
-    placeholder = tuple(
-        DefenseDecision(
-            event_id=event_id,
-            action=Action.APPROVE,
-            score=0.0,
-            rule_score=0.0,
-            calibrated_score=0.0,
-            reason_codes=(),
-            evidence_source_ids=(event_id,),
-            fallback_used=False,
-            fallback_reason=None,
-            failed_component_version=None,
-            latency_ms=0.0,
-            policy_version="1.0.0",
-        )
-        for event_id in canonical_ids
-    )
+    placeholder = tuple(_placeholder_decision(event_id) for event_id in canonical_ids)
     ordered_observations = tuple(
         sorted(observations, key=lambda row: (row.available_at, row.event_id))
     )
     try:
-        counter = bind_review_case_counter(ordered_observations, placeholder, as_of=as_of)
+        bind_review_case_counter(ordered_observations, placeholder, as_of=as_of)
     except Exception as error:
         raise ReplayContractError("production case callback binding failed") from error
     document = _case_binding_document(observations, decision_event_ids, as_of)
@@ -601,12 +713,10 @@ def bind_replay_case_counter(
         {"schema_version": "1.0.0", "binding": document, "adapter": "Task10"}
     )
     return ReplayCaseCounterBinding(
-        counter=counter,
         event_ids=decision_event_ids,
         rows_digest=rows_digest,
         as_of=as_of,
         callback_digest=callback_digest,
-        _token=_CASE_BINDING_TOKEN,
     )
 
 
@@ -614,205 +724,100 @@ def replay_defense_arms(
     *,
     matrix: FeatureMatrix,
     defender: LoadedDefenderBundle,
+    defender_verifier: DefenderBundleVerifier,
     defender_attestation: VerifiedDefenderAttestation,
     thresholds: ReplayThresholdSet,
+    threshold_labels: np.ndarray,
+    threshold_values: np.ndarray | None,
     case_counter: ReplayCaseCounterBinding,
+    evaluation_split: EvaluationSplit | None = None,
+    regime_evidence: ReplayRegimeEvidence | None = None,
     evaluation: ReplayEvaluationContext | None = None,
-    hidden_release: HiddenReleaseRequest | None = None,
+    hidden_authority: HiddenEvaluationAuthority | None = None,
+    hidden_capability: HiddenEvaluationCapability | None = None,
+    hidden_ref: ArtifactRef | None = None,
+    hidden_released_at: datetime | None = None,
+    hidden_sealed_at: datetime | None = None,
     model_failure: ModelFailure | None = None,
-) -> tuple[ReplayResult, ...]:
-    """Score identical rows, freeze decisions, then resolve evaluator-side metrics."""
+) -> tuple[ReplayResult, ...] | HiddenReplayOutcome:
+    """Replay development evidence or delegate the sealed hidden lifecycle."""
     try:
-        matrix_value = _exact_model(matrix, FeatureMatrix, "feature matrix")
-        _exact_model(thresholds, ReplayThresholdSet, "threshold set")
-        if not _is_registered_threshold_set(thresholds):
-            raise ReplayContractError(
-                "threshold set must come from exact rederived selection evidence"
-            )
-        threshold_set = thresholds
-        if type(defender) is not LoadedDefenderBundle:
-            raise ReplayContractError("defender must be an exact verified loaded bundle")
-        if type(defender_attestation) is not VerifiedDefenderAttestation:
-            raise ReplayContractError("replay requires an exact defender attestation")
-        if type(case_counter) is not ReplayCaseCounterBinding:
-            raise ReplayContractError("case callback must have exact replay lineage")
-        if (evaluation is None) == (hidden_release is None):
-            raise ReplayContractError(
-                "replay requires exactly one development context or hidden release"
-            )
-        if evaluation is not None and type(evaluation) is not ReplayEvaluationContext:
-            raise ReplayContractError("evaluation context must have its exact contract type")
-        if hidden_release is not None and type(hidden_release) is not HiddenReleaseRequest:
-            raise ReplayContractError("hidden release request must have its exact type")
-        declared_failure = (
-            None
-            if model_failure is None
-            else _exact_model(model_failure, ModelFailure, "model failure")
+        hidden_values = (
+            hidden_authority,
+            hidden_capability,
+            hidden_ref,
+            hidden_released_at,
+            hidden_sealed_at,
         )
-        rows, events = _validated_replay_rows(matrix_value, defender)
-        event_ids = tuple(row.event_id for row in rows)
-        case_counter.validate_context(matrix_value.events, event_ids, case_counter.as_of)
-        manifest_digest = _manifest_digest(defender.manifest)
-        if (
-            defender_attestation.bundle_manifest_digest != manifest_digest
-            or defender_attestation.top_ref.sha256 != manifest_digest
-            or defender_attestation.threshold_digest
-            != defender.manifest.threshold_digest
-        ):
-            raise ReplayContractError("defender attestation does not bind loaded artifacts")
-        if threshold_set.bundle_manifest_digest != manifest_digest:
-            raise ReplayContractError("threshold bundle lineage does not match defender")
-        if (
-            threshold_set.selection_row_ids_digest
-            != defender.threshold_binding.row_ids_digest
-            or threshold_set.report_for(DefenseArm.LAYERED_HYBRID).report_digest
-            != defender.threshold_report.report_digest
-        ):
-            raise ReplayContractError(
-                "threshold selection lineage does not match the signed defender"
-            )
-        audit = audit_feature_matrix(matrix_value.events, matrix_value, defender.catalog)
-        defender.verify_reload()
-
-        rule_engine = RuleEngine(defender.rule_manifest)
-        rule_results = tuple(
-            rule_engine.evaluate(event, row)
-            for event, row in zip(events, rows, strict=True)
-        )
-        mandatory = tuple(
-            any(hit.mandatory for hit in result.hits) for result in rule_results
-        )
-        common_mandatory = _common_mandatory_decisions(
-            events, mandatory, defender.rule_manifest
-        )
-        actual_failure = declared_failure
-        calibrated: np.ndarray | None = None
-        if actual_failure is None:
-            try:
-                raw_model_scores = defender.scorer.predict(matrix_value)
-                calibrated = defender.calibrator.predict(raw_model_scores)
-            except Exception:
-                actual_failure = ModelFailure(
-                    reason=DefenseReason.MODEL_UNAVAILABLE,
-                    failed_component_version=f"model:{defender.manifest.model_digest}",
-                )
-
-        raw_rule_scores = np.asarray(
-            [item.score for item in rule_results], dtype=np.float64
-        )
-        rule_scores = normalize_operating_scores(raw_rule_scores)
-        if calibrated is None:
-            gbdt_scores = normalize_operating_scores(
-                np.zeros(len(rows), dtype=np.float64)
-            )
-            hybrid_scores = rule_scores.copy()
-        else:
-            gbdt_scores = normalize_operating_scores(calibrated)
-            hybrid_scores = normalize_operating_scores(
-                np.maximum(raw_rule_scores, calibrated)
-            )
-        arm_scores = {
-            DefenseArm.RULES_ONLY: rule_scores,
-            DefenseArm.GBDT_ONLY: gbdt_scores,
-            DefenseArm.LAYERED_HYBRID: hybrid_scores,
-        }
-        # All scoring and action construction completes before the first truth row is read.
-        decisions_by_arm = {
-            arm: _arm_decisions(
-                arm=arm,
-                events=events,
-                rules=rule_results,
-                scores=arm_scores[arm],
-                calibrated=calibrated,
-                mandatory=mandatory,
-                common_mandatory=common_mandatory,
-                thresholds=threshold_set,
-                failure=actual_failure,
-                rule_fallback_thresholds=threshold_set.report_for(
-                    DefenseArm.RULES_ONLY
-                ).thresholds,
-            )
-            for arm in DefenseArm
-        }
-        frozen_decision_digest = _digest_document(
-            tuple(
-                (
-                    arm.value,
-                    tuple(item.model_dump(mode="json") for item in decisions_by_arm[arm]),
-                )
-                for arm in DefenseArm
-            )
-        )
-        if not frozen_decision_digest:
-            raise ReplayContractError("decision freeze failed")
-        resolved: ResolvedHiddenEvaluation | None = None
-        if hidden_release is not None:
-            resolved = resolve_hidden_release(hidden_release)
-            context = ReplayEvaluationContext.from_json(resolved.payload)
-            if context.evaluation.kind is not EvaluationKind.HIDDEN:
+        hidden_requested = any(item is not None for item in hidden_values)
+        if hidden_requested:
+            if (
+                evaluation is not None
+                or evaluation_split is not None
+                or regime_evidence is not None
+                or any(item is None for item in hidden_values)
+            ):
                 raise ReplayContractError(
-                    "sealed hidden release must contain a hidden evaluation descriptor"
+                    "hidden replay requires one complete authority-owned lifecycle"
                 )
-        else:
-            assert evaluation is not None
-            context = _exact_model(
-                evaluation, ReplayEvaluationContext, "evaluation context"
+            if not isinstance(hidden_authority, HiddenEvaluationAuthority):
+                raise ReplayContractError("hidden replay authority is invalid")
+            invocation = _HiddenReplayInvocation(
+                matrix,
+                defender,
+                defender_verifier,
+                defender_attestation,
+                thresholds,
+                threshold_labels,
+                threshold_values,
+                case_counter,
+                model_failure,
             )
-            if context.evaluation.kind is EvaluationKind.HIDDEN:
-                raise ReplayContractError(
-                    "hidden evaluation requires an exact sealed hidden release receipt"
-                )
-        _validate_evaluator_context(context, event_ids)
-        case_counter.validate_context(context.observations, event_ids, context.as_of)
-        if audit.passed != context.feature_assurance.leakage_passed:
-            raise ReplayContractError("feature leakage evidence disagrees with replay audit")
-        context_digest = _evaluator_context_digest(context.to_json())
-        evaluated = tuple(
-            _evaluate_frozen_arm(
-                arm=arm,
-                event_ids=event_ids,
-                events=events,
-                decisions=decisions_by_arm[arm],
-                scores=arm_scores[arm],
-                mandatory=mandatory,
-                threshold_set=threshold_set,
-                manifest=defender.manifest,
-                case_counter=case_counter,
-                context=context,
-                evaluation_context_digest=context_digest,
-                rollback_available=defender_attestation.rollback_available,
-                hidden_access_clean=resolved is None,
-                failure=actual_failure if arm is DefenseArm.GBDT_ONLY else None,
+            return cast(
+                HiddenReplayOutcome,
+                hidden_authority.evaluate_hidden_replay(  # type: ignore[attr-defined]
+                    invocation,
+                    capability=hidden_capability,
+                    restricted_ref=hidden_ref,
+                    released_at=hidden_released_at,
+                    sealed_at=hidden_sealed_at,
+                ),
             )
-            for arm in DefenseArm
+        if evaluation is None:
+            raise ReplayContractError("development replay requires an evaluation context")
+        frozen = _freeze_replay_inputs(
+            _HiddenReplayInvocation(
+                matrix,
+                defender,
+                defender_verifier,
+                defender_attestation,
+                thresholds,
+                threshold_labels,
+                threshold_values,
+                case_counter,
+                model_failure,
+            ),
+            pinned_verifier=defender_verifier,
+            pinned_attestation=defender_attestation,
+        )
+        context = _exact_model(evaluation, ReplayEvaluationContext, "evaluation context")
+        if context.evaluation.kind is EvaluationKind.HIDDEN:
+            raise ReplayContractError("hidden evaluation requires its sealed authority")
+        lineage = _validate_descriptor_lineage(
+            context.evaluation,
+            frozen.event_ids,
+            frozen.defender,
+            evaluation_split,
+            frozen.matrix,
+            frozen.defender_attestation,
+            context,
+            regime_evidence,
+        )
+        evaluated, _ = _evaluate_frozen_context(
+            frozen, context, lineage, hidden_access_clean=True
         )
         results = tuple(item.result for item in evaluated)
-        if resolved is not None:
-            evidence = tuple(item.hidden_evidence for item in evaluated)
-            receipt = seal_hidden_evaluation(
-                resolved, evidence, sealed_at=context.as_of
-            )
-            if (
-                receipt.bundle_manifest_digest != manifest_digest
-                or receipt.defender_attestation_digest
-                != defender_attestation.attestation_digest
-                or receipt.defender_top_ref_digest
-                != defender_attestation.top_ref.sha256
-                or receipt.evaluator_context_digest != context_digest
-                or not verify_hidden_receipt(receipt, resolved, evidence)
-            ):
-                raise ReplayContractError("sealed hidden release receipt failed verification")
-            results = tuple(
-                item.result.rebuild(
-                    hidden_release_receipt_digest=receipt.receipt_digest,
-                    assurance=item.result.assurance.model_copy(
-                        update={"hidden_access_clean": True}
-                    ),
-                )
-                for item in evaluated
-            )
-        if len({item.decision_event_ids for item in results}) != 1:
-            raise ReplayContractError("defense arms did not replay identical rows")
+        _validate_identical_result_rows(results)
         return results
     except ReplayContractError:
         raise
@@ -826,6 +831,335 @@ def replay_defense_arms(
         ValueError,
     ) as error:
         raise ReplayContractError("defense replay failed deterministically") from error
+
+
+def _freeze_hidden_invocation(
+    invocation: object,
+    *,
+    pinned_verifier: DefenderBundleVerifier,
+    pinned_attestation: VerifiedDefenderAttestation,
+) -> _FrozenDefenseReplay:
+    """Evaluator-only entry: materialize all actions without touching truth."""
+    if type(invocation) is not _HiddenReplayInvocation:
+        raise ReplayContractError("hidden replay invocation must have its exact type")
+    return _freeze_replay_inputs(
+        invocation,
+        pinned_verifier=pinned_verifier,
+        pinned_attestation=pinned_attestation,
+    )
+
+
+def _freeze_replay_inputs(
+    invocation: _HiddenReplayInvocation,
+    *,
+    pinned_verifier: DefenderBundleVerifier,
+    pinned_attestation: VerifiedDefenderAttestation,
+) -> _FrozenDefenseReplay:
+    matrix_value = _exact_model(invocation.matrix, FeatureMatrix, "feature matrix")
+    threshold_set = _exact_model(
+        invocation.thresholds, ReplayThresholdSet, "threshold set"
+    )
+    defender = invocation.defender
+    if type(defender) is not LoadedDefenderBundle:
+        raise ReplayContractError("defender must be an exact verified loaded bundle")
+    if (
+        type(invocation.defender_verifier) is not DefenderBundleVerifier
+        or invocation.defender_verifier is not pinned_verifier
+        or type(pinned_verifier) is not DefenderBundleVerifier
+    ):
+        raise ReplayContractError("replay requires the exact pinned defender verifier")
+    if (
+        type(invocation.defender_attestation) is not VerifiedDefenderAttestation
+        or invocation.defender_attestation is not pinned_attestation
+        or not pinned_verifier.verify(pinned_attestation)
+    ):
+        raise ReplayContractError("defender attestation failed exact re-attestation")
+    case_counter = invocation.case_counter
+    if type(case_counter) is not ReplayCaseCounterBinding:
+        raise ReplayContractError("case callback must have exact replay lineage")
+    declared_failure = (
+        None
+        if invocation.model_failure is None
+        else _exact_model(invocation.model_failure, ModelFailure, "model failure")
+    )
+    rows, events = _validated_replay_rows(matrix_value, defender)
+    event_ids = tuple(row.event_id for row in rows)
+    case_counter.reconstruct(matrix_value.events, event_ids, case_counter.as_of)
+    selection_ids = tuple(row.event_id for row in defender.threshold_matrix.rows)
+    selection_binding = bind_replay_case_counter(
+        defender.threshold_matrix.events,
+        selection_ids,
+        as_of=threshold_set.selection_as_of,
+    )
+    rederived = ReplayThresholdSet.from_selection(
+        defender,
+        selection_binding,
+        labels=invocation.threshold_labels,
+        values=invocation.threshold_values,
+    )
+    if threshold_set != rederived:
+        raise ReplayContractError(
+            "threshold set differs from exact rederived selection evidence"
+        )
+    manifest_digest = _manifest_digest(defender.manifest)
+    if (
+        pinned_attestation.bundle_manifest_digest != manifest_digest
+        or pinned_attestation.top_ref.sha256 != manifest_digest
+        or pinned_attestation.threshold_digest != defender.manifest.threshold_digest
+    ):
+        raise ReplayContractError("defender attestation does not bind loaded artifacts")
+    if threshold_set.bundle_manifest_digest != manifest_digest:
+        raise ReplayContractError("threshold bundle lineage does not match defender")
+    if (
+        threshold_set.selection_row_ids_digest
+        != defender.threshold_binding.row_ids_digest
+        or threshold_set.report_for(DefenseArm.LAYERED_HYBRID).report_digest
+        != defender.threshold_report.report_digest
+    ):
+        raise ReplayContractError(
+            "threshold selection lineage does not match the signed defender"
+        )
+    audit = audit_feature_matrix(matrix_value.events, matrix_value, defender.catalog)
+    defender.verify_reload()
+    rule_engine = RuleEngine(defender.rule_manifest)
+    rule_results = tuple(
+        rule_engine.evaluate(event, row)
+        for event, row in zip(events, rows, strict=True)
+    )
+    mandatory = tuple(any(hit.mandatory for hit in row.hits) for row in rule_results)
+    actual_failure = declared_failure
+    calibrated: np.ndarray | None = None
+    if actual_failure is None:
+        try:
+            calibrated = defender.calibrator.predict(defender.scorer.predict(matrix_value))
+        except Exception:
+            actual_failure = ModelFailure(
+                reason=DefenseReason.MODEL_UNAVAILABLE,
+                failed_component_version=f"model:{defender.manifest.model_digest}",
+            )
+    decisions_by_arm = {
+        arm: _arm_decisions(
+            arm=arm,
+            events=events,
+            vectors=rows,
+            rules=rule_results,
+            calibrated=calibrated,
+            mandatory=mandatory,
+            thresholds=threshold_set,
+            failure=actual_failure,
+            rule_manifest=defender.rule_manifest,
+            rule_fallback_thresholds=threshold_set.report_for(
+                DefenseArm.RULES_ONLY
+            ).thresholds,
+        )
+        for arm in DefenseArm
+    }
+    arm_scores = {
+        arm: np.asarray(
+            [decision.score for decision in decisions_by_arm[arm]], dtype=np.float64
+        )
+        for arm in DefenseArm
+    }
+    return _FrozenDefenseReplay(
+        matrix_value,
+        defender,
+        pinned_verifier,
+        pinned_attestation,
+        threshold_set,
+        case_counter,
+        rows,
+        events,
+        event_ids,
+        mandatory,
+        decisions_by_arm,
+        arm_scores,
+        audit.passed,
+        actual_failure,
+        manifest_digest,
+    )
+
+
+def _hidden_decision_bindings(
+    frozen: object,
+) -> tuple[HiddenDecisionBinding, ...]:
+    if type(frozen) is not _FrozenDefenseReplay:
+        raise ReplayContractError("hidden frozen replay must have its exact type")
+    bindings: list[HiddenDecisionBinding] = []
+    for arm in DefenseArm:
+        decisions = frozen.decisions_by_arm[arm]
+        mandatory_document = tuple(
+            decisions[index].model_dump(mode="json")
+            for index, selected in enumerate(frozen.mandatory)
+            if selected
+        )
+        bindings.append(
+            HiddenDecisionBinding(
+                arm=arm.value,
+                decision_event_ids_digest=_digest_document(frozen.event_ids),
+                decision_artifact_digest=_digest_document(
+                    tuple(item.model_dump(mode="json") for item in decisions)
+                ),
+                action_digest=_digest_document(
+                    tuple(item.action.value for item in decisions)
+                ),
+                score_digest=_array_digest(frozen.arm_scores[arm]),
+                common_integrity_digest=_digest_document(mandatory_document),
+                threshold_report_digest=frozen.threshold_set.report_for(
+                    arm
+                ).report_digest,
+                threshold_set_digest=frozen.threshold_set.threshold_set_digest,
+                case_callback_digest=frozen.case_counter.callback_digest,
+            )
+        )
+    result = tuple(bindings)
+    if len({item.decision_event_ids_digest for item in result}) != 1 or len(
+        {item.common_integrity_digest for item in result}
+    ) != 1:
+        raise ReplayContractError("hidden arms lack an identical common freeze")
+    return result
+
+
+def _hidden_invocation_digest(frozen: object) -> str:
+    if type(frozen) is not _FrozenDefenseReplay:
+        raise ReplayContractError("hidden frozen replay must have its exact type")
+    return _digest_document(
+        {
+            "schema_version": "1.0.0",
+            "matrix": frozen.matrix.model_dump(mode="json"),
+            "bundle_manifest_digest": frozen.manifest_digest,
+            "attestation_digest": frozen.defender_attestation.attestation_digest,
+            "threshold_set_digest": frozen.threshold_set.threshold_set_digest,
+            "case_callback_digest": frozen.case_counter.callback_digest,
+            "decisions": [
+                item.model_dump(mode="json") for item in _hidden_decision_bindings(frozen)
+            ],
+            "model_failure": (
+                None
+                if frozen.actual_failure is None
+                else frozen.actual_failure.model_dump(mode="json")
+            ),
+        }
+    )
+
+
+def _evaluate_hidden_frozen(
+    frozen: object, payload: bytes
+) -> _HiddenEvaluationProduct:
+    if type(frozen) is not _FrozenDefenseReplay or type(payload) is not bytes:
+        raise ReplayContractError("hidden evaluator inputs must have exact types")
+    context = ReplayEvaluationContext.from_json(payload)
+    if context.evaluation.kind is not EvaluationKind.HIDDEN:
+        raise ReplayContractError("restricted context is not a hidden descriptor")
+    lineage = _hidden_descriptor_lineage(
+        context.evaluation,
+        frozen.event_ids,
+        frozen.defender,
+        frozen.matrix,
+        frozen.defender_attestation,
+        context,
+    )
+    evaluated, context_digest = _evaluate_frozen_context(
+        frozen, context, lineage, hidden_access_clean=False
+    )
+    return _HiddenEvaluationProduct(
+        evaluated,
+        context_digest,
+        lineage.lineage_digest,
+        context.as_of,
+    )
+
+
+def _hidden_product_evidence(
+    product: object,
+) -> tuple[HiddenArmEvidenceBinding, ...]:
+    if type(product) is not _HiddenEvaluationProduct:
+        raise ReplayContractError("hidden evaluation product must have its exact type")
+    return tuple(item.hidden_evidence for item in product.evaluated)
+
+
+def _finalize_hidden_product(
+    product: object,
+    receipt: HiddenEvaluationReceipt,
+    *,
+    freeze_receipt: HiddenDecisionFreezeReceipt,
+    freeze_ref: ArtifactRef,
+) -> HiddenReplayOutcome:
+    if (
+        type(product) is not _HiddenEvaluationProduct
+        or type(receipt) is not HiddenEvaluationReceipt
+        or type(freeze_receipt) is not HiddenDecisionFreezeReceipt
+        or type(freeze_ref) is not ArtifactRef
+    ):
+        raise ReplayContractError("hidden finalization inputs must have exact types")
+    evidence = _hidden_product_evidence(product)
+    if (
+        receipt.arm_evidence != evidence
+        or receipt.evaluator_context_digest != product.evaluator_context_digest
+        or receipt.descriptor_lineage_digest != product.evaluation_lineage_digest
+        or receipt.decision_freeze_receipt_digest != freeze_receipt.receipt_digest
+        or receipt.decision_freeze_ref_digest != freeze_ref.sha256
+        or receipt.sealed_at != product.evaluator_as_of
+        or freeze_ref.sha256
+        != hashlib.sha256(freeze_receipt.to_json()).hexdigest()
+    ):
+        raise ReplayContractError("hidden receipt does not bind the evaluator product")
+    results = tuple(
+        item.result.rebuild(
+            hidden_release_receipt_digest=receipt.receipt_digest,
+            assurance=item.result.assurance.model_copy(
+                update={"hidden_access_clean": True}
+            ),
+        )
+        for item in product.evaluated
+    )
+    _validate_identical_result_rows(results)
+    return HiddenReplayOutcome(results, receipt)
+
+
+def _evaluate_frozen_context(
+    frozen: _FrozenDefenseReplay,
+    context: ReplayEvaluationContext,
+    lineage: EvaluationLineage,
+    *,
+    hidden_access_clean: bool,
+) -> tuple[tuple[_EvaluatedArm, ...], str]:
+    _validate_evaluator_context(context, frozen.event_ids)
+    frozen.case_counter.validate_context(
+        context.observations, frozen.event_ids, context.as_of
+    )
+    if frozen.feature_audit_passed != context.feature_assurance.leakage_passed:
+        raise ReplayContractError("feature leakage evidence disagrees with replay audit")
+    context_digest = _evaluator_context_digest(context.to_json())
+    evaluated = tuple(
+        _evaluate_frozen_arm(
+            arm=arm,
+            event_ids=frozen.event_ids,
+            events=frozen.events,
+            decisions=frozen.decisions_by_arm[arm],
+            scores=frozen.arm_scores[arm],
+            mandatory=frozen.mandatory,
+            threshold_set=frozen.threshold_set,
+            manifest=frozen.defender.manifest,
+            case_counter=frozen.case_counter,
+            context=context,
+            evaluation_lineage=lineage,
+            evaluation_context_digest=context_digest,
+            rollback_available=frozen.defender_attestation.rollback_available,
+            hidden_access_clean=hidden_access_clean,
+            failure=(
+                frozen.actual_failure if arm is DefenseArm.GBDT_ONLY else None
+            ),
+        )
+        for arm in DefenseArm
+    )
+    return evaluated, context_digest
+
+
+def _validate_identical_result_rows(results: tuple[ReplayResult, ...]) -> None:
+    if len(results) != len(DefenseArm) or len(
+        {item.decision_event_ids for item in results}
+    ) != 1:
+        raise ReplayContractError("defense arms did not replay identical rows")
 
 
 def _validated_replay_rows(
@@ -879,82 +1213,242 @@ def _validate_evaluator_context(
             )
 
 
+def _validate_descriptor_lineage(
+    descriptor: EvaluationDescriptor,
+    event_ids: tuple[str, ...],
+    defender: LoadedDefenderBundle,
+    split: EvaluationSplit | None,
+    matrix: FeatureMatrix,
+    attestation: VerifiedDefenderAttestation,
+    context: ReplayEvaluationContext,
+    regime_evidence: ReplayRegimeEvidence | None,
+) -> EvaluationLineage:
+    if type(split) is not EvaluationSplit:
+        raise ReplayContractError("evaluation descriptor lineage requires an exact split")
+    checked = _exact_model(split, EvaluationSplit, "evaluation split")
+    if descriptor.kind is not EvaluationKind.REGIME and regime_evidence is not None:
+        raise ReplayContractError("regime evidence is irrelevant to this descriptor")
+    binding = defender.training_binding
+    manifest = defender.manifest
+    if (
+        checked.split_digest != manifest.split_manifest_digest
+        or _digest_document(
+            checked.model_dump(mode="json", exclude={"split_digest"})
+        )
+        != binding.split_semantic_digest
+        or binding.split_artifact_digest != manifest.split_artifact_digest
+    ):
+        raise ReplayContractError("evaluation descriptor lineage differs from signed split")
+    if descriptor.kind is EvaluationKind.CHRONOLOGICAL:
+        expected = checked.row_ids["development"]
+    elif descriptor.kind is EvaluationKind.COLD_ENTITY:
+        cohort = EntityCohort(descriptor.value)
+        expected = tuple(
+            event_id
+            for event_id in checked.row_ids["development"]
+            if cohort in checked.entity_cohorts[event_id]
+        )
+    elif descriptor.kind is EvaluationKind.HELD_FAMILY:
+        if checked.held_out_family != descriptor.value:
+            raise ReplayContractError(
+                "held-family descriptor lineage lacks matching LOFO split"
+            )
+        expected = checked.held_out_evaluation_row_ids
+        requested = binding.requested_row_ids
+        final_fit = binding.final_fit_row_ids
+        if any(checked.row_families[row_id] == descriptor.value for row_id in requested) or any(
+            checked.row_families[row_id] == descriptor.value for row_id in final_fit
+        ):
+            raise ReplayContractError(
+                "held-family descriptor lineage lacks training-exclusion proof"
+            )
+    elif descriptor.kind is EvaluationKind.REGIME:
+        if type(regime_evidence) is not ReplayRegimeEvidence:
+            raise ReplayContractError(
+                "regime descriptor lineage requires exact derived-corpus evidence"
+            )
+        checked_regime = _exact_model(
+            regime_evidence, ReplayRegimeEvidence, "regime evidence"
+        )
+        regime_manifest = checked_regime.manifest
+        if (
+            regime_manifest.transformer.value != descriptor.value
+            or regime_manifest.parent_corpus_digest != manifest.corpus_digest
+        ):
+            raise ReplayContractError(
+                "regime descriptor lineage differs from its signed parent corpus"
+            )
+        expected_events = tuple(
+            sorted(checked_regime.derived_corpus.observations, key=lambda row: row.event_id)
+        )
+        if matrix.events != expected_events:
+            raise ReplayContractError(
+                "regime feature matrix differs from the exact derived corpus"
+            )
+        expected = tuple(
+            row.event_id
+            for row in sorted(
+                (
+                    row
+                    for row in checked_regime.derived_corpus.observations
+                    if row.is_decision_point
+                ),
+                key=lambda row: (cast(datetime, row.decision_at), row.event_id),
+            )
+        )
+    else:
+        raise ReplayContractError("hidden descriptor lineage is authority-only")
+    if event_ids != expected:
+        raise ReplayContractError(
+            "evaluation descriptor lineage row order does not match its source"
+        )
+    if descriptor.kind is EvaluationKind.REGIME:
+        cohort_document = {
+            row.event_id: [item.value for item in row.entity_cohorts]
+            for row in context.slice_assignments
+        }
+    else:
+        cohort_document = {
+            event_id: [item.value for item in checked.entity_cohorts[event_id]]
+            for event_id in event_ids
+        }
+    training_document = {
+        "requested": list(binding.requested_row_ids),
+        "excluded": list(binding.excluded_row_ids),
+        "final_fit": list(binding.final_fit_row_ids),
+        "receipt": defender.manifest.training_receipt_digest,
+        "binding": defender.manifest.training_binding_digest,
+    }
+    return EvaluationLineage.create(
+        descriptor=descriptor,
+        decision_rows_digest=_digest_document(event_ids),
+        decision_content_digest=_digest_document(matrix.model_dump(mode="json")),
+        split_digest=checked.split_digest,
+        cohort_mapping_digest=_digest_document(cohort_document),
+        training_population_digest=_digest_document(training_document),
+        bundle_manifest_digest=_manifest_digest(defender.manifest),
+        defender_top_ref_digest=attestation.top_ref.sha256,
+        regime_parent_digest=(
+            regime_evidence.manifest.parent_corpus_digest
+            if descriptor.kind is EvaluationKind.REGIME
+            and regime_evidence is not None
+            else None
+        ),
+        regime_output_digest=(
+            regime_evidence.manifest.output_corpus_digest
+            if descriptor.kind is EvaluationKind.REGIME
+            and regime_evidence is not None
+            else None
+        ),
+        regime_parameters_digest=(
+            _digest_document(regime_evidence.manifest.parameters)
+            if descriptor.kind is EvaluationKind.REGIME
+            and regime_evidence is not None
+            else None
+        ),
+        regime_truth_unchanged=(
+            regime_evidence.manifest.truth_bytes_unchanged
+            if descriptor.kind is EvaluationKind.REGIME
+            and regime_evidence is not None
+            else None
+        ),
+        held_family=(
+            cast(Family, descriptor.value)
+            if descriptor.kind is EvaluationKind.HELD_FAMILY
+            else None
+        ),
+        training_exclusion_verified=descriptor.kind is EvaluationKind.HELD_FAMILY,
+    )
+
+
 def _arm_decisions(
     *,
     arm: DefenseArm,
     events: tuple[ObservedEvent, ...],
+    vectors: tuple[FeatureVector, ...],
     rules: tuple[RuleResult, ...],
-    scores: np.ndarray,
     calibrated: np.ndarray | None,
     mandatory: tuple[bool, ...],
-    common_mandatory: tuple[DefenseDecision | None, ...],
     thresholds: ReplayThresholdSet,
     failure: ModelFailure | None,
+    rule_manifest: RuleManifest,
     rule_fallback_thresholds: PolicyThresholds | None,
 ) -> tuple[DefenseDecision, ...]:
     report = thresholds.report_for(arm)
     arm_thresholds = report.thresholds
     if arm_thresholds is None or rule_fallback_thresholds is None:
         raise ReplayContractError("replay requires feasible arm and fallback thresholds")
+    policy = ActionPolicy(rule_manifest=rule_manifest)
+    mode: Literal["rules_only", "model_only", "layered"]
+    if arm is DefenseArm.RULES_ONLY:
+        mode = "rules_only"
+    elif arm is DefenseArm.GBDT_ONLY:
+        mode = "model_only"
+    else:
+        mode = "layered"
     output: list[DefenseDecision] = []
-    for index, (event, rule_result) in enumerate(zip(events, rules, strict=True)):
-        if mandatory[index]:
-            shared = common_mandatory[index]
-            if shared is None:
-                raise ReplayContractError("mandatory decision cache is incomplete")
-            output.append(shared)
-            continue
-        if arm is DefenseArm.GBDT_ONLY and failure is not None:
-            output.append(
-                _decision(
-                    event,
-                    rule_result,
-                    action=Action.APPROVE,
-                    score=float(scores[index]),
-                    calibrated_score=None,
-                    reasons=(failure.reason,),
-                    fallback=None,
-                )
-            )
-            continue
-        if arm is DefenseArm.LAYERED_HYBRID and failure is not None:
-            output.append(
-                _decision(
-                    event,
-                    rule_result,
-                    action=_action(float(scores[index]), rule_fallback_thresholds),
-                    score=float(scores[index]),
-                    calibrated_score=None,
-                    reasons=tuple(
-                        dict.fromkeys(
-                            (item.reason for item in rule_result.hits),
-                        )
-                    )
-                    + (failure.reason,),
-                    fallback=failure,
-                )
-            )
-            continue
+    for index, (event, vector, rule_result) in enumerate(
+        zip(events, vectors, rules, strict=True)
+    ):
+        calibrated_score = (
+            None
+            if arm is DefenseArm.RULES_ONLY or failure is not None
+            else float(cast(np.ndarray, calibrated)[index])
+        )
         output.append(
-            _decision(
+            policy.choose(
                 event,
                 rule_result,
-                action=_action(float(scores[index]), arm_thresholds),
-                score=float(scores[index]),
-                calibrated_score=(
-                    None
-                    if arm is DefenseArm.RULES_ONLY
-                    else float(cast(np.ndarray, calibrated)[index])
+                calibrated_score=calibrated_score,
+                thresholds=arm_thresholds,
+                model_failure=None if failure is None else failure.reason,
+                failed_component_version=(
+                    None if failure is None else failure.failed_component_version
                 ),
-                reasons=(
-                    tuple(item.reason for item in rule_result.hits)
-                    if arm is not DefenseArm.GBDT_ONLY
-                    else ()
-                ),
-                fallback=None,
+                latency_ms=0.0,
+                vector=vector,
+                score_mode=mode,
+                fallback_thresholds=rule_fallback_thresholds,
             )
         )
+    if any(
+        selected and output[index].action is not Action.DECLINE
+        for index, selected in enumerate(mandatory)
+    ):
+        raise ReplayContractError("mandatory decision differs from production policy")
     return tuple(output)
+
+
+def _hidden_descriptor_lineage(
+    descriptor: EvaluationDescriptor,
+    event_ids: tuple[str, ...],
+    defender: LoadedDefenderBundle,
+    matrix: FeatureMatrix,
+    attestation: VerifiedDefenderAttestation,
+    context: ReplayEvaluationContext,
+) -> EvaluationLineage:
+    binding = defender.training_binding
+    cohort_document = {
+        row.event_id: [item.value for item in row.entity_cohorts]
+        for row in context.slice_assignments
+    }
+    training_document = {
+        "requested": list(binding.requested_row_ids),
+        "excluded": list(binding.excluded_row_ids),
+        "final_fit": list(binding.final_fit_row_ids),
+        "receipt": defender.manifest.training_receipt_digest,
+        "binding": defender.manifest.training_binding_digest,
+    }
+    return EvaluationLineage.create(
+        descriptor=descriptor,
+        decision_rows_digest=_digest_document(event_ids),
+        decision_content_digest=_digest_document(matrix.model_dump(mode="json")),
+        split_digest=defender.manifest.split_manifest_digest,
+        cohort_mapping_digest=_digest_document(cohort_document),
+        training_population_digest=_digest_document(training_document),
+        bundle_manifest_digest=_manifest_digest(defender.manifest),
+        defender_top_ref_digest=attestation.top_ref.sha256,
+    )
 
 
 def _common_mandatory_decisions(
@@ -1038,6 +1532,7 @@ def _evaluate_frozen_arm(
     manifest: DefenderBundleManifest,
     case_counter: ReplayCaseCounterBinding,
     context: ReplayEvaluationContext,
+    evaluation_lineage: EvaluationLineage,
     evaluation_context_digest: str,
     rollback_available: bool,
     hidden_access_clean: bool,
@@ -1045,7 +1540,10 @@ def _evaluate_frozen_arm(
 ) -> _EvaluatedArm:
     actions = np.asarray([item.action for item in decisions], dtype=object)
     cases = group_cases(context.observations, decisions, as_of=context.as_of)
-    if case_counter(actions.copy()) != len(cases):
+    production_counter = case_counter.reconstruct(
+        context.observations, event_ids, context.as_of
+    )
+    if production_counter(actions.copy()) != len(cases):
         raise ReplayContractError("production review-case callback differs from full grouping")
     queue_report = simulate_case_queue(cases, context.queue_config)
     latency = next(item.samples for item in context.latency_samples if item.arm is arm)
@@ -1090,6 +1588,7 @@ def _evaluate_frozen_arm(
     result = ReplayResult.create(
         arm=arm,
         evaluation=context.evaluation,
+        evaluation_lineage=evaluation_lineage,
         decision_event_ids=event_ids,
         decision_rows_digest=_digest_document(event_ids),
         common_integrity_digest=_digest_document(mandatory_document),
@@ -1144,10 +1643,15 @@ def _promotion_metrics(report: MetricReport) -> PromotionMetrics:
         value_escaped=report.value.value_escaped,
         review_case_count=operations.review_case_count,
         challenge_rate=operations.challenge_count / row_count,
-        false_decline_rate=(
-            operations.false_decline_count / legitimate_count
-            if legitimate_count
-            else 0.0
+        false_decline=RateEvidence(
+            numerator=operations.false_decline_count,
+            denominator=legitimate_count,
+            value=(
+                operations.false_decline_count / legitimate_count
+                if legitimate_count
+                else None
+            ),
+            defined=legitimate_count > 0,
         ),
         review_case_rate=operations.review_case_count / row_count,
         slice_performance=slices,
@@ -1168,6 +1672,23 @@ def _case_binding_document(
         "decision_event_ids": list(event_ids),
         "as_of": as_of.isoformat().replace("+00:00", "Z"),
     }
+
+
+def _placeholder_decision(event_id: str) -> DefenseDecision:
+    return DefenseDecision(
+        event_id=event_id,
+        action=Action.APPROVE,
+        score=0.0,
+        rule_score=0.0,
+        calibrated_score=0.0,
+        reason_codes=(),
+        evidence_source_ids=(event_id,),
+        fallback_used=False,
+        fallback_reason=None,
+        failed_component_version=None,
+        latency_ms=0.0,
+        policy_version="1.0.0",
+    )
 
 
 def _manifest_digest(manifest: DefenderBundleManifest) -> str:
@@ -1229,32 +1750,6 @@ def _exact_model[T: ExternalContract](value: object, expected: type[T], label: s
         )
     except ValidationError as error:
         raise ReplayContractError(f"{label} failed semantic revalidation") from error
-
-
-def _register_threshold_set(value: ReplayThresholdSet) -> None:
-    identity = id(value)
-
-    def cleanup(reference: weakref.ReferenceType[ReplayThresholdSet]) -> None:
-        if _THRESHOLD_SETS.get(identity) is reference:
-            _THRESHOLD_SETS.pop(identity, None)
-
-    _THRESHOLD_SETS[identity] = weakref.ref(value, cleanup)
-
-
-def _case_binding_state(value: ReplayCaseCounterBinding) -> _CaseBindingState:
-    if type(value) is not ReplayCaseCounterBinding:
-        raise ReplayContractError("case callback binding must have its exact type")
-    entry = _CASE_BINDINGS.get(id(value))
-    if entry is None or entry[0]() is not value:
-        raise ReplayContractError("case callback binding is not factory issued")
-    return entry[1]
-
-
-def _is_registered_threshold_set(value: object) -> bool:
-    if type(value) is not ReplayThresholdSet:
-        return False
-    reference = _THRESHOLD_SETS.get(id(value))
-    return reference is not None and reference() is value
 
 
 def _validate_digest(value: str) -> None:
@@ -1327,12 +1822,14 @@ def _json_tree(value: object) -> object:
 
 __all__ = [
     "DefenseArm",
+    "HiddenReplayOutcome",
     "ModelFailure",
     "ReplayCaseCounterBinding",
     "ReplayContractError",
     "ReplayEvaluationContext",
     "ReplayFeatureAssurance",
     "ReplayLatencySamples",
+    "ReplayRegimeEvidence",
     "ReplayThresholdSet",
     "bind_replay_case_counter",
     "replay_defense_arms",

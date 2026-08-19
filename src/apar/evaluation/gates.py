@@ -79,6 +79,91 @@ class EvaluationDescriptor(ExternalContract):
         return self
 
 
+class EvaluationLineage(ExternalContract):
+    """Aggregate descriptor provenance derived from evaluator-owned source receipts."""
+
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    descriptor: EvaluationDescriptor
+    decision_rows_digest: str
+    decision_content_digest: str
+    split_digest: str
+    cohort_mapping_digest: str
+    training_population_digest: str
+    bundle_manifest_digest: str
+    defender_top_ref_digest: str
+    regime_parent_digest: str | None = None
+    regime_output_digest: str | None = None
+    regime_parameters_digest: str | None = None
+    regime_truth_unchanged: bool | None = None
+    held_family: Family | None = None
+    training_exclusion_verified: bool = False
+    lineage_digest: str
+
+    @field_validator(
+        "decision_rows_digest",
+        "decision_content_digest",
+        "split_digest",
+        "cohort_mapping_digest",
+        "training_population_digest",
+        "bundle_manifest_digest",
+        "defender_top_ref_digest",
+        "regime_parent_digest",
+        "regime_output_digest",
+        "regime_parameters_digest",
+        "lineage_digest",
+    )
+    @classmethod
+    def lineage_digests_are_sha256(cls, value: str | None) -> str | None:
+        if value is not None:
+            _validate_digest(value)
+        return value
+
+    @field_validator("regime_truth_unchanged", "training_exclusion_verified", mode="before")
+    @classmethod
+    def lineage_flags_are_exact(cls, value: object) -> object:
+        if value is not None and type(value) is not bool:
+            raise ValueError("evaluation lineage flags must be exact bools or None")
+        return value
+
+    @model_validator(mode="after")
+    def kind_specific_provenance_is_closed(self) -> EvaluationLineage:
+        regime_values = (
+            self.regime_parent_digest,
+            self.regime_output_digest,
+            self.regime_parameters_digest,
+            self.regime_truth_unchanged,
+        )
+        if self.descriptor.kind is EvaluationKind.REGIME:
+            if any(value is None for value in regime_values):
+                raise ValueError("regime lineage requires complete derivation provenance")
+        elif any(value is not None for value in regime_values):
+            raise ValueError("non-regime lineage cannot claim regime provenance")
+        if self.descriptor.kind is EvaluationKind.HELD_FAMILY:
+            if (
+                self.held_family != self.descriptor.value
+                or not self.training_exclusion_verified
+            ):
+                raise ValueError("held-family lineage requires exact exclusion proof")
+        elif self.held_family is not None or self.training_exclusion_verified:
+            raise ValueError("non-held lineage cannot claim family exclusion")
+        expected = _digest_document(
+            self.model_dump(mode="json", exclude={"lineage_digest"})
+        )
+        if self.lineage_digest != expected:
+            raise ValueError("evaluation lineage digest is inconsistent")
+        return self
+
+    @classmethod
+    def create(cls, **fields: object) -> EvaluationLineage:
+        provisional = cast(Any, cls).model_construct(
+            **fields, lineage_digest="0" * 64
+        )
+        document = provisional.model_dump(mode="json", exclude={"lineage_digest"})
+        return cls.model_validate(
+            {**fields, "lineage_digest": _digest_document(document)}
+        )
+
+
 class AssuranceEvidence(ExternalContract):
     """Binary non-averageable assurance evidence for one replay."""
 
@@ -142,10 +227,56 @@ class SlicePerformance(ExternalContract):
         return value
 
 
+class RateEvidence(ExternalContract):
+    """Exact rate derivation with explicit undefined-denominator semantics."""
+
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    numerator: int = Field(ge=0, le=1_000_000)
+    denominator: int = Field(ge=0, le=1_000_000)
+    value: float | None
+    defined: bool
+
+    @field_validator("numerator", "denominator", mode="before")
+    @classmethod
+    def counts_are_exact_ints(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("rate evidence counts must be exact integers")
+        return value
+
+    @field_validator("defined", mode="before")
+    @classmethod
+    def defined_is_exact_bool(cls, value: object) -> object:
+        if type(value) is not bool:
+            raise ValueError("rate evidence defined flag must be exact bool")
+        return value
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def value_is_finite_rate_or_none(cls, value: object) -> object:
+        if value is not None and (
+            type(value) is not float or not math.isfinite(value) or not 0.0 <= value <= 1.0
+        ):
+            raise ValueError("rate evidence value must be None or an exact finite rate")
+        return value
+
+    @model_validator(mode="after")
+    def derivation_is_exact(self) -> RateEvidence:
+        if self.numerator > self.denominator:
+            raise ValueError("rate evidence numerator cannot exceed denominator")
+        expected_defined = self.denominator > 0
+        if self.defined != expected_defined:
+            raise ValueError("rate evidence defined flag disagrees with denominator")
+        expected_value = (
+            self.numerator / self.denominator if expected_defined else None
+        )
+        if self.value != expected_value:
+            raise ValueError("rate evidence value disagrees with exact counts")
+        return self
+
 class PromotionMetrics(ExternalContract):
     """Aggregate-only metrics needed by promotion, without evaluator truth."""
 
-    schema_version: Literal["1.0.0"] = "1.0.0"
+    schema_version: Literal["1.1.0"] = "1.1.0"
     row_count: int = Field(ge=1, le=1_000_000)
     recall: float | None
     ece: float | None
@@ -154,7 +285,7 @@ class PromotionMetrics(ExternalContract):
     value_escaped: Decimal
     review_case_count: int = Field(ge=0)
     challenge_rate: float
-    false_decline_rate: float
+    false_decline: RateEvidence
     review_case_rate: float
     slice_performance: tuple[SlicePerformance, ...]
 
@@ -170,7 +301,6 @@ class PromotionMetrics(ExternalContract):
         "ece",
         "p95_latency_ms",
         "challenge_rate",
-        "false_decline_rate",
         "review_case_rate",
         mode="before",
     )
@@ -203,7 +333,6 @@ class PromotionMetrics(ExternalContract):
             ("recall", self.recall),
             ("ECE", self.ece),
             ("challenge rate", self.challenge_rate),
-            ("false-decline rate", self.false_decline_rate),
             ("review-case rate", self.review_case_rate),
         ):
             if value is not None and not 0.0 <= value <= 1.0:
@@ -212,6 +341,8 @@ class PromotionMetrics(ExternalContract):
             raise ValueError("p95 latency must be nonnegative")
         if self.review_case_count > self.row_count:
             raise ValueError("review-case count cannot exceed row count")
+        if self.false_decline.denominator > self.row_count:
+            raise ValueError("false-decline denominator cannot exceed row count")
         keys = tuple((item.kind, item.value) for item in self.slice_performance)
         if keys != tuple(sorted(keys)) or len(keys) != len(set(keys)):
             raise ValueError("slice performance must be sorted and unique")
@@ -255,9 +386,10 @@ class ReplayFailure(ExternalContract):
 class ReplayResult(ExternalContract):
     """Aggregate public replay evidence; restricted truth never enters this model."""
 
-    schema_version: Literal["1.0.0"] = "1.0.0"
+    schema_version: Literal["1.1.0"] = "1.1.0"
     arm: DefenseArm
     evaluation: EvaluationDescriptor
+    evaluation_lineage: EvaluationLineage
     decision_event_ids: tuple[str, ...]
     decision_rows_digest: str
     common_integrity_digest: str
@@ -324,6 +456,14 @@ class ReplayResult(ExternalContract):
     def result_is_self_consistent(self) -> ReplayResult:
         if self.metrics.row_count != len(self.decision_event_ids):
             raise ValueError("replay metrics and decision rows differ")
+        if (
+            self.evaluation_lineage.descriptor != self.evaluation
+            or self.evaluation_lineage.decision_rows_digest
+            != self.decision_rows_digest
+            or self.evaluation_lineage.bundle_manifest_digest
+            != self.bundle_manifest_digest
+        ):
+            raise ValueError("replay result descriptor lineage is inconsistent")
         if self.decision_rows_digest != _digest_document(list(self.decision_event_ids)):
             raise ValueError("decision row digest does not match exact ordered IDs")
         if max(self.fallback_count, self.mandatory_decline_count) > self.metrics.row_count:
@@ -550,6 +690,10 @@ def evaluate_promotion_gates(
         arm: _hard_failure_codes(arm_rows, checked_config)
         for arm, arm_rows in by_arm.items()
     }
+    matrix_complete = _evaluation_matrix_is_complete(rows)
+    if not matrix_complete:
+        for codes in arm_codes.values():
+            codes.add("EVALUATION_COVERAGE")
     if not _evaluation_lineage_is_exact(rows):
         for codes in arm_codes.values():
             codes.add("EVALUATION_LINEAGE")
@@ -572,7 +716,7 @@ def evaluate_promotion_gates(
     hybrid = primary[DefenseArm.LAYERED_HYBRID]
     rules_primary = primary[DefenseArm.RULES_ONLY]
     gbdt_primary = primary[DefenseArm.GBDT_ONLY]
-    if hybrid is None or rules_primary is None or gbdt_primary is None:
+    if not matrix_complete or hybrid is None or rules_primary is None or gbdt_primary is None:
         status = ChampionStatus.NO_PROMOTION
         champion = None
     elif DefenseArm.LAYERED_HYBRID in passing and _hybrid_qualifies(
@@ -667,9 +811,14 @@ def _hard_failure_codes(
         if row.failure is not None:
             codes.add("MODEL_FAILURE")
         metrics = row.metrics
+        if not metrics.false_decline.defined:
+            codes.add("FALSE_DECLINE_COVERAGE")
         if (
             metrics.challenge_rate > config.challenge_rate_max
-            or metrics.false_decline_rate > config.false_decline_rate_max
+            or (
+                metrics.false_decline.value is not None
+                and metrics.false_decline.value > config.false_decline_rate_max
+            )
             or metrics.review_case_rate > config.review_case_rate_max
         ):
             codes.add("OPERATING_BUDGET")
@@ -701,14 +850,13 @@ def _hard_failure_codes(
 
 
 def _evaluation_lineage_is_exact(rows: tuple[ReplayResult, ...]) -> bool:
-    if len({row.bundle_manifest_digest for row in rows}) != 1:
+    threshold_groups: dict[tuple[DefenseArm, str, str], set[str]] = {}
+    for row in rows:
+        threshold_groups.setdefault(
+            (row.arm, row.bundle_manifest_digest, row.threshold_set_digest), set()
+        ).add(row.threshold_report_digest)
+    if any(len(digests) != 1 for digests in threshold_groups.values()):
         return False
-    if len({row.threshold_set_digest for row in rows}) != 1:
-        return False
-    for arm in DefenseArm:
-        arm_rows = tuple(row for row in rows if row.arm is arm)
-        if len({row.threshold_report_digest for row in arm_rows}) > 1:
-            return False
     descriptor_keys = {
         (row.evaluation.kind, row.evaluation.value) for row in rows
     }
@@ -719,11 +867,12 @@ def _evaluation_lineage_is_exact(rows: tuple[ReplayResult, ...]) -> bool:
             if (row.evaluation.kind, row.evaluation.value) == key
         )
         if {row.arm for row in descriptor_rows} != set(DefenseArm):
-            continue
+            return False
         lineage = {
             (
                 row.decision_event_ids,
                 row.decision_rows_digest,
+                row.evaluation_lineage.lineage_digest,
                 row.common_integrity_digest,
                 row.bundle_manifest_digest,
                 row.threshold_set_digest,
@@ -736,6 +885,18 @@ def _evaluation_lineage_is_exact(rows: tuple[ReplayResult, ...]) -> bool:
         if len(lineage) != 1:
             return False
     return True
+
+
+def _evaluation_matrix_is_complete(rows: tuple[ReplayResult, ...]) -> bool:
+    expected = {
+        (arm, kind, value)
+        for arm in DefenseArm
+        for kind, value in _required_descriptors()
+    }
+    actual = {
+        (row.arm, row.evaluation.kind, row.evaluation.value) for row in rows
+    }
+    return actual == expected
 
 
 def _apply_slice_regression(
@@ -845,10 +1006,12 @@ __all__ = [
     "ChampionStatus",
     "DefenseArm",
     "EvaluationDescriptor",
+    "EvaluationLineage",
     "EvaluationKind",
     "GateConfig",
     "GateContractError",
     "PromotionMetrics",
+    "RateEvidence",
     "ReplayFailure",
     "ReplayResult",
     "SlicePerformance",

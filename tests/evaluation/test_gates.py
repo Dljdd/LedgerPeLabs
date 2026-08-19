@@ -15,8 +15,10 @@ from apar.evaluation.gates import (
     ChampionStatus,
     EvaluationDescriptor,
     EvaluationKind,
+    EvaluationLineage,
     GateConfig,
     PromotionMetrics,
+    RateEvidence,
     ReplayResult,
     SlicePerformance,
     evaluate_promotion_gates,
@@ -41,6 +43,27 @@ def _sha(character: str) -> str:
 
 def _row_digest(ids: tuple[str, ...]) -> str:
     return hashlib.sha256(canonical_json_bytes(list(ids))).hexdigest()
+
+
+def _lineage(descriptor: EvaluationDescriptor) -> EvaluationLineage:
+    regime = descriptor.kind is EvaluationKind.REGIME
+    held = descriptor.kind is EvaluationKind.HELD_FAMILY
+    return EvaluationLineage.create(
+        descriptor=descriptor,
+        decision_rows_digest=_row_digest(DECISION_IDS),
+        decision_content_digest=_sha("1"),
+        split_digest=_sha("2"),
+        cohort_mapping_digest=_sha("3"),
+        training_population_digest=_sha("4"),
+        bundle_manifest_digest=_sha("7"),
+        defender_top_ref_digest=_sha("7"),
+        regime_parent_digest=_sha("c") if regime else None,
+        regime_output_digest=_sha("d") if regime else None,
+        regime_parameters_digest=_sha("e") if regime else None,
+        regime_truth_unchanged=True if regime else None,
+        held_family=descriptor.value if held else None,
+        training_exclusion_verified=held,
+    )
 
 
 def _metrics(
@@ -75,7 +98,12 @@ def _metrics(
         value_escaped=Decimal("20.00"),
         review_case_count=review_cases,
         challenge_rate=0.01,
-        false_decline_rate=0.0005,
+        false_decline=RateEvidence(
+            numerator=0,
+            denominator=1_000,
+            value=0.0,
+            defined=True,
+        ),
         review_case_rate=0.005,
         slice_performance=slices,
     )
@@ -122,6 +150,7 @@ def _results(
                 ReplayResult.create(
                     arm=arm,
                     evaluation=descriptor,
+                    evaluation_lineage=_lineage(descriptor),
                     decision_event_ids=DECISION_IDS,
                     decision_rows_digest=_row_digest(DECISION_IDS),
                     common_integrity_digest=_sha("2"),
@@ -160,6 +189,15 @@ def _replace(
         else:
             changed.append(row)
     return tuple(changed)
+
+
+def _lineage_update(
+    lineage: EvaluationLineage, **updates: object
+) -> EvaluationLineage:
+    fields = lineage.model_dump(mode="python", exclude={"lineage_digest"})
+    fields["descriptor"] = lineage.descriptor
+    fields.update(updates)
+    return EvaluationLineage.create(**fields)
 
 
 def test_hybrid_promotes_only_on_exact_value_improvement_over_both_comparators() -> None:
@@ -370,6 +408,12 @@ def test_gate_rejects_reversed_decision_rows_in_one_arm() -> None:
             decision_rows_digest=_row_digest(
                 tuple(reversed(row.decision_event_ids))
             ),
+            evaluation_lineage=_lineage_update(
+                row.evaluation_lineage,
+                decision_rows_digest=_row_digest(
+                    tuple(reversed(row.decision_event_ids))
+                ),
+            ),
         ),
     )
 
@@ -393,11 +437,24 @@ def test_gate_rejects_reversed_decision_rows_in_one_arm() -> None:
 def test_gate_rejects_each_cross_arm_lineage_substitution(
     updates: dict[str, object],
 ) -> None:
+    def substitute(row: ReplayResult) -> ReplayResult:
+        if "bundle_manifest_digest" not in updates:
+            return row.rebuild(**updates)
+        digest = str(updates["bundle_manifest_digest"])
+        return row.rebuild(
+            **updates,
+            evaluation_lineage=_lineage_update(
+                row.evaluation_lineage,
+                bundle_manifest_digest=digest,
+                defender_top_ref_digest=digest,
+            ),
+        )
+
     changed = _replace(
         _results(),
         arm=DefenseArm.GBDT_ONLY,
         kind=EvaluationKind.CHRONOLOGICAL,
-        transform=lambda row: row.rebuild(**updates),
+        transform=substitute,
     )
 
     decision = evaluate_promotion_gates(changed, GateConfig.competition())
@@ -434,3 +491,44 @@ def test_promotion_metrics_reject_omitted_closed_slice_vocabulary() -> None:
         PromotionMetrics.model_validate(
             {**metrics.model_dump(mode="python"), "slice_performance": incomplete}
         )
+
+
+def test_missing_one_comparator_arm_for_one_descriptor_is_global_no_promotion() -> None:
+    """Champion logic must never continue on a partial arm-by-descriptor matrix."""
+    incomplete = tuple(
+        row
+        for row in _results()
+        if not (
+            row.arm is DefenseArm.GBDT_ONLY
+            and row.evaluation.kind is EvaluationKind.REGIME
+            and row.evaluation.value is RegimeKind.COLD_ID_REMAP.value
+        )
+    )
+
+    decision = evaluate_promotion_gates(incomplete, GateConfig.competition())
+
+    assert decision.status is ChampionStatus.NO_PROMOTION
+    assert decision.champion is None
+    assert "EVALUATION_COVERAGE" in decision.failed_gate_codes
+
+
+def test_undefined_overall_false_decline_rate_is_explicit_coverage_failure() -> None:
+    """A zero legitimate denominator must not be serialized as a measured zero rate."""
+    baseline = _metrics(value="83.00", review_cases=17)
+    document = baseline.model_dump(mode="python")
+    document["false_decline"] = RateEvidence(
+        numerator=0,
+        denominator=0,
+        value=None,
+        defined=False,
+    )
+    undefined = PromotionMetrics.model_validate(document)
+    changed = _replace(
+        _results(),
+        transform=lambda row: row.rebuild(metrics=undefined),
+    )
+
+    decision = evaluate_promotion_gates(changed, GateConfig.competition())
+
+    assert decision.status is ChampionStatus.NO_PROMOTION
+    assert "FALSE_DECLINE_COVERAGE" in decision.failed_gate_codes

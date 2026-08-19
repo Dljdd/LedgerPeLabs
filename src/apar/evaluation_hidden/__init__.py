@@ -2,18 +2,16 @@
 
 from apar.evaluation_hidden.defense_authority import (
     HIDDEN_CONTEXT_MEDIA_TYPE,
+    HIDDEN_FREEZE_RECEIPT_MEDIA_TYPE,
     HiddenArmEvidenceBinding,
     HiddenBoundaryError,
+    HiddenDecisionBinding,
+    HiddenDecisionFreezeReceipt,
     HiddenEvaluationAuthority,
     HiddenEvaluationCapability,
     HiddenEvaluationReceipt,
     HiddenImportAudit,
-    HiddenReleaseRequest,
-    ResolvedHiddenEvaluation,
     audit_hidden_import_boundary,
-    resolve_hidden_release,
-    seal_hidden_evaluation,
-    verify_hidden_receipt,
 )
 from apar.evaluation_hidden.generator import HiddenCampaignGenerator
 from apar.evaluation_hidden.validity import (
@@ -23,19 +21,17 @@ from apar.evaluation_hidden.validity import (
 
 __all__ = [
     "HIDDEN_CONTEXT_MEDIA_TYPE",
+    "HIDDEN_FREEZE_RECEIPT_MEDIA_TYPE",
     "HiddenArmEvidenceBinding",
     "HiddenBoundaryError",
     "HiddenCampaignGenerator",
+    "HiddenDecisionBinding",
+    "HiddenDecisionFreezeReceipt",
     "HiddenEvaluationAuthority",
     "HiddenEvaluationCapability",
     "HiddenEvaluationReceipt",
     "HiddenImportAudit",
-    "HiddenReleaseRequest",
     "HiddenValidityOracle",
     "HiddenValidityResult",
-    "ResolvedHiddenEvaluation",
     "audit_hidden_import_boundary",
-    "resolve_hidden_release",
-    "seal_hidden_evaluation",
-    "verify_hidden_receipt",
 ]

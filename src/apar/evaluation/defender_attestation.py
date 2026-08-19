@@ -5,10 +5,8 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
-import weakref
-from dataclasses import dataclass
 from datetime import datetime
-from typing import Never, cast
+from typing import NamedTuple, Never, cast
 from uuid import UUID
 
 from cryptography.exceptions import InvalidSignature
@@ -133,20 +131,14 @@ class DefenderAttestationError(ValueError):
     """A bundle could not be authenticated by the neutral pinned verifier."""
 
 
-@dataclass(frozen=True, slots=True)
-class _VerifierState:
+class _VerifierState(NamedTuple):
     store: ArtifactStore
     signer_key_id: str
     public_key_base64: str
     public_key: bytes
 
 
-_VERIFIERS: weakref.WeakKeyDictionary[DefenderBundleVerifier, _VerifierState] = (
-    weakref.WeakKeyDictionary()
-)
-
-
-class VerifiedDefenderAttestation(bytes):
+class VerifiedDefenderAttestation(tuple[bytes]):
     """Intrinsically immutable canonical proof of one authenticated bundle."""
 
     __slots__ = ()
@@ -159,7 +151,7 @@ class VerifiedDefenderAttestation(bytes):
                 "attestations must come from the exact neutral verifier"
             )
         _attestation_document(payload)
-        return bytes.__new__(cls, payload)
+        return tuple.__new__(cls, (bytes(payload),))
 
     def __init__(self, payload: bytes, token: object = None) -> None:
         del payload
@@ -188,7 +180,7 @@ class VerifiedDefenderAttestation(bytes):
         return verifier.attestation_from_json(payload)
 
     def to_json(self) -> bytes:
-        return bytes(memoryview(self))
+        return bytes(tuple.__getitem__(self, 0))
 
     def __reduce__(self) -> Never:
         raise TypeError("attestations must be reloaded through their pinned verifier")
@@ -236,10 +228,35 @@ class VerifiedDefenderAttestation(bytes):
         return cast(str, _attestation_document(self.to_json())["attestation_digest"])
 
 
-class DefenderBundleVerifier:
+class DefenderBundleVerifier(tuple[_VerifierState]):
     """Concrete store-and-Ed25519-rooted verifier for signed bundle manifests."""
 
-    __slots__ = ("__weakref__",)
+    __slots__ = ()
+
+    def __new__(
+        cls,
+        store: ArtifactStore,
+        *,
+        signer_key_id: str,
+        public_key_base64: str,
+    ) -> DefenderBundleVerifier:
+        if type(store) is not ArtifactStore:
+            raise DefenderAttestationError("neutral verifier requires an exact ArtifactStore")
+        public = _canonical_base64(public_key_base64, 32, label="pinned public key")
+        _digest(signer_key_id, label="pinned signer key ID")
+        if hashlib.sha256(public).hexdigest() != signer_key_id:
+            raise DefenderAttestationError("pinned signer identity is inconsistent")
+        return tuple.__new__(
+            cls,
+            (
+                _VerifierState(
+                    store=store,
+                    signer_key_id=signer_key_id,
+                    public_key_base64=public_key_base64,
+                    public_key=public,
+                ),
+            ),
+        )
 
     def __init__(
         self,
@@ -248,20 +265,7 @@ class DefenderBundleVerifier:
         signer_key_id: str,
         public_key_base64: str,
     ) -> None:
-        if self in _VERIFIERS:
-            raise DefenderAttestationError("neutral verifier is already initialized")
-        if type(store) is not ArtifactStore:
-            raise DefenderAttestationError("neutral verifier requires an exact ArtifactStore")
-        public = _canonical_base64(public_key_base64, 32, label="pinned public key")
-        _digest(signer_key_id, label="pinned signer key ID")
-        if hashlib.sha256(public).hexdigest() != signer_key_id:
-            raise DefenderAttestationError("pinned signer identity is inconsistent")
-        _VERIFIERS[self] = _VerifierState(
-            store=store,
-            signer_key_id=signer_key_id,
-            public_key_base64=public_key_base64,
-            public_key=public,
-        )
+        del store, signer_key_id, public_key_base64
 
     def __setattr__(self, name: str, value: object) -> None:
         del name, value
@@ -270,6 +274,9 @@ class DefenderBundleVerifier:
     def __delattr__(self, name: str) -> None:
         del name
         raise TypeError("neutral defender verifier is immutable")
+
+    def __reduce__(self) -> Never:
+        raise TypeError("neutral defender verifier cannot be serialized")
 
     def attest(self, top_ref: ArtifactRef) -> VerifiedDefenderAttestation:
         """Authenticate a top ref, every component, and its rollback ancestry."""
@@ -335,10 +342,17 @@ class DefenderBundleVerifier:
 
 
 def _state(verifier: DefenderBundleVerifier) -> _VerifierState:
-    try:
-        return _VERIFIERS[verifier]
-    except KeyError as error:
-        raise DefenderAttestationError("neutral verifier is not initialized") from error
+    if type(verifier) is not DefenderBundleVerifier or tuple.__len__(verifier) != 1:
+        raise DefenderAttestationError("neutral verifier is not initialized")
+    state = tuple.__getitem__(verifier, 0)
+    if type(state) is not _VerifierState or type(state.store) is not ArtifactStore:
+        raise DefenderAttestationError("neutral verifier snapshot is invalid")
+    public = _canonical_base64(
+        state.public_key_base64, 32, label="pinned public key"
+    )
+    if public != state.public_key or hashlib.sha256(public).hexdigest() != state.signer_key_id:
+        raise DefenderAttestationError("neutral verifier snapshot is inconsistent")
+    return state
 
 
 def _verified_manifest(

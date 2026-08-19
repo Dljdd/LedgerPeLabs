@@ -146,8 +146,10 @@ class ActionPolicy(ExternalContract):
         failed_component_version: str | None = None,
         latency_ms: float = 0.0,
         vector: FeatureVector | None = None,
+        score_mode: Literal["rules_only", "model_only", "layered"] = "layered",
+        fallback_thresholds: PolicyThresholds | None = None,
     ) -> DefenseDecision:
-        """Apply mandatory decline, hybrid bands, then explicit rules fallback."""
+        """Apply mandatory decline then one closed production score mode."""
         if type(event) is not ObservedEvent:
             raise TypeError("event must be an exact ObservedEvent")
         if type(rule_result) is not RuleResult:
@@ -166,6 +168,10 @@ class ActionPolicy(ExternalContract):
             _validate_score(calibrated_score)
         if thresholds is not None and type(thresholds) is not PolicyThresholds:
             raise TypeError("thresholds must be exact PolicyThresholds or None")
+        if score_mode not in {"rules_only", "model_only", "layered"}:
+            raise ValueError("score_mode must be one closed production mode")
+        if fallback_thresholds is not None and type(fallback_thresholds) is not PolicyThresholds:
+            raise TypeError("fallback_thresholds must be exact PolicyThresholds or None")
         if model_failure is not None and type(model_failure) is not DefenseReason:
             raise TypeError("model_failure must be a DefenseReason or None")
         if model_failure not in {
@@ -197,31 +203,59 @@ class ActionPolicy(ExternalContract):
                 latency_ms=latency_ms,
             )
 
-        if model_available:
-            # Local import avoids the policy/threshold module initialization cycle.
-            # Task 8's exported normalization keeps exact 0/1 operating scores
-            # distinct from the true disabled threshold sentinel at 1.0.
-            from apar.defense.thresholds import normalize_operating_scores
+        if score_mode == "rules_only":
+            if thresholds is None:
+                raise ValueError("rules-only score mode requires frozen thresholds")
+            return self._scored_decision(
+                event,
+                rule_result,
+                raw_score=rule_result.score,
+                calibrated_score=None,
+                thresholds=thresholds,
+                reasons=tuple(hit.reason for hit in rule_result.hits),
+                fallback_reason=None,
+                failed_component_version=None,
+                latency_ms=latency_ms,
+            )
 
+        if score_mode == "model_only" and model_available:
             assert calibrated_score is not None
             assert thresholds is not None
-            hybrid_score = float(
-                normalize_operating_scores(
-                    np.asarray([max(rule_result.score, calibrated_score)], dtype=np.float64)
-                )[0]
+            return self._scored_decision(
+                event,
+                rule_result,
+                raw_score=calibrated_score,
+                calibrated_score=calibrated_score,
+                thresholds=thresholds,
+                reasons=(),
+                fallback_reason=None,
+                failed_component_version=None,
+                latency_ms=latency_ms,
             )
-            if hybrid_score >= thresholds.decline:
-                action = Action.DECLINE
-            elif hybrid_score >= thresholds.challenge:
-                action = Action.CHALLENGE
-            else:
-                action = Action.APPROVE
+
+        if score_mode == "model_only":
+            failure = model_failure or DefenseReason.MODEL_UNAVAILABLE
             return self._decision(
                 event,
                 rule_result,
-                action=action,
-                score=hybrid_score,
+                action=Action.APPROVE,
+                score=0.0,
+                calibrated_score=None,
+                reasons=(failure,),
+                fallback_reason=None,
+                failed_component_version=None,
+                latency_ms=latency_ms,
+            )
+
+        if model_available:
+            assert calibrated_score is not None
+            assert thresholds is not None
+            return self._scored_decision(
+                event,
+                rule_result,
+                raw_score=max(rule_result.score, calibrated_score),
                 calibrated_score=calibrated_score,
+                thresholds=thresholds,
                 reasons=tuple(hit.reason for hit in rule_result.hits),
                 fallback_reason=None,
                 failed_component_version=None,
@@ -230,31 +264,58 @@ class ActionPolicy(ExternalContract):
 
         failure = model_failure or DefenseReason.MODEL_UNAVAILABLE
         component_identity = failed_component_version or "unknown"
-        from apar.defense.thresholds import normalize_operating_scores
-
-        fallback_score = float(
-            normalize_operating_scores(
-                np.asarray([rule_result.score], dtype=np.float64)
-            )[0]
+        selected_fallback = fallback_thresholds or PolicyThresholds(
+            challenge=self.rules_challenge_threshold,
+            decline=self.rules_decline_threshold,
         )
-        if fallback_score >= self.rules_decline_threshold:
-            fallback_action = Action.DECLINE
-        elif fallback_score >= self.rules_challenge_threshold:
-            fallback_action = Action.CHALLENGE
-        else:
-            fallback_action = Action.APPROVE
         fallback_reasons = _unique_reasons(
             *(hit.reason for hit in rule_result.hits), failure
         )
-        return self._decision(
+        return self._scored_decision(
             event,
             rule_result,
-            action=fallback_action,
-            score=fallback_score,
+            raw_score=rule_result.score,
             calibrated_score=None,
+            thresholds=selected_fallback,
             reasons=fallback_reasons,
             fallback_reason=failure,
             failed_component_version=component_identity,
+            latency_ms=latency_ms,
+        )
+
+    def _scored_decision(
+        self,
+        event: ObservedEvent,
+        rule_result: RuleResult,
+        *,
+        raw_score: float,
+        calibrated_score: float | None,
+        thresholds: PolicyThresholds,
+        reasons: tuple[DefenseReason, ...],
+        fallback_reason: DefenseReason | None,
+        failed_component_version: str | None,
+        latency_ms: float,
+    ) -> DefenseDecision:
+        from apar.defense.thresholds import normalize_operating_scores
+
+        score = float(
+            normalize_operating_scores(np.asarray([raw_score], dtype=np.float64))[0]
+        )
+        if score >= thresholds.decline:
+            action = Action.DECLINE
+        elif score >= thresholds.challenge:
+            action = Action.CHALLENGE
+        else:
+            action = Action.APPROVE
+        return self._decision(
+            event,
+            rule_result,
+            action=action,
+            score=score,
+            calibrated_score=calibrated_score,
+            reasons=reasons,
+            fallback_reason=fallback_reason,
+            failed_component_version=failed_component_version,
             latency_ms=latency_ms,
         )
 

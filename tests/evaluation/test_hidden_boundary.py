@@ -18,18 +18,11 @@ from apar.evaluation.defender_attestation import (
     VerifiedDefenderAttestation,
 )
 from apar.evaluation_hidden.defense_authority import (
-    HIDDEN_CONTEXT_MEDIA_TYPE,
-    HiddenArmEvidenceBinding,
     HiddenBoundaryError,
     HiddenEvaluationAuthority,
-    HiddenEvaluationReceipt,
     audit_hidden_import_boundary,
-    resolve_hidden_release,
-    seal_hidden_evaluation,
-    verify_hidden_receipt,
 )
 from apar.runs.wire import canonical_json_bytes
-from apar.storage.artifacts import ArtifactStore
 from tests.defense.test_bundle import BundleFixture
 
 pytest_plugins = ("tests.defense.test_bundle",)
@@ -56,34 +49,14 @@ def _attested(fixture: BundleFixture):
     return manifest, top_ref, verifier, verifier.attest(top_ref)
 
 
-def _restricted(fixture: BundleFixture, payload: bytes = b"{}"):
-    return fixture.store.put_bytes(payload, HIDDEN_CONTEXT_MEDIA_TYPE)
-
-
-def test_hidden_reference_cannot_resolve_before_bundle_freeze(
-    bundle_fixture: BundleFixture,
-) -> None:
-    restricted_ref = _restricted(bundle_fixture)
-    authority = HiddenEvaluationAuthority(_verifier(bundle_fixture), bundle_fixture.store)
-
-    with pytest.raises(HiddenBoundaryError, match="frozen defender"):
-        authority.prepare_release(None, restricted_ref, released_at=ISSUED_AT)
-
-
-def test_verified_top_ref_is_sealed_before_restricted_resolution(
+def test_verified_top_ref_is_sealed_into_an_opaque_capability(
     bundle_fixture: BundleFixture,
 ) -> None:
     manifest, top_ref, verifier, attestation = _attested(bundle_fixture)
-    restricted_ref = _restricted(bundle_fixture)
     authority = HiddenEvaluationAuthority(verifier, bundle_fixture.store)
 
     capability = authority.freeze_and_issue(attestation, issued_at=ISSUED_AT)
-    request = authority.prepare_release(
-        capability, restricted_ref, released_at=ISSUED_AT
-    )
-    resolved = resolve_hidden_release(request)
 
-    assert resolved.payload == b"{}"
     assert capability.bundle_manifest_digest == top_ref.sha256
     assert capability.bundle_id == manifest.bundle_id
     assert capability.issued_at == ISSUED_AT
@@ -98,7 +71,7 @@ def test_manifest_substitution_invalid_signature_and_wrong_top_ref_fail_closed(
 
     with pytest.raises(HiddenBoundaryError, match="exact verified signed"):
         authority.freeze_and_issue(object(), issued_at=ISSUED_AT)  # type: ignore[arg-type]
-    altered = bytes(attestation)[:-1] + b"0"
+    altered = attestation.to_json()[:-1] + b"0"
     with pytest.raises((DefenderAttestationError, HiddenBoundaryError)):
         VerifiedDefenderAttestation.from_json(altered, verifier=verifier)
 
@@ -137,29 +110,17 @@ def test_capability_is_immutable_unforgeable_single_authority_and_nonreplayable(
         authority.freeze_and_issue(attestation, issued_at=ISSUED_AT)
     with pytest.raises((TypeError, HiddenBoundaryError, AttributeError)):
         object.__setattr__(authority, "_active_capability_digest", None)
+    with pytest.raises(TypeError, match="types are sealed"):
+        type(authority).freeze_and_issue = lambda *args, **kwargs: capability
+    with pytest.raises(TypeError, match="types are sealed"):
+        type(capability).bundle_id = "substituted"
     with pytest.raises(HiddenBoundaryError, match="already frozen"):
         authority.freeze_and_issue(attestation, issued_at=ISSUED_AT)
 
     other = HiddenEvaluationAuthority(verifier, bundle_fixture.store)
-    ref = _restricted(bundle_fixture)
-    with pytest.raises(HiddenBoundaryError, match="frozen defender|capability"):
-        other.prepare_release(capability, ref, released_at=ISSUED_AT)
-
-
-def test_wrong_restricted_store_and_forged_ref_do_not_resolve(
-    tmp_path: Path, bundle_fixture: BundleFixture
-) -> None:
-    _, _, verifier, attestation = _attested(bundle_fixture)
-    authority = HiddenEvaluationAuthority(verifier, bundle_fixture.store)
-    capability = authority.freeze_and_issue(attestation, issued_at=ISSUED_AT)
-    other_store = ArtifactStore(tmp_path / "wrong-store")
-    wrong_ref = other_store.put_bytes(b"{}", HIDDEN_CONTEXT_MEDIA_TYPE)
-
-    with pytest.raises(HiddenBoundaryError, match="restricted reference"):
-        request = authority.prepare_release(
-            capability, wrong_ref, released_at=ISSUED_AT
-        )
-        resolve_hidden_release(request)
+    with pytest.raises(HiddenBoundaryError, match="already frozen"):
+        authority.freeze_and_issue(attestation, issued_at=ISSUED_AT)
+    assert other is not authority
 
 
 def test_hidden_authority_rejects_nonexact_manifest_and_noncanonical_issue_time(
@@ -228,11 +189,29 @@ def test_defense_and_features_cannot_import_hidden_package(tmp_path: Path) -> No
         "load = getattr(il, 'import_module')\n"
         "load('apar.evaluation_hidden.getattr')\n"
     )
+    (apar_root / "features" / "composed_reflection.py").write_text(
+        "import importlib as il\n"
+        "reflect = getattr\n"
+        "attribute = 'import_' + 'module'\n"
+        "load = reflect(il, attribute)\n"
+        "load('apar.evaluation_hidden.composed_reflection')\n"
+    )
+    (apar_root / "defense" / "code_execution.py").write_text(
+        "runner = compile\n"
+        "runner('import apar.evaluation_hidden', '<attack>', 'exec')\n"
+    )
+    (apar_root / "features" / "nested_reflection.py").write_text(
+        "loader = getattr(__import__('importlib'), 'import_module')\n"
+        "loader('apar.evaluation_hidden.nested_reflection')\n"
+    )
 
     result = audit_hidden_import_boundary(apar_root)
 
     assert not result.passed
-    assert len(result.violations) == 10
+    assert len(result.violations) >= 12
+    assert any("composed_reflection.py" in item for item in result.violations)
+    assert any("code_execution.py" in item for item in result.violations)
+    assert any("nested_reflection.py" in item for item in result.violations)
 
 
 def test_hidden_authority_state_registry_expires_without_reachable_mutable_state(
@@ -248,85 +227,6 @@ def test_hidden_authority_state_registry_expires_without_reachable_mutable_state
 
     assert authority_ref() is None
     assert capability.bundle_id == attestation.bundle_id
-
-
-def test_hidden_receipt_binds_exact_release_capability_content_and_arm_evidence(
-    bundle_fixture: BundleFixture,
-) -> None:
-    _, top_ref, verifier, attestation = _attested(bundle_fixture)
-    authority = HiddenEvaluationAuthority(verifier, bundle_fixture.store)
-    capability = authority.freeze_and_issue(attestation, issued_at=ISSUED_AT)
-    restricted_ref = _restricted(bundle_fixture, b'{"evaluation":"held"}')
-    request = authority.prepare_release(
-        capability, restricted_ref, released_at=ISSUED_AT
-    )
-    resolved = resolve_hidden_release(request)
-    evidence = tuple(
-        HiddenArmEvidenceBinding(
-            arm=arm,
-            evaluator_input_digest=character * 64,
-            derivation_evidence_digest=character * 64,
-            metric_report_digest=character * 64,
-        )
-        for arm, character in (
-            ("rules_only", "1"),
-            ("gbdt_only", "2"),
-            ("layered_hybrid", "3"),
-        )
-    )
-
-    receipt = seal_hidden_evaluation(resolved, evidence, sealed_at=ISSUED_AT)
-
-    assert receipt.bundle_manifest_digest == top_ref.sha256
-    assert receipt.restricted_artifact_digest == restricted_ref.sha256
-    assert receipt.arm_evidence == evidence
-    assert verify_hidden_receipt(receipt, resolved, evidence)
-    assert authority.receipt_from_json(receipt.to_json()) is receipt
-    structural_clone = HiddenEvaluationReceipt.from_json(receipt.to_json())
-    assert structural_clone == receipt
-    assert structural_clone is not receipt
-    assert not verify_hidden_receipt(structural_clone, resolved, evidence)
-    constructed = HiddenEvaluationReceipt.model_construct(
-        **{
-            **receipt.model_dump(mode="python"),
-            "canonical_content_digest": "f" * 64,
-        }
-    )
-    with pytest.raises((HiddenBoundaryError, ValueError)):
-        constructed.to_json()
-    with pytest.raises(HiddenBoundaryError, match="already consumed"):
-        resolve_hidden_release(request)
-    with pytest.raises(HiddenBoundaryError, match="already sealed"):
-        seal_hidden_evaluation(resolved, evidence, sealed_at=ISSUED_AT)
-    with pytest.raises((HiddenBoundaryError, ValueError)):
-        HiddenEvaluationReceipt.model_validate(
-            {
-                **receipt.model_dump(mode="python"),
-                "canonical_content_digest": "f" * 64,
-            }
-        )
-
-
-def test_hidden_authority_enforces_bounded_release_lifecycle(
-    bundle_fixture: BundleFixture,
-) -> None:
-    _, _, verifier, attestation = _attested(bundle_fixture)
-    authority = HiddenEvaluationAuthority(verifier, bundle_fixture.store)
-    capability = authority.freeze_and_issue(attestation, issued_at=ISSUED_AT)
-    restricted_ref = _restricted(bundle_fixture)
-
-    requests = tuple(
-        authority.prepare_release(
-            capability, restricted_ref, released_at=ISSUED_AT
-        )
-        for _ in range(64)
-    )
-
-    assert len(requests) == 64
-    with pytest.raises(HiddenBoundaryError, match="cap is exhausted"):
-        authority.prepare_release(
-            capability, restricted_ref, released_at=ISSUED_AT
-        )
 
 
 def test_hidden_authority_rejects_structurally_compatible_fake_loader(
@@ -359,6 +259,8 @@ def test_neutral_attestation_verifies_signature_top_ref_and_roundtrip(
 
     assert verifier.attestation_from_json(attestation.to_json()) == attestation
     assert attestation.bundle_manifest_digest == top_ref.sha256
+    with pytest.raises((AttributeError, TypeError)):
+        object.__setattr__(verifier[0], "store", object())
     with pytest.raises((TypeError, DefenderAttestationError)):
         type(attestation)(attestation.to_json())
     with pytest.raises((AttributeError, TypeError, DefenderAttestationError)):
@@ -419,3 +321,25 @@ def test_neutral_attestation_derives_loadable_rollback_evidence(
     )
     with pytest.raises(DefenderAttestationError, match="rollback"):
         verifier.attest(missing_ref)
+
+
+def test_public_hidden_boundary_never_exposes_restricted_payload_bytes() -> None:
+    """Removing the resolver must make payload exfiltration impossible by API use."""
+    import apar.evaluation_hidden.defense_authority as authority_module
+
+    assert not hasattr(authority_module, "resolve_hidden_release")
+    assert not hasattr(authority_module, "ResolvedHiddenEvaluation")
+    assert not hasattr(authority_module, "_AUTHORITIES")
+    assert not hasattr(authority_module, "_CAPABILITIES")
+    assert not hasattr(authority_module, "_REQUESTS")
+
+
+def test_verified_attestation_is_not_a_bytes_subtype(
+    bundle_fixture: BundleFixture,
+) -> None:
+    """A bytes constructor bypass must not produce the verifier's proof type."""
+    _, _, verifier, attestation = _attested(bundle_fixture)
+
+    assert not isinstance(attestation, bytes)
+    forged = bytes(attestation.to_json())
+    assert not verifier.verify(forged)
