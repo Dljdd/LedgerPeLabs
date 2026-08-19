@@ -611,9 +611,9 @@ class _IncrementalGraph:
     def canonical_roots(self, roots: set[str] | frozenset[str]) -> frozenset[str]:
         return frozenset(self.find(root) for root in roots)
 
-    def attach_case(self, case_id: str, roots: set[str] | frozenset[str]) -> None:
+    def bind_case(self, case_id: str, roots: set[str] | frozenset[str]) -> None:
         for root in self.canonical_roots(roots):
-            self._components[root].case_ids.add(case_id)
+            self._components[root].case_ids = {case_id}
 
     def case_ids(self, roots: set[str] | frozenset[str]) -> set[str]:
         result: set[str] = set()
@@ -797,7 +797,7 @@ def _group_validated(
                 row = observation_by_id[event_id]
                 anchor.actor_ids.add(row.actor_id)
                 anchor.counterparty_ids.add(row.counterparty_id)
-            graph.attach_case(anchor.case_id, member_roots)
+            graph.bind_case(anchor.case_id, member_roots)
         position = end
 
     return tuple(

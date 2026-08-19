@@ -333,3 +333,14 @@ def test_queue_normalizes_datetime_overflow_and_bounds_configuration() -> None:
         simulate_case_queue((case(1, opened_at=near_limit),), QueueConfig())
     with pytest.raises(ValidationError, match="less than or equal"):
         QueueConfig(analyst_count=100_001)
+
+
+def test_report_loader_rejects_payload_before_unbounded_json_parse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from apar.cases import queue
+
+    monkeypatch.setattr(queue, "_MAX_QUEUE_PAYLOAD_BYTES", 64)
+
+    with pytest.raises(QueueContractError, match="payload|resource"):
+        QueueReport.from_json(b"x" * 65)

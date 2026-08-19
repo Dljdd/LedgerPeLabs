@@ -22,6 +22,7 @@ class QueueContractError(ValueError):
 _MAX_QUEUE_ROWS = 100_000
 _MAX_ANALYST_COUNT = 100_000
 _MAX_MINUTES = 1_000_000
+_MAX_QUEUE_PAYLOAD_BYTES = 64 * 1024 * 1024
 
 
 class QueueConfig(ExternalContract):
@@ -213,6 +214,10 @@ class QueueReport(ExternalContract):
     @classmethod
     def from_json(cls, payload: bytes) -> QueueReport:
         """Load exact canonical JSON and revalidate every derived field."""
+        if type(payload) is not bytes:
+            raise QueueContractError("queue report payload must be exact bytes")
+        if len(payload) > _MAX_QUEUE_PAYLOAD_BYTES:
+            raise QueueContractError("queue report payload exceeds frozen resource cap")
         try:
             document = strict_json_loads(payload)
             if type(document) is not dict:

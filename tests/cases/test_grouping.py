@@ -22,6 +22,7 @@ from apar.cases import (
 from apar.contracts.decisions import Action
 from apar.defense.policy import DefenseDecision, OperatingBudget
 from apar.defense.thresholds import select_policy_thresholds
+from apar.runs.wire import canonical_json_bytes
 from tests.cases.conftest import NOW, decision, observation
 
 
@@ -227,6 +228,13 @@ def test_equal_time_available_edge_is_excluded_from_graph() -> None:
 
     assert len(boundary) == 2
     assert len(visible) == 1
+    boundary_first = next(
+        case for case in boundary if "alert-a" in case.event_ids
+    ).alert_evidence[0]
+    visible_first = visible[0].alert_evidence[0]
+    assert canonical_json_bytes(
+        boundary_first.model_dump(mode="json")
+    ) == canonical_json_bytes(visible_first.model_dump(mode="json"))
 
 
 @pytest.mark.parametrize(
@@ -583,6 +591,73 @@ def test_grouping_visits_each_graph_observation_once(monkeypatch: pytest.MonkeyP
 
     assert len(group_cases(rows, decisions, as_of=rows[-1].decision_at)) == row_count
     assert visits == row_count
+
+
+def test_merged_case_index_does_not_rescan_stale_aliases_per_later_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from apar.cases import grouping
+
+    isolated_count = 100
+    bridge_at = NOW + timedelta(minutes=1)
+    merge_at = NOW + timedelta(minutes=2)
+    later_at = NOW + timedelta(minutes=3)
+    isolated = tuple(
+        observation(
+            f"isolated-{index:03d}",
+            actor_id=f"actor-{index:03d}",
+            counterparty_id=f"merchant-{index:03d}",
+        )
+        for index in range(isolated_count)
+    )
+    bridges = tuple(
+        observation(
+            f"bridge-{index:03d}",
+            actor_id=f"actor-{index:03d}",
+            counterparty_id=f"merchant-{index + 1:03d}",
+            decision_at=bridge_at,
+        )
+        for index in range(isolated_count - 1)
+    )
+    merger = observation(
+        "merger",
+        actor_id="actor-000",
+        counterparty_id="merchant-000",
+        decision_at=merge_at,
+    )
+    later = tuple(
+        observation(
+            f"later-{index:03d}",
+            actor_id="actor-000",
+            counterparty_id="merchant-000",
+            decision_at=later_at + timedelta(microseconds=index),
+        )
+        for index in range(isolated_count)
+    )
+    rows = isolated + bridges + (merger,) + later
+    decisions = (
+        tuple(decision(row.event_id) for row in isolated)
+        + tuple(decision(row.event_id, action=Action.APPROVE) for row in bridges)
+        + (decision("merger"),)
+        + tuple(decision(row.event_id) for row in later)
+    )
+    lookup_ids = 0
+    original = grouping._IncrementalGraph.case_ids
+
+    def counted(
+        graph: object, roots: set[str] | frozenset[str]
+    ) -> set[str]:
+        nonlocal lookup_ids
+        result = original(graph, roots)  # type: ignore[arg-type]
+        lookup_ids += len(result)
+        return result
+
+    monkeypatch.setattr(grouping._IncrementalGraph, "case_ids", counted)
+
+    grouped = group_cases(rows, decisions, as_of=later[-1].decision_at)
+
+    assert len(grouped) == 1
+    assert lookup_ids <= isolated_count * 3
 
 
 def test_1500_isolated_grouping_meets_frozen_benchmark_ceiling() -> None:
