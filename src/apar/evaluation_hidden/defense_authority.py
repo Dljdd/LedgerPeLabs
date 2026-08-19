@@ -2,6 +2,7 @@
 
 from apar.evaluation_hidden.authority_core import (
     HIDDEN_CONTEXT_MEDIA_TYPE,
+    HIDDEN_EVALUATION_RECEIPT_MEDIA_TYPE,
     HIDDEN_FREEZE_RECEIPT_MEDIA_TYPE,
     HiddenArmEvidenceBinding,
     HiddenBoundaryError,
@@ -10,6 +11,7 @@ from apar.evaluation_hidden.authority_core import (
     HiddenEvaluationAuthority,
     HiddenEvaluationCapability,
     HiddenEvaluationReceipt,
+    HiddenReplayOutcome,
 )
 from apar.evaluation_hidden.import_audit import (
     HiddenImportAudit,
@@ -18,6 +20,7 @@ from apar.evaluation_hidden.import_audit import (
 
 __all__ = [
     "HIDDEN_CONTEXT_MEDIA_TYPE",
+    "HIDDEN_EVALUATION_RECEIPT_MEDIA_TYPE",
     "HIDDEN_FREEZE_RECEIPT_MEDIA_TYPE",
     "HiddenArmEvidenceBinding",
     "HiddenBoundaryError",
@@ -26,6 +29,7 @@ __all__ = [
     "HiddenEvaluationAuthority",
     "HiddenEvaluationCapability",
     "HiddenEvaluationReceipt",
+    "HiddenReplayOutcome",
     "HiddenImportAudit",
     "audit_hidden_import_boundary",
 ]

@@ -5,15 +5,13 @@ from __future__ import annotations
 import base64
 import hashlib
 import secrets
+import threading
 from datetime import datetime
-from typing import Any, Literal, Never, Protocol, cast
+from pathlib import Path
+from typing import Any, Literal, NamedTuple, Never, Protocol, cast
 
 from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import (
-    Ed25519PrivateKey,
-    Ed25519PublicKey,
-)
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from pydantic import ValidationError, field_validator, model_validator
 
 from apar.contracts._validation import ExternalContract, validate_utc_timestamp
@@ -21,12 +19,27 @@ from apar.evaluation.defender_attestation import (
     DefenderBundleVerifier,
     VerifiedDefenderAttestation,
 )
+from apar.evaluation.gates import (
+    EvaluatorReplayVerifier,
+    EvaluatorSigningIdentity,
+    HiddenPublicProof,
+    ReplayResult,
+    VerifiedReplayBatch,
+)
+from apar.evaluation_hidden.worker_client import (
+    EvaluatorWorkerClient,
+    EvaluatorWorkerManifest,
+    HiddenWorkerError,
+)
 from apar.runs.wire import WireContractError, canonical_json_bytes, strict_json_loads
 from apar.storage.artifacts import ArtifactRef, ArtifactStore
 
 HIDDEN_CONTEXT_MEDIA_TYPE = "application/vnd.apar.hidden-evaluation-context+json"
 HIDDEN_FREEZE_RECEIPT_MEDIA_TYPE = (
     "application/vnd.apar.hidden-decision-freeze-receipt+json"
+)
+HIDDEN_EVALUATION_RECEIPT_MEDIA_TYPE = (
+    "application/vnd.apar.hidden-evaluation-receipt+json"
 )
 _MAX_HIDDEN_BYTES = 64 * 1024 * 1024
 _MAX_RECEIPT_BYTES = 256 * 1024
@@ -36,6 +49,17 @@ _OBJECT_TOKEN = object()
 
 class HiddenBoundaryError(ValueError):
     """A hidden-evaluation caller violated the sealed lifecycle."""
+
+
+class HiddenReplayOutcome(NamedTuple):
+    """Public aggregate-only result of one isolated hidden evaluation."""
+
+    batch: VerifiedReplayBatch
+    public_proof: HiddenPublicProof
+
+    @property
+    def results(self) -> tuple[ReplayResult, ...]:
+        return self.batch.results
 
 
 class HiddenDecisionBinding(ExternalContract):
@@ -167,7 +191,7 @@ class HiddenDecisionFreezeReceipt(ExternalContract):
 class HiddenEvaluationReceipt(ExternalContract):
     """Signed aggregate-only proof of evaluator use after the decision freeze."""
 
-    schema_version: Literal["2.0.0"] = "2.0.0"
+    schema_version: Literal["3.1.0"] = "3.1.0"
     capability_digest: str
     defender_attestation_digest: str
     defender_top_ref_digest: str
@@ -176,9 +200,14 @@ class HiddenEvaluationReceipt(ExternalContract):
     restricted_artifact_digest: str
     canonical_content_digest: str
     evaluator_context_digest: str
+    restricted_cohort_mapping_digest: str
     descriptor_lineage_digest: str
     decision_freeze_receipt_digest: str
     decision_freeze_ref_digest: str
+    decision_bindings_digest: str
+    replay_batch_digest: str
+    worker_manifest_digest: str
+    public_proof_id: str
     release_sequence: int
     released_at: datetime
     sealed_at: datetime
@@ -197,9 +226,13 @@ class HiddenEvaluationReceipt(ExternalContract):
         "restricted_artifact_digest",
         "canonical_content_digest",
         "evaluator_context_digest",
+        "restricted_cohort_mapping_digest",
         "descriptor_lineage_digest",
         "decision_freeze_receipt_digest",
         "decision_freeze_ref_digest",
+        "decision_bindings_digest",
+        "replay_batch_digest",
+        "worker_manifest_digest",
         "signer_key_id",
         "receipt_digest",
     )
@@ -227,6 +260,18 @@ class HiddenEvaluationReceipt(ExternalContract):
     def evidence_is_tuple(cls, value: object) -> object:
         if type(value) is not tuple:
             raise ValueError("hidden arm evidence must be an exact tuple")
+        return value
+
+    @field_validator("public_proof_id")
+    @classmethod
+    def proof_id_is_opaque(cls, value: str) -> str:
+        if (
+            type(value) is not str
+            or not value.startswith("hpf_")
+            or len(value) != 36
+            or any(character not in "0123456789abcdef" for character in value[4:])
+        ):
+            raise ValueError("hidden receipt public proof ID is invalid")
         return value
 
     @model_validator(mode="after")
@@ -299,10 +344,11 @@ class HiddenEvaluationAuthority(metaclass=_SealedType):
         cls,
         verifier: DefenderBundleVerifier,
         restricted_store: ArtifactStore,
+        evaluator_signer: EvaluatorSigningIdentity,
     ) -> HiddenEvaluationAuthority:
         if cls is not HiddenEvaluationAuthority:
             raise HiddenBoundaryError("hidden authority cannot be constructed externally")
-        return _new_authority(verifier, restricted_store)
+        return _new_authority(verifier, restricted_store, evaluator_signer)
 
     def __setattr__(self, name: str, value: object) -> None:
         del name, value
@@ -325,34 +371,40 @@ class HiddenEvaluationAuthority(metaclass=_SealedType):
 
 class _HiddenProductView(Protocol):
     evaluator_context_digest: str
+    restricted_cohort_mapping_digest: str
     evaluation_lineage_digest: str
 
 
 def _new_authority(
     verifier: DefenderBundleVerifier,
     restricted_store: ArtifactStore,
+    evaluator_signer: EvaluatorSigningIdentity,
 ) -> HiddenEvaluationAuthority:
     if type(verifier) is not DefenderBundleVerifier:
         raise HiddenBoundaryError("hidden authority requires the exact neutral verifier")
     if type(restricted_store) is not ArtifactStore:
         raise HiddenBoundaryError("hidden authority requires an exact restricted store")
+    if not EvaluatorSigningIdentity.is_exact(evaluator_signer):
+        raise HiddenBoundaryError("hidden authority requires an exact evaluator signer")
 
     trusted_verifier = verifier
     trusted_store = restricted_store
-    signing_key = Ed25519PrivateKey.generate()
-    public_key = signing_key.public_key().public_bytes(
-        serialization.Encoding.Raw, serialization.PublicFormat.Raw
-    )
-    public_key_base64 = base64.b64encode(public_key).decode("ascii")
-    signer_key_id = hashlib.sha256(public_key).hexdigest()
+    trusted_signer = evaluator_signer
+    evaluator_verifier = EvaluatorReplayVerifier.from_signer(trusted_signer)
+    worker_manifest = EvaluatorWorkerManifest.create(trusted_signer)
+    worker_client = EvaluatorWorkerClient(worker_manifest, evaluator_verifier)
+    public_key_base64 = trusted_signer.public_key_base64
+    signer_key_id = trusted_signer.key_id
     initialized = False
+    authority_instance: HiddenEvaluationAuthority | None = None
     active_capability: HiddenEvaluationCapability | None = None
     active_attestation: VerifiedDefenderAttestation | None = None
     capability_digest: str | None = None
     capability_issued_at: datetime | None = None
     release_sequence = 0
-    consumed_invocations: tuple[str, ...] = ()
-    issued_receipts: tuple[HiddenEvaluationReceipt, ...] = ()
+    lifecycle = "READY"
+    issuance_state = "UNISSUED"
+    lifecycle_lock = threading.Lock()
 
     class _BoundCapability(HiddenEvaluationCapability):
         __slots__ = ()
@@ -397,20 +449,24 @@ def _new_authority(
             cls,
             verifier: DefenderBundleVerifier,
             restricted_store: ArtifactStore,
+            evaluator_signer: EvaluatorSigningIdentity,
         ) -> _BoundAuthority:
-            del cls, verifier, restricted_store
+            del cls, verifier, restricted_store, evaluator_signer
             raise HiddenBoundaryError("hidden authority cannot be constructed externally")
 
         def __init__(
             self,
             verifier: DefenderBundleVerifier,
             restricted_store: ArtifactStore,
+            evaluator_signer: EvaluatorSigningIdentity,
         ) -> None:
             nonlocal initialized
             if (
                 initialized
+                or self is not authority_instance
                 or verifier is not trusted_verifier
                 or restricted_store is not trusted_store
+                or evaluator_signer is not trusted_signer
             ):
                 raise HiddenBoundaryError("hidden authority is already initialized")
             initialized = True
@@ -423,32 +479,51 @@ def _new_authority(
         ) -> HiddenEvaluationCapability:
             nonlocal active_capability, active_attestation
             nonlocal capability_digest, capability_issued_at
-            if active_capability is not None:
-                raise HiddenBoundaryError("hidden authority is already frozen")
-            if (
-                type(attestation) is not VerifiedDefenderAttestation
-                or not trusted_verifier.verify(attestation)
-            ):
-                raise HiddenBoundaryError(
-                    "hidden release requires an exact verified signed defender attestation"
+            nonlocal issuance_state
+            if self is not authority_instance:
+                raise HiddenBoundaryError("hidden authority instance identity is invalid")
+            with lifecycle_lock:
+                if issuance_state != "UNISSUED" or active_capability is not None:
+                    raise HiddenBoundaryError("hidden authority is already frozen")
+                issuance_state = "ISSUING"
+            try:
+                if (
+                    type(attestation) is not VerifiedDefenderAttestation
+                    or not trusted_verifier.verify(attestation)
+                ):
+                    raise HiddenBoundaryError(
+                        "hidden release requires an exact verified signed defender attestation"
+                    )
+                checked_at = _utc(issued_at, label="hidden capability issue time")
+                if attestation.frozen_at > checked_at:
+                    raise HiddenBoundaryError(
+                        "defender freeze follows hidden capability issue"
+                    )
+                next_digest = _digest_document(
+                    {
+                        "schema_version": "2.0.0",
+                        "attestation_digest": attestation.attestation_digest,
+                        "bundle_manifest_digest": attestation.bundle_manifest_digest,
+                        "bundle_id": attestation.bundle_id,
+                        "issued_at": _time_wire(checked_at),
+                        "nonce": secrets.token_hex(32),
+                    }
                 )
-            checked_at = _utc(issued_at, label="hidden capability issue time")
-            if attestation.frozen_at > checked_at:
-                raise HiddenBoundaryError("defender freeze follows hidden capability issue")
-            active_attestation = attestation
-            capability_issued_at = checked_at
-            capability_digest = _digest_document(
-                {
-                    "schema_version": "2.0.0",
-                    "attestation_digest": attestation.attestation_digest,
-                    "bundle_manifest_digest": attestation.bundle_manifest_digest,
-                    "bundle_id": attestation.bundle_id,
-                    "issued_at": _time_wire(checked_at),
-                    "nonce": secrets.token_hex(32),
-                }
-            )
-            active_capability = _BoundCapability(_OBJECT_TOKEN)
-            return active_capability
+                next_capability = _BoundCapability(_OBJECT_TOKEN)
+            except BaseException:
+                with lifecycle_lock:
+                    if issuance_state == "ISSUING":
+                        issuance_state = "UNISSUED"
+                raise
+            with lifecycle_lock:
+                if issuance_state != "ISSUING" or active_capability is not None:
+                    raise HiddenBoundaryError("hidden capability issuance was lost")
+                active_attestation = attestation
+                capability_issued_at = checked_at
+                capability_digest = next_digest
+                active_capability = next_capability
+                issuance_state = "FROZEN"
+                return active_capability
 
         def evaluate_hidden_replay(
             self,
@@ -459,113 +534,373 @@ def _new_authority(
             released_at: datetime,
             sealed_at: datetime,
         ) -> object:
-            nonlocal release_sequence, consumed_invocations, issued_receipts
-            if active_capability is None or active_attestation is None:
-                raise HiddenBoundaryError("restricted refs require a frozen defender")
-            if capability is not active_capability or type(capability) is not _BoundCapability:
-                raise HiddenBoundaryError("hidden capability identity is invalid")
-            if not trusted_verifier.verify(active_attestation):
-                raise HiddenBoundaryError("active defender attestation no longer verifies")
-            ref = _restricted_ref(restricted_ref)
-            release_time = _utc(released_at, label="hidden release time")
-            seal_time = _utc(sealed_at, label="hidden seal time")
-            assert capability_issued_at is not None
-            if release_time < capability_issued_at or seal_time < release_time:
-                raise HiddenBoundaryError("hidden release timestamps are out of order")
-            if release_sequence >= _MAX_RELEASES:
-                raise HiddenBoundaryError("hidden release cap is exhausted")
-
-            # Importing the evaluator surface here preserves the package boundary and
-            # gives callers no callback through which restricted bytes could escape.
-            from apar.evaluation import replay as replay_module
-
-            frozen = replay_module._freeze_hidden_invocation(
-                invocation,
-                pinned_verifier=trusted_verifier,
-                pinned_attestation=active_attestation,
-            )
-            invocation_digest = replay_module._hidden_invocation_digest(frozen)
-            if invocation_digest in consumed_invocations:
-                raise HiddenBoundaryError("hidden replay invocation is already consumed")
-            decisions = replay_module._hidden_decision_bindings(frozen)
-            sequence = release_sequence + 1
-            freeze_receipt = _sign_freeze_receipt(
-                signing_key,
-                signer_key_id=signer_key_id,
-                public_key_base64=public_key_base64,
-                capability_digest=cast(str, capability_digest),
-                attestation=active_attestation,
-                restricted_ref=ref,
-                invocation_digest=invocation_digest,
-                release_sequence=sequence,
-                released_at=release_time,
-                frozen_at=seal_time,
-                decisions=decisions,
-            )
-            # Persistence is part of the release condition and happens before the
-            # first restricted read. A failed write therefore cannot release truth.
-            freeze_ref = trusted_store.put_bytes(
-                freeze_receipt.to_json(), HIDDEN_FREEZE_RECEIPT_MEDIA_TYPE
-            )
+            nonlocal release_sequence, lifecycle
+            if self is not authority_instance:
+                raise HiddenBoundaryError("hidden authority instance identity is invalid")
+            reserved_here = False
             try:
-                payload = trusted_store.read(ref)
-            except Exception as error:
-                raise HiddenBoundaryError(
-                    "restricted reference is invalid for the pinned store"
-                ) from error
-            if type(payload) is not bytes or not 0 < len(payload) <= _MAX_HIDDEN_BYTES:
-                raise HiddenBoundaryError("restricted hidden payload violates resource limits")
-            try:
-                document = strict_json_loads(payload)
-            except WireContractError as error:
-                raise HiddenBoundaryError(
-                    "restricted hidden payload is not canonical JSON"
-                ) from error
-            if canonical_json_bytes(document) != payload:
-                raise HiddenBoundaryError("restricted hidden payload is not canonical JSON")
+                with lifecycle_lock:
+                    if lifecycle != "READY":
+                        raise HiddenBoundaryError(
+                            "hidden replay capability is already reserved or consumed"
+                        )
+                    lifecycle = "RESERVED"
+                    reserved_here = True
+                    sequence = release_sequence + 1
+                if active_capability is None or active_attestation is None:
+                    raise HiddenBoundaryError("restricted refs require a frozen defender")
+                if capability is not active_capability or type(capability) is not _BoundCapability:
+                    raise HiddenBoundaryError("hidden capability identity is invalid")
+                if not trusted_verifier.verify(active_attestation):
+                    raise HiddenBoundaryError("active defender attestation no longer verifies")
+                ref = _restricted_ref(restricted_ref)
+                release_time = _utc(released_at, label="hidden release time")
+                seal_time = _utc(sealed_at, label="hidden seal time")
+                assert capability_issued_at is not None
+                if release_time < capability_issued_at or seal_time < release_time:
+                    raise HiddenBoundaryError("hidden release timestamps are out of order")
+                if sequence > _MAX_RELEASES:
+                    raise HiddenBoundaryError("hidden release cap is exhausted")
 
-            product = replay_module._evaluate_hidden_frozen(frozen, payload)
-            evidence = replay_module._hidden_product_evidence(product)
-            receipt = _sign_evaluation_receipt(
-                signing_key,
-                signer_key_id=signer_key_id,
-                public_key_base64=public_key_base64,
-                capability_digest=cast(str, capability_digest),
-                attestation=active_attestation,
-                restricted_ref=ref,
-                payload=payload,
-                product=product,
-                freeze_receipt=freeze_receipt,
-                freeze_ref=freeze_ref,
-                release_sequence=sequence,
-                released_at=release_time,
-                sealed_at=seal_time,
-                arm_evidence=evidence,
-            )
-            outcome = replay_module._finalize_hidden_product(
-                product,
-                receipt,
-                freeze_receipt=freeze_receipt,
-                freeze_ref=freeze_ref,
-            )
-            consumed_invocations = (*consumed_invocations, invocation_digest)
-            issued_receipts = (*issued_receipts, receipt)
-            release_sequence = sequence
-            return outcome
+                from apar.evaluation import replay as replay_module
 
-        def receipt_from_json(self, payload: bytes) -> HiddenEvaluationReceipt:
-            candidate = HiddenEvaluationReceipt.from_json(payload)
-            if (
-                candidate.signer_key_id != signer_key_id
-                or candidate.public_key_base64 != public_key_base64
-            ):
-                raise HiddenBoundaryError("hidden receipt signer is not this authority")
-            for receipt in issued_receipts:
-                if candidate.receipt_digest == receipt.receipt_digest:
-                    return receipt
-            raise HiddenBoundaryError("hidden receipt is not active for this authority")
+                frozen = replay_module._freeze_hidden_invocation(
+                    invocation,
+                    pinned_verifier=trusted_verifier,
+                    pinned_attestation=active_attestation,
+                )
+                proof_id = "hpf_" + secrets.token_hex(16)
+                frozen_document = replay_module._hidden_worker_frozen_document(
+                    frozen, proof_id=proof_id
+                )
+                invocation_digest = _digest_document(frozen_document)
+                decisions = replay_module._hidden_decision_bindings(frozen)
+                decision_bindings_digest = _digest_document(
+                    [item.model_dump(mode="json") for item in decisions]
+                )
+                freeze_receipt = _sign_freeze_receipt(
+                    trusted_signer,
+                    signer_key_id=signer_key_id,
+                    public_key_base64=public_key_base64,
+                    capability_digest=cast(str, capability_digest),
+                    attestation=active_attestation,
+                    restricted_ref=ref,
+                    invocation_digest=invocation_digest,
+                    release_sequence=sequence,
+                    released_at=release_time,
+                    frozen_at=seal_time,
+                    decisions=decisions,
+                )
+                freeze_ref = trusted_store.put_bytes(
+                    freeze_receipt.to_json(), HIDDEN_FREEZE_RECEIPT_MEDIA_TYPE
+                )
+                with lifecycle_lock:
+                    if lifecycle != "RESERVED":
+                        raise HiddenBoundaryError("hidden lifecycle reservation was lost")
+                    lifecycle = "CONSUMED"
+                    release_sequence = sequence
+                request = {
+                    "schema_version": "1.0.0",
+                    "store_root": str(trusted_store.validated_worker_root()),
+                    "restricted_ref": _ref_document(ref),
+                    "frozen": frozen_document,
+                    "freeze_receipt_base64": base64.b64encode(
+                        freeze_receipt.to_json()
+                    ).decode("ascii"),
+                    "freeze_ref": _ref_document(freeze_ref),
+                    "signer_private_seed_base64": base64.b64encode(
+                        trusted_signer._worker_private_bytes()
+                    ).decode("ascii"),
+                    "worker_manifest_digest": worker_manifest.manifest_digest,
+                    "decision_bindings_digest": decision_bindings_digest,
+                    "capability_digest": cast(str, capability_digest),
+                    "defender_attestation_digest": active_attestation.attestation_digest,
+                    "defender_top_ref_digest": active_attestation.top_ref.sha256,
+                    "bundle_manifest_digest": active_attestation.bundle_manifest_digest,
+                    "release_sequence": sequence,
+                    "released_at": _time_wire(release_time),
+                    "sealed_at": _time_wire(seal_time),
+                }
+                response = worker_client.invoke(request)
+                outcome = _public_outcome_from_worker(
+                    response,
+                    verifier=evaluator_verifier,
+                    proof_id=proof_id,
+                    worker_manifest_digest=worker_manifest.manifest_digest,
+                    decision_bindings_digest=decision_bindings_digest,
+                    attestation=active_attestation,
+                )
+                return outcome
+            except HiddenBoundaryError:
+                raise
+            except (HiddenWorkerError, TypeError) as error:
+                raise HiddenBoundaryError("isolated hidden evaluation failed closed") from error
+            finally:
+                with lifecycle_lock:
+                    if reserved_here and lifecycle == "RESERVED":
+                        lifecycle = "CONSUMED"
+                        release_sequence = max(release_sequence, 1)
 
-    return cast(HiddenEvaluationAuthority, object.__new__(_BoundAuthority))
+    authority_instance = cast(
+        HiddenEvaluationAuthority, object.__new__(_BoundAuthority)
+    )
+    return authority_instance
+
+
+class _WorkerAttestationView(NamedTuple):
+    attestation_digest: str
+    top_ref: ArtifactRef
+    bundle_manifest_digest: str
+
+
+def _isolated_worker_main(document: object) -> dict[str, object]:
+    """Resolve and evaluate restricted truth only inside the pinned worker process."""
+    if type(document) is not dict:
+        raise HiddenBoundaryError("isolated worker request must be an exact object")
+    request = cast(dict[str, object], document)
+    expected = {
+        "schema_version",
+        "store_root",
+        "restricted_ref",
+        "frozen",
+        "freeze_receipt_base64",
+        "freeze_ref",
+        "signer_private_seed_base64",
+        "worker_manifest_digest",
+        "decision_bindings_digest",
+        "capability_digest",
+        "defender_attestation_digest",
+        "defender_top_ref_digest",
+        "bundle_manifest_digest",
+        "release_sequence",
+        "released_at",
+        "sealed_at",
+    }
+    if set(request) != expected or request["schema_version"] != "1.0.0":
+        raise HiddenBoundaryError("isolated worker request field set is invalid")
+    capability_digest = _exact_digest_field(request["capability_digest"])
+    attestation_digest = _exact_digest_field(
+        request["defender_attestation_digest"]
+    )
+    top_ref_digest = _exact_digest_field(request["defender_top_ref_digest"])
+    bundle_manifest_digest = _exact_digest_field(
+        request["bundle_manifest_digest"]
+    )
+    worker_manifest_digest = _exact_digest_field(request["worker_manifest_digest"])
+    release_sequence = _exact_release_sequence(request["release_sequence"])
+    released_at_wire = _exact_time_wire(request["released_at"])
+    sealed_at_wire = _exact_time_wire(request["sealed_at"])
+    seed = _decode_base64_exact(
+        request["signer_private_seed_base64"], expected_size=32
+    )
+    signer = EvaluatorSigningIdentity.from_private_bytes(seed)
+    verifier = EvaluatorReplayVerifier.from_signer(signer)
+    freeze_payload = _decode_base64_bounded(
+        request["freeze_receipt_base64"], maximum=_MAX_RECEIPT_BYTES
+    )
+    freeze_receipt = HiddenDecisionFreezeReceipt.from_json(freeze_payload)
+    if (
+        freeze_receipt.signer_key_id != signer.key_id
+        or freeze_receipt.public_key_base64 != signer.public_key_base64
+    ):
+        raise HiddenBoundaryError("isolated freeze receipt signer is invalid")
+    restricted_ref = _restricted_ref(_ref_from_document(request["restricted_ref"]))
+    freeze_ref = _ref_from_document(request["freeze_ref"])
+    if (
+        freeze_ref.media_type != HIDDEN_FREEZE_RECEIPT_MEDIA_TYPE
+        or freeze_ref.size_bytes != len(freeze_payload)
+        or freeze_ref.sha256 != hashlib.sha256(freeze_payload).hexdigest()
+        or freeze_receipt.restricted_ref_digest != _ref_digest(restricted_ref)
+        or freeze_receipt.capability_digest != capability_digest
+        or freeze_receipt.defender_attestation_digest
+        != attestation_digest
+        or freeze_receipt.defender_top_ref_digest != top_ref_digest
+        or freeze_receipt.bundle_manifest_digest != bundle_manifest_digest
+        or freeze_receipt.release_sequence != release_sequence
+        or _time_wire(freeze_receipt.released_at) != released_at_wire
+        or _time_wire(freeze_receipt.frozen_at) != sealed_at_wire
+        or freeze_receipt.invocation_digest != _digest_document(request["frozen"])
+    ):
+        raise HiddenBoundaryError("isolated freeze receipt bindings are invalid")
+    from apar.evaluation import replay as replay_module
+
+    decisions = replay_module._hidden_worker_decision_bindings_from_document(
+        request["frozen"]
+    )
+    decision_bindings_digest = _digest_document(
+        [item.model_dump(mode="json") for item in decisions]
+    )
+    if (
+        decisions != freeze_receipt.decisions
+        or decision_bindings_digest != request["decision_bindings_digest"]
+    ):
+        raise HiddenBoundaryError("isolated decision freeze does not verify")
+
+    store_root = request["store_root"]
+    if type(store_root) is not str or not store_root or len(store_root) > 4096:
+        raise HiddenBoundaryError("isolated artifact root is invalid")
+    store = ArtifactStore(Path(store_root))
+    if store.read(freeze_ref) != freeze_payload:
+        raise HiddenBoundaryError("persisted decision freeze receipt is inconsistent")
+    payload = store.read(restricted_ref)
+    if type(payload) is not bytes or not 0 < len(payload) <= _MAX_HIDDEN_BYTES:
+        raise HiddenBoundaryError("restricted hidden payload violates resource limits")
+    try:
+        parsed = strict_json_loads(payload)
+    except WireContractError as error:
+        raise HiddenBoundaryError("restricted hidden payload is not canonical JSON") from error
+    if canonical_json_bytes(parsed) != payload:
+        raise HiddenBoundaryError("restricted hidden payload is not canonical JSON")
+    product = replay_module._evaluate_hidden_worker_document(request["frozen"], payload)
+    if _time_wire(product.evaluator_as_of) != sealed_at_wire:
+        raise HiddenBoundaryError("hidden evaluator time differs from sealed release time")
+    results = tuple(item.result for item in product.evaluated)
+    batch = signer.sign_batch(results)
+    proof_id = results[0].hidden_public_proof_id
+    if proof_id is None:
+        raise HiddenBoundaryError("hidden evaluator omitted its public proof ID")
+    proof = HiddenPublicProof.create(
+        proof_id=proof_id,
+        replay_batch_digest=batch.batch_digest,
+        decision_bindings_digest=decision_bindings_digest,
+        bundle_manifest_digest=bundle_manifest_digest,
+        defender_top_ref_digest=top_ref_digest,
+        worker_manifest_digest=worker_manifest_digest,
+        evaluator_context_token=results[0].evaluation_context_digest,
+        cohort_mapping_token=(
+            results[0].evaluation_lineage.cohort_mapping_digest
+        ),
+        issued_at=sealed_at_wire,
+        signer=signer,
+    )
+    attestation_view = _WorkerAttestationView(
+        attestation_digest=attestation_digest,
+        top_ref=ArtifactRef(
+            sha256=top_ref_digest,
+            media_type="application/vnd.apar.defender-bundle+json",
+            size_bytes=1,
+            relative_path=f"{top_ref_digest}/payload",
+        ),
+        bundle_manifest_digest=bundle_manifest_digest,
+    )
+    receipt = _sign_evaluation_receipt(
+        signer,
+        signer_key_id=signer.key_id,
+        public_key_base64=signer.public_key_base64,
+        capability_digest=capability_digest,
+        attestation=cast(VerifiedDefenderAttestation, attestation_view),
+        restricted_ref=restricted_ref,
+        payload=payload,
+        product=product,
+        freeze_receipt=freeze_receipt,
+        freeze_ref=freeze_ref,
+        release_sequence=release_sequence,
+        released_at=freeze_receipt.released_at,
+        sealed_at=product.evaluator_as_of,
+        arm_evidence=tuple(item.hidden_evidence for item in product.evaluated),
+        decision_bindings_digest=decision_bindings_digest,
+        replay_batch_digest=batch.batch_digest,
+        worker_manifest_digest=worker_manifest_digest,
+        public_proof_id=proof.proof_id,
+    )
+    store.put_bytes(receipt.to_json(), HIDDEN_EVALUATION_RECEIPT_MEDIA_TYPE)
+    if not verifier.verify_batch(batch) or not verifier.verify_public_proof(proof):
+        raise HiddenBoundaryError("isolated aggregate signatures are invalid")
+    return {
+        "schema_version": "1.0.0",
+        "batch_base64": base64.b64encode(batch.to_json()).decode("ascii"),
+        "public_proof_base64": base64.b64encode(proof.to_json()).decode("ascii"),
+    }
+
+
+def _public_outcome_from_worker(
+    response: object,
+    *,
+    verifier: EvaluatorReplayVerifier,
+    proof_id: str,
+    worker_manifest_digest: str,
+    decision_bindings_digest: str,
+    attestation: VerifiedDefenderAttestation,
+) -> HiddenReplayOutcome:
+    if type(response) is not dict or set(response) != {
+        "schema_version",
+        "batch_base64",
+        "public_proof_base64",
+    } or response["schema_version"] != "1.0.0":
+        raise HiddenBoundaryError("isolated evaluator response field set is invalid")
+    batch = VerifiedReplayBatch.from_json(
+        _decode_base64_bounded(response["batch_base64"], maximum=32_000_000)
+    )
+    proof = HiddenPublicProof.from_json(
+        _decode_base64_bounded(response["public_proof_base64"], maximum=64_000)
+    )
+    if (
+        not verifier.verify_batch(batch)
+        or not verifier.verify_public_proof(proof)
+        or proof.proof_id != proof_id
+        or proof.replay_batch_digest != batch.batch_digest
+        or proof.worker_manifest_digest != worker_manifest_digest
+        or proof.decision_bindings_digest != decision_bindings_digest
+        or proof.bundle_manifest_digest != attestation.bundle_manifest_digest
+        or proof.defender_top_ref_digest != attestation.top_ref.sha256
+        or tuple(row.arm.value for row in batch.results) != _ARM_ORDER
+        or any(
+            row.hidden_public_proof_id != proof.proof_id
+            or row.evaluation.kind.value != "hidden"
+            or not row.assurance.hidden_access_clean
+            or row.evaluation_context_digest != proof.evaluator_context_token
+            or row.evaluation_lineage.cohort_mapping_digest
+            != proof.cohort_mapping_token
+            for row in batch.results
+        )
+    ):
+        raise HiddenBoundaryError("isolated evaluator aggregate proof is invalid")
+    return HiddenReplayOutcome(batch=batch, public_proof=proof)
+
+
+def _ref_document(ref: ArtifactRef) -> dict[str, object]:
+    return {
+        "sha256": ref.sha256,
+        "media_type": ref.media_type,
+        "size_bytes": ref.size_bytes,
+        "relative_path": ref.relative_path,
+    }
+
+
+def _ref_from_document(document: object) -> ArtifactRef:
+    if type(document) is not dict or set(document) != {
+        "sha256",
+        "media_type",
+        "size_bytes",
+        "relative_path",
+    }:
+        raise HiddenBoundaryError("isolated artifact reference is invalid")
+    values = cast(dict[str, object], document)
+    return ArtifactRef(
+        sha256=cast(str, values["sha256"]),
+        media_type=cast(str, values["media_type"]),
+        size_bytes=cast(int, values["size_bytes"]),
+        relative_path=cast(str, values["relative_path"]),
+    )
+
+
+def _decode_base64_exact(value: object, *, expected_size: int) -> bytes:
+    payload = _decode_base64_bounded(value, maximum=expected_size)
+    if len(payload) != expected_size:
+        raise HiddenBoundaryError("isolated base64 field has invalid size")
+    return payload
+
+
+def _decode_base64_bounded(value: object, *, maximum: int) -> bytes:
+    if type(value) is not str or not value or len(value) > maximum * 2:
+        raise HiddenBoundaryError("isolated base64 field violates bounds")
+    try:
+        payload = base64.b64decode(value, validate=True)
+    except (TypeError, ValueError) as error:
+        raise HiddenBoundaryError("isolated base64 field is invalid") from error
+    if not payload or len(payload) > maximum:
+        raise HiddenBoundaryError("isolated base64 field violates bounds")
+    return payload
 
 
 def _restricted_ref(ref: ArtifactRef) -> ArtifactRef:
@@ -580,7 +915,7 @@ def _restricted_ref(ref: ArtifactRef) -> ArtifactRef:
 
 
 def _sign_freeze_receipt(
-    key: Ed25519PrivateKey,
+    signer: EvaluatorSigningIdentity,
     *,
     signer_key_id: str,
     public_key_base64: str,
@@ -609,12 +944,12 @@ def _sign_freeze_receipt(
     }
     return cast(
         HiddenDecisionFreezeReceipt,
-        _signed_contract(HiddenDecisionFreezeReceipt, fields, key),
+        _signed_contract(HiddenDecisionFreezeReceipt, fields, signer),
     )
 
 
 def _sign_evaluation_receipt(
-    key: Ed25519PrivateKey,
+    signer: EvaluatorSigningIdentity,
     *,
     signer_key_id: str,
     public_key_base64: str,
@@ -629,6 +964,10 @@ def _sign_evaluation_receipt(
     released_at: datetime,
     sealed_at: datetime,
     arm_evidence: tuple[HiddenArmEvidenceBinding, ...],
+    decision_bindings_digest: str,
+    replay_batch_digest: str,
+    worker_manifest_digest: str,
+    public_proof_id: str,
 ) -> HiddenEvaluationReceipt:
     product_view = cast(_HiddenProductView, product)
     context_digest = product_view.evaluator_context_digest
@@ -642,9 +981,16 @@ def _sign_evaluation_receipt(
         "restricted_artifact_digest": restricted_ref.sha256,
         "canonical_content_digest": hashlib.sha256(payload).hexdigest(),
         "evaluator_context_digest": context_digest,
+        "restricted_cohort_mapping_digest": (
+            product_view.restricted_cohort_mapping_digest
+        ),
         "descriptor_lineage_digest": lineage_digest,
         "decision_freeze_receipt_digest": freeze_receipt.receipt_digest,
         "decision_freeze_ref_digest": freeze_ref.sha256,
+        "decision_bindings_digest": decision_bindings_digest,
+        "replay_batch_digest": replay_batch_digest,
+        "worker_manifest_digest": worker_manifest_digest,
+        "public_proof_id": public_proof_id,
         "release_sequence": release_sequence,
         "released_at": released_at,
         "sealed_at": sealed_at,
@@ -654,21 +1000,21 @@ def _sign_evaluation_receipt(
     }
     return cast(
         HiddenEvaluationReceipt,
-        _signed_contract(HiddenEvaluationReceipt, fields, key),
+        _signed_contract(HiddenEvaluationReceipt, fields, signer),
     )
 
 
 def _signed_contract(
     contract_type: type[HiddenDecisionFreezeReceipt] | type[HiddenEvaluationReceipt],
     fields: dict[str, object],
-    key: Ed25519PrivateKey,
+    signer: EvaluatorSigningIdentity,
 ) -> HiddenDecisionFreezeReceipt | HiddenEvaluationReceipt:
     unsigned = cast(Any, contract_type).model_construct(
         **fields,
         signature_base64="",
         receipt_digest="0" * 64,
     ).model_dump(mode="json", exclude={"signature_base64", "receipt_digest"})
-    signature = base64.b64encode(key.sign(canonical_json_bytes(unsigned))).decode("ascii")
+    signature = signer._sign(unsigned)
     digest = _digest_document({**unsigned, "signature_base64": signature})
     return contract_type.model_validate(
         {**fields, "signature_base64": signature, "receipt_digest": digest}
@@ -771,11 +1117,39 @@ def _validate_digest(value: str) -> None:
         raise ValueError("hidden evidence digest must be lowercase SHA-256")
 
 
+def _exact_digest_field(value: object) -> str:
+    if type(value) is not str:
+        raise HiddenBoundaryError("isolated digest field must be an exact string")
+    try:
+        _validate_digest(value)
+    except ValueError as error:
+        raise HiddenBoundaryError("isolated digest field is invalid") from error
+    return value
+
+
+def _exact_release_sequence(value: object) -> int:
+    if type(value) is not int or not 1 <= value <= _MAX_RELEASES:
+        raise HiddenBoundaryError("isolated release sequence is invalid")
+    return value
+
+
+def _exact_time_wire(value: object) -> str:
+    if (
+        type(value) is not str
+        or not value.endswith("Z")
+        or "T" not in value
+        or len(value) > 40
+    ):
+        raise HiddenBoundaryError("isolated timestamp wire value is invalid")
+    return value
+
+
 _ARM_ORDER = ("rules_only", "gbdt_only", "layered_hybrid")
 
 
 __all__ = [
     "HIDDEN_CONTEXT_MEDIA_TYPE",
+    "HIDDEN_EVALUATION_RECEIPT_MEDIA_TYPE",
     "HIDDEN_FREEZE_RECEIPT_MEDIA_TYPE",
     "HiddenArmEvidenceBinding",
     "HiddenBoundaryError",
@@ -784,4 +1158,5 @@ __all__ = [
     "HiddenEvaluationAuthority",
     "HiddenEvaluationCapability",
     "HiddenEvaluationReceipt",
+    "HiddenReplayOutcome",
 ]

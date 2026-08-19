@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import math
+from collections.abc import Iterator
 from decimal import ROUND_HALF_EVEN, Context, Decimal, localcontext
 from enum import StrEnum
-from typing import Any, Literal, cast
+from typing import Any, Literal, Never, cast
+from weakref import WeakKeyDictionary
 
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
 from pydantic import Field, ValidationError, field_validator, model_validator
 
 from apar.contracts._validation import ExternalContract
@@ -386,7 +396,7 @@ class ReplayFailure(ExternalContract):
 class ReplayResult(ExternalContract):
     """Aggregate public replay evidence; restricted truth never enters this model."""
 
-    schema_version: Literal["1.1.0"] = "1.1.0"
+    schema_version: Literal["1.2.0"] = "1.2.0"
     arm: DefenseArm
     evaluation: EvaluationDescriptor
     evaluation_lineage: EvaluationLineage
@@ -400,7 +410,7 @@ class ReplayResult(ExternalContract):
     bundle_manifest_digest: str
     case_callback_digest: str
     evaluation_context_digest: str
-    hidden_release_receipt_digest: str | None
+    hidden_public_proof_id: str | None
     metric_report_digest: str
     metrics: PromotionMetrics
     assurance: AssuranceEvidence
@@ -435,7 +445,6 @@ class ReplayResult(ExternalContract):
         "bundle_manifest_digest",
         "case_callback_digest",
         "evaluation_context_digest",
-        "hidden_release_receipt_digest",
         "metric_report_digest",
         "result_digest",
     )
@@ -443,6 +452,18 @@ class ReplayResult(ExternalContract):
     def digests_are_sha256(cls, value: str | None) -> str | None:
         if value is not None:
             _validate_digest(value)
+        return value
+
+    @field_validator("hidden_public_proof_id")
+    @classmethod
+    def hidden_proof_id_is_opaque(cls, value: str | None) -> str | None:
+        if value is not None and (
+            type(value) is not str
+            or not value.startswith("hpf_")
+            or len(value) != 36
+            or any(character not in "0123456789abcdef" for character in value[4:])
+        ):
+            raise ValueError("hidden public proof ID is invalid")
         return value
 
     @field_validator("fallback_count", "mandatory_decline_count", mode="before")
@@ -474,11 +495,11 @@ class ReplayResult(ExternalContract):
             raise ValueError("failed GBDT-only replay cannot claim fallback")
         if self.evaluation.kind is EvaluationKind.HIDDEN:
             if self.assurance.hidden_access_clean != (
-                self.hidden_release_receipt_digest is not None
+                self.hidden_public_proof_id is not None
             ):
-                raise ValueError("hidden access evidence must bind an exact receipt")
-        elif self.hidden_release_receipt_digest is not None:
-            raise ValueError("non-hidden replay cannot claim hidden receipt evidence")
+                raise ValueError("hidden access evidence must bind an opaque public proof")
+        elif self.hidden_public_proof_id is not None:
+            raise ValueError("non-hidden replay cannot claim hidden public proof")
         expected = _digest_document(self.model_dump(mode="json", exclude={"result_digest"}))
         if self.result_digest != expected:
             raise ValueError("replay result digest is inconsistent")
@@ -533,6 +554,684 @@ class ReplayResult(ExternalContract):
             if result.to_json() != payload:
                 raise GateContractError("replay result JSON is not canonical")
             return result
+        except (ValidationError, WireContractError, ValueError) as error:
+            raise GateContractError(str(error)) from error
+
+
+class EvaluatorSigningIdentity:
+    """Explicit Ed25519 identity used only for evaluator aggregate evidence."""
+
+    __slots__ = ()
+
+    def __new__(cls, *args: object, **kwargs: object) -> EvaluatorSigningIdentity:
+        del cls, args, kwargs
+        raise TypeError("evaluator signing identities require the private-byte factory")
+
+    @property
+    def key_id(self) -> str:
+        raise TypeError("unbound evaluator signing identity")
+
+    @property
+    def public_key_base64(self) -> str:
+        raise TypeError("unbound evaluator signing identity")
+
+    def _private_key(self) -> Ed25519PrivateKey:
+        raise TypeError("unbound evaluator signing identity")
+
+    def _private_seed_bytes(self) -> bytes:
+        raise TypeError("unbound evaluator signing identity")
+
+    @classmethod
+    def from_private_bytes(cls, private_seed: bytes) -> EvaluatorSigningIdentity:
+        if type(private_seed) is not bytes or len(private_seed) != 32:
+            raise ValueError("evaluator private seed must be exactly 32 bytes")
+        return _new_evaluator_signer(bytes(private_seed))
+
+    @classmethod
+    def is_exact(cls, value: object) -> bool:
+        del cls
+        return _is_evaluator_signer(value)
+
+    def sign_batch(self, results: tuple[ReplayResult, ...]) -> VerifiedReplayBatch:
+        return VerifiedReplayBatch.create(results=results, signer=self)
+
+    def _sign(self, document: object) -> str:
+        return base64.b64encode(
+            self._private_key().sign(canonical_json_bytes(document))
+        ).decode("ascii")
+
+    def _worker_private_bytes(self) -> bytes:
+        """Return an isolated-process copy; callers never receive restricted data."""
+        return self._private_seed_bytes()
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise TypeError("evaluator signing identity is immutable")
+
+    def __delattr__(self, name: str) -> None:
+        del name
+        raise TypeError("evaluator signing identity is immutable")
+
+    def __copy__(self) -> Never:
+        raise TypeError("evaluator signing identity cannot be copied")
+
+    def __deepcopy__(self, memo: object) -> Never:
+        del memo
+        raise TypeError("evaluator signing identity cannot be copied")
+
+    def __reduce__(self) -> Never:
+        raise TypeError("evaluator signing identity cannot be serialized")
+
+
+def _new_evaluator_signer(private_seed: bytes) -> EvaluatorSigningIdentity:
+    key = Ed25519PrivateKey.from_private_bytes(private_seed)
+    public = key.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+    )
+    key_id = hashlib.sha256(public).hexdigest()
+    public_key_base64 = base64.b64encode(public).decode("ascii")
+    instance: EvaluatorSigningIdentity | None = None
+
+    class _BoundEvaluatorSigner(EvaluatorSigningIdentity):
+        __slots__ = ()
+
+        def __new__(cls, *args: object, **kwargs: object) -> _BoundEvaluatorSigner:
+            del cls, args, kwargs
+            raise TypeError("bound evaluator signer cannot be constructed")
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del self, args, kwargs
+            raise TypeError("evaluator signing identity cannot be reinitialized")
+
+        @property
+        def key_id(self) -> str:
+            return key_id
+
+        @property
+        def public_key_base64(self) -> str:
+            return public_key_base64
+
+        def _private_key(self) -> Ed25519PrivateKey:
+            if self is not instance:
+                raise TypeError("evaluator signer identity is invalid")
+            return key
+
+        def _private_seed_bytes(self) -> bytes:
+            if self is not instance:
+                raise TypeError("evaluator signer identity is invalid")
+            return key.private_bytes_raw()
+
+    instance = cast(EvaluatorSigningIdentity, object.__new__(_BoundEvaluatorSigner))
+    return instance
+
+
+def _is_evaluator_signer(value: object) -> bool:
+    if not isinstance(value, EvaluatorSigningIdentity):
+        return False
+    try:
+        return len(value._worker_private_bytes()) == 32
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def _verifier_state_store() -> tuple[Any, Any]:
+    states: WeakKeyDictionary[object, tuple[Ed25519PublicKey, str, str]] = (
+        WeakKeyDictionary()
+    )
+
+    def register(
+        instance: object,
+        state: tuple[Ed25519PublicKey, str, str],
+    ) -> None:
+        if instance in states:
+            raise TypeError("evaluator verifier cannot be reinitialized")
+        states[instance] = state
+
+    def get(instance: object) -> tuple[Ed25519PublicKey, str, str]:
+        try:
+            return states[instance]
+        except KeyError as error:
+            raise TypeError("evaluator verifier identity is invalid") from error
+
+    return register, get
+
+
+_register_verifier_state, _get_verifier_state = _verifier_state_store()
+
+
+class EvaluatorReplayVerifier:
+    """Separately pinned, externally immutable evaluator verification identity."""
+
+    __slots__ = ("__weakref__",)
+
+    def __init__(
+        self,
+        *,
+        signer_key_id: str,
+        public_key_base64: str,
+        _register: Any = _register_verifier_state,
+        _get: Any = _get_verifier_state,
+    ) -> None:
+        if type(self) is not EvaluatorReplayVerifier:
+            raise TypeError("evaluator verifier must have its exact type")
+        try:
+            _get(self)
+        except TypeError:
+            pass
+        else:
+            raise TypeError("evaluator verifier cannot be reinitialized")
+        public = self._validate_key_fields(signer_key_id, public_key_base64)
+        _register(
+            self,
+            (
+                Ed25519PublicKey.from_public_bytes(public),
+                signer_key_id,
+                public_key_base64,
+            ),
+        )
+
+    @property
+    def key_id(self, _get: Any = _get_verifier_state) -> str:
+        return cast(tuple[Ed25519PublicKey, str, str], _get(self))[1]
+
+    @property
+    def public_key_base64(self, _get: Any = _get_verifier_state) -> str:
+        return cast(tuple[Ed25519PublicKey, str, str], _get(self))[2]
+
+    def _public_key(self, _get: Any = _get_verifier_state) -> Ed25519PublicKey:
+        return cast(tuple[Ed25519PublicKey, str, str], _get(self))[0]
+
+    @staticmethod
+    def _validate_key_fields(
+        signer_key_id: str, public_key_base64: str
+    ) -> bytes:
+        _validate_digest(signer_key_id)
+        if type(public_key_base64) is not str:
+            raise GateContractError("evaluator public key encoding is invalid")
+        try:
+            public = base64.b64decode(public_key_base64, validate=True)
+        except (ValueError, binascii.Error) as error:
+            raise GateContractError("evaluator public key encoding is invalid") from error
+        if len(public) != 32 or hashlib.sha256(public).hexdigest() != signer_key_id:
+            raise GateContractError("evaluator public key identity is inconsistent")
+        return public
+
+    @classmethod
+    def from_signer(cls, signer: EvaluatorSigningIdentity) -> EvaluatorReplayVerifier:
+        if not EvaluatorSigningIdentity.is_exact(signer):
+            raise GateContractError("evaluator signer must have its exact type")
+        return cls(
+            signer_key_id=signer.key_id,
+            public_key_base64=signer.public_key_base64,
+        )
+
+    def verify_batch(self, batch: VerifiedReplayBatch) -> bool:
+        if type(batch) is not VerifiedReplayBatch or batch.signer_key_id != self.key_id:
+            return False
+        try:
+            signature = base64.b64decode(batch.signature_base64, validate=True)
+            self._public_key().verify(
+                signature, canonical_json_bytes(batch.unsigned_document())
+            )
+        except (InvalidSignature, TypeError, ValueError, binascii.Error):
+            return False
+        expected = _digest_document(
+            {**batch.unsigned_document(), "signature_base64": batch.signature_base64}
+        )
+        return expected == batch.batch_digest
+
+    def verify_document(self, document: object, signature_base64: str) -> bool:
+        """Verify a canonical evaluator evidence document under the pinned key."""
+        if type(signature_base64) is not str:
+            return False
+        try:
+            signature = base64.b64decode(signature_base64, validate=True)
+            self._public_key().verify(signature, canonical_json_bytes(document))
+        except (InvalidSignature, TypeError, ValueError, binascii.Error):
+            return False
+        return True
+
+    def verify_public_proof(self, proof: HiddenPublicProof) -> bool:
+        if type(proof) is not HiddenPublicProof or proof.signer_key_id != self.key_id:
+            return False
+        try:
+            signature = base64.b64decode(proof.signature_base64, validate=True)
+            self._public_key().verify(
+                signature, canonical_json_bytes(proof.unsigned_document())
+            )
+        except (InvalidSignature, TypeError, ValueError, binascii.Error):
+            return False
+        expected = _digest_document(
+            {**proof.unsigned_document(), "signature_base64": proof.signature_base64}
+        )
+        return expected == proof.proof_digest
+
+    def verify_promotion_envelope(self, envelope: VerifiedPromotionEnvelope) -> bool:
+        if (
+            type(envelope) is not VerifiedPromotionEnvelope
+            or envelope.signer_key_id != self.key_id
+        ):
+            return False
+        if not self.verify_document(
+            envelope.unsigned_document(), envelope.signature_base64
+        ):
+            return False
+        expected = _digest_document(
+            {
+                **envelope.unsigned_document(),
+                "signature_base64": envelope.signature_base64,
+            }
+        )
+        return expected == envelope.envelope_digest
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise TypeError("evaluator verifier is immutable")
+
+    def __delattr__(self, name: str) -> None:
+        del name
+        raise TypeError("evaluator verifier is immutable")
+
+    def __copy__(self) -> Never:
+        raise TypeError("evaluator verifier cannot be copied")
+
+    def __deepcopy__(self, memo: object) -> Never:
+        del memo
+        raise TypeError("evaluator verifier cannot be copied")
+
+    def __reduce__(self) -> Never:
+        raise TypeError("evaluator verifier cannot be serialized")
+
+
+class VerifiedReplayBatch(ExternalContract):
+    """Evaluator-signed exact replay results; raw result tuples are never trusted."""
+
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    results: tuple[ReplayResult, ...]
+    signer_key_id: str
+    signature_base64: str
+    batch_digest: str
+
+    @field_validator("results", mode="before")
+    @classmethod
+    def results_are_exact_tuple(cls, value: object) -> object:
+        if type(value) is not tuple:
+            raise ValueError("verified replay results must be an exact tuple")
+        return value
+
+    @field_validator("signer_key_id", "batch_digest")
+    @classmethod
+    def batch_digests_are_sha256(cls, value: str) -> str:
+        _validate_digest(value)
+        return value
+
+    @model_validator(mode="after")
+    def batch_is_closed(self) -> VerifiedReplayBatch:
+        if not self.results or len(self.results) > _MAX_RESULTS:
+            raise ValueError("verified replay batch must be bounded and nonempty")
+        if any(type(row) is not ReplayResult for row in self.results):
+            raise ValueError("verified replay batch contains a nonexact result")
+        keys = tuple(
+            (row.evaluation.kind, row.evaluation.value, row.arm) for row in self.results
+        )
+        expected_keys = tuple(
+            sorted(
+                keys,
+                key=lambda item: (
+                    tuple(EvaluationKind).index(item[0]),
+                    item[1],
+                    tuple(DefenseArm).index(item[2]),
+                ),
+            )
+        )
+        if keys != expected_keys or len(keys) != len(set(keys)):
+            raise ValueError("verified replay batch order or keys are invalid")
+        expected_digest = _digest_document(
+            {**self.unsigned_document(), "signature_base64": self.signature_base64}
+        )
+        if self.batch_digest != expected_digest:
+            raise ValueError("verified replay batch digest is inconsistent")
+        return self
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        results: tuple[ReplayResult, ...],
+        signer: EvaluatorSigningIdentity,
+    ) -> VerifiedReplayBatch:
+        if not EvaluatorSigningIdentity.is_exact(signer):
+            raise GateContractError("verified replay batch requires exact evaluator signer")
+        checked_results = _validated_results(results)
+        unsigned = {
+            "schema_version": "1.0.0",
+            "results": [row.model_dump(mode="json") for row in checked_results],
+            "signer_key_id": signer.key_id,
+        }
+        signature = signer._sign(unsigned)
+        digest = _digest_document({**unsigned, "signature_base64": signature})
+        return cls(
+            results=checked_results,
+            signer_key_id=signer.key_id,
+            signature_base64=signature,
+            batch_digest=digest,
+        )
+
+    def unsigned_document(self) -> dict[str, object]:
+        return self.model_dump(
+            mode="json", exclude={"signature_base64", "batch_digest"}
+        )
+
+    def to_json(self) -> bytes:
+        if type(self) is not VerifiedReplayBatch:
+            raise GateContractError("verified replay batch must be exact")
+        checked = VerifiedReplayBatch.model_validate(
+            self.model_dump(mode="python", warnings=False), strict=True
+        )
+        payload = canonical_json_bytes(checked.model_dump(mode="json"))
+        if len(payload) > 32_000_000:
+            raise GateContractError("verified replay batch exceeds its resource cap")
+        return payload
+
+    @classmethod
+    def from_json(cls, payload: bytes) -> VerifiedReplayBatch:
+        if type(payload) is not bytes or not 0 < len(payload) <= 32_000_000:
+            raise GateContractError("verified replay batch payload is invalid")
+        try:
+            document = strict_json_loads(payload)
+            if type(document) is not dict or type(document.get("results")) is not list:
+                raise GateContractError("verified replay batch must be an object")
+            document["results"] = tuple(
+                ReplayResult.from_json(canonical_json_bytes(item))
+                for item in document["results"]
+            )
+            batch = cls.model_validate(document)
+            if batch.to_json() != payload:
+                raise GateContractError("verified replay batch JSON is not canonical")
+            return batch
+        except (ValidationError, WireContractError, ValueError) as error:
+            raise GateContractError(str(error)) from error
+
+    def __iter__(self) -> Iterator[ReplayResult]:  # type: ignore[override]
+        return iter(self.results)
+
+    def __len__(self) -> int:
+        return len(self.results)
+
+    def __getitem__(self, index: int) -> ReplayResult:
+        return self.results[index]
+
+
+class HiddenPublicProof(ExternalContract):
+    """Opaque public proof joining aggregate hidden results to evaluator authority."""
+
+    schema_version: Literal["1.1.0"] = "1.1.0"
+    proof_id: str
+    replay_batch_digest: str
+    decision_bindings_digest: str
+    bundle_manifest_digest: str
+    defender_top_ref_digest: str
+    worker_manifest_digest: str
+    evaluator_context_token: str
+    cohort_mapping_token: str
+    issued_at: str
+    signer_key_id: str
+    signature_base64: str
+    proof_digest: str
+
+    @field_validator("proof_id")
+    @classmethod
+    def proof_id_is_opaque(cls, value: str) -> str:
+        checked = ReplayResult.hidden_proof_id_is_opaque(value)
+        assert checked is not None
+        return checked
+
+    @field_validator(
+        "replay_batch_digest",
+        "decision_bindings_digest",
+        "bundle_manifest_digest",
+        "defender_top_ref_digest",
+        "worker_manifest_digest",
+        "evaluator_context_token",
+        "cohort_mapping_token",
+        "signer_key_id",
+        "proof_digest",
+    )
+    @classmethod
+    def proof_digests_are_sha256(cls, value: str) -> str:
+        _validate_digest(value)
+        return value
+
+    @field_validator("issued_at")
+    @classmethod
+    def issued_at_is_canonical_utc(cls, value: str) -> str:
+        if (
+            type(value) is not str
+            or len(value) > 40
+            or not value.endswith("Z")
+            or "T" not in value
+        ):
+            raise ValueError("hidden public proof timestamp is invalid")
+        return value
+
+    @model_validator(mode="after")
+    def proof_is_self_consistent(self) -> HiddenPublicProof:
+        expected = _digest_document(
+            {**self.unsigned_document(), "signature_base64": self.signature_base64}
+        )
+        if self.proof_digest != expected:
+            raise ValueError("hidden public proof digest is inconsistent")
+        return self
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        proof_id: str,
+        replay_batch_digest: str,
+        decision_bindings_digest: str,
+        bundle_manifest_digest: str,
+        defender_top_ref_digest: str,
+        worker_manifest_digest: str,
+        evaluator_context_token: str,
+        cohort_mapping_token: str,
+        issued_at: str,
+        signer: EvaluatorSigningIdentity,
+    ) -> HiddenPublicProof:
+        if not EvaluatorSigningIdentity.is_exact(signer):
+            raise GateContractError("hidden public proof requires exact evaluator signer")
+        fields: dict[str, object] = {
+            "schema_version": "1.1.0",
+            "proof_id": proof_id,
+            "replay_batch_digest": replay_batch_digest,
+            "decision_bindings_digest": decision_bindings_digest,
+            "bundle_manifest_digest": bundle_manifest_digest,
+            "defender_top_ref_digest": defender_top_ref_digest,
+            "worker_manifest_digest": worker_manifest_digest,
+            "evaluator_context_token": evaluator_context_token,
+            "cohort_mapping_token": cohort_mapping_token,
+            "issued_at": issued_at,
+            "signer_key_id": signer.key_id,
+        }
+        signature = signer._sign(fields)
+        digest = _digest_document({**fields, "signature_base64": signature})
+        return cls(
+            schema_version="1.1.0",
+            proof_id=proof_id,
+            replay_batch_digest=replay_batch_digest,
+            decision_bindings_digest=decision_bindings_digest,
+            bundle_manifest_digest=bundle_manifest_digest,
+            defender_top_ref_digest=defender_top_ref_digest,
+            worker_manifest_digest=worker_manifest_digest,
+            evaluator_context_token=evaluator_context_token,
+            cohort_mapping_token=cohort_mapping_token,
+            issued_at=issued_at,
+            signer_key_id=signer.key_id,
+            signature_base64=signature,
+            proof_digest=digest,
+        )
+
+    def unsigned_document(self) -> dict[str, object]:
+        return self.model_dump(
+            mode="json", exclude={"signature_base64", "proof_digest"}
+        )
+
+    def to_json(self) -> bytes:
+        if type(self) is not HiddenPublicProof:
+            raise GateContractError("hidden public proof must be exact")
+        checked = HiddenPublicProof.model_validate(
+            self.model_dump(mode="python", warnings=False), strict=True
+        )
+        payload = canonical_json_bytes(checked.model_dump(mode="json"))
+        if len(payload) > 64_000:
+            raise GateContractError("hidden public proof exceeds resource cap")
+        return payload
+
+    @classmethod
+    def from_json(cls, payload: bytes) -> HiddenPublicProof:
+        if type(payload) is not bytes or not 0 < len(payload) <= 64_000:
+            raise GateContractError("hidden public proof payload is invalid")
+        try:
+            document = strict_json_loads(payload)
+            proof = cls.model_validate(document)
+            if proof.to_json() != payload:
+                raise GateContractError("hidden public proof JSON is not canonical")
+            return proof
+        except (ValidationError, WireContractError, ValueError) as error:
+            raise GateContractError(str(error)) from error
+
+
+class VerifiedPromotionEnvelope(ExternalContract):
+    """Evaluator-signed complete matrix joined to exact hidden public proofs."""
+
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    component_batches: tuple[VerifiedReplayBatch, ...]
+    hidden_proofs: tuple[HiddenPublicProof, ...]
+    combined_batch: VerifiedReplayBatch
+    signer_key_id: str
+    signature_base64: str
+    envelope_digest: str
+
+    @field_validator("component_batches", "hidden_proofs", mode="before")
+    @classmethod
+    def collections_are_exact_tuples(cls, value: object) -> object:
+        if type(value) is not tuple:
+            raise ValueError("promotion envelope collections must be exact tuples")
+        return value
+
+    @field_validator("signer_key_id", "envelope_digest")
+    @classmethod
+    def envelope_digests_are_sha256(cls, value: str) -> str:
+        _validate_digest(value)
+        return value
+
+    @model_validator(mode="after")
+    def envelope_is_closed(self) -> VerifiedPromotionEnvelope:
+        if not self.component_batches or len(self.component_batches) > 128:
+            raise ValueError("promotion envelope component count is invalid")
+        if len(self.hidden_proofs) > 8:
+            raise ValueError("promotion envelope hidden proof count is invalid")
+        if any(type(item) is not VerifiedReplayBatch for item in self.component_batches):
+            raise ValueError("promotion envelope component batch is not exact")
+        if any(type(item) is not HiddenPublicProof for item in self.hidden_proofs):
+            raise ValueError("promotion envelope hidden proof is not exact")
+        if type(self.combined_batch) is not VerifiedReplayBatch:
+            raise ValueError("promotion envelope combined batch is not exact")
+        expected = _digest_document(
+            {**self.unsigned_document(), "signature_base64": self.signature_base64}
+        )
+        if self.envelope_digest != expected:
+            raise ValueError("promotion envelope digest is inconsistent")
+        return self
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        component_batches: tuple[VerifiedReplayBatch, ...],
+        hidden_proofs: tuple[HiddenPublicProof, ...],
+        signer: EvaluatorSigningIdentity,
+    ) -> VerifiedPromotionEnvelope:
+        if not EvaluatorSigningIdentity.is_exact(signer):
+            raise GateContractError("promotion envelope requires exact evaluator signer")
+        verifier = EvaluatorReplayVerifier.from_signer(signer)
+        checked_components, checked_proofs = _validate_envelope_components(
+            component_batches,
+            hidden_proofs,
+            evaluator_verifier=verifier,
+            hidden_proof_verifier=verifier,
+        )
+        combined = signer.sign_batch(
+            tuple(row for batch in checked_components for row in batch.results)
+        )
+        fields: dict[str, object] = {
+            "schema_version": "1.0.0",
+            "component_batches": [
+                item.model_dump(mode="json") for item in checked_components
+            ],
+            "hidden_proofs": [item.model_dump(mode="json") for item in checked_proofs],
+            "combined_batch": combined.model_dump(mode="json"),
+            "signer_key_id": signer.key_id,
+        }
+        signature = signer._sign(fields)
+        digest = _digest_document({**fields, "signature_base64": signature})
+        return cls(
+            component_batches=checked_components,
+            hidden_proofs=checked_proofs,
+            combined_batch=combined,
+            signer_key_id=signer.key_id,
+            signature_base64=signature,
+            envelope_digest=digest,
+        )
+
+    def unsigned_document(self) -> dict[str, object]:
+        return self.model_dump(
+            mode="json", exclude={"signature_base64", "envelope_digest"}
+        )
+
+    def to_json(self) -> bytes:
+        if type(self) is not VerifiedPromotionEnvelope:
+            raise GateContractError("promotion envelope must be exact")
+        checked = VerifiedPromotionEnvelope.model_validate(
+            self.model_dump(mode="python", warnings=False), strict=True
+        )
+        payload = canonical_json_bytes(checked.model_dump(mode="json"))
+        if len(payload) > 64_000_000:
+            raise GateContractError("promotion envelope exceeds resource cap")
+        return payload
+
+    @classmethod
+    def from_json(cls, payload: bytes) -> VerifiedPromotionEnvelope:
+        if type(payload) is not bytes or not 0 < len(payload) <= 64_000_000:
+            raise GateContractError("promotion envelope payload is invalid")
+        try:
+            document = strict_json_loads(payload)
+            if type(document) is not dict:
+                raise GateContractError("promotion envelope must be an object")
+            raw_components = document.get("component_batches")
+            raw_proofs = document.get("hidden_proofs")
+            raw_combined = document.get("combined_batch")
+            if (
+                type(raw_components) is not list
+                or type(raw_proofs) is not list
+                or type(raw_combined) is not dict
+            ):
+                raise GateContractError("promotion envelope field types are invalid")
+            document["component_batches"] = tuple(
+                VerifiedReplayBatch.from_json(canonical_json_bytes(item))
+                for item in raw_components
+            )
+            document["hidden_proofs"] = tuple(
+                HiddenPublicProof.from_json(canonical_json_bytes(item))
+                for item in raw_proofs
+            )
+            document["combined_batch"] = VerifiedReplayBatch.from_json(
+                canonical_json_bytes(raw_combined)
+            )
+            envelope = cls.model_validate(document)
+            if envelope.to_json() != payload:
+                raise GateContractError("promotion envelope JSON is not canonical")
+            return envelope
         except (ValidationError, WireContractError, ValueError) as error:
             raise GateContractError(str(error)) from error
 
@@ -677,11 +1376,130 @@ class ChampionDecision(ExternalContract):
             raise GateContractError(str(error)) from error
 
 
+def _validate_envelope_components(
+    component_batches: object,
+    hidden_proofs: object,
+    *,
+    evaluator_verifier: EvaluatorReplayVerifier,
+    hidden_proof_verifier: EvaluatorReplayVerifier,
+) -> tuple[tuple[VerifiedReplayBatch, ...], tuple[HiddenPublicProof, ...]]:
+    if type(component_batches) is not tuple or not component_batches:
+        raise GateContractError("promotion components must be a nonempty exact tuple")
+    if type(hidden_proofs) is not tuple:
+        raise GateContractError("promotion hidden proofs must be an exact tuple")
+    components = cast(tuple[object, ...], component_batches)
+    proofs = cast(tuple[object, ...], hidden_proofs)
+    if len(components) > 128 or len(proofs) > 8:
+        raise GateContractError("promotion evidence exceeds resource caps")
+    checked_components: list[VerifiedReplayBatch] = []
+    descriptor_keys: list[tuple[EvaluationKind, str]] = []
+    for item in components:
+        if type(item) is not VerifiedReplayBatch or not evaluator_verifier.verify_batch(item):
+            raise GateContractError("promotion component signature is invalid")
+        rows = item.results
+        if not rows or len(rows) > len(DefenseArm) or len({row.arm for row in rows}) != len(rows):
+            raise GateContractError("promotion component arm membership is invalid")
+        descriptors = {(row.evaluation.kind, row.evaluation.value) for row in rows}
+        if len(descriptors) != 1:
+            raise GateContractError("promotion component spans multiple descriptors")
+        descriptor_keys.append(next(iter(descriptors)))
+        checked_components.append(item)
+    ordered = tuple(
+        sorted(
+            zip(descriptor_keys, checked_components, strict=True),
+            key=lambda item: (tuple(EvaluationKind).index(item[0][0]), item[0][1]),
+        )
+    )
+    if tuple(zip(descriptor_keys, checked_components, strict=True)) != ordered:
+        raise GateContractError("promotion components are not canonically ordered")
+    if len(descriptor_keys) != len(set(descriptor_keys)):
+        raise GateContractError("promotion component descriptors are duplicated")
+    checked_proofs: list[HiddenPublicProof] = []
+    for item in proofs:
+        if (
+            type(item) is not HiddenPublicProof
+            or not hidden_proof_verifier.verify_public_proof(item)
+        ):
+            raise GateContractError("promotion hidden proof signature is invalid")
+        checked_proofs.append(item)
+    if tuple(item.proof_id for item in checked_proofs) != tuple(
+        sorted(item.proof_id for item in checked_proofs)
+    ) or len({item.proof_id for item in checked_proofs}) != len(checked_proofs):
+        raise GateContractError("promotion hidden proofs are not canonical")
+    hidden_batches = tuple(
+        batch
+        for key, batch in ordered
+        if key[0] is EvaluationKind.HIDDEN
+    )
+    if len(hidden_batches) != len(checked_proofs):
+        raise GateContractError("each hidden descriptor requires one exact public proof")
+    proofs_by_batch = {item.replay_batch_digest: item for item in checked_proofs}
+    if len(proofs_by_batch) != len(checked_proofs):
+        raise GateContractError("hidden proof batch bindings are duplicated")
+    for batch in hidden_batches:
+        proof = proofs_by_batch.get(batch.batch_digest)
+        if proof is None:
+            raise GateContractError("hidden proof does not bind its descriptor batch")
+        for row in batch.results:
+            if (
+                row.hidden_public_proof_id != proof.proof_id
+                or row.evaluation_context_digest != proof.evaluator_context_token
+                or row.evaluation_lineage.cohort_mapping_digest
+                != proof.cohort_mapping_token
+                or row.bundle_manifest_digest != proof.bundle_manifest_digest
+                or row.evaluation_lineage.defender_top_ref_digest
+                != proof.defender_top_ref_digest
+                or not row.assurance.hidden_access_clean
+            ):
+                raise GateContractError("hidden proof aggregate bindings are invalid")
+    return tuple(checked_components), tuple(checked_proofs)
+
+
+def _validated_promotion_envelope(
+    envelope: object,
+    *,
+    evaluator_verifier: EvaluatorReplayVerifier,
+    hidden_proof_verifier: EvaluatorReplayVerifier,
+) -> VerifiedReplayBatch:
+    if (
+        type(envelope) is not VerifiedPromotionEnvelope
+        or not evaluator_verifier.verify_promotion_envelope(envelope)
+    ):
+        raise GateContractError("promotion requires a verified evaluator envelope")
+    components, _ = _validate_envelope_components(
+        envelope.component_batches,
+        envelope.hidden_proofs,
+        evaluator_verifier=evaluator_verifier,
+        hidden_proof_verifier=hidden_proof_verifier,
+    )
+    combined = envelope.combined_batch
+    if not evaluator_verifier.verify_batch(combined):
+        raise GateContractError("promotion combined replay batch is invalid")
+    expected = tuple(row for batch in components for row in batch.results)
+    if _validated_results(expected) != combined.results:
+        raise GateContractError("promotion envelope matrix differs from its components")
+    return combined
+
+
 def evaluate_promotion_gates(
-    results: tuple[ReplayResult, ...], config: GateConfig
+    envelope: VerifiedPromotionEnvelope,
+    config: GateConfig,
+    *,
+    evaluator_verifier: EvaluatorReplayVerifier | None = None,
+    hidden_proof_verifier: EvaluatorReplayVerifier | None = None,
 ) -> ChampionDecision:
     """Apply every hard blocker before exact champion/challenger selection."""
-    rows = _validated_results(results)
+    if (
+        type(evaluator_verifier) is not EvaluatorReplayVerifier
+        or type(hidden_proof_verifier) is not EvaluatorReplayVerifier
+    ):
+        raise GateContractError("promotion requires exact pinned evaluator verifiers")
+    batch = _validated_promotion_envelope(
+        envelope,
+        evaluator_verifier=evaluator_verifier,
+        hidden_proof_verifier=hidden_proof_verifier,
+    )
+    rows = _validated_results(batch.results)
     checked_config = _exact_model(config, GateConfig, "gate config")
     by_arm: dict[DefenseArm, tuple[ReplayResult, ...]] = {
         arm: tuple(row for row in rows if row.arm is arm) for arm in DefenseArm
@@ -831,20 +1649,32 @@ def _hard_failure_codes(
             for item in metrics.slice_performance
             if item.kind == "family"
         }
+        family_floor_failed: bool
         if row.evaluation.kind in {
             EvaluationKind.CHRONOLOGICAL,
             EvaluationKind.HIDDEN,
         }:
             families_to_check: tuple[str, ...] = _FAMILIES
+            family_floor_failed = any(
+                family_recall.get(family) is None
+                or cast(float, family_recall[family])
+                < config.minimum_family_recall
+                for family in families_to_check
+            )
         elif row.evaluation.kind is EvaluationKind.HELD_FAMILY:
             families_to_check = (row.evaluation.value,)
+            family_floor_failed = any(
+                family_recall.get(family) is None
+                or cast(float, family_recall[family])
+                < config.minimum_family_recall
+                for family in families_to_check
+            )
         else:
-            families_to_check = ()
-        if any(
-            family_recall.get(family) is None
-            or cast(float, family_recall[family]) < config.minimum_family_recall
-            for family in families_to_check
-        ):
+            family_floor_failed = any(
+                recall is not None and recall < config.minimum_family_recall
+                for recall in family_recall.values()
+            )
+        if family_floor_failed:
             codes.add("PER_FAMILY_RECALL")
     return codes
 
@@ -878,7 +1708,7 @@ def _evaluation_lineage_is_exact(rows: tuple[ReplayResult, ...]) -> bool:
                 row.threshold_set_digest,
                 row.case_callback_digest,
                 row.evaluation_context_digest,
-                row.hidden_release_receipt_digest,
+                row.hidden_public_proof_id,
             )
             for row in descriptor_rows
         }
@@ -1008,12 +1838,17 @@ __all__ = [
     "EvaluationDescriptor",
     "EvaluationLineage",
     "EvaluationKind",
+    "EvaluatorReplayVerifier",
+    "EvaluatorSigningIdentity",
     "GateConfig",
     "GateContractError",
+    "HiddenPublicProof",
     "PromotionMetrics",
     "RateEvidence",
     "ReplayFailure",
     "ReplayResult",
     "SlicePerformance",
+    "VerifiedReplayBatch",
+    "VerifiedPromotionEnvelope",
     "evaluate_promotion_gates",
 ]

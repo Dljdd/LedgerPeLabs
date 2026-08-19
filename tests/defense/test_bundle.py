@@ -177,9 +177,10 @@ def _split(matrix: FeatureMatrix, scorer: CatBoostScorer) -> EvaluationSplit:
             viewpoint="development",
             is_fraud=fraud[event.event_id],
             label_source="population_truth",
-            label_mature_at=T0,
+            label_mature_at=event.decision_at or event.event_time,
             first_settlement_at=None,
-            net_settled_value=Decimal(index + 1),
+            # Authorization-only fixture lifecycles have no settled value.
+            net_settled_value=Decimal("0.00"),
             lifecycle_event_ids=(event.event_id,),
         )
         for index, event in enumerate(matrix.events)

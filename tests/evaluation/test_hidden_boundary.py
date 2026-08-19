@@ -6,7 +6,11 @@ import base64
 import copy
 import gc
 import pickle
+import subprocess
+import sys
+import time
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -17,10 +21,16 @@ from apar.evaluation.defender_attestation import (
     DefenderBundleVerifier,
     VerifiedDefenderAttestation,
 )
+from apar.evaluation.gates import EvaluatorReplayVerifier, EvaluatorSigningIdentity
 from apar.evaluation_hidden.defense_authority import (
     HiddenBoundaryError,
     HiddenEvaluationAuthority,
     audit_hidden_import_boundary,
+)
+from apar.evaluation_hidden.worker_client import (
+    EvaluatorWorkerClient,
+    EvaluatorWorkerManifest,
+    HiddenWorkerError,
 )
 from apar.runs.wire import canonical_json_bytes
 from tests.defense.test_bundle import BundleFixture
@@ -28,6 +38,7 @@ from tests.defense.test_bundle import BundleFixture
 pytest_plugins = ("tests.defense.test_bundle",)
 
 ISSUED_AT = datetime(2026, 8, 19, 12, tzinfo=UTC)
+EVALUATOR_SIGNER = EvaluatorSigningIdentity.from_private_bytes(b"e" * 32)
 
 
 def _freeze(fixture: BundleFixture):
@@ -53,7 +64,7 @@ def test_verified_top_ref_is_sealed_into_an_opaque_capability(
     bundle_fixture: BundleFixture,
 ) -> None:
     manifest, top_ref, verifier, attestation = _attested(bundle_fixture)
-    authority = HiddenEvaluationAuthority(verifier, bundle_fixture.store)
+    authority = HiddenEvaluationAuthority(verifier, bundle_fixture.store, EVALUATOR_SIGNER)
 
     capability = authority.freeze_and_issue(attestation, issued_at=ISSUED_AT)
 
@@ -67,7 +78,7 @@ def test_manifest_substitution_invalid_signature_and_wrong_top_ref_fail_closed(
     bundle_fixture: BundleFixture,
 ) -> None:
     _, _, verifier, attestation = _attested(bundle_fixture)
-    authority = HiddenEvaluationAuthority(verifier, bundle_fixture.store)
+    authority = HiddenEvaluationAuthority(verifier, bundle_fixture.store, EVALUATOR_SIGNER)
 
     with pytest.raises(HiddenBoundaryError, match="exact verified signed"):
         authority.freeze_and_issue(object(), issued_at=ISSUED_AT)  # type: ignore[arg-type]
@@ -80,7 +91,7 @@ def test_capability_is_immutable_unforgeable_single_authority_and_nonreplayable(
     bundle_fixture: BundleFixture,
 ) -> None:
     _, _, verifier, attestation = _attested(bundle_fixture)
-    authority = HiddenEvaluationAuthority(verifier, bundle_fixture.store)
+    authority = HiddenEvaluationAuthority(verifier, bundle_fixture.store, EVALUATOR_SIGNER)
     capability = authority.freeze_and_issue(attestation, issued_at=ISSUED_AT)
 
     assert not isinstance(capability, bytes)
@@ -117,7 +128,7 @@ def test_capability_is_immutable_unforgeable_single_authority_and_nonreplayable(
     with pytest.raises(HiddenBoundaryError, match="already frozen"):
         authority.freeze_and_issue(attestation, issued_at=ISSUED_AT)
 
-    other = HiddenEvaluationAuthority(verifier, bundle_fixture.store)
+    other = HiddenEvaluationAuthority(verifier, bundle_fixture.store, EVALUATOR_SIGNER)
     with pytest.raises(HiddenBoundaryError, match="already frozen"):
         authority.freeze_and_issue(attestation, issued_at=ISSUED_AT)
     assert other is not authority
@@ -127,7 +138,7 @@ def test_hidden_authority_rejects_nonexact_manifest_and_noncanonical_issue_time(
     bundle_fixture: BundleFixture,
 ) -> None:
     _, _, verifier, attestation = _attested(bundle_fixture)
-    authority = HiddenEvaluationAuthority(verifier, bundle_fixture.store)
+    authority = HiddenEvaluationAuthority(verifier, bundle_fixture.store, EVALUATOR_SIGNER)
 
     with pytest.raises(HiddenBoundaryError):
         authority.freeze_and_issue(object(), issued_at=ISSUED_AT)  # type: ignore[arg-type]
@@ -204,21 +215,94 @@ def test_defense_and_features_cannot_import_hidden_package(tmp_path: Path) -> No
         "loader = getattr(__import__('importlib'), 'import_module')\n"
         "loader('apar.evaluation_hidden.nested_reflection')\n"
     )
+    (apar_root / "defense" / "mapping_reflection.py").write_text(
+        "namespace = globals()\n"
+        "builtins_value = namespace['__builtins__']\n"
+        "loader = builtins_value['__import__']\n"
+        "loader('apar.evaluation_hidden.mapping_reflection')\n"
+    )
+    (apar_root / "features" / "composed_mapping_key.py").write_text(
+        "import builtins\n"
+        "mapping = builtins.__dict__\n"
+        "key = '__im' + 'port__'\n"
+        "loader = mapping[key]\n"
+        "loader('apar.evaluation_hidden.composed_mapping')\n"
+    )
+    (apar_root / "defense" / "direct_dunder_mapping.py").write_text(
+        "import importlib\n"
+        "mapping = importlib.__dict__\n"
+        "loader = mapping['import_module']\n"
+        "loader('apar.evaluation_hidden.dunder_mapping')\n"
+    )
 
     result = audit_hidden_import_boundary(apar_root)
 
     assert not result.passed
-    assert len(result.violations) >= 12
+    assert len(result.violations) >= 15
     assert any("composed_reflection.py" in item for item in result.violations)
     assert any("code_execution.py" in item for item in result.violations)
     assert any("nested_reflection.py" in item for item in result.violations)
+    assert any("mapping_reflection.py" in item for item in result.violations)
+    assert any("composed_mapping_key.py" in item for item in result.violations)
+    assert any("direct_dunder_mapping.py" in item for item in result.violations)
+
+
+def test_hidden_authority_methods_are_bound_to_the_exact_instance(
+    bundle_fixture: BundleFixture,
+) -> None:
+    """An unbound method cannot apply one authority's closure state to another."""
+    _, _, verifier, attestation = _attested(bundle_fixture)
+    authority = HiddenEvaluationAuthority(verifier, bundle_fixture.store, EVALUATOR_SIGNER)
+    other = HiddenEvaluationAuthority(verifier, bundle_fixture.store, EVALUATOR_SIGNER)
+
+    with pytest.raises(HiddenBoundaryError, match="identity"):
+        type(authority).freeze_and_issue(
+            other,
+            attestation,
+            issued_at=ISSUED_AT,
+        )
+
+    capability = authority.freeze_and_issue(attestation, issued_at=ISSUED_AT)
+    assert capability.bundle_id == attestation.bundle_id
+
+
+def test_hidden_capability_issuance_is_atomic_under_concurrency(
+    bundle_fixture: BundleFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exactly one concurrent freeze may publish the active capability identity."""
+    _, _, verifier, attestation = _attested(bundle_fixture)
+    authority = HiddenEvaluationAuthority(verifier, bundle_fixture.store, EVALUATOR_SIGNER)
+    original_verify = DefenderBundleVerifier.verify
+
+    def synchronized_verify(self, candidate):
+        time.sleep(0.05)
+        return original_verify(self, candidate)
+
+    monkeypatch.setattr(DefenderBundleVerifier, "verify", synchronized_verify)
+
+    def issue() -> object:
+        try:
+            return authority.freeze_and_issue(attestation, issued_at=ISSUED_AT)
+        except Exception as error:  # exact typed outcome asserted below
+            return error
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = tuple(executor.map(lambda _: issue(), range(2)))
+
+    capabilities = tuple(
+        item for item in outcomes if not isinstance(item, Exception)
+    )
+    failures = tuple(item for item in outcomes if isinstance(item, Exception))
+    assert len(capabilities) == 1
+    assert len(failures) == 1
+    assert isinstance(failures[0], HiddenBoundaryError)
 
 
 def test_hidden_authority_state_registry_expires_without_reachable_mutable_state(
     bundle_fixture: BundleFixture,
 ) -> None:
     _, _, verifier, attestation = _attested(bundle_fixture)
-    authority = HiddenEvaluationAuthority(verifier, bundle_fixture.store)
+    authority = HiddenEvaluationAuthority(verifier, bundle_fixture.store, EVALUATOR_SIGNER)
     capability = authority.freeze_and_issue(attestation, issued_at=ISSUED_AT)
     authority_ref = weakref.ref(authority)
 
@@ -238,7 +322,7 @@ def test_hidden_authority_rejects_structurally_compatible_fake_loader(
             return object()
 
     with pytest.raises(HiddenBoundaryError, match="exact neutral verifier"):
-        HiddenEvaluationAuthority(FakeLoader(), bundle_fixture.store)
+        HiddenEvaluationAuthority(FakeLoader(), bundle_fixture.store, EVALUATOR_SIGNER)
 
 
 def test_neutral_attestation_verifies_signature_top_ref_and_roundtrip(
@@ -343,3 +427,62 @@ def test_verified_attestation_is_not_a_bytes_subtype(
     assert not isinstance(attestation, bytes)
     forged = bytes(attestation.to_json())
     assert not verifier.verify(forged)
+
+
+def test_hidden_worker_watchdog_kills_a_memory_overage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parent-side RSS enforcement must fail closed before unbounded collection."""
+    import apar.evaluation_hidden.worker_client as worker_module
+
+    process = subprocess.Popen(
+        [sys.executable, "-I", "-c", "import time; time.sleep(10)"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        close_fds=True,
+        start_new_session=True,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_resident_bytes",
+        lambda process_id: worker_module._MAX_RSS_BYTES + 1,
+        raising=False,
+    )
+    client = object.__new__(EvaluatorWorkerClient)
+
+    with pytest.raises(HiddenWorkerError, match="memory"):
+        client._collect_bounded(
+            process,
+            request=b"{}",
+            deadline=time.monotonic() + 2,
+        )
+
+    assert process.poll() is not None
+
+
+def test_hidden_worker_rejects_source_swap_between_inventory_check_and_use(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The child must execute only the immutable snapshot bytes just verified."""
+    manifest = EvaluatorWorkerManifest.create(EVALUATOR_SIGNER)
+    verifier = EvaluatorReplayVerifier.from_signer(EVALUATOR_SIGNER)
+    client = EvaluatorWorkerClient(manifest, verifier)
+    source_root = Path(__file__).resolve().parents[2] / "src"
+    worker_path = (source_root / manifest.entrypoint).resolve()
+    original_read_bytes = Path.read_bytes
+    reads = 0
+
+    def swapping_read_bytes(path: Path) -> bytes:
+        nonlocal reads
+        raw = original_read_bytes(path)
+        if path.resolve() == worker_path:
+            reads += 1
+            if reads >= 2:
+                return bytes([raw[0] ^ 1]) + raw[1:]
+        return raw
+
+    monkeypatch.setattr(Path, "read_bytes", swapping_read_bytes)
+
+    with pytest.raises(HiddenWorkerError, match="source snapshot changed"):
+        client.invoke({"schema_version": "invalid"})

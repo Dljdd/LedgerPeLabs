@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import pickle
 from decimal import Decimal, getcontext
 
 import pytest
@@ -16,11 +17,16 @@ from apar.evaluation.gates import (
     EvaluationDescriptor,
     EvaluationKind,
     EvaluationLineage,
+    EvaluatorReplayVerifier,
+    EvaluatorSigningIdentity,
     GateConfig,
+    GateContractError,
+    HiddenPublicProof,
     PromotionMetrics,
     RateEvidence,
     ReplayResult,
     SlicePerformance,
+    VerifiedPromotionEnvelope,
     evaluate_promotion_gates,
 )
 from apar.evaluation.regimes import RegimeKind
@@ -35,6 +41,8 @@ FAMILIES = (
     "synthetic_merchant_refund",
 )
 DECISION_IDS = tuple(f"event-{index:04d}" for index in range(1000))
+EVALUATOR_SIGNER = EvaluatorSigningIdentity.from_private_bytes(b"e" * 32)
+EVALUATOR_VERIFIER = EvaluatorReplayVerifier.from_signer(EVALUATOR_SIGNER)
 
 
 def _sha(character: str) -> str:
@@ -161,8 +169,8 @@ def _results(
                     bundle_manifest_digest=_sha("7"),
                     case_callback_digest=_sha("8"),
                     evaluation_context_digest=_sha("a"),
-                    hidden_release_receipt_digest=(
-                        _sha("b")
+                    hidden_public_proof_id=(
+                        "hpf_" + "b" * 32
                         if descriptor.kind is EvaluationKind.HIDDEN
                         else None
                     ),
@@ -191,6 +199,69 @@ def _replace(
     return tuple(changed)
 
 
+def _promotion_envelope(
+    results: tuple[ReplayResult, ...],
+    *,
+    signer: EvaluatorSigningIdentity = EVALUATOR_SIGNER,
+) -> VerifiedPromotionEnvelope:
+    descriptor_keys = sorted(
+        {(row.evaluation.kind, row.evaluation.value) for row in results},
+        key=lambda item: (tuple(EvaluationKind).index(item[0]), item[1]),
+    )
+    components = tuple(
+        signer.sign_batch(
+            tuple(
+                row
+                for row in results
+                if (row.evaluation.kind, row.evaluation.value) == key
+            )
+        )
+        for key in descriptor_keys
+    )
+    hidden_batches = tuple(
+        batch
+        for batch in components
+        if batch.results[0].evaluation.kind is EvaluationKind.HIDDEN
+    )
+    proofs: tuple[HiddenPublicProof, ...] = ()
+    if hidden_batches:
+        hidden_batch = hidden_batches[0]
+        hidden_row = hidden_batch.results[0]
+        proofs = (
+            HiddenPublicProof.create(
+                proof_id="hpf_" + "b" * 32,
+                replay_batch_digest=hidden_batch.batch_digest,
+                decision_bindings_digest=_sha("9"),
+                bundle_manifest_digest=hidden_row.bundle_manifest_digest,
+                defender_top_ref_digest=(
+                    hidden_row.evaluation_lineage.defender_top_ref_digest
+                ),
+                worker_manifest_digest=_sha("c"),
+                evaluator_context_token=hidden_row.evaluation_context_digest,
+                cohort_mapping_token=(
+                    hidden_row.evaluation_lineage.cohort_mapping_digest
+                ),
+                issued_at="2026-08-19T00:00:00Z",
+                signer=signer,
+            ),
+        )
+    envelope = VerifiedPromotionEnvelope.create(
+        component_batches=components,
+        hidden_proofs=proofs,
+        signer=signer,
+    )
+    return envelope
+
+
+def _evaluate(results: tuple[ReplayResult, ...]):
+    return evaluate_promotion_gates(
+        _promotion_envelope(results),
+        GateConfig.competition(),
+        evaluator_verifier=EVALUATOR_VERIFIER,
+        hidden_proof_verifier=EVALUATOR_VERIFIER,
+    )
+
+
 def _lineage_update(
     lineage: EvaluationLineage, **updates: object
 ) -> EvaluationLineage:
@@ -201,20 +272,102 @@ def _lineage_update(
 
 
 def test_hybrid_promotes_only_on_exact_value_improvement_over_both_comparators() -> None:
-    decision = evaluate_promotion_gates(_results(), GateConfig.competition())
+    decision = _evaluate(_results())
 
     assert decision.status is ChampionStatus.PROMOTED
     assert decision.champion is DefenseArm.LAYERED_HYBRID
     assert decision.failed_gate_codes == ()
 
 
+def test_gate_rejects_raw_caller_authored_replay_matrix() -> None:
+    """Self-digested public results are not trusted promotion provenance."""
+    with pytest.raises(GateContractError, match="verified|signed|evaluator"):
+        evaluate_promotion_gates(_results(), GateConfig.competition())
+
+
+def test_evaluator_signer_and_verifier_are_immutable_and_pinned() -> None:
+    signer = EvaluatorSigningIdentity.from_private_bytes(b"x" * 32)
+    verifier = EvaluatorReplayVerifier.from_signer(signer)
+    original_key_id = verifier.key_id
+    replacement = EvaluatorSigningIdentity.from_private_bytes(b"y" * 32)
+
+    for operation in (copy.copy, copy.deepcopy, pickle.dumps):
+        with pytest.raises(TypeError):
+            operation(signer)
+        with pytest.raises(TypeError):
+            operation(verifier)
+    with pytest.raises((AttributeError, TypeError)):
+        object.__setattr__(signer, "key_id", replacement.key_id)
+    with pytest.raises((AttributeError, TypeError)):
+        object.__setattr__(verifier, "key_id", replacement.key_id)
+    with pytest.raises(TypeError, match="reinitialized"):
+        type(signer).__init__(signer)
+    with pytest.raises(TypeError, match="reinitialized"):
+        type(verifier).__init__(
+            verifier,
+            signer_key_id=replacement.key_id,
+            public_key_base64=replacement.public_key_base64,
+        )
+
+    assert verifier.key_id == original_key_id
+    replacement_envelope = _promotion_envelope(_results(), signer=replacement)
+    with pytest.raises(GateContractError, match="verified|signature"):
+        evaluate_promotion_gates(
+            replacement_envelope,
+            GateConfig.competition(),
+            evaluator_verifier=verifier,
+            hidden_proof_verifier=verifier,
+        )
+
+
+def test_promotion_envelope_rejects_arbitrary_signed_hidden_proof_identity() -> None:
+    envelope = _promotion_envelope(_results())
+    hidden_batch = next(
+        item
+        for item in envelope.component_batches
+        if item.results[0].evaluation.kind is EvaluationKind.HIDDEN
+    )
+    row = hidden_batch.results[0]
+    substituted = HiddenPublicProof.create(
+        proof_id="hpf_" + "c" * 32,
+        replay_batch_digest=hidden_batch.batch_digest,
+        decision_bindings_digest=_sha("9"),
+        bundle_manifest_digest=row.bundle_manifest_digest,
+        defender_top_ref_digest=row.evaluation_lineage.defender_top_ref_digest,
+        worker_manifest_digest=_sha("c"),
+        evaluator_context_token=row.evaluation_context_digest,
+        cohort_mapping_token=row.evaluation_lineage.cohort_mapping_digest,
+        issued_at="2026-08-19T00:00:00Z",
+        signer=EVALUATOR_SIGNER,
+    )
+
+    with pytest.raises(GateContractError, match="hidden proof"):
+        VerifiedPromotionEnvelope.create(
+            component_batches=envelope.component_batches,
+            hidden_proofs=(substituted,),
+            signer=EVALUATOR_SIGNER,
+        )
+
+
+def test_promotion_envelope_roundtrip_and_constructor_tamper_fail_closed() -> None:
+    envelope = _promotion_envelope(_results())
+
+    assert VerifiedPromotionEnvelope.from_json(envelope.to_json()) == envelope
+    document = json.loads(envelope.to_json())
+    document["hidden_proofs"][0]["proof_id"] = "hpf_" + "c" * 32
+    with pytest.raises(GateContractError, match="digest|proof"):
+        VerifiedPromotionEnvelope.from_json(canonical_json_bytes(document))
+    forged = VerifiedPromotionEnvelope.model_construct(
+        **envelope.model_dump(mode="python", exclude={"envelope_digest"}),
+        envelope_digest=_sha("0"),
+    )
+    with pytest.raises((GateContractError, ValueError), match="digest|verified"):
+        forged.to_json()
+
+
 def test_within_one_cent_requires_strictly_lower_workload() -> None:
-    retained = evaluate_promotion_gates(
-        _results(hybrid_value="82.00", hybrid_cases=18), GateConfig.competition()
-    )
-    promoted = evaluate_promotion_gates(
-        _results(hybrid_value="81.99", hybrid_cases=17), GateConfig.competition()
-    )
+    retained = _evaluate(_results(hybrid_value="82.00", hybrid_cases=18))
+    promoted = _evaluate(_results(hybrid_value="81.99", hybrid_cases=17))
 
     assert retained.status is ChampionStatus.RETAINED
     assert retained.champion is DefenseArm.GBDT_ONLY
@@ -240,16 +393,19 @@ def test_each_assurance_failure_is_a_non_averageable_hard_blocker(
         assurance = row.assurance.model_copy(update={field: value})
         updates: dict[str, object] = {"assurance": assurance}
         if field == "hidden_access_clean" and row.evaluation.kind is EvaluationKind.HIDDEN:
-            updates["hidden_release_receipt_digest"] = None
+            updates["hidden_public_proof_id"] = None
         return row.rebuild(**updates)
 
     changed = _replace(
         _results(), arm=DefenseArm.LAYERED_HYBRID, transform=weaken
     )
-    decision = evaluate_promotion_gates(changed, GateConfig.competition())
-
-    assert decision.champion is not DefenseArm.LAYERED_HYBRID
-    assert code in decision.failed_gate_codes
+    if field == "hidden_access_clean":
+        with pytest.raises(GateContractError, match="hidden proof"):
+            _evaluate(changed)
+    else:
+        decision = _evaluate(changed)
+        assert decision.champion is not DefenseArm.LAYERED_HYBRID
+        assert code in decision.failed_gate_codes
 
 
 @pytest.mark.parametrize(
@@ -267,7 +423,7 @@ def test_numeric_hard_limits_are_inclusive_and_cannot_be_averaged(
         arm=DefenseArm.LAYERED_HYBRID,
         transform=lambda row: row.rebuild(metrics=metrics),
     )
-    decision = evaluate_promotion_gates(changed, GateConfig.competition())
+    decision = _evaluate(changed)
 
     assert decision.champion is not DefenseArm.LAYERED_HYBRID
     assert code in decision.failed_gate_codes
@@ -281,10 +437,25 @@ def test_one_strategic_family_below_floor_vetoes_all_promotion() -> None:
         transform=lambda row: row.rebuild(metrics=weak),
     )
 
-    decision = evaluate_promotion_gates(changed, GateConfig.competition())
+    decision = _evaluate(changed)
 
     assert decision.status is ChampionStatus.NO_PROMOTION
     assert decision.champion is None
+    assert "PER_FAMILY_RECALL" in decision.failed_gate_codes
+
+
+def test_strategic_family_floor_applies_inside_each_regime() -> None:
+    weak = _metrics(value="83.00", review_cases=17, family_recall=0.49)
+    changed = _replace(
+        _results(),
+        arm=DefenseArm.LAYERED_HYBRID,
+        kind=EvaluationKind.REGIME,
+        transform=lambda row: row.rebuild(metrics=weak),
+    )
+
+    decision = _evaluate(changed)
+
+    assert decision.champion is DefenseArm.GBDT_ONLY
     assert "PER_FAMILY_RECALL" in decision.failed_gate_codes
 
 
@@ -297,7 +468,7 @@ def test_hybrid_slice_recall_regression_over_five_points_vetoes_hybrid() -> None
         transform=lambda row: row.rebuild(metrics=weak),
     )
 
-    decision = evaluate_promotion_gates(changed, GateConfig.competition())
+    decision = _evaluate(changed)
 
     assert decision.champion is DefenseArm.GBDT_ONLY
     assert "SLICE_RECALL_REGRESSION" in decision.failed_gate_codes
@@ -316,8 +487,8 @@ def test_budget_breach_and_missing_required_evaluation_are_hard_failures() -> No
         row for row in _results() if row.evaluation.kind is not EvaluationKind.HIDDEN
     )
 
-    budget_decision = evaluate_promotion_gates(changed, GateConfig.competition())
-    coverage_decision = evaluate_promotion_gates(missing_hidden, GateConfig.competition())
+    budget_decision = _evaluate(changed)
+    coverage_decision = _evaluate(missing_hidden)
 
     assert "OPERATING_BUDGET" in budget_decision.failed_gate_codes
     assert coverage_decision.status is ChampionStatus.NO_PROMOTION
@@ -329,7 +500,7 @@ def test_missing_chronological_view_returns_negative_result_instead_of_crashing(
         row for row in _results() if row.evaluation.kind is not EvaluationKind.CHRONOLOGICAL
     )
 
-    decision = evaluate_promotion_gates(missing, GateConfig.competition())
+    decision = _evaluate(missing)
 
     assert decision.status is ChampionStatus.NO_PROMOTION
     assert decision.champion is None
@@ -349,7 +520,7 @@ def test_zero_row_nonapplicable_family_slices_do_not_create_false_family_failure
         transform=lambda row: row.rebuild(metrics=undefined),
     )
 
-    decision = evaluate_promotion_gates(changed, GateConfig.competition())
+    decision = _evaluate(changed)
 
     assert decision.status is ChampionStatus.PROMOTED
     assert "PER_FAMILY_RECALL" not in decision.failed_gate_codes
@@ -363,7 +534,7 @@ def test_no_promotion_remains_a_valid_negative_result_when_all_arms_fail() -> No
             assurance=row.assurance.model_copy(update={"leakage_passed": False})
         ),
     )
-    decision = evaluate_promotion_gates(changed, GateConfig.competition())
+    decision = _evaluate(changed)
 
     assert decision.status is ChampionStatus.NO_PROMOTION
     assert decision.champion is None
@@ -372,8 +543,8 @@ def test_no_promotion_remains_a_valid_negative_result_when_all_arms_fail() -> No
 
 def test_gate_results_are_order_invariant_and_canonical_roundtrip_rejects_tamper() -> None:
     results = _results()
-    forward = evaluate_promotion_gates(results, GateConfig.competition())
-    reverse = evaluate_promotion_gates(tuple(reversed(results)), GateConfig.competition())
+    forward = _evaluate(results)
+    reverse = _evaluate(tuple(reversed(results)))
     loaded = type(forward).from_json(forward.to_json())
 
     assert reverse == forward
@@ -387,10 +558,10 @@ def test_gate_results_are_order_invariant_and_canonical_roundtrip_rejects_tamper
 def test_decimal_champion_selection_is_independent_of_ambient_context() -> None:
     original = copy.copy(getcontext())
     try:
-        baseline = evaluate_promotion_gates(_results(), GateConfig.competition()).to_json()
+        baseline = _evaluate(_results()).to_json()
         getcontext().prec = 3
         getcontext().rounding = "ROUND_UP"
-        changed = evaluate_promotion_gates(_results(), GateConfig.competition()).to_json()
+        changed = _evaluate(_results()).to_json()
     finally:
         getcontext().prec = original.prec
         getcontext().rounding = original.rounding
@@ -417,7 +588,7 @@ def test_gate_rejects_reversed_decision_rows_in_one_arm() -> None:
         ),
     )
 
-    decision = evaluate_promotion_gates(changed, GateConfig.competition())
+    decision = _evaluate(changed)
 
     assert decision.status is ChampionStatus.NO_PROMOTION
     assert "EVALUATION_LINEAGE" in decision.failed_gate_codes
@@ -457,26 +628,24 @@ def test_gate_rejects_each_cross_arm_lineage_substitution(
         transform=substitute,
     )
 
-    decision = evaluate_promotion_gates(changed, GateConfig.competition())
+    decision = _evaluate(changed)
 
     assert decision.status is ChampionStatus.NO_PROMOTION
     assert "EVALUATION_LINEAGE" in decision.failed_gate_codes
 
 
-def test_gate_rejects_hidden_receipt_substitution_in_one_arm() -> None:
+def test_gate_rejects_hidden_public_proof_substitution_in_one_arm() -> None:
     changed = _replace(
         _results(),
         arm=DefenseArm.GBDT_ONLY,
         kind=EvaluationKind.HIDDEN,
         transform=lambda row: row.rebuild(
-            hidden_release_receipt_digest=_sha("c")
+            hidden_public_proof_id="hpf_" + "c" * 32
         ),
     )
 
-    decision = evaluate_promotion_gates(changed, GateConfig.competition())
-
-    assert decision.status is ChampionStatus.NO_PROMOTION
-    assert "EVALUATION_LINEAGE" in decision.failed_gate_codes
+    with pytest.raises(GateContractError, match="hidden proof"):
+        _evaluate(changed)
 
 
 def test_promotion_metrics_reject_omitted_closed_slice_vocabulary() -> None:
@@ -505,7 +674,7 @@ def test_missing_one_comparator_arm_for_one_descriptor_is_global_no_promotion() 
         )
     )
 
-    decision = evaluate_promotion_gates(incomplete, GateConfig.competition())
+    decision = _evaluate(incomplete)
 
     assert decision.status is ChampionStatus.NO_PROMOTION
     assert decision.champion is None
@@ -528,7 +697,7 @@ def test_undefined_overall_false_decline_rate_is_explicit_coverage_failure() -> 
         transform=lambda row: row.rebuild(metrics=undefined),
     )
 
-    decision = evaluate_promotion_gates(changed, GateConfig.competition())
+    decision = _evaluate(changed)
 
     assert decision.status is ChampionStatus.NO_PROMOTION
     assert "FALSE_DECLINE_COVERAGE" in decision.failed_gate_codes

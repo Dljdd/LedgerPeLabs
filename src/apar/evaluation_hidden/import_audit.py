@@ -105,6 +105,8 @@ def _hidden_imports(tree: ast.AST) -> tuple[tuple[int, str], ...]:
     dynamic_import_names = {"__import__", "importlib.import_module"}
     reflection_names = {"getattr"}
     code_execution_names = {"eval", "exec", "compile"}
+    namespace_reflection_names = {"globals", "vars"}
+    import_mapping_names: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -125,6 +127,8 @@ def _hidden_imports(tree: ast.AST) -> tuple[tuple[int, str], ...]:
                     reflection_names.add(target)
                 elif alias.name in code_execution_names:
                     code_execution_names.add(target)
+                elif alias.name in namespace_reflection_names:
+                    namespace_reflection_names.add(target)
     dynamic_import_names.update(f"{name}.import_module" for name in importlib_names)
     dynamic_import_names.update(f"{name}.__import__" for name in builtins_names)
     changed = True
@@ -139,6 +143,24 @@ def _hidden_imports(tree: ast.AST) -> tuple[tuple[int, str], ...]:
                     continue
                 alias_name = _call_name(assignment_target)
                 source_name = _call_name(node.value)
+                if (
+                    isinstance(node.value, ast.Attribute)
+                    and node.value.attr == "__dict__"
+                    and _call_name(node.value.value)
+                    in importlib_names | builtins_names
+                    and alias_name
+                    and alias_name not in import_mapping_names
+                ):
+                    import_mapping_names.add(alias_name)
+                    changed = True
+                if (
+                    isinstance(node.value, ast.Subscript)
+                    and _call_name(node.value.value) in import_mapping_names
+                    and alias_name
+                    and alias_name not in dynamic_import_names
+                ):
+                    dynamic_import_names.add(alias_name)
+                    changed = True
                 if source_name in importlib_names and alias_name not in importlib_names:
                     importlib_names.add(alias_name)
                     dynamic_import_names.add(f"{alias_name}.import_module")
@@ -169,6 +191,13 @@ def _hidden_imports(tree: ast.AST) -> tuple[tuple[int, str], ...]:
                 ):
                     code_execution_names.add(alias_name)
                     changed = True
+                if (
+                    alias_name
+                    and source_name in namespace_reflection_names
+                    and alias_name not in namespace_reflection_names
+                ):
+                    namespace_reflection_names.add(alias_name)
+                    changed = True
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -192,6 +221,9 @@ def _hidden_imports(tree: ast.AST) -> tuple[tuple[int, str], ...]:
                 found.append((node.lineno, "apar.evaluation_hidden"))
         elif isinstance(node, ast.Call):
             name = _call_name(node.func)
+            if name in namespace_reflection_names:
+                found.append((node.lineno, "<namespace-reflection>"))
+                continue
             if name in code_execution_names:
                 found.append((node.lineno, "<dynamic-code-execution>"))
                 continue
@@ -209,7 +241,32 @@ def _hidden_imports(tree: ast.AST) -> tuple[tuple[int, str], ...]:
                 found.append((node.lineno, f"<dynamic-import:{argument.value}>"))
             else:
                 found.append((node.lineno, "<unresolved-dynamic-import>"))
+        elif isinstance(node, ast.Attribute) and (
+            node.attr in {"__dict__", "__import__", "import_module"}
+            and _call_name(node.value) in importlib_names | builtins_names
+        ):
+            found.append((node.lineno, "<import-dunder-reflection>"))
+        elif isinstance(node, ast.Subscript) and (
+            _dangerous_mapping_key(node.slice)
+            or _call_name(node.value) in import_mapping_names
+            or (
+                isinstance(node.value, ast.Attribute)
+                and node.value.attr == "__dict__"
+                and _call_name(node.value.value)
+                in importlib_names | builtins_names
+            )
+        ):
+            found.append((node.lineno, "<import-mapping-reflection>"))
     return tuple(sorted(set(found)))
+
+
+def _dangerous_mapping_key(node: ast.expr) -> bool:
+    """Reject mapping access that can recover Python's import machinery."""
+    return (
+        isinstance(node, ast.Constant)
+        and type(node.value) is str
+        and node.value in {"__builtins__", "__dict__", "__import__", "import_module"}
+    )
 
 
 def _import_argument(node: ast.Call) -> ast.expr | None:
