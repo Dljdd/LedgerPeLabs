@@ -427,7 +427,7 @@ def test_model_threshold_edges_use_decline_before_challenge_and_greater_equal(
         vector=feature_vector,
     )
     assert decision.action is expected
-    assert decision.score == score
+    assert decision.score == (1.0 - 1e-8 if score == 1.0 else score)
 
 
 def test_hybrid_uses_stronger_continuous_rule_score() -> None:
@@ -500,7 +500,7 @@ def test_model_failure_with_clear_rules_approves_but_remains_visible() -> None:
         vector=feature_vector,
     )
     assert decision.action is Action.APPROVE
-    assert decision.score == 0.0
+    assert decision.score == 1e-8
     assert decision.reason_codes == (DefenseReason.MODEL_UNAVAILABLE,)
     assert decision.fallback_used is True
     assert decision.failed_component_version == "unknown"
@@ -547,7 +547,7 @@ def test_high_calibrated_score_cannot_influence_missing_threshold_fallback() -> 
         vector=feature_vector,
     )
     assert decision.action is Action.APPROVE
-    assert decision.score == 0.0
+    assert decision.score == 1e-8
     assert decision.calibrated_score is None
     assert decision.failed_component_version == "unknown"
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from typing import Literal
 
+import numpy as np
 from pydantic import Field, field_validator, model_validator
 
 from apar.contracts._validation import ExternalContract, validate_semantic_version
@@ -197,9 +198,18 @@ class ActionPolicy(ExternalContract):
             )
 
         if model_available:
+            # Local import avoids the policy/threshold module initialization cycle.
+            # Task 8's exported normalization keeps exact 0/1 operating scores
+            # distinct from the true disabled threshold sentinel at 1.0.
+            from apar.defense.thresholds import normalize_operating_scores
+
             assert calibrated_score is not None
             assert thresholds is not None
-            hybrid_score = max(rule_result.score, calibrated_score)
+            hybrid_score = float(
+                normalize_operating_scores(
+                    np.asarray([max(rule_result.score, calibrated_score)], dtype=np.float64)
+                )[0]
+            )
             if hybrid_score >= thresholds.decline:
                 action = Action.DECLINE
             elif hybrid_score >= thresholds.challenge:
@@ -220,9 +230,16 @@ class ActionPolicy(ExternalContract):
 
         failure = model_failure or DefenseReason.MODEL_UNAVAILABLE
         component_identity = failed_component_version or "unknown"
-        if rule_result.score >= self.rules_decline_threshold:
+        from apar.defense.thresholds import normalize_operating_scores
+
+        fallback_score = float(
+            normalize_operating_scores(
+                np.asarray([rule_result.score], dtype=np.float64)
+            )[0]
+        )
+        if fallback_score >= self.rules_decline_threshold:
             fallback_action = Action.DECLINE
-        elif rule_result.score >= self.rules_challenge_threshold:
+        elif fallback_score >= self.rules_challenge_threshold:
             fallback_action = Action.CHALLENGE
         else:
             fallback_action = Action.APPROVE
@@ -233,7 +250,7 @@ class ActionPolicy(ExternalContract):
             event,
             rule_result,
             action=fallback_action,
-            score=rule_result.score,
+            score=fallback_score,
             calibrated_score=None,
             reasons=fallback_reasons,
             fallback_reason=failure,
