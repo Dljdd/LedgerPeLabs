@@ -138,6 +138,86 @@ def test_empty_report_keeps_denominator_and_latency_quantiles_undefined() -> Non
     assert report.engineering.feature_ms.p99.undefined_reason == "empty_latency_samples"
 
 
+def test_empty_public_report_requires_exact_restricted_evidence() -> None:
+    queue = simulate_case_queue((), QueueConfig())
+    inputs = MetricReportInputs(
+        truth=(),
+        observations=(),
+        decisions=(),
+        cases=(),
+        queue_report=queue,
+        latency_samples=(),
+        as_of=AS_OF,
+        slice_assignments=(),
+    )
+    evidence = metric_module.MetricDerivationEvidence.from_inputs(inputs)
+    report = compute_metric_report(inputs)
+    assert report.derivation_evidence_digest == evidence.evidence_digest
+    with pytest.raises(MetricContractError, match="restricted metric evidence"):
+        metric_module.MetricReport.from_json(report.to_json())
+    assert metric_module.MetricReport.from_json(
+        report.to_json(), evidence=evidence
+    ) == report
+
+
+def test_forged_empty_report_cannot_bypass_exact_evidence_rederivation() -> None:
+    queue = simulate_case_queue((), QueueConfig())
+    inputs = MetricReportInputs(
+        truth=(),
+        observations=(),
+        decisions=(),
+        cases=(),
+        queue_report=queue,
+        latency_samples=(),
+        as_of=AS_OF,
+        slice_assignments=(),
+    )
+    evidence = metric_module.MetricDerivationEvidence.from_inputs(inputs)
+    original = json.loads(compute_metric_report(inputs).to_json())
+    document = copy.deepcopy(original)
+    document["evaluator_as_of"] = "2030-01-01T00:00:00Z"
+    document["evaluator_input_digest"] = "0" * 64
+    document["derivation_evidence_digest"] = "1" * 64
+    unsigned = {key: value for key, value in document.items() if key != "report_digest"}
+    document["report_digest"] = hashlib.sha256(
+        canonical_json_bytes(unsigned)
+    ).hexdigest()
+    payload = canonical_json_bytes(document)
+
+    with pytest.raises(MetricContractError, match="restricted metric evidence"):
+        metric_module.MetricReport.from_json(payload)
+    with pytest.raises(MetricContractError, match="evidence digest|as_of|input digest"):
+        metric_module.MetricReport.from_json(payload, evidence=evidence)
+
+    changed_as_of = copy.deepcopy(original)
+    changed_as_of["evaluator_as_of"] = "2030-01-01T00:00:00Z"
+    unsigned = {
+        key: value for key, value in changed_as_of.items() if key != "report_digest"
+    }
+    changed_as_of["report_digest"] = hashlib.sha256(
+        canonical_json_bytes(unsigned)
+    ).hexdigest()
+    with pytest.raises(MetricContractError, match="as_of"):
+        metric_module.MetricReport.from_json(
+            canonical_json_bytes(changed_as_of), evidence=evidence
+        )
+
+    changed_input_digest = copy.deepcopy(original)
+    changed_input_digest["evaluator_input_digest"] = "0" * 64
+    unsigned = {
+        key: value
+        for key, value in changed_input_digest.items()
+        if key != "report_digest"
+    }
+    changed_input_digest["report_digest"] = hashlib.sha256(
+        canonical_json_bytes(unsigned)
+    ).hexdigest()
+    with pytest.raises(MetricContractError, match="input digest"):
+        metric_module.MetricReport.from_json(
+            canonical_json_bytes(changed_input_digest), evidence=evidence
+        )
+
+
 def test_count_contracts_reject_bool_coercion() -> None:
     undefined = MetricValue(
         value=None,
@@ -369,6 +449,102 @@ def test_confidence_evidence_is_bound_to_exact_evaluator_input_digest() -> None:
     with pytest.raises(MetricContractError, match="evidence digest"):
         ConfidenceIntervals.from_json(
             canonical_json_bytes(confidence), evidence=evidence
+        )
+
+
+def test_coordinated_bootstrap_digest_forgery_rejects_changed_evaluator() -> None:
+    inputs = four_row_inputs()
+    evidence_document = json.loads(
+        BootstrapDerivationEvidence.from_inputs(inputs).to_bytes()
+    )
+    evidence_document["evaluator_input_digest"] = "0" * 64
+    forged_payload = canonical_json_bytes(evidence_document)
+    with pytest.raises(MetricContractError, match="evaluator input digest"):
+        BootstrapDerivationEvidence.from_bytes(forged_payload)
+    forged_evidence = bytes.__new__(BootstrapDerivationEvidence, forged_payload)
+    public_document = json.loads(campaign_bootstrap(inputs).to_json())
+    public_document["evaluator_input_digest"] = "0" * 64
+    public_document["derivation_evidence_digest"] = forged_evidence.evidence_digest
+    unsigned = {
+        key: value
+        for key, value in public_document.items()
+        if key != "intervals_digest"
+    }
+    public_document["intervals_digest"] = hashlib.sha256(
+        canonical_json_bytes(unsigned)
+    ).hexdigest()
+
+    with pytest.raises(MetricContractError, match="evaluator input digest"):
+        ConfidenceIntervals.from_json(
+            canonical_json_bytes(public_document), evidence=forged_evidence
+        )
+
+
+def test_coordinated_zero_bootstrap_contributions_reject_original_evaluator() -> None:
+    inputs = four_row_inputs()
+    evidence_document = json.loads(
+        BootstrapDerivationEvidence.from_inputs(inputs).to_bytes()
+    )
+    for contribution in evidence_document["campaign_contributions"]:
+        contribution.update(
+            {
+                "true_positives": 0,
+                "false_positives": 0,
+                "false_negatives": 0,
+                "true_negatives": 0,
+                "fraud_campaign": 0,
+                "detected_campaign": 0,
+                "fraudulent_value": "0.00",
+                "preventable_value": "0.00",
+            }
+        )
+    forged_payload = canonical_json_bytes(evidence_document)
+    with pytest.raises(MetricContractError, match="campaign contributions"):
+        BootstrapDerivationEvidence.from_bytes(forged_payload)
+    forged_evidence = bytes.__new__(BootstrapDerivationEvidence, forged_payload)
+    public_document = json.loads(campaign_bootstrap(inputs).to_json())
+    for interval in public_document["intervals"]:
+        if interval["metric_name"] in {
+            "precision",
+            "recall",
+            "f1",
+            "false_positive_rate",
+            "campaign_recall",
+        }:
+            interval.update(
+                {
+                    "lower": None,
+                    "median": None,
+                    "upper": None,
+                    "valid_replicates": 0,
+                    "undefined_replicates": 1000,
+                    "undefined_reason": "no_defined_bootstrap_replicates",
+                }
+            )
+        else:
+            interval.update(
+                {
+                    "lower": 0.0,
+                    "median": 0.0,
+                    "upper": 0.0,
+                    "valid_replicates": 1000,
+                    "undefined_replicates": 0,
+                    "undefined_reason": None,
+                }
+            )
+    public_document["derivation_evidence_digest"] = forged_evidence.evidence_digest
+    unsigned = {
+        key: value
+        for key, value in public_document.items()
+        if key != "intervals_digest"
+    }
+    public_document["intervals_digest"] = hashlib.sha256(
+        canonical_json_bytes(unsigned)
+    ).hexdigest()
+
+    with pytest.raises(MetricContractError, match="campaign contributions"):
+        ConfidenceIntervals.from_json(
+            canonical_json_bytes(public_document), evidence=forged_evidence
         )
 
 
