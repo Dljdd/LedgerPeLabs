@@ -139,17 +139,14 @@ def _hidden_imports(tree: ast.AST) -> tuple[tuple[int, str], ...]:
     while changed:
         changed = False
         for node in ast.walk(tree):
-            if not isinstance(node, (ast.Assign, ast.AnnAssign)) or node.value is None:
-                continue
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            for assignment_target in targets:
-                for target_leaf in _assignment_target_leaves(assignment_target):
+            for binding_target, binding_value in _binding_pairs(node):
+                for target_leaf in _assignment_target_leaves(binding_target):
                     alias_name = _call_name(target_leaf)
-                    source_name = _call_name(node.value)
+                    source_name = _call_name(binding_value)
                     changed |= _propagate_assignment_provenance(
                         alias_name=alias_name,
                         source_name=source_name,
-                        value=node.value,
+                        value=binding_value,
                         importlib_names=importlib_names,
                         builtins_names=builtins_names,
                         dynamic_import_names=dynamic_import_names,
@@ -238,6 +235,68 @@ def _hidden_imports(tree: ast.AST) -> tuple[tuple[int, str], ...]:
         ):
             found.append((node.lineno, "<import-mapping-reflection>"))
     return tuple(sorted(set(found)))
+
+
+def _binding_pairs(node: ast.AST) -> tuple[tuple[ast.expr, ast.expr], ...]:
+    """Return value-to-target edges for every Python binding form with a value."""
+    if isinstance(node, ast.Assign):
+        return tuple((target, node.value) for target in node.targets)
+    if isinstance(node, ast.AnnAssign):
+        return () if node.value is None else ((node.target, node.value),)
+    if isinstance(node, (ast.NamedExpr, ast.AugAssign)):
+        return ((node.target, node.value),)
+    if isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+        return ((node.target, node.iter),)
+    if isinstance(node, ast.withitem):
+        if node.optional_vars is None:
+            return ()
+        return ((node.optional_vars, node.context_expr),)
+    if isinstance(node, ast.ExceptHandler):
+        if node.name is None or node.type is None:
+            return ()
+        return ((ast.Name(id=node.name, ctx=ast.Store()), node.type),)
+    if isinstance(node, ast.Match):
+        return tuple(
+            (ast.Name(id=name, ctx=ast.Store()), node.subject)
+            for case in node.cases
+            for name in _match_capture_names(case.pattern)
+        )
+    return ()
+
+
+def _match_capture_names(pattern: ast.pattern) -> tuple[str, ...]:
+    """Return every name captured by a structural-pattern binding."""
+    if isinstance(pattern, ast.MatchAs):
+        nested = () if pattern.pattern is None else _match_capture_names(pattern.pattern)
+        return nested + (() if pattern.name is None else (pattern.name,))
+    if isinstance(pattern, ast.MatchStar):
+        return () if pattern.name is None else (pattern.name,)
+    if isinstance(pattern, ast.MatchSequence):
+        return tuple(
+            name
+            for nested_pattern in pattern.patterns
+            for name in _match_capture_names(nested_pattern)
+        )
+    if isinstance(pattern, ast.MatchMapping):
+        nested = tuple(
+            name
+            for nested_pattern in pattern.patterns
+            for name in _match_capture_names(nested_pattern)
+        )
+        return nested + (() if pattern.rest is None else (pattern.rest,))
+    if isinstance(pattern, ast.MatchClass):
+        return tuple(
+            name
+            for nested_pattern in (*pattern.patterns, *pattern.kwd_patterns)
+            for name in _match_capture_names(nested_pattern)
+        )
+    if isinstance(pattern, ast.MatchOr):
+        return tuple(
+            name
+            for nested_pattern in pattern.patterns
+            for name in _match_capture_names(nested_pattern)
+        )
+    return ()
 
 
 def _assignment_target_leaves(target: ast.expr) -> tuple[ast.expr, ...]:

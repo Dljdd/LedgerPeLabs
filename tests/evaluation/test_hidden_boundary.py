@@ -274,6 +274,44 @@ def test_defense_and_features_cannot_import_hidden_package(tmp_path: Path) -> No
         "    [first, *rest] = mapping.values()\n"
         "    first('apar.evaluation_hidden.mapping_nested')\n"
     )
+    (apar_root / "features" / "mapping_namedexpr.py").write_text(
+        "def invoke(mapping, key):\n"
+        "    if loader := mapping.get(key):\n"
+        "        loader('apar.evaluation_hidden.mapping_namedexpr')\n"
+    )
+    (apar_root / "defense" / "mapping_for.py").write_text(
+        "def invoke(mapping):\n"
+        "    for loader in mapping.values():\n"
+        "        loader('apar.evaluation_hidden.mapping_for')\n"
+    )
+    (apar_root / "features" / "mapping_async_for.py").write_text(
+        "async def invoke(mapping):\n"
+        "    async for loader in mapping.values():\n"
+        "        loader('apar.evaluation_hidden.mapping_async_for')\n"
+    )
+    (apar_root / "defense" / "mapping_comprehension.py").write_text(
+        "def invoke(mapping):\n"
+        "    return [loader('apar.evaluation_hidden.mapping_comprehension')\n"
+        "            for loader in mapping.values()]\n"
+    )
+    (apar_root / "features" / "mapping_with.py").write_text(
+        "def invoke(mapping, key):\n"
+        "    with mapping.get(key) as loader:\n"
+        "        loader('apar.evaluation_hidden.mapping_with')\n"
+    )
+    (apar_root / "defense" / "mapping_except.py").write_text(
+        "def invoke(mapping, key):\n"
+        "    try:\n"
+        "        raise RuntimeError\n"
+        "    except mapping.get(key) as loader:\n"
+        "        loader('apar.evaluation_hidden.mapping_except')\n"
+    )
+    (apar_root / "features" / "mapping_match.py").write_text(
+        "def invoke(mapping):\n"
+        "    match mapping.values():\n"
+        "        case [loader]:\n"
+        "            loader('apar.evaluation_hidden.mapping_match')\n"
+    )
 
     result = audit_hidden_import_boundary(apar_root)
 
@@ -291,6 +329,13 @@ def test_defense_and_features_cannot_import_hidden_package(tmp_path: Path) -> No
     assert any("mapping_method_alias.py" in item for item in result.violations)
     assert any("mapping_getattr_chain.py" in item for item in result.violations)
     assert any("mapping_destructure.py" in item for item in result.violations)
+    assert any("mapping_namedexpr.py" in item for item in result.violations)
+    assert any("mapping_for.py" in item for item in result.violations)
+    assert any("mapping_async_for.py" in item for item in result.violations)
+    assert any("mapping_comprehension.py" in item for item in result.violations)
+    assert any("mapping_with.py" in item for item in result.violations)
+    assert any("mapping_except.py" in item for item in result.violations)
+    assert any("mapping_match.py" in item for item in result.violations)
 
 
 def test_hidden_authority_methods_are_bound_to_the_exact_instance(
