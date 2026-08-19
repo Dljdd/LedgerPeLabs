@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import copy
 import math
+import pickle
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from time import perf_counter
@@ -20,6 +22,7 @@ from apar.cases import (
     group_cases,
 )
 from apar.contracts.decisions import Action
+from apar.defense.contracts import ObservedEvent
 from apar.defense.policy import DefenseDecision, OperatingBudget
 from apar.defense.thresholds import select_policy_thresholds
 from apar.runs.wire import canonical_json_bytes
@@ -881,7 +884,9 @@ def test_shared_counterparty_motif_is_stable_without_future_rejoin() -> None:
     assert after[0].first_evidence_ids == before[0].first_evidence_ids
 
 
-def test_grouping_visits_each_graph_observation_once(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_grouping_topology_work_is_bounded_logarithmically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from apar.cases import grouping
 
     row_count = 400
@@ -896,24 +901,20 @@ def test_grouping_visits_each_graph_observation_once(monkeypatch: pytest.MonkeyP
     )
     decisions = tuple(decision(row.event_id) for row in rows)
     visits = 0
-    original = grouping._IncrementalGraph.add_observation
+    original = grouping._RollbackTopologyDsu.add_edge
 
-    def counted(graph: object, row: object) -> None:
+    def counted(graph: object, left: int, right: int, row: object) -> None:
         nonlocal visits
         visits += 1
-        original(graph, row)  # type: ignore[arg-type]
+        original(graph, left, right, row)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(grouping._IncrementalGraph, "add_observation", counted)
+    monkeypatch.setattr(grouping._RollbackTopologyDsu, "add_edge", counted)
 
     assert len(group_cases(rows, decisions, as_of=rows[-1].decision_at)) == row_count
-    assert visits == row_count
+    assert visits <= row_count * 20
 
 
-def test_merged_case_index_does_not_rescan_stale_aliases_per_later_batch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from apar.cases import grouping
-
+def test_merged_case_index_resolves_stale_aliases_for_later_batches() -> None:
     isolated_count = 100
     bridge_at = NOW + timedelta(minutes=1)
     merge_at = NOW + timedelta(minutes=2)
@@ -957,23 +958,10 @@ def test_merged_case_index_does_not_rescan_stale_aliases_per_later_batch(
         + (decision("merger"),)
         + tuple(decision(row.event_id) for row in later)
     )
-    lookup_ids = 0
-    original = grouping._IncrementalGraph.case_ids
-
-    def counted(
-        graph: object, roots: set[str] | frozenset[str]
-    ) -> set[str]:
-        nonlocal lookup_ids
-        result = original(graph, roots)  # type: ignore[arg-type]
-        lookup_ids += len(result)
-        return result
-
-    monkeypatch.setattr(grouping._IncrementalGraph, "case_ids", counted)
-
     grouped = group_cases(rows, decisions, as_of=later[-1].decision_at)
 
     assert len(grouped) == 1
-    assert lookup_ids <= isolated_count * 3
+    assert len(grouped[0].event_ids) == isolated_count * 2 + 1
 
 
 def test_1500_isolated_grouping_meets_frozen_benchmark_ceiling() -> None:
@@ -1028,6 +1016,308 @@ def test_review_case_counter_random_masks_match_full_grouping() -> None:
 
         assert callback(actions) == expected
         assert callback(actions) == expected
+
+
+def test_review_case_counter_matches_full_grouping_for_varied_availability_ties() -> None:
+    rows = tuple(
+        sorted(
+            (
+                observation(
+                    "d3",
+                    actor_id="a1",
+                    counterparty_id="c2",
+                    available_at=NOW,
+                    event_time=NOW - timedelta(seconds=1),
+                    decision_at=NOW + timedelta(seconds=1),
+                ),
+                observation(
+                    "d4",
+                    actor_id="a2",
+                    counterparty_id="c0",
+                    available_at=NOW,
+                    event_time=NOW - timedelta(seconds=1),
+                    decision_at=NOW + timedelta(seconds=1),
+                ),
+                observation(
+                    "d2",
+                    actor_id="a1",
+                    counterparty_id="c0",
+                    available_at=NOW + timedelta(seconds=2),
+                    event_time=NOW + timedelta(seconds=1),
+                    decision_at=NOW + timedelta(seconds=5),
+                ),
+                observation(
+                    "d0",
+                    actor_id="a0",
+                    counterparty_id="c1",
+                    available_at=NOW + timedelta(seconds=1),
+                    event_time=NOW,
+                    decision_at=NOW + timedelta(seconds=2),
+                ),
+                observation(
+                    "d6",
+                    actor_id="a0",
+                    counterparty_id="c0",
+                    available_at=NOW,
+                    event_time=NOW - timedelta(seconds=1),
+                    decision_at=NOW + timedelta(seconds=2),
+                ),
+            ),
+            key=lambda row: (row.available_at, row.event_id),
+        )
+    )
+    decisions = tuple(
+        decision(event_id)
+        for event_id in ("d3", "d4", "d0", "d6", "d2")
+    )
+    as_of = NOW + timedelta(seconds=5)
+    callback = bind_review_case_counter(rows, decisions, as_of=as_of)
+    actions = np.asarray([Action.CHALLENGE] * len(decisions), dtype=object)
+
+    full_count = len(group_cases(rows, decisions, as_of=as_of))
+
+    assert full_count == 2
+    assert callback(actions) == full_count
+
+
+def test_review_case_counter_randomized_varied_availability_matches_full_grouping() -> None:
+    generator = np.random.default_rng(6)
+    row_count = 8
+    as_of = NOW + timedelta(seconds=8)
+
+    for trial in range(32):
+        unsorted_rows = []
+        for index in range(row_count):
+            decision_offset = int(generator.integers(1, 8))
+            available_offset = int(generator.integers(0, decision_offset))
+            unsorted_rows.append(
+                observation(
+                    f"fuzz-{trial:02d}-{index:02d}",
+                    actor_id=f"actor-{int(generator.integers(0, 4))}",
+                    counterparty_id=f"merchant-{int(generator.integers(0, 4))}",
+                    available_at=NOW + timedelta(seconds=available_offset),
+                    event_time=NOW - timedelta(seconds=1),
+                    decision_at=NOW + timedelta(seconds=decision_offset),
+                )
+            )
+        rows = tuple(
+            sorted(unsorted_rows, key=lambda row: (row.available_at, row.event_id))
+        )
+        observation_by_id = {row.event_id: row for row in rows}
+        templates = tuple(
+            sorted(
+                (decision(row.event_id, action=Action.APPROVE) for row in rows),
+                key=lambda item: (
+                    observation_by_id[item.event_id].decision_at,
+                    item.event_id,
+                ),
+            )
+        )
+        actions = np.asarray(
+            tuple(
+                Action.CHALLENGE if selected else Action.APPROVE
+                for selected in generator.integers(0, 2, row_count)
+            ),
+            dtype=object,
+        )
+        candidates = tuple(
+            decision(row.event_id, action=cast(Action, actions[index]))
+            for index, row in enumerate(templates)
+        )
+        callback = bind_review_case_counter(rows, templates, as_of=as_of)
+
+        assert callback(actions) == len(group_cases(rows, candidates, as_of=as_of))
+
+
+def test_content_case_id_tie_break_cannot_mutate_to_numeric_creation_order() -> None:
+    bridge_at = NOW + timedelta(seconds=1)
+    trigger_at = NOW + timedelta(seconds=2)
+    rows = (
+        observation("case-a", actor_id="actor-a", counterparty_id="merchant-a"),
+        observation("case-b", actor_id="actor-b", counterparty_id="merchant-b"),
+        observation(
+            "bridge",
+            actor_id="actor-a",
+            counterparty_id="merchant-b",
+            decision_at=bridge_at,
+        ),
+        observation(
+            "trigger",
+            actor_id="actor-a",
+            counterparty_id="merchant-new",
+            decision_at=trigger_at,
+        ),
+    )
+    decisions = tuple(decision(row.event_id) for row in rows)
+    callback = bind_review_case_counter(rows, decisions, as_of=trigger_at)
+    actions = np.asarray([Action.CHALLENGE] * len(decisions), dtype=object)
+
+    before_trigger = group_cases(rows[:-1], decisions[:-1], as_of=bridge_at)
+    bridge_case = next(case for case in before_trigger if "bridge" in case.event_ids)
+    content_minimum = min(
+        case.case_id
+        for case in group_cases(rows[:2], decisions[:2], as_of=NOW)
+    )
+
+    assert bridge_case.case_id == content_minimum
+    assert len(group_cases(rows, decisions, as_of=trigger_at)) == 1
+    assert callback(actions) == 1
+
+
+def test_causal_topology_resource_caps_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from apar.cases import grouping
+
+    rows, decisions, as_of = _early_available_future_decision_chain(16)
+    monkeypatch.setattr(grouping, "_MAX_TOPOLOGY_INTERVAL_REFS", 1)
+    with pytest.raises(CaseContractError, match="interval resource cap"):
+        group_cases(rows, decisions, as_of=as_of)
+
+    monkeypatch.setattr(grouping, "_MAX_TOPOLOGY_INTERVAL_REFS", 10_000)
+    monkeypatch.setattr(grouping, "_MAX_TOPOLOGY_MEMBERSHIP_ENTRIES", 1)
+    with pytest.raises(CaseContractError, match="membership resource cap"):
+        bind_review_case_counter(rows, decisions, as_of=as_of)
+
+
+def test_review_case_counter_private_state_poison_cannot_change_original_result() -> None:
+    isolated_rows = (
+        observation("isolated-a", actor_id="actor-a", counterparty_id="merchant-a"),
+        observation(
+            "isolated-b",
+            actor_id="actor-b",
+            counterparty_id="merchant-b",
+            decision_at=NOW + timedelta(seconds=1),
+        ),
+    )
+    connected_rows = (
+        observation("connected-a", actor_id="actor-a", counterparty_id="merchant"),
+        observation(
+            "connected-b",
+            actor_id="actor-b",
+            counterparty_id="merchant",
+            decision_at=NOW + timedelta(seconds=1),
+        ),
+    )
+    isolated = bind_review_case_counter(
+        isolated_rows,
+        tuple(decision(row.event_id) for row in isolated_rows),
+        as_of=NOW + timedelta(seconds=1),
+    )
+    connected = bind_review_case_counter(
+        connected_rows,
+        tuple(decision(row.event_id) for row in connected_rows),
+        as_of=NOW + timedelta(seconds=1),
+    )
+    actions = np.asarray([Action.CHALLENGE, Action.CHALLENGE], dtype=object)
+
+    assert isolated(actions) == 2
+    assert connected(actions) == 1
+    private = getattr(isolated, "__pydantic_private__", None)
+    if isinstance(private, dict):
+        private["_topology"] = connected._topology
+
+    assert isolated(actions) == 2
+
+
+def test_review_case_counter_is_intrinsically_immutable_across_copy_and_pickle() -> None:
+    rows = (
+        observation("immutable-a", actor_id="actor-a", counterparty_id="merchant-a"),
+        observation(
+            "immutable-b",
+            actor_id="actor-b",
+            counterparty_id="merchant-b",
+            decision_at=NOW + timedelta(seconds=1),
+        ),
+    )
+    callback = bind_review_case_counter(
+        rows,
+        tuple(decision(row.event_id) for row in rows),
+        as_of=NOW + timedelta(seconds=1),
+    )
+    actions = np.asarray([Action.CHALLENGE, Action.CHALLENGE], dtype=object)
+
+    assert callback(actions) == 2
+    assert not hasattr(callback, "__dict__")
+    assert not hasattr(callback, "__pydantic_private__")
+    assert not hasattr(callback, "_replace")
+    with pytest.raises(TypeError, match="immutable"):
+        callback._topology = callback._topology
+    with pytest.raises(TypeError, match="immutable"):
+        del callback._topology
+    with pytest.raises(TypeError):
+        callback[0] = callback[0]  # type: ignore[index]
+    with pytest.raises((AttributeError, TypeError)):
+        callback._topology.batches = ()  # type: ignore[misc]
+
+    callback.__init__()
+    assert callback(actions) == 2
+    assert copy.copy(callback)(actions) == 2
+    assert copy.deepcopy(callback)(actions) == 2
+    assert pickle.loads(pickle.dumps(callback))(actions) == 2
+
+
+def _early_available_future_decision_chain(
+    row_count: int,
+) -> tuple[tuple[ObservedEvent, ...], tuple[DefenseDecision, ...], datetime]:
+    rows = tuple(
+        sorted(
+            (
+                observation(
+                    f"chain-{index:04d}",
+                    actor_id=f"actor-{(index + 1) // 2:04d}",
+                    counterparty_id=f"merchant-{index // 2:04d}",
+                    available_at=NOW,
+                    event_time=NOW - timedelta(seconds=1),
+                    decision_at=NOW + timedelta(seconds=index + 1),
+                )
+                for index in range(row_count)
+            ),
+            key=lambda row: (row.available_at, row.event_id),
+        )
+    )
+    decisions = tuple(decision(f"chain-{index:04d}") for index in range(row_count))
+    return rows, decisions, NOW + timedelta(seconds=row_count + 1)
+
+
+def test_batch_exclusion_adjacency_work_is_near_linear(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from apar.cases import grouping
+
+    row_count = 600
+    rows, decisions, as_of = _early_available_future_decision_chain(row_count)
+    visits = 0
+
+    original = grouping._RollbackTopologyDsu.add_edge
+
+    def count_topology(graph: object, left: int, right: int, row: object) -> None:
+        nonlocal visits
+        visits += 1
+        original(graph, left, right, row)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(grouping._RollbackTopologyDsu, "add_edge", count_topology)
+
+    assert len(group_cases(rows, decisions, as_of=as_of)) == 1
+    assert visits <= row_count * 20
+
+
+def test_batch_exclusion_has_no_legacy_adjacency_engine() -> None:
+    from apar.cases import grouping
+
+    assert not hasattr(grouping, "_ExcludingGraphView")
+    assert not hasattr(grouping, "_CountExcludingGraphView")
+
+
+def test_1500_early_available_future_decision_chain_meets_frozen_ceiling() -> None:
+    rows, decisions, as_of = _early_available_future_decision_chain(1_500)
+
+    started = perf_counter()
+    grouped = group_cases(rows, decisions, as_of=as_of)
+    elapsed = perf_counter() - started
+
+    assert len(grouped) == 1
+    assert elapsed < 2.5
 
 
 def test_review_case_counter_matches_full_grouping_with_context_rows() -> None:
@@ -1088,6 +1378,30 @@ def test_high_cardinality_threshold_callback_meets_frozen_ceiling() -> None:
         for index, row in enumerate(rows)
     )
     callback = bind_review_case_counter(rows, templates, as_of=NOW)
+    scores = np.linspace(0.001, 0.999, row_count, dtype=np.float64)
+    labels = np.zeros(row_count, dtype=np.int8)
+    labels[-30:] = 1
+    mandatory = np.empty(row_count, dtype=object)
+    mandatory[:] = [Action.APPROVE] * row_count
+
+    started = perf_counter()
+    report = select_policy_thresholds(
+        scores,
+        labels,
+        mandatory,
+        callback,
+        OperatingBudget(),
+    )
+    elapsed = perf_counter() - started
+
+    assert report.candidate_threshold_count == row_count + 2
+    assert elapsed < 3.0
+
+
+def test_high_cardinality_chain_threshold_callback_meets_frozen_ceiling() -> None:
+    row_count = 300
+    rows, templates, as_of = _early_available_future_decision_chain(row_count)
+    callback = bind_review_case_counter(rows, templates, as_of=as_of)
     scores = np.linspace(0.001, 0.999, row_count, dtype=np.float64)
     labels = np.zeros(row_count, dtype=np.int8)
     labels[-30:] = 1
