@@ -108,6 +108,9 @@ def _hidden_imports(tree: ast.AST) -> tuple[tuple[int, str], ...]:
     namespace_reflection_names = {"globals", "locals", "vars"}
     import_mapping_names: set[str] = set()
     subscript_callable_names: set[str] = set()
+    retrieval_accessor_names: set[str] = set()
+    dynamic_callable_names: set[str] = set()
+    retrieval_methods = {"get", "__getitem__", "pop", "setdefault", "values"}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -150,6 +153,47 @@ def _hidden_imports(tree: ast.AST) -> tuple[tuple[int, str], ...]:
                     and alias_name not in subscript_callable_names
                 ):
                     subscript_callable_names.add(alias_name)
+                    changed = True
+                if (
+                    alias_name
+                    and isinstance(node.value, ast.Attribute)
+                    and node.value.attr in retrieval_methods
+                    and alias_name not in retrieval_accessor_names
+                ):
+                    retrieval_accessor_names.add(alias_name)
+                    changed = True
+                if (
+                    alias_name
+                    and isinstance(node.value, ast.Call)
+                    and (
+                        _call_name(node.value.func) in retrieval_accessor_names
+                        or (
+                            isinstance(node.value.func, ast.Attribute)
+                            and node.value.func.attr in retrieval_methods
+                        )
+                        or (
+                            _call_name(node.value.func) in reflection_names
+                            and not _is_allowed_feature_dispatch(node.value)
+                        )
+                        or isinstance(node.value.func, (ast.Call, ast.Subscript))
+                    )
+                    and alias_name not in dynamic_callable_names
+                ):
+                    dynamic_callable_names.add(alias_name)
+                    changed = True
+                if (
+                    alias_name
+                    and source_name in retrieval_accessor_names
+                    and alias_name not in retrieval_accessor_names
+                ):
+                    retrieval_accessor_names.add(alias_name)
+                    changed = True
+                if (
+                    alias_name
+                    and source_name in dynamic_callable_names
+                    and alias_name not in dynamic_callable_names
+                ):
+                    dynamic_callable_names.add(alias_name)
                     changed = True
                 if (
                     isinstance(node.value, ast.Attribute)
@@ -229,7 +273,11 @@ def _hidden_imports(tree: ast.AST) -> tuple[tuple[int, str], ...]:
                 found.append((node.lineno, "apar.evaluation_hidden"))
         elif isinstance(node, ast.Call):
             name = _call_name(node.func)
-            if isinstance(node.func, ast.Subscript) or name in subscript_callable_names:
+            if (
+                isinstance(node.func, (ast.Call, ast.Subscript))
+                or name in subscript_callable_names
+                or name in dynamic_callable_names
+            ):
                 found.append((node.lineno, "<mapping-derived-callable>"))
                 continue
             if name in namespace_reflection_names:
@@ -286,6 +334,27 @@ def _dangerous_mapping_key(node: ast.expr) -> bool:
         isinstance(node, ast.Constant)
         and type(node.value) is str
         and node.value in {"__builtins__", "__dict__", "__import__", "import_module"}
+    )
+
+
+def _is_allowed_feature_dispatch(node: ast.Call) -> bool:
+    """Allow only the existing closed feature-name dispatch reflection shape."""
+    if (
+        _call_name(node.func) != "getattr"
+        or len(node.args) != 3
+        or _call_name(node.args[0]) != "self"
+        or not isinstance(node.args[1], ast.JoinedStr)
+        or not isinstance(node.args[2], ast.Constant)
+        or node.args[2].value is not None
+    ):
+        return False
+    parts = node.args[1].values
+    return (
+        len(parts) == 2
+        and isinstance(parts[0], ast.Constant)
+        and parts[0].value == "_feature_"
+        and isinstance(parts[1], ast.FormattedValue)
+        and _call_name(parts[1].value) == "definition.name"
     )
 
 

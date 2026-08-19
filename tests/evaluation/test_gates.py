@@ -29,6 +29,7 @@ from apar.evaluation.gates import (
     ReplayResult,
     SlicePerformance,
     VerifiedPromotionEnvelope,
+    VerifiedReplayBatch,
     evaluate_promotion_gates,
 )
 from apar.evaluation.regimes import RegimeKind
@@ -379,6 +380,82 @@ def test_evaluator_identity_types_reject_key_accessor_replacement() -> None:
     finally:
         type.__setattr__(EvaluatorSigningIdentity, "key_id", signer_property)
         type.__setattr__(EvaluatorReplayVerifier, "key_id", verifier_property)
+
+
+def test_trusted_sign_and_verify_ignore_direct_type_mutation() -> None:
+    signer_a = EvaluatorSigningIdentity.from_private_bytes(b"a" * 32)
+    signer_b = EvaluatorSigningIdentity.from_private_bytes(b"b" * 32)
+    verifier_a = EvaluatorReplayVerifier.from_signer(signer_a)
+    verifier_b = EvaluatorReplayVerifier.from_signer(signer_b)
+    verifier_b_key_id = verifier_b.key_id
+    verifier_b_public_key = verifier_b._public_key()
+    signer_b_key_id = signer_b.key_id
+    signer_b_private_key = signer_b._private_key()
+    envelope_a = _promotion_envelope(_results(), signer=signer_a)
+    envelope_b = _promotion_envelope(_results(), signer=signer_b)
+    verifier_fields = {
+        name: EvaluatorReplayVerifier.__dict__[name]
+        for name in (
+            "key_id",
+            "_public_key",
+            "verify_batch",
+            "verify_public_proof",
+            "verify_promotion_envelope",
+        )
+    }
+    signer_type = type(signer_a)
+    signer_fields = {
+        name: signer_type.__dict__[name]
+        for name in ("key_id", "_private_key")
+    }
+    try:
+        type.__setattr__(
+            EvaluatorReplayVerifier,
+            "key_id",
+            property(lambda _: verifier_b_key_id),
+        )
+        type.__setattr__(
+            EvaluatorReplayVerifier,
+            "_public_key",
+            lambda _: verifier_b_public_key,
+        )
+        for name in (
+            "verify_batch",
+            "verify_public_proof",
+            "verify_promotion_envelope",
+        ):
+            type.__setattr__(EvaluatorReplayVerifier, name, lambda *_: True)
+
+        with pytest.raises(GateContractError):
+            evaluate_promotion_gates(
+                envelope_b,
+                GateConfig.competition(),
+                evaluator_verifier=verifier_a,
+                hidden_proof_verifier=verifier_a,
+            )
+        assert evaluate_promotion_gates(
+            envelope_a,
+            GateConfig.competition(),
+            evaluator_verifier=verifier_a,
+            hidden_proof_verifier=verifier_a,
+        ).status is ChampionStatus.PROMOTED
+
+        for name, value in verifier_fields.items():
+            type.__setattr__(EvaluatorReplayVerifier, name, value)
+
+        type.__setattr__(signer_type, "key_id", property(lambda _: signer_b_key_id))
+        type.__setattr__(signer_type, "_private_key", lambda _: signer_b_private_key)
+        batch = VerifiedReplayBatch.create(
+            results=envelope_a.combined_batch.results,
+            signer=signer_a,
+        )
+        assert verifier_a.verify_batch(batch)
+        assert not verifier_b.verify_batch(batch)
+    finally:
+        for name, value in verifier_fields.items():
+            type.__setattr__(EvaluatorReplayVerifier, name, value)
+        for name, value in signer_fields.items():
+            type.__setattr__(signer_type, name, value)
 
 
 def test_promotion_envelope_accepts_distinct_promotion_and_hidden_authorities() -> None:

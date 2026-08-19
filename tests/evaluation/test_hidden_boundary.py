@@ -250,6 +250,22 @@ def test_defense_and_features_cannot_import_hidden_package(tmp_path: Path) -> No
         "loader = namespace[pieces[0] + pieces[1]]\n"
         "loader('apar.evaluation_hidden.composed_namespace')\n"
     )
+    (apar_root / "features" / "mapping_method_callable.py").write_text(
+        "def invoke(mapping, key):\n"
+        "    loader = mapping.get(key)\n"
+        "    loader('apar.evaluation_hidden.mapping_get')\n"
+    )
+    (apar_root / "defense" / "mapping_method_alias.py").write_text(
+        "def invoke(mapping, key):\n"
+        "    retrieve = mapping.__getitem__\n"
+        "    loader = retrieve(key)\n"
+        "    loader('apar.evaluation_hidden.mapping_alias')\n"
+    )
+    (apar_root / "features" / "mapping_getattr_chain.py").write_text(
+        "def invoke(mapping, key):\n"
+        "    retrieve = getattr(mapping, 'get')\n"
+        "    retrieve(key)('apar.evaluation_hidden.mapping_chain')\n"
+    )
 
     result = audit_hidden_import_boundary(apar_root)
 
@@ -263,6 +279,9 @@ def test_defense_and_features_cannot_import_hidden_package(tmp_path: Path) -> No
     assert any("direct_dunder_mapping.py" in item for item in result.violations)
     assert any("namespace_attribute.py" in item for item in result.violations)
     assert any("composed_namespace_mapping.py" in item for item in result.violations)
+    assert any("mapping_method_callable.py" in item for item in result.violations)
+    assert any("mapping_method_alias.py" in item for item in result.violations)
+    assert any("mapping_getattr_chain.py" in item for item in result.violations)
 
 
 def test_hidden_authority_methods_are_bound_to_the_exact_instance(
