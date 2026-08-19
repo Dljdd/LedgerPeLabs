@@ -28,8 +28,6 @@ _ESTIMATED_MINUTES = 20
 _VALUE_SCALE = 1_000.0
 _MAX_GROUPING_ROWS = 100_000
 _MAX_IDENTIFIER_LENGTH = 4_096
-_MAX_COUNTER_ROWS = 4_096
-_MAX_MASK_CACHE_ENTRIES = 8_192
 
 
 class CaseContractError(ValueError):
@@ -257,12 +255,20 @@ class _AlertPlan:
 class _CountRow:
     actor_node: str
     counterparty_node: str
+    available_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class _CountBatch:
+    decision_at: datetime
+    decision_positions: tuple[int, ...]
+    row_positions: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class _CountTopology:
     rows: tuple[_CountRow, ...]
-    batches: tuple[tuple[int, ...], ...]
+    batches: tuple[_CountBatch, ...]
 
 
 class ReviewCaseCounter(ExternalContract):
@@ -272,13 +278,12 @@ class ReviewCaseCounter(ExternalContract):
     decisions: tuple[DefenseDecision, ...]
     as_of: datetime
     _topology: _CountTopology = PrivateAttr()
-    _mask_cache: dict[bytes, int] = PrivateAttr(default_factory=dict)
 
     @field_validator("observations", mode="before")
     @classmethod
     def observations_are_exact(cls, value: object) -> object:
-        if type(value) is tuple and len(value) > _MAX_COUNTER_ROWS:
-            raise ValueError("review-case counter exceeds the frozen 4096-row cap")
+        if type(value) is tuple and len(value) > _MAX_GROUPING_ROWS:
+            raise ValueError("review-case counter exceeds the grouping row resource cap")
         if type(value) is not tuple or any(
             type(row) is not ObservedEvent for row in cast(tuple[object, ...], value)
         ):
@@ -313,23 +318,37 @@ class ReviewCaseCounter(ExternalContract):
         expected = tuple(
             sorted(
                 self.observations,
-                key=lambda row: (cast(datetime, row.decision_at), row.event_id),
+                key=lambda row: (row.available_at, row.event_id),
             )
         )
         if self.observations != expected:
-            raise ValueError("review-case observations must use canonical decision order")
-        if tuple(row.event_id for row in self.decisions) != tuple(
-            row.event_id for row in self.observations
-        ):
-            raise ValueError("review-case decisions must align with canonical observations")
-        if len(self.observations) > _MAX_COUNTER_ROWS:
-            raise ValueError("review-case counter exceeds the frozen 4096-row cap")
+            raise ValueError("review-case observations must use canonical availability order")
+        observation_by_id = {row.event_id: row for row in self.observations}
+        expected_decisions = tuple(
+            sorted(
+                self.decisions,
+                key=lambda row: (
+                    cast(datetime, observation_by_id[row.event_id].decision_at),
+                    row.event_id,
+                ),
+            )
+        )
+        if self.decisions != expected_decisions:
+            raise ValueError("review-case decisions must use canonical decision order")
+        if len(self.observations) > _MAX_GROUPING_ROWS:
+            raise ValueError("review-case counter exceeds the grouping row resource cap")
         return self
 
     def model_post_init(self, __context: Any) -> None:
         """Precompute truth-blind causal topology once at binding time."""
         del __context
-        self._topology = _build_count_topology(self.observations)
+        self._topology = _build_count_topology(self.observations, self.decisions)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Keep the precomputed topology reference write-once like public fields."""
+        if name == "_topology" and hasattr(self, "_topology"):
+            raise TypeError("review-case topology is immutable")
+        super().__setattr__(name, value)
 
     def __call__(self, actions: NDArray[np.object_]) -> int:
         """Count grouped interventions without observing labels or action severity."""
@@ -346,14 +365,7 @@ class ReviewCaseCounter(ExternalContract):
                     raise TypeError("every action must be an exact Action")
             for index, action in enumerate(actions):
                 intervention_mask[index] = int(action is not Action.APPROVE)
-            cache_key = bytes(intervention_mask)
-            cached = self._mask_cache.get(cache_key)
-            if cached is not None:
-                return cached
-            result = _count_intervention_cases(self._topology, cache_key)
-            if len(self._mask_cache) < _MAX_MASK_CACHE_ENTRIES:
-                self._mask_cache[cache_key] = result
-            return result
+            return _count_intervention_cases(self._topology, bytes(intervention_mask))
         except (ArithmeticError, MemoryError, OverflowError) as error:
             raise CaseContractError("case counting exceeded frozen resource bounds") from error
 
@@ -366,23 +378,33 @@ def bind_review_case_counter(
 ) -> ReviewCaseCounter:
     """Bind exact canonical decision rows for threshold selection."""
     try:
-        if type(observations) is tuple and len(observations) > _MAX_COUNTER_ROWS:
+        if type(observations) is tuple and len(observations) > _MAX_GROUPING_ROWS:
             raise CaseContractError(
-                "review-case counter exceeds the frozen 4096-row cap"
+                "review-case counter exceeds the grouping row resource cap"
             )
         observation_rows, decision_rows = _validated_rows(observations, decisions, as_of)
         expected_observations = tuple(
             sorted(
                 observation_rows,
-                key=lambda row: (cast(datetime, row.decision_at), row.event_id),
+                key=lambda row: (row.available_at, row.event_id),
             )
         )
         if observation_rows != expected_observations:
-            raise CaseContractError("review-case observations must use canonical decision order")
-        if tuple(row.event_id for row in decision_rows) != tuple(
-            row.event_id for row in observation_rows
-        ):
-            raise CaseContractError("review-case decisions must align with observations")
+            raise CaseContractError(
+                "review-case observations must use canonical availability order"
+            )
+        observation_by_id = {row.event_id: row for row in observation_rows}
+        expected_decisions = tuple(
+            sorted(
+                decision_rows,
+                key=lambda row: (
+                    cast(datetime, observation_by_id[row.event_id].decision_at),
+                    row.event_id,
+                ),
+            )
+        )
+        if decision_rows != expected_decisions:
+            raise CaseContractError("review-case decisions must use canonical decision order")
         return ReviewCaseCounter(
             observations=observation_rows,
             decisions=decision_rows,
@@ -403,18 +425,19 @@ def group_cases(
 
     The priority frozen when a case first opens is::
 
-        historical_risk_value = score * value visible strictly before the alert
+        current_expected_value = score * current transaction amount
 
         100 * (0.45 * score
-             + 0.30 * historical_risk_value / (historical_risk_value + 1000)
+             + 0.30 * current_expected_value / (current_expected_value + 1000)
              + 0.15 * min(max(entity_count - 2, 0) / 8, 1)
              + 0.10 * 1 / (1 + minutes_since_latest_graph_evidence))
 
     Current-batch rows are admitted only after every decision at that exact time,
-    so self/peer amounts and edges cannot affect evidence or priority. The recency
-    term is zero when there is no prior graph evidence. Later alerts may extend or
-    merge a case, but the canonical first-evidence ID and priority of the earliest
-    case remain unchanged.
+    so self/peer amounts and edges cannot affect historical evidence, grouping,
+    recency, or entity coverage. The explicit current expected-value term is the
+    sole use of the current amount. The recency term is zero when there is no prior
+    graph evidence. Later alerts may extend or merge a case, but the canonical
+    first-evidence ID and priority of the earliest case remain unchanged.
     """
     try:
         observation_rows, decision_rows = _validated_rows(observations, decisions, as_of)
@@ -435,52 +458,73 @@ def _validated_rows(
         raise TypeError("observations and decisions must be exact tuples")
     observation_rows = cast(tuple[ObservedEvent, ...], observations)
     decision_rows = cast(tuple[DefenseDecision, ...], decisions)
-    if len(observation_rows) != len(decision_rows):
-        raise CaseContractError("observations and decisions must have equal lengths")
-    if len(observation_rows) > _MAX_GROUPING_ROWS:
+    if (
+        len(observation_rows) > _MAX_GROUPING_ROWS
+        or len(decision_rows) > _MAX_GROUPING_ROWS
+    ):
         raise CaseContractError("case grouping row count exceeds frozen resource cap")
+    if any(type(row) is not ObservedEvent for row in observation_rows):
+        raise TypeError("observations must contain exact ObservedEvent rows")
+    if any(type(row) is not DefenseDecision for row in decision_rows):
+        raise TypeError("decisions must contain exact DefenseDecision rows")
+    raw_observation_ids = tuple(row.event_id for row in observation_rows)
+    raw_decision_ids = tuple(row.event_id for row in decision_rows)
+    if all(type(item) is str for item in raw_observation_ids) and len(
+        set(raw_observation_ids)
+    ) != len(raw_observation_ids):
+        raise CaseContractError("duplicate observation event_id")
+    if all(type(item) is str for item in raw_decision_ids) and len(
+        set(raw_decision_ids)
+    ) != len(raw_decision_ids):
+        raise CaseContractError("duplicate decision event_id")
     revalidated_observations: list[ObservedEvent] = []
     for observation_row in observation_rows:
-        if type(observation_row) is not ObservedEvent:
-            raise TypeError("observations must contain exact ObservedEvent rows")
         validated_observation = _revalidate_observation(observation_row)
         _validate_observation(validated_observation, as_of)
         revalidated_observations.append(validated_observation)
     revalidated_decisions: list[DefenseDecision] = []
     for decision_row in decision_rows:
-        if type(decision_row) is not DefenseDecision:
-            raise TypeError("decisions must contain exact DefenseDecision rows")
         validated_decision = _revalidate_decision(decision_row)
         if type(validated_decision.action) is not Action:
             raise CaseContractError("decision action must be an exact Action")
         revalidated_decisions.append(validated_decision)
     canonical_observations = tuple(revalidated_observations)
     canonical_decisions = tuple(revalidated_decisions)
-    observation_ids = tuple(row.event_id for row in canonical_observations)
     decision_ids = tuple(row.event_id for row in canonical_decisions)
-    if len(set(observation_ids)) != len(observation_ids):
-        raise CaseContractError("duplicate observation event_id")
-    if len(set(decision_ids)) != len(decision_ids):
-        raise CaseContractError("duplicate decision event_id")
-    if set(observation_ids) != set(decision_ids):
-        raise CaseContractError("observation and decision event IDs must match bijectively")
+    observation_by_id = {row.event_id: row for row in canonical_observations}
+    decision_point_ids = {
+        row.event_id for row in canonical_observations if row.is_decision_point
+    }
+    if set(decision_ids) != decision_point_ids:
+        raise CaseContractError(
+            "decision event IDs must match decision-point observations bijectively"
+        )
+    if any(observation_by_id[event_id].decision_at is None for event_id in decision_ids):
+        raise CaseContractError("decision observations require an exact decision_at")
     return canonical_observations, canonical_decisions
 
 
 def _validate_observation(row: ObservedEvent, as_of: datetime) -> None:
-    if not row.is_decision_point or row.decision_at is None:
-        raise CaseContractError("every observation must be an exact decision-point row")
     for timestamp_label, timestamp_value in (
         ("event_time", row.event_time),
         ("available_at", row.available_at),
-        ("decision_at", row.decision_at),
     ):
         _utc(timestamp_value, label=f"observation {timestamp_label}")
+    if row.is_decision_point:
+        if row.decision_at is None:
+            raise CaseContractError("decision-point observations require decision_at")
+        _utc(row.decision_at, label="observation decision_at")
+    elif row.decision_at is not None:
+        raise CaseContractError("nondecision observations must not declare decision_at")
     if row.event_time > row.available_at:
         raise CaseContractError("observation event_time must not exceed available_at")
-    if row.available_at > row.decision_at:
+    if row.decision_at is not None and row.available_at > row.decision_at:
         raise CaseContractError("observation available_at must not exceed decision_at")
-    if row.event_time > as_of or row.available_at > as_of or row.decision_at > as_of:
+    if (
+        row.event_time > as_of
+        or row.available_at > as_of
+        or (row.decision_at is not None and row.decision_at > as_of)
+    ):
         raise CaseContractError("observation or decision occurs after as_of")
     for identifier_label, identifier_value in (
         ("event_id", row.event_id),
@@ -584,21 +628,43 @@ class _GraphComponent:
     latest_evidence: tuple[datetime, str] | None = None
 
 
+@dataclass(slots=True)
+class _ExcludedComponent:
+    root: str
+    nodes: frozenset[str]
+    case_ids: set[str]
+    total_value: Decimal
+    first_event_id: str | None
+    latest_evidence: tuple[datetime, str] | None
+
+
 class _IncrementalGraph:
     """Union-find graph that consumes each available observation exactly once."""
 
-    __slots__ = ("_components", "_parent", "_size")
+    __slots__ = (
+        "_adjacency",
+        "_components",
+        "_node_case_ids",
+        "_parent",
+        "_rows_by_id",
+        "_size",
+    )
 
     def __init__(self) -> None:
         self._parent: dict[str, str] = {}
         self._size: dict[str, int] = {}
         self._components: dict[str, _GraphComponent] = {}
+        self._adjacency: dict[str, set[str]] = {}
+        self._node_case_ids: dict[str, set[str]] = {}
+        self._rows_by_id: dict[str, ObservedEvent] = {}
 
     def _ensure(self, node: str) -> str:
         if node not in self._parent:
             self._parent[node] = node
             self._size[node] = 1
             self._components[node] = _GraphComponent(nodes={node}, case_ids=set())
+            self._adjacency[node] = set()
+            self._node_case_ids[node] = set()
         return node
 
     def find(self, node: str) -> str:
@@ -641,7 +707,12 @@ class _IncrementalGraph:
         return left_root
 
     def add_observation(self, row: ObservedEvent) -> None:
-        root = self._union(_actor(row.actor_id), _counterparty(row.counterparty_id))
+        actor_node = _actor(row.actor_id)
+        counterparty_node = _counterparty(row.counterparty_id)
+        root = self._union(actor_node, counterparty_node)
+        self._rows_by_id[row.event_id] = row
+        self._adjacency[actor_node].add(row.event_id)
+        self._adjacency[counterparty_node].add(row.event_id)
         component = self._components[root]
         component.total_value += row.amount
         if component.first_event_id is None or row.event_id < component.first_event_id:
@@ -668,6 +739,11 @@ class _IncrementalGraph:
     def attach_case(self, case_id: str, roots: set[str] | frozenset[str]) -> None:
         for root in self.canonical_roots(roots):
             self._components[root].case_ids.add(case_id)
+
+    def attach_case_row(self, case_id: str, row: ObservedEvent) -> None:
+        self.attach_case(case_id, self.roots_for(row))
+        self._node_case_ids[_actor(row.actor_id)].add(case_id)
+        self._node_case_ids[_counterparty(row.counterparty_id)].add(case_id)
 
     def case_ids(self, roots: set[str] | frozenset[str]) -> set[str]:
         result: set[str] = set()
@@ -709,21 +785,150 @@ class _IncrementalGraph:
         return tuple(sorted(sources))
 
 
+class _ExcludingGraphView:
+    """Read-mostly component view with one decision batch's rows removed."""
+
+    __slots__ = ("_by_node", "_by_root", "_excluded", "_source")
+
+    def __init__(
+        self, source: _IncrementalGraph, excluded: frozenset[str]
+    ) -> None:
+        self._source = source
+        self._excluded = excluded
+        self._by_node: dict[str, _ExcludedComponent] = {}
+        self._by_root: dict[str, _ExcludedComponent] = {}
+
+    def _component(self, node: str) -> _ExcludedComponent:
+        cached = self._by_node.get(node)
+        if cached is not None:
+            return cached
+        stack = [node]
+        nodes: set[str] = set()
+        edge_ids: set[str] = set()
+        while stack:
+            current = stack.pop()
+            if current in nodes:
+                continue
+            nodes.add(current)
+            for event_id in self._source._adjacency.get(current, ()):
+                if event_id in self._excluded:
+                    continue
+                edge_ids.add(event_id)
+                row = self._source._rows_by_id[event_id]
+                actor_node = _actor(row.actor_id)
+                counterparty_node = _counterparty(row.counterparty_id)
+                other = counterparty_node if current == actor_node else actor_node
+                if other not in nodes:
+                    stack.append(other)
+        ordered_edges = tuple(
+            sorted(
+                (self._source._rows_by_id[event_id] for event_id in edge_ids),
+                key=lambda row: (row.available_at, row.event_id),
+            )
+        )
+        latest = (
+            (ordered_edges[-1].available_at, ordered_edges[-1].event_id)
+            if ordered_edges
+            else None
+        )
+        component = _ExcludedComponent(
+            root=min(nodes),
+            nodes=frozenset(nodes),
+            case_ids={
+                case_id
+                for member in nodes
+                for case_id in self._source._node_case_ids.get(member, ())
+            },
+            total_value=sum((row.amount for row in ordered_edges), start=Decimal(0)),
+            first_event_id=min((row.event_id for row in ordered_edges), default=None),
+            latest_evidence=latest,
+        )
+        for member in nodes:
+            self._by_node[member] = component
+        self._by_root[component.root] = component
+        return component
+
+    def roots_for(self, row: ObservedEvent) -> frozenset[str]:
+        return frozenset(
+            {
+                self._component(_actor(row.actor_id)).root,
+                self._component(_counterparty(row.counterparty_id)).root,
+            }
+        )
+
+    def canonical_roots(self, roots: set[str] | frozenset[str]) -> frozenset[str]:
+        return frozenset(self._component(root).root for root in roots)
+
+    def bind_case(self, case_id: str, roots: set[str] | frozenset[str]) -> None:
+        for root in self.canonical_roots(roots):
+            self._by_root[root].case_ids = {case_id}
+
+    def case_ids(self, roots: set[str] | frozenset[str]) -> set[str]:
+        return {
+            case_id
+            for root in self.canonical_roots(roots)
+            for case_id in self._by_root[root].case_ids
+        }
+
+    def entity_count(self, roots: set[str] | frozenset[str]) -> int:
+        return sum(len(self._by_root[root].nodes) for root in self.canonical_roots(roots))
+
+    def visible_value(self, roots: set[str] | frozenset[str]) -> Decimal:
+        return sum(
+            (self._by_root[root].total_value for root in self.canonical_roots(roots)),
+            start=Decimal(0),
+        )
+
+    def latest_evidence_at(
+        self, roots: set[str] | frozenset[str]
+    ) -> datetime | None:
+        evidence = tuple(
+            item
+            for root in self.canonical_roots(roots)
+            if (item := self._by_root[root].latest_evidence) is not None
+        )
+        return max(evidence)[0] if evidence else None
+
+    def bounded_source_ids(
+        self, roots: set[str] | frozenset[str]
+    ) -> tuple[str, ...]:
+        sources: set[str] = set()
+        for root in self.canonical_roots(roots):
+            component = self._by_root[root]
+            if component.first_event_id is not None:
+                sources.add(component.first_event_id)
+            if component.latest_evidence is not None:
+                sources.add(component.latest_evidence[1])
+        return tuple(sorted(sources))
+
+
 class _CountGraph:
     """Minimal causal graph used only for intervention-mask case counts."""
 
-    __slots__ = ("_case_ids", "_parent", "_size")
+    __slots__ = (
+        "_adjacency",
+        "_case_ids",
+        "_node_case_ids",
+        "_parent",
+        "_rows",
+        "_size",
+    )
 
-    def __init__(self) -> None:
+    def __init__(self, rows: tuple[_CountRow, ...]) -> None:
+        self._rows = rows
         self._parent: dict[str, str] = {}
         self._size: dict[str, int] = {}
         self._case_ids: dict[str, set[int]] = {}
+        self._adjacency: dict[str, set[int]] = {}
+        self._node_case_ids: dict[str, set[int]] = {}
 
     def _ensure(self, node: str) -> None:
         if node not in self._parent:
             self._parent[node] = node
             self._size[node] = 1
             self._case_ids[node] = set()
+            self._adjacency[node] = set()
+            self._node_case_ids[node] = set()
 
     def find(self, node: str) -> str:
         self._ensure(node)
@@ -753,8 +958,11 @@ class _CountGraph:
     def roots_for(self, row: _CountRow) -> frozenset[str]:
         return frozenset({self.find(row.actor_node), self.find(row.counterparty_node)})
 
-    def add_row(self, row: _CountRow) -> None:
+    def add_row(self, row_position: int) -> None:
+        row = self._rows[row_position]
         self._union(row.actor_node, row.counterparty_node)
+        self._adjacency[row.actor_node].add(row_position)
+        self._adjacency[row.counterparty_node].add(row_position)
 
     def cases_for_root(self, root: str) -> set[int]:
         return set(self._case_ids[self.find(root)])
@@ -765,37 +973,127 @@ class _CountGraph:
     def attach_case(self, case_id: int, row: _CountRow) -> None:
         for root in self.roots_for(row):
             self._case_ids[root].add(case_id)
+        self._node_case_ids[row.actor_node].add(case_id)
+        self._node_case_ids[row.counterparty_node].add(case_id)
+
+
+@dataclass(slots=True)
+class _CountExcludedComponent:
+    root: str
+    nodes: frozenset[str]
+    case_ids: set[int]
+
+
+class _CountExcludingGraphView:
+    __slots__ = ("_by_node", "_by_root", "_excluded", "_source")
+
+    def __init__(self, source: _CountGraph, excluded: frozenset[int]) -> None:
+        self._source = source
+        self._excluded = excluded
+        self._by_node: dict[str, _CountExcludedComponent] = {}
+        self._by_root: dict[str, _CountExcludedComponent] = {}
+
+    def _component(self, node: str) -> _CountExcludedComponent:
+        cached = self._by_node.get(node)
+        if cached is not None:
+            return cached
+        stack = [node]
+        nodes: set[str] = set()
+        while stack:
+            current = stack.pop()
+            if current in nodes:
+                continue
+            nodes.add(current)
+            for row_position in self._source._adjacency.get(current, ()):
+                if row_position in self._excluded:
+                    continue
+                row = self._source._rows[row_position]
+                other = (
+                    row.counterparty_node
+                    if current == row.actor_node
+                    else row.actor_node
+                )
+                if other not in nodes:
+                    stack.append(other)
+        component = _CountExcludedComponent(
+            root=min(nodes),
+            nodes=frozenset(nodes),
+            case_ids={
+                case_id
+                for member in nodes
+                for case_id in self._source._node_case_ids.get(member, ())
+            },
+        )
+        for member in nodes:
+            self._by_node[member] = component
+        self._by_root[component.root] = component
+        return component
+
+    def roots_for(self, row: _CountRow) -> frozenset[str]:
+        return frozenset(
+            {
+                self._component(row.actor_node).root,
+                self._component(row.counterparty_node).root,
+            }
+        )
+
+    def cases_for_root(self, root: str) -> set[int]:
+        return set(self._component(root).case_ids)
+
+    def bind_case(self, case_id: int, root: str) -> None:
+        self._component(root).case_ids = {case_id}
 
 
 def _build_count_topology(
     observations: tuple[ObservedEvent, ...],
+    decisions: tuple[DefenseDecision, ...],
 ) -> _CountTopology:
     rows = tuple(
         _CountRow(
             actor_node=_actor(row.actor_id),
             counterparty_node=_counterparty(row.counterparty_id),
+            available_at=row.available_at,
         )
         for row in observations
     )
-    batches: list[tuple[int, ...]] = []
+    row_position_by_id = {
+        row.event_id: index for index, row in enumerate(observations)
+    }
+    observation_by_id = {row.event_id: row for row in observations}
+    batches: list[_CountBatch] = []
     position = 0
-    while position < len(observations):
-        decision_time = observations[position].decision_at
+    while position < len(decisions):
+        decision_time = cast(
+            datetime, observation_by_id[decisions[position].event_id].decision_at
+        )
         end = position + 1
         while (
-            end < len(observations)
-            and observations[end].decision_at == decision_time
+            end < len(decisions)
+            and observation_by_id[decisions[end].event_id].decision_at == decision_time
         ):
             end += 1
-        batches.append(tuple(range(position, end)))
+        decision_positions = tuple(range(position, end))
+        batches.append(
+            _CountBatch(
+                decision_at=decision_time,
+                decision_positions=decision_positions,
+                row_positions=tuple(
+                    row_position_by_id[decisions[index].event_id]
+                    for index in decision_positions
+                ),
+            )
+        )
         position = end
     return _CountTopology(rows=rows, batches=tuple(batches))
 
 
 def _count_intervention_cases(topology: _CountTopology, mask: bytes) -> int:
-    if len(mask) != len(topology.rows):
+    decision_count = sum(len(batch.decision_positions) for batch in topology.batches)
+    if len(mask) != decision_count:
         raise CaseContractError("intervention mask must align with count topology")
-    graph = _CountGraph()
+    primary_graph = _CountGraph(topology.rows)
+    admitted: set[int] = set()
+    availability_position = 0
     active_cases: set[int] = set()
     aliases: dict[int, int] = {}
     next_case_id = 0
@@ -810,11 +1108,31 @@ def _count_intervention_cases(topology: _CountTopology, mask: bytes) -> int:
         return case_id
 
     for batch in topology.batches:
-        plans: list[tuple[int, str | None, tuple[int, ...]]] = []
-        for index in batch:
-            if mask[index] == 0:
+        current_rows = frozenset(batch.row_positions)
+        while (
+            availability_position < len(topology.rows)
+            and topology.rows[availability_position].available_at < batch.decision_at
+        ):
+            row_position = availability_position
+            availability_position += 1
+            if row_position in current_rows or row_position in admitted:
                 continue
-            roots = graph.roots_for(topology.rows[index])
+            primary_graph.add_row(row_position)
+            admitted.add(row_position)
+
+        excluded = current_rows.intersection(admitted)
+        graph = (
+            _CountExcludingGraphView(primary_graph, excluded)
+            if excluded
+            else primary_graph
+        )
+        plans: list[tuple[int, int, str | None, tuple[int, ...]]] = []
+        for decision_position, row_position in zip(
+            batch.decision_positions, batch.row_positions, strict=True
+        ):
+            if mask[decision_position] == 0:
+                continue
+            roots = graph.roots_for(topology.rows[row_position])
             candidates: list[tuple[tuple[int, str], str, tuple[int, ...]]] = []
             for root in sorted(roots):
                 matching = tuple(
@@ -830,12 +1148,12 @@ def _count_intervention_cases(topology: _CountTopology, mask: bytes) -> int:
                     candidates.append(((matching[0], root), root, matching))
             if candidates:
                 _, chosen_root, matching = min(candidates, key=lambda item: item[0])
-                plans.append((index, chosen_root, matching))
+                plans.append((decision_position, row_position, chosen_root, matching))
             else:
-                plans.append((index, None, ()))
+                plans.append((decision_position, row_position, None, ()))
 
         assignments: dict[int, int] = {}
-        for index, plan_root, matching in plans:
+        for decision_position, _row_position, plan_root, matching in plans:
             active_matching = tuple(
                 sorted(
                     {
@@ -856,12 +1174,16 @@ def _count_intervention_cases(topology: _CountTopology, mask: bytes) -> int:
                 anchor = next_case_id
                 next_case_id += 1
                 active_cases.add(anchor)
-            assignments[index] = anchor
+            assignments[decision_position] = anchor
 
-        for index in batch:
-            graph.add_row(topology.rows[index])
-        for index, _, _ in plans:
-            graph.attach_case(resolve(assignments[index]), topology.rows[index])
+        for row_position in batch.row_positions:
+            if row_position not in admitted:
+                primary_graph.add_row(row_position)
+                admitted.add(row_position)
+        for decision_position, row_position, _, _ in plans:
+            primary_graph.attach_case(
+                resolve(assignments[decision_position]), topology.rows[row_position]
+            )
 
     return len(active_cases)
 
@@ -888,7 +1210,12 @@ def _group_validated(
             for event_id in action_by_id
         )
     )
-    graph = _IncrementalGraph()
+    primary_graph = _IncrementalGraph()
+    available_rows = tuple(
+        sorted(observations, key=lambda row: (row.available_at, row.event_id))
+    )
+    admitted_by_id: dict[str, ObservedEvent] = {}
+    availability_position = 0
     states: dict[str, _CaseState] = {}
     case_aliases: dict[str, str] = {}
 
@@ -908,6 +1235,26 @@ def _group_validated(
         while end < len(decision_events) and decision_events[end][0] == decision_time:
             end += 1
         batch_ids = tuple(event_id for _, event_id in decision_events[position:end])
+        current_ids = frozenset(batch_ids)
+        while (
+            availability_position < len(available_rows)
+            and available_rows[availability_position].available_at < decision_time
+        ):
+            available_row = available_rows[availability_position]
+            availability_position += 1
+            if (
+                available_row.event_id in current_ids
+                or available_row.event_id in admitted_by_id
+            ):
+                continue
+            primary_graph.add_observation(available_row)
+            admitted_by_id[available_row.event_id] = available_row
+        excluded_ids = current_ids.intersection(admitted_by_id)
+        graph = (
+            _ExcludingGraphView(primary_graph, excluded_ids)
+            if excluded_ids
+            else primary_graph
+        )
         prebatch_views = {
             case_id: _CaseView(
                 case_id=case_id,
@@ -948,7 +1295,7 @@ def _group_validated(
                 if matching
                 else _priority(
                     score=decision_by_id[event_id].score,
-                    visible_value_before_alert=visible_value,
+                    current_amount=row.amount,
                     entity_count=graph.entity_count(roots),
                     latest_graph_evidence_at=latest_evidence_at,
                     decision_time=decision_time,
@@ -1014,12 +1361,14 @@ def _group_validated(
             assignments[plan.event_id] = anchor.case_id
 
         for event_id in batch_ids:
-            graph.add_observation(observation_by_id[event_id])
+            if event_id not in admitted_by_id:
+                current_row = observation_by_id[event_id]
+                primary_graph.add_observation(current_row)
+                admitted_by_id[event_id] = current_row
         for plan in plans:
             active_case_id = resolve_case(assignments[plan.event_id])
-            graph.attach_case(
-                active_case_id,
-                graph.roots_for(observation_by_id[plan.event_id]),
+            primary_graph.attach_case_row(
+                active_case_id, observation_by_id[plan.event_id]
             )
         position = end
 
@@ -1043,7 +1392,7 @@ def _group_validated(
 
 
 def _select_prebatch_matches(
-    graph: _IncrementalGraph,
+    graph: _IncrementalGraph | _ExcludingGraphView,
     roots: frozenset[str],
     views: dict[str, _CaseView],
     *,
@@ -1088,13 +1437,19 @@ def _motif_for_alert(
 def _priority(
     *,
     score: float,
-    visible_value_before_alert: Decimal,
+    current_amount: Decimal,
     entity_count: int,
     latest_graph_evidence_at: datetime | None,
     decision_time: datetime,
 ) -> float:
-    risk_amount = float(visible_value_before_alert) * score
-    value_term = risk_amount / (risk_amount + _VALUE_SCALE) if risk_amount else 0.0
+    score_decimal = Decimal(str(score))
+    current_expected_value = current_amount * score_decimal
+    value_scale = Decimal(str(_VALUE_SCALE))
+    value_term = (
+        float(current_expected_value / (current_expected_value + value_scale))
+        if current_expected_value
+        else 0.0
+    )
     coverage = min(max((entity_count - 2) / 8.0, 0.0), 1.0)
     if latest_graph_evidence_at is not None:
         age_minutes = max(

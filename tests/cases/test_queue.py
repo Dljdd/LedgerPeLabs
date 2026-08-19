@@ -398,3 +398,21 @@ def test_simulation_normalizes_serialization_resource_failure(
 
     with pytest.raises(QueueContractError, match="payload|resource"):
         simulate_case_queue((case(1),), QueueConfig())
+
+
+def test_to_json_revalidates_model_constructed_report_before_emitting() -> None:
+    valid = simulate_case_queue((case(1),), QueueConfig())
+    forged_document = {**valid.__dict__, "completed_count": 999}
+    digest_document = valid.model_dump(mode="json", exclude={"report_digest"})
+    digest_document["completed_count"] = 999
+    forged_document["report_digest"] = hashlib.sha256(
+        canonical_json_bytes(digest_document)
+    ).hexdigest()
+    forged = QueueReport.model_construct(**forged_document)
+    tampered = valid.model_copy(update=forged_document)
+
+    with pytest.raises(QueueContractError, match="schedule|semantic|completed"):
+        forged.to_json()
+    with pytest.raises(QueueContractError, match="schedule|semantic|completed"):
+        tampered.to_json()
+    assert QueueReport.from_json(valid.to_json()) == valid

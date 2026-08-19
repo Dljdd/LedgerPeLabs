@@ -215,11 +215,26 @@ class QueueReport(ExternalContract):
 
     def to_json(self) -> bytes:
         """Return canonical digest-bound queue evidence."""
+        if type(self) is not QueueReport:
+            raise QueueContractError("queue report must be an exact QueueReport")
         try:
-            payload = _canonical_report_bytes(self)
-        except (ArithmeticError, MemoryError, OverflowError) as error:
+            validated = QueueReport.model_validate(
+                self.model_dump(mode="python", warnings=False), strict=True
+            )
+            payload = _canonical_report_bytes(validated)
+        except QueueContractError:
+            raise
+        except (
+            ArithmeticError,
+            AttributeError,
+            MemoryError,
+            OverflowError,
+            TypeError,
+            ValidationError,
+            ValueError,
+        ) as error:
             raise QueueContractError(
-                "queue report payload exceeds frozen resource cap"
+                "queue report failed semantic revalidation or payload resource cap"
             ) from error
         if len(payload) > _MAX_QUEUE_PAYLOAD_BYTES:
             raise QueueContractError("queue report payload exceeds frozen resource cap")

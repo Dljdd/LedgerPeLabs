@@ -223,7 +223,7 @@ def test_equal_time_batch_is_symmetric_and_canonical() -> None:
     assert tuple(item.event_ids for item in forward) == (("a-event",), ("z-event",))
 
 
-def test_current_alert_does_not_contribute_its_own_value_or_recency() -> None:
+def test_current_alert_value_is_excluded_from_historical_evidence() -> None:
     row = observation(
         "current",
         actor_id="actor",
@@ -237,7 +237,7 @@ def test_current_alert_does_not_contribute_its_own_value_or_recency() -> None:
     assert evidence.visible_value_before_alert == Decimal("0")
     assert evidence.latest_graph_evidence_at is None
     assert evidence.evidence_source_ids == ()
-    assert grouped[0].priority == 36.0
+    assert grouped[0].priority == 38.222222
 
 
 def test_same_decision_peer_cannot_rewrite_first_alert_evidence_or_identity() -> None:
@@ -373,6 +373,181 @@ def test_current_batch_edge_is_excluded_regardless_of_early_availability() -> No
     ) == canonical_json_bytes(visible_first.model_dump(mode="json"))
 
 
+def test_future_decision_bridge_is_admitted_at_knowledge_time() -> None:
+    alert_at = NOW + timedelta(minutes=1)
+    bridge_decision_at = NOW + timedelta(minutes=2)
+    historical = observation(
+        "historical",
+        actor_id="actor-a",
+        counterparty_id="merchant-a",
+        amount="10.00",
+    )
+    bridge = observation(
+        "approved-bridge",
+        actor_id="actor-b",
+        counterparty_id="merchant-a",
+        amount="20.00",
+        event_time=NOW + timedelta(seconds=20),
+        available_at=NOW + timedelta(seconds=30),
+        decision_at=bridge_decision_at,
+    )
+    alert = observation(
+        "alert",
+        actor_id="actor-b",
+        counterparty_id="merchant-b",
+        decision_at=alert_at,
+    )
+    decisions = (
+        decision("historical"),
+        decision("alert"),
+        decision("approved-bridge", action=Action.APPROVE, score=0.1),
+    )
+
+    first = group_cases((bridge, alert, historical), decisions, as_of=bridge_decision_at)
+    shifted_bridge = bridge.model_copy(
+        update={"decision_at": bridge_decision_at + timedelta(minutes=1)}
+    )
+    shifted = group_cases(
+        (alert, historical, shifted_bridge),
+        decisions,
+        as_of=bridge_decision_at + timedelta(minutes=1),
+    )
+
+    assert len(first) == 1
+    assert first[0].event_ids == ("alert", "historical")
+    assert first[0].alert_evidence == shifted[0].alert_evidence
+
+
+def test_nondecision_bridge_uses_availability_and_strict_equal_time_boundary() -> None:
+    alert_at = NOW + timedelta(minutes=1)
+    historical = observation(
+        "historical",
+        actor_id="actor-a",
+        counterparty_id="merchant-a",
+    )
+    bridge = observation(
+        "context-bridge",
+        actor_id="actor-b",
+        counterparty_id="merchant-a",
+        event_time=NOW + timedelta(seconds=20),
+        available_at=NOW + timedelta(seconds=30),
+        decision_at=alert_at,
+    ).model_copy(update={"decision_at": None, "is_decision_point": False})
+    alert = observation(
+        "alert",
+        actor_id="actor-b",
+        counterparty_id="merchant-b",
+        decision_at=alert_at,
+    )
+    decisions = (decision("historical"), decision("alert"))
+
+    visible = group_cases((bridge, alert, historical), decisions, as_of=alert_at)
+    boundary_bridge = bridge.model_copy(update={"available_at": alert_at})
+    boundary = group_cases(
+        (alert, boundary_bridge, historical), decisions, as_of=alert_at
+    )
+
+    assert len(visible) == 1
+    assert len(boundary) == 2
+    assert visible == group_cases(
+        (historical, alert, bridge), tuple(reversed(decisions)), as_of=alert_at
+    )
+
+
+def test_current_batch_temporarily_excludes_previously_known_own_edge() -> None:
+    trigger_at = NOW + timedelta(minutes=1)
+    current_at = NOW + timedelta(minutes=2)
+    later_at = NOW + timedelta(minutes=3)
+    historical = observation(
+        "historical", actor_id="actor-a", counterparty_id="merchant-a"
+    )
+    early_bridge = observation(
+        "early-bridge",
+        actor_id="actor-b",
+        counterparty_id="merchant-a",
+        event_time=NOW + timedelta(seconds=20),
+        available_at=NOW + timedelta(seconds=30),
+        decision_at=current_at,
+    )
+    trigger = observation(
+        "trigger",
+        actor_id="actor-trigger",
+        counterparty_id="merchant-trigger",
+        decision_at=trigger_at,
+    )
+    current_peer = observation(
+        "current-peer",
+        actor_id="actor-b",
+        counterparty_id="merchant-b",
+        decision_at=current_at,
+    )
+    decisions = (
+        decision("historical"),
+        decision("trigger", action=Action.APPROVE),
+        decision("early-bridge", action=Action.APPROVE),
+        decision("current-peer"),
+    )
+
+    at_current = group_cases(
+        (current_peer, early_bridge, historical, trigger),
+        decisions,
+        as_of=current_at,
+    )
+
+    assert len(at_current) == 2
+    peer_case = next(item for item in at_current if "current-peer" in item.event_ids)
+    assert peer_case.alert_evidence[0].motif is CaseMotif.ISOLATED
+
+    later = observation(
+        "later",
+        actor_id="actor-b",
+        counterparty_id="merchant-b",
+        decision_at=later_at,
+    )
+    after = group_cases(
+        (later, current_peer, early_bridge, historical, trigger),
+        decisions + (decision("later"),),
+        as_of=later_at,
+    )
+
+    assert len(after) == 1
+
+
+def test_isolated_priority_includes_current_expected_value_not_visible_history() -> None:
+    small = observation(
+        "small",
+        actor_id="actor-small",
+        counterparty_id="merchant-small",
+        amount="1.00",
+    )
+    large = observation(
+        "large",
+        actor_id="actor-large",
+        counterparty_id="merchant-large",
+        amount="1000000.00",
+    )
+
+    small_case = group_cases((small,), (decision("small", score=0.8),), as_of=NOW)[0]
+    large_case = group_cases((large,), (decision("large", score=0.8),), as_of=NOW)[0]
+
+    assert small_case.alert_evidence[0].visible_value_before_alert == Decimal("0")
+    assert large_case.alert_evidence[0].visible_value_before_alert == Decimal("0")
+    assert small_case.priority == 36.023981
+    assert large_case.priority == 65.962547
+    assert small_case.priority < large_case.priority
+
+
+def test_current_expected_value_overflow_is_a_typed_case_error() -> None:
+    row = observation(
+        "overflow",
+        actor_id="actor",
+        counterparty_id="merchant",
+    ).model_copy(update={"amount": Decimal("1e1000000")})
+
+    with pytest.raises(CaseContractError, match="resource|priority|bounds"):
+        group_cases((row,), (decision("overflow", score=0.8),), as_of=NOW)
+
+
 @pytest.mark.parametrize(
     ("observations", "decisions", "match"),
     [
@@ -400,7 +575,7 @@ def test_current_batch_edge_is_excluded_regardless_of_early_availability() -> No
         (
             lambda: (observation("one", actor_id="a", counterparty_id="x"),),
             lambda: (),
-            "equal lengths",
+            "decision event IDs",
         ),
         (
             lambda: (
@@ -409,7 +584,7 @@ def test_current_batch_edge_is_excluded_regardless_of_early_availability() -> No
                 ),
             ),
             lambda: (decision("one"),),
-            "decision-point",
+            "nondecision",
         ),
     ],
 )
@@ -527,9 +702,9 @@ def test_callback_binding_rejects_noncanonical_or_misaligned_rows() -> None:
         observation("event-b", actor_id="actor-b", counterparty_id="shared"),
     )
     decisions = (decision("event-a"), decision("event-b"))
-    with pytest.raises(ValueError, match="canonical decision order"):
+    with pytest.raises(ValueError, match="canonical availability order"):
         bind_review_case_counter(tuple(reversed(observations)), decisions, as_of=NOW)
-    with pytest.raises(ValueError, match="align"):
+    with pytest.raises(ValueError, match="canonical decision order"):
         bind_review_case_counter(observations, tuple(reversed(decisions)), as_of=NOW)
 
 
@@ -855,6 +1030,49 @@ def test_review_case_counter_random_masks_match_full_grouping() -> None:
         assert callback(actions) == expected
 
 
+def test_review_case_counter_matches_full_grouping_with_context_rows() -> None:
+    alert_at = NOW + timedelta(minutes=1)
+    historical = observation(
+        "historical", actor_id="actor-a", counterparty_id="merchant-a"
+    )
+    context = observation(
+        "context",
+        actor_id="actor-b",
+        counterparty_id="merchant-a",
+        available_at=NOW + timedelta(seconds=30),
+        event_time=NOW + timedelta(seconds=20),
+        decision_at=alert_at,
+    ).model_copy(update={"decision_at": None, "is_decision_point": False})
+    alert = observation(
+        "alert",
+        actor_id="actor-b",
+        counterparty_id="merchant-b",
+        decision_at=alert_at,
+    )
+    rows = (historical, context, alert)
+    templates = (decision("historical"), decision("alert"))
+    callback = bind_review_case_counter(rows, templates, as_of=alert_at)
+    actions = np.asarray([Action.CHALLENGE, Action.CHALLENGE], dtype=object)
+
+    assert callback(actions) == len(group_cases(rows, templates, as_of=alert_at)) == 1
+
+
+def test_review_case_counter_has_no_reachable_result_cache_to_poison() -> None:
+    rows = (
+        observation("first", actor_id="actor-a", counterparty_id="merchant-a"),
+        observation("second", actor_id="actor-b", counterparty_id="merchant-b"),
+    )
+    decisions = tuple(decision(row.event_id) for row in rows)
+    callback = bind_review_case_counter(rows, decisions, as_of=NOW)
+    actions = np.asarray([Action.CHALLENGE, Action.CHALLENGE], dtype=object)
+
+    assert callback(actions) == 2
+    assert not hasattr(callback, "_mask_cache")
+    with pytest.raises(TypeError, match="immutable"):
+        callback._topology = callback._topology
+    assert callback(actions) == 2
+
+
 def test_high_cardinality_threshold_callback_meets_frozen_ceiling() -> None:
     row_count = 300
     rows = tuple(
@@ -890,7 +1108,7 @@ def test_high_cardinality_threshold_callback_meets_frozen_ceiling() -> None:
     assert elapsed < 3.0
 
 
-def test_review_case_counter_enforces_task8_maximum_before_binding() -> None:
+def test_review_case_counter_accepts_more_rows_than_unique_score_limit() -> None:
     row_count = 4_097
     rows = tuple(
         observation(
@@ -900,9 +1118,38 @@ def test_review_case_counter_enforces_task8_maximum_before_binding() -> None:
         )
         for index in range(row_count)
     )
-    decisions = tuple(
-        decision(row.event_id, action=Action.APPROVE) for row in rows
+    decisions = tuple(decision(row.event_id, action=Action.APPROVE) for row in rows)
+    callback = bind_review_case_counter(rows, decisions, as_of=NOW)
+    scores = np.full(row_count, 0.1, dtype=np.float64)
+    scores[-1] = 0.9
+    labels = np.zeros(row_count, dtype=np.int8)
+    labels[-1] = 1
+    mandatory = np.empty(row_count, dtype=object)
+    mandatory[:] = [Action.APPROVE] * row_count
+
+    report = select_policy_thresholds(
+        scores, labels, mandatory, callback, OperatingBudget()
     )
 
-    with pytest.raises(CaseContractError, match="4096|cap"):
-        bind_review_case_counter(rows, decisions, as_of=NOW)
+    assert report.row_count == row_count
+    assert report.candidate_threshold_count == 4
+
+
+def test_review_case_counter_uses_grouping_row_cap_not_score_cap() -> None:
+    from apar.cases import grouping
+
+    row = observation("repeated", actor_id="actor", counterparty_id="merchant")
+    template = decision("repeated", action=Action.APPROVE)
+
+    with pytest.raises(CaseContractError, match="duplicate observation"):
+        bind_review_case_counter(
+            (row,) * grouping._MAX_GROUPING_ROWS,
+            (template,) * grouping._MAX_GROUPING_ROWS,
+            as_of=NOW,
+        )
+    with pytest.raises(CaseContractError, match="resource cap"):
+        bind_review_case_counter(
+            (row,) * (grouping._MAX_GROUPING_ROWS + 1),
+            (template,) * (grouping._MAX_GROUPING_ROWS + 1),
+            as_of=NOW,
+        )
