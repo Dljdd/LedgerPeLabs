@@ -13,6 +13,8 @@ import pytest
 from apar.contracts.events import Rail
 from apar.evaluation.gates import (
     AssuranceEvidence,
+    CandidateBundleRole,
+    CandidateRoleEvidence,
     ChampionStatus,
     EvaluationDescriptor,
     EvaluationKind,
@@ -53,9 +55,19 @@ def _row_digest(ids: tuple[str, ...]) -> str:
     return hashlib.sha256(canonical_json_bytes(list(ids))).hexdigest()
 
 
+def _candidate_material(
+    descriptor: EvaluationDescriptor,
+) -> tuple[str, str, str, str]:
+    if descriptor.kind is not EvaluationKind.HELD_FAMILY:
+        return "pooled-candidate", _sha("7"), _sha("7"), _sha("6")
+    marker = dict(zip(FAMILIES, "abcd", strict=True))[descriptor.value]
+    return f"lofo-{descriptor.value}", _sha(marker), _sha(marker), _sha(marker)
+
+
 def _lineage(descriptor: EvaluationDescriptor) -> EvaluationLineage:
     regime = descriptor.kind is EvaluationKind.REGIME
     held = descriptor.kind is EvaluationKind.HELD_FAMILY
+    _, bundle_digest, top_ref_digest, _ = _candidate_material(descriptor)
     return EvaluationLineage.create(
         descriptor=descriptor,
         decision_rows_digest=_row_digest(DECISION_IDS),
@@ -63,8 +75,8 @@ def _lineage(descriptor: EvaluationDescriptor) -> EvaluationLineage:
         split_digest=_sha("2"),
         cohort_mapping_digest=_sha("3"),
         training_population_digest=_sha("4"),
-        bundle_manifest_digest=_sha("7"),
-        defender_top_ref_digest=_sha("7"),
+        bundle_manifest_digest=bundle_digest,
+        defender_top_ref_digest=top_ref_digest,
         regime_parent_digest=_sha("c") if regime else None,
         regime_output_digest=_sha("d") if regime else None,
         regime_parameters_digest=_sha("e") if regime else None,
@@ -152,6 +164,9 @@ def _results(
     }
     rows: list[ReplayResult] = []
     for descriptor in _descriptors():
+        bundle_id, bundle_digest, top_ref_digest, threshold_set_digest = (
+            _candidate_material(descriptor)
+        )
         for arm in DefenseArm:
             value, cases = arm_values[arm]
             rows.append(
@@ -159,14 +174,30 @@ def _results(
                     arm=arm,
                     evaluation=descriptor,
                     evaluation_lineage=_lineage(descriptor),
+                    candidate_role=CandidateRoleEvidence.create(
+                        role=(
+                            CandidateBundleRole.HELD_FAMILY_LOFO
+                            if descriptor.kind is EvaluationKind.HELD_FAMILY
+                            else CandidateBundleRole.POOLED
+                        ),
+                        held_family=(
+                            descriptor.value
+                            if descriptor.kind is EvaluationKind.HELD_FAMILY
+                            else None
+                        ),
+                        bundle_id=bundle_id,
+                        bundle_manifest_digest=bundle_digest,
+                        defender_top_ref_digest=top_ref_digest,
+                        threshold_set_digest=threshold_set_digest,
+                    ),
                     decision_event_ids=DECISION_IDS,
                     decision_rows_digest=_row_digest(DECISION_IDS),
                     common_integrity_digest=_sha("2"),
                     action_digest=_sha("3"),
                     score_digest=_sha("4"),
                     threshold_report_digest=_sha("5"),
-                    threshold_set_digest=_sha("6"),
-                    bundle_manifest_digest=_sha("7"),
+                    threshold_set_digest=threshold_set_digest,
+                    bundle_manifest_digest=bundle_digest,
                     case_callback_digest=_sha("8"),
                     evaluation_context_digest=_sha("a"),
                     hidden_public_proof_id=(
@@ -230,7 +261,7 @@ def _promotion_envelope(
         proofs = (
             HiddenPublicProof.create(
                 proof_id="hpf_" + "b" * 32,
-                replay_batch_digest=hidden_batch.batch_digest,
+                batch_content_digest=hidden_batch.batch_content_digest,
                 decision_bindings_digest=_sha("9"),
                 bundle_manifest_digest=hidden_row.bundle_manifest_digest,
                 defender_top_ref_digest=(
@@ -249,6 +280,7 @@ def _promotion_envelope(
         component_batches=components,
         hidden_proofs=proofs,
         signer=signer,
+        hidden_proof_verifier=EvaluatorReplayVerifier.from_signer(signer),
     )
     return envelope
 
@@ -269,6 +301,14 @@ def _lineage_update(
     fields["descriptor"] = lineage.descriptor
     fields.update(updates)
     return EvaluationLineage.create(**fields)
+
+
+def _candidate_role_update(
+    role: CandidateRoleEvidence, **updates: object
+) -> CandidateRoleEvidence:
+    fields = role.model_dump(mode="python", exclude={"role_digest"})
+    fields.update(updates)
+    return CandidateRoleEvidence.create(**fields)
 
 
 def test_hybrid_promotes_only_on_exact_value_improvement_over_both_comparators() -> None:
@@ -320,6 +360,85 @@ def test_evaluator_signer_and_verifier_are_immutable_and_pinned() -> None:
         )
 
 
+def test_evaluator_identity_types_reject_key_accessor_replacement() -> None:
+    signer_property = EvaluatorSigningIdentity.key_id
+    verifier_property = EvaluatorReplayVerifier.key_id
+    try:
+        with pytest.raises(TypeError):
+            EvaluatorSigningIdentity.key_id = property(lambda _: "0" * 64)  # type: ignore[misc]
+        with pytest.raises(TypeError):
+            EvaluatorReplayVerifier.key_id = property(lambda _: "0" * 64)  # type: ignore[misc]
+        with pytest.raises(TypeError):
+            delattr(EvaluatorReplayVerifier, "key_id")
+        with pytest.raises(TypeError):
+            type(EvaluatorSigningIdentity).__setattr__(
+                EvaluatorSigningIdentity,
+                "key_id",
+                property(lambda _: "0" * 64),
+            )
+    finally:
+        type.__setattr__(EvaluatorSigningIdentity, "key_id", signer_property)
+        type.__setattr__(EvaluatorReplayVerifier, "key_id", verifier_property)
+
+
+def test_promotion_envelope_accepts_distinct_promotion_and_hidden_authorities() -> None:
+    hidden_signer = EvaluatorSigningIdentity.from_private_bytes(b"h" * 32)
+    hidden_verifier = EvaluatorReplayVerifier.from_signer(hidden_signer)
+    envelope = _promotion_envelope(_results())
+    original_hidden = next(
+        batch
+        for batch in envelope.component_batches
+        if batch.results[0].evaluation.kind is EvaluationKind.HIDDEN
+    )
+    hidden_batch = hidden_signer.sign_batch(original_hidden.results)
+    hidden_row = hidden_batch.results[0]
+    hidden_proof = HiddenPublicProof.create(
+        proof_id=hidden_row.hidden_public_proof_id or "",
+        batch_content_digest=hidden_batch.batch_content_digest,
+        decision_bindings_digest=_sha("9"),
+        bundle_manifest_digest=hidden_row.bundle_manifest_digest,
+        defender_top_ref_digest=hidden_row.evaluation_lineage.defender_top_ref_digest,
+        worker_manifest_digest=_sha("c"),
+        evaluator_context_token=hidden_row.evaluation_context_digest,
+        cohort_mapping_token=hidden_row.evaluation_lineage.cohort_mapping_digest,
+        issued_at="2026-08-19T00:00:00Z",
+        signer=hidden_signer,
+    )
+    components = tuple(
+        hidden_batch if item is original_hidden else item
+        for item in envelope.component_batches
+    )
+
+    distinct = VerifiedPromotionEnvelope.create(
+        component_batches=components,
+        hidden_proofs=(hidden_proof,),
+        signer=EVALUATOR_SIGNER,
+        hidden_proof_verifier=hidden_verifier,  # type: ignore[call-arg]
+    )
+
+    assert EVALUATOR_VERIFIER.verify_promotion_envelope(distinct)
+    assert evaluate_promotion_gates(
+        distinct,
+        GateConfig.competition(),
+        evaluator_verifier=EVALUATOR_VERIFIER,
+        hidden_proof_verifier=hidden_verifier,
+    ).status is ChampionStatus.PROMOTED
+    with pytest.raises(GateContractError, match="component signature"):
+        evaluate_promotion_gates(
+            distinct,
+            GateConfig.competition(),
+            evaluator_verifier=EVALUATOR_VERIFIER,
+            hidden_proof_verifier=EVALUATOR_VERIFIER,
+        )
+    with pytest.raises(GateContractError, match="envelope"):
+        evaluate_promotion_gates(
+            distinct,
+            GateConfig.competition(),
+            evaluator_verifier=hidden_verifier,
+            hidden_proof_verifier=EVALUATOR_VERIFIER,
+        )
+
+
 def test_promotion_envelope_rejects_arbitrary_signed_hidden_proof_identity() -> None:
     envelope = _promotion_envelope(_results())
     hidden_batch = next(
@@ -330,7 +449,7 @@ def test_promotion_envelope_rejects_arbitrary_signed_hidden_proof_identity() -> 
     row = hidden_batch.results[0]
     substituted = HiddenPublicProof.create(
         proof_id="hpf_" + "c" * 32,
-        replay_batch_digest=hidden_batch.batch_digest,
+        batch_content_digest=hidden_batch.batch_content_digest,
         decision_bindings_digest=_sha("9"),
         bundle_manifest_digest=row.bundle_manifest_digest,
         defender_top_ref_digest=row.evaluation_lineage.defender_top_ref_digest,
@@ -346,6 +465,7 @@ def test_promotion_envelope_rejects_arbitrary_signed_hidden_proof_identity() -> 
             component_batches=envelope.component_batches,
             hidden_proofs=(substituted,),
             signer=EVALUATOR_SIGNER,
+            hidden_proof_verifier=EVALUATOR_VERIFIER,
         )
 
 
@@ -609,17 +729,26 @@ def test_gate_rejects_each_cross_arm_lineage_substitution(
     updates: dict[str, object],
 ) -> None:
     def substitute(row: ReplayResult) -> ReplayResult:
-        if "bundle_manifest_digest" not in updates:
-            return row.rebuild(**updates)
-        digest = str(updates["bundle_manifest_digest"])
-        return row.rebuild(
-            **updates,
-            evaluation_lineage=_lineage_update(
+        rebuild = dict(updates)
+        role_updates: dict[str, object] = {}
+        if "threshold_set_digest" in updates:
+            role_updates["threshold_set_digest"] = updates["threshold_set_digest"]
+        if "bundle_manifest_digest" in updates:
+            digest = str(updates["bundle_manifest_digest"])
+            rebuild["evaluation_lineage"] = _lineage_update(
                 row.evaluation_lineage,
                 bundle_manifest_digest=digest,
                 defender_top_ref_digest=digest,
-            ),
-        )
+            )
+            role_updates.update(
+                bundle_manifest_digest=digest,
+                defender_top_ref_digest=digest,
+            )
+        if role_updates:
+            rebuild["candidate_role"] = _candidate_role_update(
+                row.candidate_role, **role_updates
+            )
+        return row.rebuild(**rebuild)
 
     changed = _replace(
         _results(),
@@ -679,6 +808,97 @@ def test_missing_one_comparator_arm_for_one_descriptor_is_global_no_promotion() 
     assert decision.status is ChampionStatus.NO_PROMOTION
     assert decision.champion is None
     assert "EVALUATION_COVERAGE" in decision.failed_gate_codes
+
+
+def test_pooled_candidate_substitution_across_regimes_is_global_no_promotion() -> None:
+    changed = _replace(
+        _results(),
+        kind=EvaluationKind.REGIME,
+        transform=lambda row: row.rebuild(
+            bundle_manifest_digest=_sha("f"),
+            evaluation_lineage=_lineage_update(
+                row.evaluation_lineage,
+                bundle_manifest_digest=_sha("f"),
+                defender_top_ref_digest=_sha("e"),
+            ),
+            candidate_role=_candidate_role_update(
+                row.candidate_role,
+                bundle_id="substituted-pooled",
+                bundle_manifest_digest=_sha("f"),
+                defender_top_ref_digest=_sha("e"),
+            ),
+        ),
+    )
+
+    decision = _evaluate(changed)
+
+    assert decision.status is ChampionStatus.NO_PROMOTION
+    assert "CANDIDATE_ROLE" in decision.failed_gate_codes
+
+
+def test_candidate_role_matrix_has_one_pool_and_four_distinct_lofo_identities() -> None:
+    results = _results()
+    pooled = {
+        row.candidate_role.role_digest
+        for row in results
+        if row.evaluation.kind is not EvaluationKind.HELD_FAMILY
+    }
+    lofo = {
+        row.evaluation.value: row.candidate_role
+        for row in results
+        if row.evaluation.kind is EvaluationKind.HELD_FAMILY
+    }
+
+    assert len(pooled) == 1
+    assert set(lofo) == set(FAMILIES)
+    assert len(
+        {
+            (
+                evidence.bundle_id,
+                evidence.bundle_manifest_digest,
+                evidence.defender_top_ref_digest,
+                evidence.threshold_set_digest,
+            )
+            for evidence in lofo.values()
+        }
+    ) == 4
+    assert _evaluate(results).status is ChampionStatus.PROMOTED
+
+
+def test_duplicate_lofo_candidate_identity_is_global_no_promotion() -> None:
+    source = EvaluationDescriptor(
+        kind=EvaluationKind.HELD_FAMILY,
+        value=FAMILIES[0],
+    )
+    source_id, source_bundle, source_top, source_threshold = _candidate_material(source)
+    target_family = FAMILIES[1]
+    changed = tuple(
+        row.rebuild(
+            bundle_manifest_digest=source_bundle,
+            threshold_set_digest=source_threshold,
+            evaluation_lineage=_lineage_update(
+                row.evaluation_lineage,
+                bundle_manifest_digest=source_bundle,
+                defender_top_ref_digest=source_top,
+            ),
+            candidate_role=_candidate_role_update(
+                row.candidate_role,
+                bundle_id=source_id,
+                bundle_manifest_digest=source_bundle,
+                defender_top_ref_digest=source_top,
+                threshold_set_digest=source_threshold,
+            ),
+        )
+        if row.evaluation.kind is EvaluationKind.HELD_FAMILY
+        and row.evaluation.value == target_family
+        else row
+        for row in _results()
+    )
+
+    decision = _evaluate(changed)
+
+    assert decision.status is ChampionStatus.NO_PROMOTION
+    assert "CANDIDATE_ROLE" in decision.failed_gate_codes
 
 
 def test_undefined_overall_false_decline_rate_is_explicit_coverage_failure() -> None:

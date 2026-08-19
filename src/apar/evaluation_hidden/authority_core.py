@@ -761,7 +761,7 @@ def _isolated_worker_main(document: object) -> dict[str, object]:
         raise HiddenBoundaryError("hidden evaluator omitted its public proof ID")
     proof = HiddenPublicProof.create(
         proof_id=proof_id,
-        replay_batch_digest=batch.batch_digest,
+        batch_content_digest=batch.batch_content_digest,
         decision_bindings_digest=decision_bindings_digest,
         bundle_manifest_digest=bundle_manifest_digest,
         defender_top_ref_digest=top_ref_digest,
@@ -838,7 +838,7 @@ def _public_outcome_from_worker(
         not verifier.verify_batch(batch)
         or not verifier.verify_public_proof(proof)
         or proof.proof_id != proof_id
-        or proof.replay_batch_digest != batch.batch_digest
+        or proof.batch_content_digest != batch.batch_content_digest
         or proof.worker_manifest_digest != worker_manifest_digest
         or proof.decision_bindings_digest != decision_bindings_digest
         or proof.bundle_manifest_digest != attestation.bundle_manifest_digest

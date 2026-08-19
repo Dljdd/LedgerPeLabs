@@ -393,13 +393,76 @@ class ReplayFailure(ExternalContract):
         return value
 
 
+class CandidateBundleRole(StrEnum):
+    """Closed candidate identity roles across robustness descriptors."""
+
+    POOLED = "pooled"
+    HELD_FAMILY_LOFO = "held_family_lofo"
+
+
+class CandidateRoleEvidence(ExternalContract):
+    """Exact bundle/top-ref/threshold identity for one candidate role."""
+
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    role: CandidateBundleRole
+    held_family: Family | None = None
+    bundle_id: str
+    bundle_manifest_digest: str
+    defender_top_ref_digest: str
+    threshold_set_digest: str
+    role_digest: str
+
+    @field_validator("bundle_id")
+    @classmethod
+    def bundle_id_is_bounded(cls, value: str) -> str:
+        if type(value) is not str or not value or len(value) > 128:
+            raise ValueError("candidate bundle ID must be bounded nonempty text")
+        return value
+
+    @field_validator(
+        "bundle_manifest_digest",
+        "defender_top_ref_digest",
+        "threshold_set_digest",
+        "role_digest",
+    )
+    @classmethod
+    def role_digests_are_sha256(cls, value: str) -> str:
+        _validate_digest(value)
+        return value
+
+    @model_validator(mode="after")
+    def role_is_closed(self) -> CandidateRoleEvidence:
+        if self.role is CandidateBundleRole.POOLED:
+            if self.held_family is not None:
+                raise ValueError("pooled candidate cannot claim a held family")
+        elif self.held_family not in _FAMILIES:
+            raise ValueError("LOFO candidate requires one strategic held family")
+        expected = _digest_document(
+            self.model_dump(mode="json", exclude={"role_digest"})
+        )
+        if self.role_digest != expected:
+            raise ValueError("candidate role digest is inconsistent")
+        return self
+
+    @classmethod
+    def create(cls, **fields: object) -> CandidateRoleEvidence:
+        provisional = cast(Any, cls).model_construct(
+            **fields, role_digest="0" * 64
+        )
+        document = provisional.model_dump(mode="json", exclude={"role_digest"})
+        return cls.model_validate(
+            {**fields, "role_digest": _digest_document(document)}
+        )
+
+
 class ReplayResult(ExternalContract):
     """Aggregate public replay evidence; restricted truth never enters this model."""
 
-    schema_version: Literal["1.2.0"] = "1.2.0"
+    schema_version: Literal["1.3.0"] = "1.3.0"
     arm: DefenseArm
     evaluation: EvaluationDescriptor
     evaluation_lineage: EvaluationLineage
+    candidate_role: CandidateRoleEvidence
     decision_event_ids: tuple[str, ...]
     decision_rows_digest: str
     common_integrity_digest: str
@@ -485,6 +548,26 @@ class ReplayResult(ExternalContract):
             != self.bundle_manifest_digest
         ):
             raise ValueError("replay result descriptor lineage is inconsistent")
+        if (
+            type(self.candidate_role) is not CandidateRoleEvidence
+            or self.candidate_role.bundle_manifest_digest
+            != self.bundle_manifest_digest
+            or self.candidate_role.defender_top_ref_digest
+            != self.evaluation_lineage.defender_top_ref_digest
+            or self.candidate_role.threshold_set_digest != self.threshold_set_digest
+        ):
+            raise ValueError("replay candidate role identity is inconsistent")
+        if self.evaluation.kind is EvaluationKind.HELD_FAMILY:
+            if (
+                self.candidate_role.role is not CandidateBundleRole.HELD_FAMILY_LOFO
+                or self.candidate_role.held_family != self.evaluation.value
+            ):
+                raise ValueError("held-family replay requires its exact LOFO role")
+        elif (
+            self.candidate_role.role is not CandidateBundleRole.POOLED
+            or self.candidate_role.held_family is not None
+        ):
+            raise ValueError("non-held replay requires the pooled candidate role")
         if self.decision_rows_digest != _digest_document(list(self.decision_event_ids)):
             raise ValueError("decision row digest does not match exact ordered IDs")
         if max(self.fallback_count, self.mandatory_decline_count) > self.metrics.row_count:
@@ -558,10 +641,37 @@ class ReplayResult(ExternalContract):
             raise GateContractError(str(error)) from error
 
 
-class EvaluatorSigningIdentity:
+class _SealedIdentityType(type):
+    """Prevent runtime replacement of pinned evaluator identity behavior."""
+
+    def __setattr__(cls, name: str, value: object) -> None:
+        del cls, name, value
+        raise TypeError("evaluator identity types are sealed")
+
+    def __delattr__(cls, name: str) -> None:
+        del cls, name
+        raise TypeError("evaluator identity types are sealed")
+
+
+def _signer_identity_store() -> tuple[Any, Any]:
+    issued: WeakKeyDictionary[object, bool] = WeakKeyDictionary()
+
+    def register(instance: object) -> None:
+        issued[instance] = True
+
+    def contains(instance: object) -> bool:
+        return issued.get(instance, False)
+
+    return register, contains
+
+
+_register_signer_identity, _is_registered_signer = _signer_identity_store()
+
+
+class EvaluatorSigningIdentity(metaclass=_SealedIdentityType):
     """Explicit Ed25519 identity used only for evaluator aggregate evidence."""
 
-    __slots__ = ()
+    __slots__ = ("__weakref__",)
 
     def __new__(cls, *args: object, **kwargs: object) -> EvaluatorSigningIdentity:
         del cls, args, kwargs
@@ -662,11 +772,12 @@ def _new_evaluator_signer(private_seed: bytes) -> EvaluatorSigningIdentity:
             return key.private_bytes_raw()
 
     instance = cast(EvaluatorSigningIdentity, object.__new__(_BoundEvaluatorSigner))
+    _register_signer_identity(instance)
     return instance
 
 
 def _is_evaluator_signer(value: object) -> bool:
-    if not isinstance(value, EvaluatorSigningIdentity):
+    if not isinstance(value, EvaluatorSigningIdentity) or not _is_registered_signer(value):
         return False
     try:
         return len(value._worker_private_bytes()) == 32
@@ -699,7 +810,7 @@ def _verifier_state_store() -> tuple[Any, Any]:
 _register_verifier_state, _get_verifier_state = _verifier_state_store()
 
 
-class EvaluatorReplayVerifier:
+class EvaluatorReplayVerifier(metaclass=_SealedIdentityType):
     """Separately pinned, externally immutable evaluator verification identity."""
 
     __slots__ = ("__weakref__",)
@@ -846,8 +957,9 @@ class EvaluatorReplayVerifier:
 class VerifiedReplayBatch(ExternalContract):
     """Evaluator-signed exact replay results; raw result tuples are never trusted."""
 
-    schema_version: Literal["1.0.0"] = "1.0.0"
+    schema_version: Literal["1.1.0"] = "1.1.0"
     results: tuple[ReplayResult, ...]
+    batch_content_digest: str
     signer_key_id: str
     signature_base64: str
     batch_digest: str
@@ -859,7 +971,7 @@ class VerifiedReplayBatch(ExternalContract):
             raise ValueError("verified replay results must be an exact tuple")
         return value
 
-    @field_validator("signer_key_id", "batch_digest")
+    @field_validator("batch_content_digest", "signer_key_id", "batch_digest")
     @classmethod
     def batch_digests_are_sha256(cls, value: str) -> str:
         _validate_digest(value)
@@ -886,6 +998,9 @@ class VerifiedReplayBatch(ExternalContract):
         )
         if keys != expected_keys or len(keys) != len(set(keys)):
             raise ValueError("verified replay batch order or keys are invalid")
+        expected_content = _batch_content_digest(self.results)
+        if self.batch_content_digest != expected_content:
+            raise ValueError("verified replay batch content digest is inconsistent")
         expected_digest = _digest_document(
             {**self.unsigned_document(), "signature_base64": self.signature_base64}
         )
@@ -904,14 +1019,16 @@ class VerifiedReplayBatch(ExternalContract):
             raise GateContractError("verified replay batch requires exact evaluator signer")
         checked_results = _validated_results(results)
         unsigned = {
-            "schema_version": "1.0.0",
+            "schema_version": "1.1.0",
             "results": [row.model_dump(mode="json") for row in checked_results],
+            "batch_content_digest": _batch_content_digest(checked_results),
             "signer_key_id": signer.key_id,
         }
         signature = signer._sign(unsigned)
         digest = _digest_document({**unsigned, "signature_base64": signature})
         return cls(
             results=checked_results,
+            batch_content_digest=cast(str, unsigned["batch_content_digest"]),
             signer_key_id=signer.key_id,
             signature_base64=signature,
             batch_digest=digest,
@@ -965,9 +1082,9 @@ class VerifiedReplayBatch(ExternalContract):
 class HiddenPublicProof(ExternalContract):
     """Opaque public proof joining aggregate hidden results to evaluator authority."""
 
-    schema_version: Literal["1.1.0"] = "1.1.0"
+    schema_version: Literal["1.2.0"] = "1.2.0"
     proof_id: str
-    replay_batch_digest: str
+    batch_content_digest: str
     decision_bindings_digest: str
     bundle_manifest_digest: str
     defender_top_ref_digest: str
@@ -987,7 +1104,7 @@ class HiddenPublicProof(ExternalContract):
         return checked
 
     @field_validator(
-        "replay_batch_digest",
+        "batch_content_digest",
         "decision_bindings_digest",
         "bundle_manifest_digest",
         "defender_top_ref_digest",
@@ -1028,7 +1145,7 @@ class HiddenPublicProof(ExternalContract):
         cls,
         *,
         proof_id: str,
-        replay_batch_digest: str,
+        batch_content_digest: str,
         decision_bindings_digest: str,
         bundle_manifest_digest: str,
         defender_top_ref_digest: str,
@@ -1041,9 +1158,9 @@ class HiddenPublicProof(ExternalContract):
         if not EvaluatorSigningIdentity.is_exact(signer):
             raise GateContractError("hidden public proof requires exact evaluator signer")
         fields: dict[str, object] = {
-            "schema_version": "1.1.0",
+            "schema_version": "1.2.0",
             "proof_id": proof_id,
-            "replay_batch_digest": replay_batch_digest,
+            "batch_content_digest": batch_content_digest,
             "decision_bindings_digest": decision_bindings_digest,
             "bundle_manifest_digest": bundle_manifest_digest,
             "defender_top_ref_digest": defender_top_ref_digest,
@@ -1056,9 +1173,9 @@ class HiddenPublicProof(ExternalContract):
         signature = signer._sign(fields)
         digest = _digest_document({**fields, "signature_base64": signature})
         return cls(
-            schema_version="1.1.0",
+            schema_version="1.2.0",
             proof_id=proof_id,
-            replay_batch_digest=replay_batch_digest,
+            batch_content_digest=batch_content_digest,
             decision_bindings_digest=decision_bindings_digest,
             bundle_manifest_digest=bundle_manifest_digest,
             defender_top_ref_digest=defender_top_ref_digest,
@@ -1151,15 +1268,18 @@ class VerifiedPromotionEnvelope(ExternalContract):
         component_batches: tuple[VerifiedReplayBatch, ...],
         hidden_proofs: tuple[HiddenPublicProof, ...],
         signer: EvaluatorSigningIdentity,
+        hidden_proof_verifier: EvaluatorReplayVerifier,
     ) -> VerifiedPromotionEnvelope:
         if not EvaluatorSigningIdentity.is_exact(signer):
             raise GateContractError("promotion envelope requires exact evaluator signer")
         verifier = EvaluatorReplayVerifier.from_signer(signer)
+        if type(hidden_proof_verifier) is not EvaluatorReplayVerifier:
+            raise GateContractError("promotion envelope requires pinned hidden verifier")
         checked_components, checked_proofs = _validate_envelope_components(
             component_batches,
             hidden_proofs,
             evaluator_verifier=verifier,
-            hidden_proof_verifier=verifier,
+            hidden_proof_verifier=hidden_proof_verifier,
         )
         combined = signer.sign_batch(
             tuple(row for batch in checked_components for row in batch.results)
@@ -1394,9 +1514,18 @@ def _validate_envelope_components(
     checked_components: list[VerifiedReplayBatch] = []
     descriptor_keys: list[tuple[EvaluationKind, str]] = []
     for item in components:
-        if type(item) is not VerifiedReplayBatch or not evaluator_verifier.verify_batch(item):
-            raise GateContractError("promotion component signature is invalid")
+        if type(item) is not VerifiedReplayBatch:
+            raise GateContractError("promotion component type is invalid")
         rows = item.results
+        if not rows:
+            raise GateContractError("promotion component rows are empty")
+        component_verifier = (
+            hidden_proof_verifier
+            if rows[0].evaluation.kind is EvaluationKind.HIDDEN
+            else evaluator_verifier
+        )
+        if not component_verifier.verify_batch(item):
+            raise GateContractError("promotion component signature is invalid")
         if not rows or len(rows) > len(DefenseArm) or len({row.arm for row in rows}) != len(rows):
             raise GateContractError("promotion component arm membership is invalid")
         descriptors = {(row.evaluation.kind, row.evaluation.value) for row in rows}
@@ -1433,11 +1562,11 @@ def _validate_envelope_components(
     )
     if len(hidden_batches) != len(checked_proofs):
         raise GateContractError("each hidden descriptor requires one exact public proof")
-    proofs_by_batch = {item.replay_batch_digest: item for item in checked_proofs}
+    proofs_by_batch = {item.batch_content_digest: item for item in checked_proofs}
     if len(proofs_by_batch) != len(checked_proofs):
         raise GateContractError("hidden proof batch bindings are duplicated")
     for batch in hidden_batches:
-        proof = proofs_by_batch.get(batch.batch_digest)
+        proof = proofs_by_batch.get(batch.batch_content_digest)
         if proof is None:
             raise GateContractError("hidden proof does not bind its descriptor batch")
         for row in batch.results:
@@ -1515,6 +1644,9 @@ def evaluate_promotion_gates(
     if not _evaluation_lineage_is_exact(rows):
         for codes in arm_codes.values():
             codes.add("EVALUATION_LINEAGE")
+    if not _candidate_roles_are_exact(rows):
+        for codes in arm_codes.values():
+            codes.add("CANDIDATE_ROLE")
     _apply_slice_regression(arm_codes, by_arm, checked_config)
     passing = {arm for arm in DefenseArm if not arm_codes[arm]}
     primary = {
@@ -1703,6 +1835,7 @@ def _evaluation_lineage_is_exact(rows: tuple[ReplayResult, ...]) -> bool:
                 row.decision_event_ids,
                 row.decision_rows_digest,
                 row.evaluation_lineage.lineage_digest,
+                row.candidate_role.role_digest,
                 row.common_integrity_digest,
                 row.bundle_manifest_digest,
                 row.threshold_set_digest,
@@ -1715,6 +1848,43 @@ def _evaluation_lineage_is_exact(rows: tuple[ReplayResult, ...]) -> bool:
         if len(lineage) != 1:
             return False
     return True
+
+
+def _candidate_roles_are_exact(rows: tuple[ReplayResult, ...]) -> bool:
+    pooled_identities: set[tuple[str, str, str, str]] = set()
+    lofo_identities: dict[Family, set[tuple[str, str, str, str]]] = {
+        family: set() for family in _FAMILIES
+    }
+    for row in rows:
+        evidence = row.candidate_role
+        identity = (
+            evidence.bundle_id,
+            evidence.bundle_manifest_digest,
+            evidence.defender_top_ref_digest,
+            evidence.threshold_set_digest,
+        )
+        if row.evaluation.kind is EvaluationKind.HELD_FAMILY:
+            family = cast(Family, row.evaluation.value)
+            if (
+                evidence.role is not CandidateBundleRole.HELD_FAMILY_LOFO
+                or evidence.held_family != family
+            ):
+                return False
+            lofo_identities[family].add(identity)
+        else:
+            if (
+                evidence.role is not CandidateBundleRole.POOLED
+                or evidence.held_family is not None
+            ):
+                return False
+            pooled_identities.add(identity)
+    if len(pooled_identities) != 1 or any(
+        len(identities) != 1 for identities in lofo_identities.values()
+    ):
+        return False
+    pooled = next(iter(pooled_identities))
+    lofo = tuple(next(iter(lofo_identities[family])) for family in _FAMILIES)
+    return len(set(lofo)) == len(_FAMILIES) and pooled not in set(lofo)
 
 
 def _evaluation_matrix_is_complete(rows: tuple[ReplayResult, ...]) -> bool:
@@ -1829,9 +1999,20 @@ def _digest_document(document: object) -> str:
     return hashlib.sha256(canonical_json_bytes(document)).hexdigest()
 
 
+def _batch_content_digest(results: tuple[ReplayResult, ...]) -> str:
+    return _digest_document(
+        {
+            "schema_version": "1.0.0",
+            "results": [item.model_dump(mode="json") for item in results],
+        }
+    )
+
+
 __all__ = [
     "ArmGateResult",
     "AssuranceEvidence",
+    "CandidateBundleRole",
+    "CandidateRoleEvidence",
     "ChampionDecision",
     "ChampionStatus",
     "DefenseArm",

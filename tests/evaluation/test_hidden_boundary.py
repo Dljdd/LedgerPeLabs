@@ -234,6 +234,22 @@ def test_defense_and_features_cannot_import_hidden_package(tmp_path: Path) -> No
         "loader = mapping['import_module']\n"
         "loader('apar.evaluation_hidden.dunder_mapping')\n"
     )
+    (apar_root / "features" / "namespace_attribute.py").write_text(
+        "def innocent():\n"
+        "    return None\n"
+        "namespace = innocent.__globals__\n"
+        "outer = '__buil' + 'tins__'\n"
+        "inner = '__im' + 'port__'\n"
+        "namespace[outer][inner]('apar.evaluation_hidden.namespace')\n"
+    )
+    (apar_root / "defense" / "composed_namespace_mapping.py").write_text(
+        "import builtins\n"
+        "reflect = vars\n"
+        "namespace = reflect(builtins)\n"
+        "pieces = ('__im', 'port__')\n"
+        "loader = namespace[pieces[0] + pieces[1]]\n"
+        "loader('apar.evaluation_hidden.composed_namespace')\n"
+    )
 
     result = audit_hidden_import_boundary(apar_root)
 
@@ -245,6 +261,8 @@ def test_defense_and_features_cannot_import_hidden_package(tmp_path: Path) -> No
     assert any("mapping_reflection.py" in item for item in result.violations)
     assert any("composed_mapping_key.py" in item for item in result.violations)
     assert any("direct_dunder_mapping.py" in item for item in result.violations)
+    assert any("namespace_attribute.py" in item for item in result.violations)
+    assert any("composed_namespace_mapping.py" in item for item in result.violations)
 
 
 def test_hidden_authority_methods_are_bound_to_the_exact_instance(

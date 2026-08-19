@@ -37,6 +37,8 @@ from apar.evaluation.defender_attestation import (
 )
 from apar.evaluation.gates import (
     AssuranceEvidence,
+    CandidateBundleRole,
+    CandidateRoleEvidence,
     DefenseArm,
     EvaluationDescriptor,
     EvaluationKind,
@@ -1205,6 +1207,7 @@ def _hidden_worker_frozen_document(
             else frozen.actual_failure.model_dump(mode="json")
         ),
         "rollback_available": frozen.defender_attestation.rollback_available,
+        "bundle_id": frozen.defender.manifest.bundle_id,
         "bundle_manifest_digest": frozen.manifest_digest,
         "defender_top_ref_digest": frozen.defender_attestation.top_ref.sha256,
         "decision_content_digest": _digest_document(
@@ -1319,6 +1322,7 @@ def _evaluate_hidden_worker_document(
         "feature_audit_passed",
         "model_failure",
         "rollback_available",
+        "bundle_id",
         "bundle_manifest_digest",
         "defender_top_ref_digest",
         "decision_content_digest",
@@ -1327,6 +1331,9 @@ def _evaluate_hidden_worker_document(
     }
     if set(document) != required or document["schema_version"] != "1.0.0":
         raise ReplayContractError("isolated hidden freeze field set is invalid")
+    bundle_id = document["bundle_id"]
+    if type(bundle_id) is not str or not bundle_id or len(bundle_id) > 128:
+        raise ReplayContractError("isolated hidden bundle ID is invalid")
     proof_id = document["proof_id"]
     if (
         type(proof_id) is not str
@@ -1452,6 +1459,7 @@ def _evaluate_hidden_worker_document(
             threshold_report_digest=report_digests[arm],
             threshold_set_digest=cast(str, document["threshold_set_digest"]),
             bundle_manifest_digest=cast(str, document["bundle_manifest_digest"]),
+            candidate_bundle_id=bundle_id,
             case_counter=case_counter,
             context=context,
             evaluation_lineage=lineage,
@@ -1533,6 +1541,7 @@ def _evaluate_frozen_context(
             threshold_report_digest=frozen.threshold_set.report_for(arm).report_digest,
             threshold_set_digest=frozen.threshold_set.threshold_set_digest,
             bundle_manifest_digest=frozen.manifest_digest,
+            candidate_bundle_id=frozen.defender.manifest.bundle_id,
             case_counter=frozen.case_counter,
             context=context,
             evaluation_lineage=lineage,
@@ -2007,6 +2016,7 @@ def _evaluate_frozen_arm(
     threshold_report_digest: str,
     threshold_set_digest: str,
     bundle_manifest_digest: str,
+    candidate_bundle_id: str,
     case_counter: ReplayCaseCounterBinding,
     context: ReplayEvaluationContext,
     evaluation_lineage: EvaluationLineage,
@@ -2066,6 +2076,22 @@ def _evaluate_frozen_arm(
         arm=arm,
         evaluation=context.evaluation,
         evaluation_lineage=evaluation_lineage,
+        candidate_role=CandidateRoleEvidence.create(
+            role=(
+                CandidateBundleRole.HELD_FAMILY_LOFO
+                if context.evaluation.kind is EvaluationKind.HELD_FAMILY
+                else CandidateBundleRole.POOLED
+            ),
+            held_family=(
+                cast(Family, context.evaluation.value)
+                if context.evaluation.kind is EvaluationKind.HELD_FAMILY
+                else None
+            ),
+            bundle_id=candidate_bundle_id,
+            bundle_manifest_digest=bundle_manifest_digest,
+            defender_top_ref_digest=evaluation_lineage.defender_top_ref_digest,
+            threshold_set_digest=threshold_set_digest,
+        ),
         decision_event_ids=event_ids,
         decision_rows_digest=_digest_document(event_ids),
         common_integrity_digest=_digest_document(mandatory_document),

@@ -105,8 +105,9 @@ def _hidden_imports(tree: ast.AST) -> tuple[tuple[int, str], ...]:
     dynamic_import_names = {"__import__", "importlib.import_module"}
     reflection_names = {"getattr"}
     code_execution_names = {"eval", "exec", "compile"}
-    namespace_reflection_names = {"globals", "vars"}
+    namespace_reflection_names = {"globals", "locals", "vars"}
     import_mapping_names: set[str] = set()
+    subscript_callable_names: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -143,6 +144,13 @@ def _hidden_imports(tree: ast.AST) -> tuple[tuple[int, str], ...]:
                     continue
                 alias_name = _call_name(assignment_target)
                 source_name = _call_name(node.value)
+                if (
+                    isinstance(node.value, ast.Subscript)
+                    and alias_name
+                    and alias_name not in subscript_callable_names
+                ):
+                    subscript_callable_names.add(alias_name)
+                    changed = True
                 if (
                     isinstance(node.value, ast.Attribute)
                     and node.value.attr == "__dict__"
@@ -221,6 +229,9 @@ def _hidden_imports(tree: ast.AST) -> tuple[tuple[int, str], ...]:
                 found.append((node.lineno, "apar.evaluation_hidden"))
         elif isinstance(node, ast.Call):
             name = _call_name(node.func)
+            if isinstance(node.func, ast.Subscript) or name in subscript_callable_names:
+                found.append((node.lineno, "<mapping-derived-callable>"))
+                continue
             if name in namespace_reflection_names:
                 found.append((node.lineno, "<namespace-reflection>"))
                 continue
@@ -229,9 +240,10 @@ def _hidden_imports(tree: ast.AST) -> tuple[tuple[int, str], ...]:
                 continue
             if name in reflection_names:
                 owner = _call_name(node.args[0]) if node.args else ""
-                # Reflection on import machinery is rejected even when the
-                # attribute is composed or otherwise unresolved.
-                if owner in importlib_names or owner in builtins_names:
+                # Only the two audited production self-lookups are ordinary
+                # reflection. Every other getattr chain is unresolved code
+                # provenance and therefore fails closed.
+                if owner != "self":
                     found.append((node.lineno, "<import-reflection>"))
                 continue
             if name not in dynamic_import_names:
@@ -241,11 +253,19 @@ def _hidden_imports(tree: ast.AST) -> tuple[tuple[int, str], ...]:
                 found.append((node.lineno, f"<dynamic-import:{argument.value}>"))
             else:
                 found.append((node.lineno, "<unresolved-dynamic-import>"))
-        elif isinstance(node, ast.Attribute) and (
-            node.attr in {"__dict__", "__import__", "import_module"}
-            and _call_name(node.value) in importlib_names | builtins_names
-        ):
-            found.append((node.lineno, "<import-dunder-reflection>"))
+        elif isinstance(node, ast.Attribute):
+            if (
+                node.attr.startswith("__")
+                and node.attr.endswith("__")
+                and node.attr
+                not in {"__version__", "__name__", "__getattribute__", "__setattr__"}
+            ) or (
+                node.attr in {"__dict__", "__globals__", "__builtins__", "__import__"}
+            ) or (
+                node.attr == "import_module"
+                and _call_name(node.value) in importlib_names
+            ):
+                found.append((node.lineno, "<import-dunder-reflection>"))
         elif isinstance(node, ast.Subscript) and (
             _dangerous_mapping_key(node.slice)
             or _call_name(node.value) in import_mapping_names
