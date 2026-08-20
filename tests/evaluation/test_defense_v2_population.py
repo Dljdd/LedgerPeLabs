@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -12,7 +13,8 @@ from apar.evaluation.v2_population import (
     build_benign_base,
     inject_frozen_campaigns,
 )
-from apar.evaluation.v2_protocol import PrevalenceStratum, V2Protocol
+from apar.evaluation.v2_protocol import PrevalenceStratum, SeedCommitment, V2Protocol
+from apar.runs.wire import canonical_json_bytes
 
 
 FAMILIES = (
@@ -24,10 +26,31 @@ FAMILIES = (
 CAMPAIGN_START = datetime(2026, 2, 1, tzinfo=UTC)
 
 
-def fixture_protocol(*, transaction_count: int = 100, day_count: int = 2) -> V2Protocol:
+def fixture_seed_commitment(name: str, seed: int) -> SeedCommitment:
+    return SeedCommitment(
+        name=name,
+        commitment_sha256=hashlib.sha256(
+            canonical_json_bytes({"name": name, "seed": seed})
+        ).hexdigest(),
+    )
+
+
+def fixture_protocol(
+    *,
+    transaction_count: int = 100,
+    day_count: int = 2,
+    operating_seed: int = 11,
+    injection_seed: int = 17,
+) -> V2Protocol:
     protocol = V2Protocol.fixture(transaction_count=transaction_count)
     return protocol.model_copy(
-        update={"operating": protocol.operating.model_copy(update={"day_count": day_count})}
+        update={
+            "operating": protocol.operating.model_copy(update={"day_count": day_count}),
+            "seed_commitments": (
+                fixture_seed_commitment("operating_population", operating_seed),
+                fixture_seed_commitment("campaign_injection", injection_seed),
+            ),
+        }
     )
 
 
@@ -67,6 +90,43 @@ def test_entity_overlap_is_rejected() -> None:
 
     with pytest.raises(PopulationIsolationError, match="entity overlap"):
         inject_frozen_campaigns(base, (injection,), PrevalenceStratum.fixture(), seed=17)
+
+
+def test_entity_overlap_between_injected_campaigns_is_rejected() -> None:
+    base = build_benign_base(fixture_protocol(transaction_count=100), seed=11)
+    shared_entity = "injected-shared-entity"
+    first = CampaignInjection.fixture(
+        campaign_id="campaign-first",
+        entity_ids=(shared_entity, "injected-counterparty-one"),
+        start_at=CAMPAIGN_START,
+    )
+    second = CampaignInjection.fixture(
+        campaign_id="campaign-second",
+        entity_ids=(shared_entity, "injected-counterparty-two"),
+        start_at=CAMPAIGN_START + timedelta(days=1),
+    )
+
+    with pytest.raises(PopulationIsolationError, match="entity overlap"):
+        inject_frozen_campaigns(base, (first, second), PrevalenceStratum.fixture(), seed=17)
+
+
+def test_operating_seed_must_match_the_protocol_commitment() -> None:
+    protocol = fixture_protocol(transaction_count=100, operating_seed=12)
+
+    with pytest.raises(PopulationIsolationError, match="operating_population seed commitment"):
+        build_benign_base(protocol, seed=11)
+
+
+def test_injection_seed_must_match_the_protocol_commitment() -> None:
+    base = build_benign_base(fixture_protocol(transaction_count=100), seed=11)
+
+    with pytest.raises(PopulationIsolationError, match="campaign_injection seed commitment"):
+        inject_frozen_campaigns(
+            base,
+            campaign_injections(total_decisions=20),
+            PrevalenceStratum.fixture(),
+            seed=18,
+        )
 
 
 @pytest.mark.parametrize(

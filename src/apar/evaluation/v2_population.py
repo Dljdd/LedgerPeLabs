@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import random
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -145,7 +146,9 @@ def build_benign_base(protocol: V2Protocol, *, seed: int) -> OperatingPopulation
         raise TypeError("protocol must be an exact V2Protocol")
     count = protocol.operating.transaction_count
     days = protocol.operating.day_count
-    seed_commitment = _seed_commitment("operating_population", seed)
+    seed_commitment = _verify_seed_commitment(
+        protocol.seed_commitments, name="operating_population", seed=seed
+    )
     identity_prefix = seed_commitment.commitment_sha256[:16]
     rng = random.Random(seed)
     observations: list[ObservedEvent] = []
@@ -195,7 +198,7 @@ def build_benign_base(protocol: V2Protocol, *, seed: int) -> OperatingPopulation
         population_kind="benign_base",
         day_count=days,
         stratum_name=None,
-        seed_commitments=(seed_commitment,),
+        seed_commitments=protocol.seed_commitments,
     )
 
 
@@ -209,6 +212,9 @@ def inject_frozen_campaigns(
     """Replace exactly ``stratum.fraud_transaction_count`` benign decisions."""
     _require_seed(seed)
     _validate_benign_base(base)
+    _verify_seed_commitment(
+        base.manifest.seed_commitments, name="campaign_injection", seed=seed
+    )
     if type(stratum) is not PrevalenceStratum:
         raise TypeError("stratum must be an exact PrevalenceStratum")
     if len(base.observations) != stratum.transaction_count:
@@ -231,14 +237,13 @@ def inject_frozen_campaigns(
     ):
         observations[index] = observation
         truth[index] = truth_row
-    seed_commitments = (*base.manifest.seed_commitments, _seed_commitment("campaign_injection", seed))
     return _population(
         observations=tuple(observations),
         truth=tuple(truth),
         population_kind="injected",
         day_count=base.manifest.day_count,
         stratum_name=stratum.name,
-        seed_commitments=seed_commitments,
+        seed_commitments=base.manifest.seed_commitments,
     )
 
 
@@ -315,6 +320,12 @@ def _validate_injection_context(
     injection_entities = set().union(*(set(injection.entity_ids) for injection in injections))
     if base_entities & injection_entities:
         raise PopulationIsolationError("entity overlap")
+    prior_campaign_entities: set[str] = set()
+    for injection in injections:
+        entities = set(injection.entity_ids)
+        if prior_campaign_entities & entities:
+            raise PopulationIsolationError("entity overlap")
+        prior_campaign_entities.update(entities)
     base_start, base_end = _decision_interval(base.observations)
     for injection in injections:
         start, end = _decision_interval(injection.observations)
@@ -396,13 +407,16 @@ def _decision_interval(rows: tuple[ObservedEvent, ...]) -> tuple[datetime, datet
     return min(exact), max(exact)
 
 
-def _seed_commitment(name: str, seed: int) -> SeedCommitment:
-    return SeedCommitment(
-        name=name,
-        commitment_sha256=hashlib.sha256(
-            canonical_json_bytes({"name": name, "seed": seed})
-        ).hexdigest(),
-    )
+def _verify_seed_commitment(
+    commitments: tuple[SeedCommitment, ...], *, name: str, seed: int
+) -> SeedCommitment:
+    matching = tuple(commitment for commitment in commitments if commitment.name == name)
+    if len(matching) != 1:
+        raise PopulationIsolationError(f"{name} seed commitment is missing or ambiguous")
+    expected = hashlib.sha256(canonical_json_bytes({"name": name, "seed": seed})).hexdigest()
+    if not hmac.compare_digest(matching[0].commitment_sha256, expected):
+        raise PopulationIsolationError(f"{name} seed commitment mismatch")
+    return matching[0]
 
 
 def _rows_digest(rows: tuple[ObservedEvent, ...] | tuple[EvaluationTruthRow, ...]) -> str:
