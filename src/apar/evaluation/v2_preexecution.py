@@ -174,18 +174,20 @@ def _contains_disallowed_import(
             for name in node.names
         ):
             return True
-        if isinstance(node, ast.ImportFrom) and _is_disallowed_module(
-            node.module, forbidden, allowed_prefix
-        ) and not _is_frozen_v1_import(path, source_root, node.module):
-            return True
+        if isinstance(node, ast.ImportFrom):
+            for module in _resolved_import_targets(node, path, source_root):
+                if _is_disallowed_module(
+                    module, forbidden, allowed_prefix
+                ) and not _is_frozen_v1_import(path, source_root, module):
+                    return True
         if isinstance(node, ast.Call) and _is_dynamic_import_call(
             node, importlib_aliases, import_function_aliases
         ):
             if not node.args or not isinstance(node.args[0], ast.Constant):
                 return True
-            module = node.args[0].value
-            if not isinstance(module, str) or _is_disallowed_module(
-                module, forbidden, allowed_prefix
+            module_value = node.args[0].value
+            if not isinstance(module_value, str) or _is_disallowed_module(
+                module_value, forbidden, allowed_prefix
             ):
                 return True
     return False
@@ -197,12 +199,18 @@ def _import_bindings(tree: ast.AST) -> tuple[set[str], set[str]]:
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for name in node.names:
-                if name.name == "importlib":
-                    importlib_aliases.add(name.asname or name.name)
-        elif isinstance(node, ast.ImportFrom) and node.module == "importlib":
+                if name.name == "importlib" or name.name.startswith("importlib."):
+                    importlib_aliases.add(name.asname or name.name.split(".", 1)[0])
+        elif (
+            isinstance(node, ast.ImportFrom)
+            and node.module
+            and node.module.startswith("importlib")
+        ):
             for name in node.names:
                 if name.name in {"__import__", "import_module"}:
                     import_function_aliases.add(name.asname or name.name)
+                elif node.module == "importlib":
+                    importlib_aliases.add(name.asname or name.name)
     return importlib_aliases, import_function_aliases
 
 
@@ -214,8 +222,7 @@ def _is_dynamic_import_call(
     return (
         isinstance(node.func, ast.Attribute)
         and node.func.attr in {"__import__", "import_module"}
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id in importlib_aliases
+        and _has_importlib_root(node.func.value, importlib_aliases)
     )
 
 
@@ -225,6 +232,42 @@ def _is_disallowed_module(module: str | None, forbidden: str, allowed_prefix: st
     return module == forbidden or module.startswith(f"{forbidden}.") or (
         (module == "apar.evaluation" or module.startswith("apar.evaluation."))
         and not module.startswith(allowed_prefix)
+    )
+
+
+def _resolved_import_targets(
+    node: ast.ImportFrom, path: Path, source_root: Path
+) -> tuple[str, ...]:
+    if node.level == 0:
+        resolved = node.module
+        base: tuple[str, ...] = ()
+    else:
+        package = _defender_package(path, source_root)
+        keep = len(package) - node.level + 1
+        if keep <= 0:
+            raise ValueError("relative import escapes the defender package")
+        base = package[:keep]
+        resolved = ".".join((*base, *(node.module or "").split("."))).rstrip(".")
+    if node.module is None:
+        return tuple(".".join((*base, name.name)) for name in node.names)
+    if resolved == "apar.evaluation":
+        return tuple(f"{resolved}.{name.name}" for name in node.names)
+    if resolved:
+        return (resolved,)
+    return ()
+
+
+def _defender_package(path: Path, source_root: Path) -> tuple[str, ...]:
+    relative = path.relative_to(source_root)
+    parents = () if relative.parent == Path(".") else relative.parent.parts
+    return ("apar", "defense", *parents)
+
+
+def _has_importlib_root(value: ast.expr, importlib_aliases: set[str]) -> bool:
+    if isinstance(value, ast.Name):
+        return value.id in importlib_aliases
+    return isinstance(value, ast.Attribute) and _has_importlib_root(
+        value.value, importlib_aliases
     )
 
 

@@ -64,6 +64,61 @@ def test_dynamic_importlib_module_expression_fails_preexecution(tmp_path: Path) 
     assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
 
 
+def test_importlib_metadata_binds_the_importlib_root(tmp_path: Path) -> None:
+    """A submodule import still exposes the importlib root capability."""
+    _write_defender_source(
+        tmp_path,
+        "import importlib.metadata\n"
+        "module = 'apar.evaluation_hidden'\n"
+        "importlib.import_module(module)\n",
+    )
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
+def test_importlib_metadata_alias_cannot_import_a_computed_target(tmp_path: Path) -> None:
+    """Aliases of importlib submodules remain dynamic import capabilities."""
+    _write_defender_source(
+        tmp_path,
+        "import importlib.metadata as loader\n"
+        "module = 'apar.evaluation_hidden'\n"
+        "loader.import_module(module)\n",
+    )
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
+def test_relative_evaluator_import_fails_preexecution(tmp_path: Path) -> None:
+    """Relative imports cannot reach an evaluator module outside the v2 namespace."""
+    _write_defender_source(tmp_path, "from ..evaluation import hidden_source\n")
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
+def test_relative_evaluation_package_import_fails_preexecution(tmp_path: Path) -> None:
+    """Importing the evaluator package itself bypasses no version boundary."""
+    _write_defender_source(tmp_path, "from .. import evaluation\n")
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
+def test_relative_versioned_evaluator_import_remains_admissible(tmp_path: Path) -> None:
+    """Relative syntax may still name an explicitly versioned public contract."""
+    _write_defender_source(tmp_path, "from ..evaluation import v2_preexecution\n")
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" not in report.codes
+
+
 def test_versioned_public_evaluator_import_remains_admissible(tmp_path: Path) -> None:
     """The sealed pre-execution public contract remains an approved dependency."""
     _write_defender_source(
