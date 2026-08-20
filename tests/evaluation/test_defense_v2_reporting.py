@@ -6,7 +6,11 @@ from pathlib import Path
 
 import pytest
 
-from apar.evaluation.v2_preregistration import ExecutionReceipt
+from apar.evaluation.v2_preregistration import (
+    TRUSTED_V2_EXECUTION_NONCE,
+    TRUSTED_V2_PREREGISTRATION_ID,
+    ExecutionReceipt,
+)
 from apar.evaluation.v2_protocol import load_v2_protocol
 from apar.evaluation.v2_reporting import (
     DefenseV2GateReport,
@@ -66,7 +70,8 @@ def test_current_scorecard_rejects_a_different_protocol_digest(tmp_path: Path) -
     card, _ = render_v2_scorecard(result, signer=signer())
     (state / "defense-v2-scorecard.json").write_bytes(card.to_json())
     receipt = ExecutionReceipt(
-        preregistration_id="apar-defend-v2", execution_nonce="receipt-present"
+        preregistration_id=TRUSTED_V2_PREREGISTRATION_ID,
+        execution_nonce=TRUSTED_V2_EXECUTION_NONCE,
     )
     (state / "execution-receipt.json").write_bytes(
         canonical_json_bytes(receipt.model_dump(mode="json"))
@@ -126,4 +131,4 @@ def test_promotion_eligible_rejects_an_arm_with_a_failed_gate() -> None:
 
 
 def signer() -> RunSigningIdentity:
-    return RunSigningIdentity.from_private_bytes(b"r" * 32)
+    return RunSigningIdentity.from_private_bytes(b"v" * 32)

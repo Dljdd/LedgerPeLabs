@@ -9,8 +9,8 @@ import numpy as np
 
 from apar.contracts.decisions import Action
 from apar.evaluation.contracts import EvaluationTruthRow
+from apar.evaluation.gates import EvaluatorSigningIdentity
 from apar.evaluation.v2_controls import (
-    ControlResult,
     run_benign_only_control,
     run_score_permutation_control,
 )
@@ -226,8 +226,11 @@ def candidate(
 
 
 def control_validity(*, valid: bool) -> ControlValidity:
+    signer = EvaluatorSigningIdentity.from_private_bytes(b"v" * 32)
     benign = run_benign_only_control(
-        actions=(Action.APPROVE,), truth=(_control_truth("benign", fraud=False),)
+        actions=(Action.APPROVE,),
+        truth=(_control_truth("benign", fraud=False),),
+        signer=signer,
     )
     permutation = run_score_permutation_control(
         scores=np.array([0.8, 0.2]),
@@ -238,9 +241,14 @@ def control_validity(*, valid: bool) -> ControlValidity:
         blocks=("case", "case"),
         seed=7,
         evaluator=lambda scores, truth, blocks: False,
+        signer=signer,
     )
     if not valid:
-        benign = ControlResult.invalid("benign_only", "control_not_run")
+        benign = run_benign_only_control(
+            actions=(Action.APPROVE,),
+            truth=(_control_truth("fraud-control", fraud=True),),
+            signer=signer,
+        )
     return ControlValidity.attest(
         benign_only=benign,
         score_permutation=permutation,

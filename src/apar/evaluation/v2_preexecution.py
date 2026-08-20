@@ -165,10 +165,113 @@ def verify_manifest_registry(root: Path, preregistration: object) -> Preexecutio
                     or hashlib.sha256(canonical_json_bytes(manifests[name])).hexdigest() != expected
                 ):
                     raise ValueError(f"manifest binding mismatch: {name}")
+            _verify_frozen_manifest_inputs(root, manifests)
             passed = True
         except (OSError, AttributeError, TypeError, ValueError, WireContractError):
             passed = False
     return PreexecutionCheck(code="MANIFEST_BINDINGS_INVALID", passed=passed)
+
+
+def _verify_frozen_manifest_inputs(root: Path, manifests: dict[str, object]) -> None:
+    """Verify the exact bytes and complete source inventory named by the registry."""
+    source = manifests.get("source")
+    feature = manifests.get("feature")
+    candidates = manifests.get("candidate_grid")
+    population = manifests.get("population")
+    if not all(type(item) is dict for item in (source, feature, candidates, population)):
+        raise ValueError("frozen input manifest sections are invalid")
+    assert isinstance(source, dict)
+    assert isinstance(feature, dict)
+    assert isinstance(candidates, dict)
+    assert isinstance(population, dict)
+    if set(source) != {"roots", "files"}:
+        raise ValueError("source manifest must contain roots and files")
+    roots = source["roots"]
+    files = source["files"]
+    if type(roots) is not list or roots != ["src/apar/defense", "src/apar/features"]:
+        raise ValueError("source roots are not exact")
+    if type(files) is not dict or not files:
+        raise ValueError("source file inventory is missing")
+    actual_source_files: set[str] = set()
+    for relative_root in roots:
+        source_root = _resolved_frozen_path(root, relative_root)
+        if not source_root.is_dir() or source_root.is_symlink():
+            raise ValueError("source root is not a regular directory")
+        actual_source_files.update(
+            path.relative_to(root).as_posix()
+            for path in source_root.rglob("*.py")
+            if path.is_file() and not path.is_symlink()
+        )
+    if set(files) != actual_source_files:
+        raise ValueError("source inventory differs from the frozen tree")
+    for relative_path, expected_digest in files.items():
+        _verify_frozen_file(root, relative_path, expected_digest)
+
+    if set(feature) != {"catalog", "reachable_roots"}:
+        raise ValueError("feature manifest does not bind its catalog")
+    _verify_frozen_reference(
+        root, feature["catalog"], expected_path="config/defense/feature-catalog.json"
+    )
+
+    if not {"arms", "defender_bundle", "threshold_artifacts"}.issubset(candidates):
+        raise ValueError("candidate manifest omits frozen inputs")
+    _verify_frozen_reference(
+        root,
+        candidates["defender_bundle"],
+        expected_path="fixtures/defense/v1/defender-bundle.json",
+    )
+    thresholds = candidates["threshold_artifacts"]
+    if type(thresholds) is not list or len(thresholds) != 2:
+        raise ValueError("threshold artifact inventory is incomplete")
+    expected_threshold_paths = (
+        "fixtures/defense/v1/calibration.json",
+        "fixtures/defense/v1/thresholds.json",
+    )
+    for reference, expected_path in zip(thresholds, expected_threshold_paths, strict=True):
+        _verify_frozen_reference(root, reference, expected_path=expected_path)
+
+    if "campaign_ledger" not in population:
+        raise ValueError("population manifest omits its campaign ledger")
+    _verify_frozen_reference(
+        root,
+        population["campaign_ledger"],
+        expected_path="fixtures/defense/v1/split-manifest.json",
+    )
+
+
+def _verify_frozen_reference(root: Path, value: object, *, expected_path: str) -> None:
+    if type(value) is not dict or set(value) != {"path", "sha256"}:
+        raise ValueError("frozen content reference is invalid")
+    if value["path"] != expected_path:
+        raise ValueError("frozen content path is invalid")
+    _verify_frozen_file(root, value["path"], value["sha256"])
+
+
+def _verify_frozen_file(root: Path, relative_path: object, expected_digest: object) -> None:
+    if type(relative_path) is not str or type(expected_digest) is not str:
+        raise ValueError("frozen file binding is invalid")
+    if len(expected_digest) != 64 or any(
+        character not in "0123456789abcdef" for character in expected_digest
+    ):
+        raise ValueError("frozen file digest is invalid")
+    path = _resolved_frozen_path(root, relative_path)
+    if not path.is_file() or path.is_symlink():
+        raise ValueError("frozen input is not a regular file")
+    if hashlib.sha256(path.read_bytes()).hexdigest() != expected_digest:
+        raise ValueError("frozen input digest mismatch")
+
+
+def _resolved_frozen_path(root: Path, relative_path: object) -> Path:
+    if type(relative_path) is not str:
+        raise ValueError("frozen input path is invalid")
+    relative = Path(relative_path)
+    if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+        raise ValueError("frozen input path escapes the repository")
+    resolved_root = root.resolve(strict=True)
+    resolved = (root / relative).resolve(strict=True)
+    if not resolved.is_relative_to(resolved_root):
+        raise ValueError("frozen input path escapes the repository")
+    return resolved
 
 
 def verify_no_v2_execution_receipt(root: Path) -> PreexecutionCheck:
@@ -199,27 +302,28 @@ def verify_import_boundary(root: Path, *, forbidden: str, allowed_prefix: str) -
     project_source = root / "src"
     defender_root = project_source / "apar" / "defense"
     try:
-        pending = list(defender_root.rglob("*.py"))
-        seen: set[Path] = set()
+        pending = [(path, False) for path in defender_root.rglob("*.py")]
+        seen: dict[Path, bool] = {}
         while pending:
-            path = pending.pop()
-            if path in seen:
+            path, traverse_dependencies = pending.pop()
+            if path in seen and (seen[path] or not traverse_dependencies):
                 continue
-            seen.add(path)
+            seen[path] = seen.get(path, False) or traverse_dependencies
             if _contains_disallowed_import(
                 path, project_source, defender_root, forbidden, allowed_prefix
             ):
                 return PreexecutionCheck(code="HIDDEN_IMPORT_BOUNDARY", passed=False)
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
             for module in _local_import_targets(tree, path, project_source):
-                if not (
-                    module == "apar.defense"
-                    or module.startswith("apar.defense.")
-                    or module == "apar.features"
-                    or module.startswith("apar.features.")
-                ):
+                if not (module == "apar" or module.startswith("apar.")):
                     continue
-                pending.extend(_local_module_paths(project_source, module))
+                if module == "apar.evaluation" or module.startswith("apar.evaluation."):
+                    continue
+                is_feature = module == "apar.features" or module.startswith("apar.features.")
+                if traverse_dependencies or is_feature:
+                    pending.extend(
+                        (target, True) for target in _local_module_paths(project_source, module)
+                    )
     except (OSError, UnicodeError, SyntaxError, ValueError):
         return PreexecutionCheck(code="HIDDEN_IMPORT_BOUNDARY", passed=False)
     return PreexecutionCheck(code="HIDDEN_IMPORT_BOUNDARY", passed=True)
@@ -230,7 +334,11 @@ def verify_preregistration(preregistration: object) -> PreexecutionCheck:
     if type(preregistration) is not V2Preregistration:
         return PreexecutionCheck(code="PREREGISTRATION_INVALID", passed=False)
     try:
-        valid = preregistration.verify_manifest_bindings() and preregistration.verify_signature()
+        valid = (
+            preregistration.verify_manifest_bindings()
+            and preregistration.verify_signature()
+            and preregistration.verify_trusted_authority()
+        )
     except (AttributeError, TypeError, ValueError):
         valid = False
     return PreexecutionCheck(code="PREREGISTRATION_INVALID", passed=valid)
@@ -284,7 +392,7 @@ def _contains_disallowed_import(
 
 def _import_bindings(tree: ast.AST) -> tuple[set[str], set[str], set[str]]:
     importlib_aliases: set[str] = set()
-    builtins_aliases: set[str] = set()
+    builtins_aliases: set[str] = {"__builtins__"}
     import_function_aliases = {"__import__"}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -314,8 +422,16 @@ def _import_bindings(tree: ast.AST) -> tuple[set[str], set[str], set[str]]:
                     if isinstance(target, ast.Name) and target.id not in importlib_aliases:
                         importlib_aliases.add(target.id)
                         changed = True
-            elif isinstance(node, ast.Assign) and _is_builtin_import_reference(
-                node.value, builtins_aliases, import_function_aliases
+            elif isinstance(node, ast.Assign) and _has_named_root(node.value, builtins_aliases):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id not in builtins_aliases:
+                        builtins_aliases.add(target.id)
+                        changed = True
+            elif isinstance(node, ast.Assign) and _is_import_function_reference(
+                node.value,
+                importlib_aliases,
+                builtins_aliases,
+                import_function_aliases,
             ):
                 for target in node.targets:
                     if isinstance(target, ast.Name) and target.id not in import_function_aliases:
@@ -334,8 +450,20 @@ def _import_bindings(tree: ast.AST) -> tuple[set[str], set[str], set[str]]:
                 isinstance(node, ast.AnnAssign)
                 and node.value is not None
                 and isinstance(node.target, ast.Name)
-                and _is_builtin_import_reference(
-                    node.value, builtins_aliases, import_function_aliases
+                and _has_named_root(node.value, builtins_aliases)
+                and node.target.id not in builtins_aliases
+            ):
+                builtins_aliases.add(node.target.id)
+                changed = True
+            elif (
+                isinstance(node, ast.AnnAssign)
+                and node.value is not None
+                and isinstance(node.target, ast.Name)
+                and _is_import_function_reference(
+                    node.value,
+                    importlib_aliases,
+                    builtins_aliases,
+                    import_function_aliases,
                 )
                 and node.target.id not in import_function_aliases
             ):
@@ -350,16 +478,11 @@ def _is_dynamic_import_call(
     builtins_aliases: set[str],
     import_function_aliases: set[str],
 ) -> bool:
-    if isinstance(node.func, ast.Name):
-        return node.func.id in import_function_aliases
-    if not isinstance(node.func, ast.Attribute):
-        return False
-    if node.func.attr == "import_module":
-        return _has_importlib_root(node.func.value, importlib_aliases)
-    return (
-        node.func.attr == "__import__"
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id in builtins_aliases
+    return _is_import_function_reference(
+        node.func,
+        importlib_aliases,
+        builtins_aliases,
+        import_function_aliases,
     )
 
 
@@ -406,6 +529,7 @@ def _source_package(path: Path, project_source: Path) -> tuple[str, ...]:
 
 def _local_import_targets(tree: ast.AST, path: Path, project_source: Path) -> tuple[str, ...]:
     modules: set[str] = set()
+    importlib_aliases, builtins_aliases, import_function_aliases = _import_bindings(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             modules.update(name.name for name in node.names)
@@ -414,6 +538,16 @@ def _local_import_targets(tree: ast.AST, path: Path, project_source: Path) -> tu
             modules.update(bases)
             for base in bases:
                 modules.update(f"{base}.{name.name}" for name in node.names if name.name != "*")
+        elif (
+            isinstance(node, ast.Call)
+            and _is_dynamic_import_call(
+                node, importlib_aliases, builtins_aliases, import_function_aliases
+            )
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            modules.add(node.args[0].value)
     return tuple(
         sorted(module for module in modules if module == "apar" or module.startswith("apar."))
     )
@@ -429,39 +563,68 @@ def _local_module_paths(project_source: Path, module: str) -> tuple[Path, ...]:
 
 
 def _has_importlib_root(value: ast.expr, importlib_aliases: set[str]) -> bool:
+    reflected = _reflection_mapping_root(value)
+    if reflected is not value:
+        return _has_importlib_root(reflected, importlib_aliases)
     if isinstance(value, ast.Name):
         return value.id in importlib_aliases
     return isinstance(value, ast.Attribute) and _has_importlib_root(value.value, importlib_aliases)
 
 
-def _is_builtin_import_reference(
-    value: ast.expr, builtins_aliases: set[str], import_function_aliases: set[str]
+def _is_import_function_reference(
+    value: ast.expr,
+    importlib_aliases: set[str],
+    builtins_aliases: set[str],
+    import_function_aliases: set[str],
 ) -> bool:
     if isinstance(value, ast.Name):
         return value.id in import_function_aliases
     if isinstance(value, ast.Attribute):
         return (
-            value.attr == "__import__"
-            and isinstance(value.value, ast.Name)
-            and value.value.id in builtins_aliases
-        )
+            value.attr == "import_module" and _has_importlib_root(value.value, importlib_aliases)
+        ) or (value.attr == "__import__" and _has_named_root(value.value, builtins_aliases))
     if isinstance(value, ast.Call):
-        return (
+        if (
             isinstance(value.func, ast.Name)
             and value.func.id == "getattr"
             and len(value.args) >= 2
-            and isinstance(value.args[0], ast.Name)
-            and value.args[0].id in builtins_aliases
             and isinstance(value.args[1], ast.Constant)
-            and value.args[1].value == "__import__"
-        )
-    return (
-        isinstance(value, ast.Subscript)
-        and isinstance(value.value, ast.Name)
-        and value.value.id in builtins_aliases
-        and isinstance(value.slice, ast.Constant)
-        and value.slice.value == "__import__"
+        ):
+            attribute = value.args[1].value
+            return (
+                attribute == "__import__" and _has_named_root(value.args[0], builtins_aliases)
+            ) or (
+                attribute == "import_module"
+                and _has_importlib_root(value.args[0], importlib_aliases)
+            )
+        return False
+    if not isinstance(value, ast.Subscript) or not isinstance(value.slice, ast.Constant):
+        return False
+    attribute = value.slice.value
+    root = _reflection_mapping_root(value.value)
+    return (attribute == "__import__" and _has_named_root(root, builtins_aliases)) or (
+        attribute == "import_module" and _has_importlib_root(root, importlib_aliases)
     )
+
+
+def _reflection_mapping_root(value: ast.expr) -> ast.expr:
+    if isinstance(value, ast.Attribute) and value.attr == "__dict__":
+        return value.value
+    if (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id == "vars"
+        and len(value.args) == 1
+    ):
+        return value.args[0]
+    return value
+
+
+def _has_named_root(value: ast.expr, aliases: set[str]) -> bool:
+    reflected = _reflection_mapping_root(value)
+    if reflected is not value:
+        return _has_named_root(reflected, aliases)
+    return isinstance(value, ast.Name) and value.id in aliases
 
 
 def _is_frozen_v1_import(path: Path, source_root: Path, module: str | None) -> bool:

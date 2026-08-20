@@ -4,11 +4,14 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import numpy as np
+import pytest
 
 from apar.contracts.decisions import Action
 from apar.evaluation.contracts import EvaluationTruthRow
+from apar.evaluation.gates import EvaluatorSigningIdentity
 from apar.evaluation.v2_controls import (
     ControlResult,
+    V2ControlError,
     admit_control_result,
     run_benign_only_control,
     run_score_permutation_control,
@@ -34,7 +37,9 @@ def truth_row(event_id: str, *, fraud: bool) -> EvaluationTruthRow:
 
 def test_benign_control_reports_interventions_without_true_positives() -> None:
     result = run_benign_only_control(
-        actions=(Action.CHALLENGE,), truth=(truth_row("row-1", fraud=False),)
+        actions=(Action.CHALLENGE,),
+        truth=(truth_row("row-1", fraud=False),),
+        signer=evaluator_signer(),
     )
     assert result.valid is True
     assert result.intervention_count == 1
@@ -44,8 +49,12 @@ def test_benign_control_reports_interventions_without_true_positives() -> None:
 def test_qualifying_permuted_scores_invalidates_run() -> None:
     rows = (truth_row("fraud", fraud=True), truth_row("benign", fraud=False))
     result = run_score_permutation_control(
-        scores=np.array([1.0, 0.0]), truth=rows, blocks=("same-case", "same-case"), seed=7,
+        scores=np.array([1.0, 0.0]),
+        truth=rows,
+        blocks=("same-case", "same-case"),
+        seed=7,
         evaluator=lambda scores, truth, blocks: True,
+        signer=evaluator_signer(),
     )
     assert (result.valid, result.reason) == (False, "permuted_scores_qualified")
 
@@ -59,6 +68,7 @@ def test_score_permutation_keeps_blocks_intact() -> None:
         blocks=("case-a", "case-a", "case-b", "case-b"),
         seed=3,
         evaluator=lambda scores, truth, blocks: observed.append(tuple(scores)) or False,
+        signer=evaluator_signer(),
     )
     assert result.valid is True
     assert observed == [(0.2, 0.1, 0.9, 0.8)]
@@ -66,7 +76,9 @@ def test_score_permutation_keeps_blocks_intact() -> None:
 
 def test_invalid_control_is_a_typed_no_promotion_admission() -> None:
     control = run_benign_only_control(
-        actions=(Action.CHALLENGE,), truth=(truth_row("row-1", fraud=True),)
+        actions=(Action.CHALLENGE,),
+        truth=(truth_row("row-1", fraud=True),),
+        signer=evaluator_signer(),
     )
     admission = admit_control_result(control)
     assert (admission.valid, admission.status, admission.reason) == (
@@ -78,15 +90,23 @@ def test_invalid_control_is_a_typed_no_promotion_admission() -> None:
 
 def test_malformed_control_invalidates_the_whole_run() -> None:
     result = run_score_permutation_control(
-        scores=np.array([0.5]), truth=(truth_row("row-1", fraud=False),), blocks=(), seed=7,
+        scores=np.array([0.5]),
+        truth=(truth_row("row-1", fraud=False),),
+        blocks=(),
+        seed=7,
         evaluator=lambda scores, truth, blocks: False,
+        signer=evaluator_signer(),
     )
     assert (result.valid, result.reason) == (False, "malformed_permutation_control")
 
 
 def test_missing_evaluator_is_invalid() -> None:
     result = run_score_permutation_control(
-        scores=np.array([0.5]), truth=(truth_row("row-1", fraud=False),), blocks=("case",), seed=7
+        scores=np.array([0.5]),
+        truth=(truth_row("row-1", fraud=False),),
+        blocks=("case",),
+        seed=7,
+        signer=evaluator_signer(),
     )
     assert (result.valid, result.reason) == (False, "evaluator_missing")
 
@@ -96,8 +116,12 @@ def test_evaluator_exception_is_fail_closed() -> None:
         raise RuntimeError("gate unavailable")
 
     result = run_score_permutation_control(
-        scores=np.array([0.5]), truth=(truth_row("row-1", fraud=False),), blocks=("case",), seed=7,
+        scores=np.array([0.5]),
+        truth=(truth_row("row-1", fraud=False),),
+        blocks=("case",),
+        seed=7,
         evaluator=explode,
+        signer=evaluator_signer(),
     )
     assert (result.valid, result.reason) == (False, "evaluator_failed")
 
@@ -115,6 +139,42 @@ def test_benign_action_property_exception_is_fail_closed() -> None:
             raise RuntimeError("action unavailable")
 
     result = run_benign_only_control(
-        actions=(BrokenAction(),), truth=(truth_row("row-1", fraud=False),)
+        actions=(BrokenAction(),),
+        truth=(truth_row("row-1", fraud=False),),
+        signer=evaluator_signer(),
     )
     assert (result.valid, result.reason) == (False, "malformed_benign_control")
+
+
+def test_invalid_attestation_cannot_be_model_copied_to_valid() -> None:
+    """Changing signed invalid evidence cannot create a valid control admission."""
+    invalid = run_benign_only_control(
+        actions=(Action.APPROVE,),
+        truth=(truth_row("fraud", fraud=True),),
+        signer=evaluator_signer(),
+    )
+    tampered = invalid.model_copy(update={"valid": True, "reason": None})
+
+    admission = admit_control_result(tampered)
+
+    assert (admission.valid, admission.status, admission.reason) == (
+        False,
+        "no_promotion",
+        "invalid_control_attestation",
+    )
+
+
+def test_external_signer_cannot_mint_control_attestation() -> None:
+    """A self-declared fresh key is not the committed evaluator authority."""
+    outsider = EvaluatorSigningIdentity.from_private_bytes(b"x" * 32)
+
+    with pytest.raises(V2ControlError, match="trusted evaluator"):
+        run_benign_only_control(
+            actions=(Action.APPROVE,),
+            truth=(truth_row("benign", fraud=False),),
+            signer=outsider,
+        )
+
+
+def evaluator_signer() -> EvaluatorSigningIdentity:
+    return EvaluatorSigningIdentity.from_private_bytes(b"v" * 32)

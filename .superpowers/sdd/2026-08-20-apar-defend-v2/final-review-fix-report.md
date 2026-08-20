@@ -90,3 +90,116 @@ Final exact-tree verification after the last seed, budget, and component-manifes
 .venv/bin/python -m pytest -q
 1827 passed, 1 skipped in 481.88s (0:08:01)
 ```
+
+## Final Important-findings hardening round
+
+### Scope
+
+This follow-up closes the remaining Important findings without modifying any
+frozen V1 file and without starting V2 evaluation work.
+
+- The committed manifest registry now contains a complete SHA-256 inventory of
+  every Python file in the frozen defender/feature source trees and raw-byte
+  bindings for the feature catalog, defender bundle, campaign ledger, calibration
+  artifact, and threshold artifact. Preexecution rejects missing, added, symlinked,
+  path-escaped, or content-modified inputs.
+- The import scan now follows constant dynamic local imports and every local
+  dependency reachable through a feature module. It recognizes direct, aliased,
+  assigned, `getattr`, `__dict__`, subscript, and `__builtins__` import capabilities
+  for both builtins and importlib while preserving explicit public
+  `apar.evaluation.v2_*` imports.
+- `ControlResult` is now canonical Ed25519 evidence signed by the committed V2
+  evaluator authority. Admission revalidates the signature and exact content, so
+  `model_copy` mutation cannot promote an invalid result. Both exact control kinds
+  remain mandatory at selection.
+- Durable API state now accepts only the exact committed preregistration ID and
+  execution nonce. Current and fallback scorecards must be signed by the committed
+  evaluator/publication authority; a fresh self-declared signing key is rejected.
+
+### RED evidence
+
+The initial preexecution regression run was:
+
+```text
+uv run pytest tests/evaluation/test_defense_v2_preexecution.py -q
+11 failed, 27 passed in 2.93s
+```
+
+The failures covered four reflective builtins/importlib call shapes, a constant
+dynamic feature import, a feature-reachable local package, and raw-byte mutations
+of each required frozen input class (source, catalog, bundle, campaign ledger, and
+threshold artifact).
+
+The new control and API tests initially failed during collection because the
+required `V2ControlError` and committed preregistration/nonce authority constants
+did not exist. After exposing those interfaces, an additional alias probe was run:
+
+```text
+.venv/bin/pytest \
+  tests/evaluation/test_defense_v2_preexecution.py::test_reflective_dynamic_import_capabilities_fail_closed -q
+1 failed, 5 passed in 0.31s
+```
+
+The remaining failure was `runtime = builtins; runtime.__import__(module)`, proving
+that builtins-root alias propagation was still absent before the final scanner
+change.
+
+A final reflective mapping probe then failed before implementation:
+
+```text
+.venv/bin/pytest \
+  tests/evaluation/test_defense_v2_preexecution.py::test_reflective_dynamic_import_capabilities_fail_closed -q
+2 failed, 6 passed in 0.40s
+```
+
+Those two failures covered import-function lookup through aliases of
+`builtins.__dict__` and `vars(importlib)`.
+
+### GREEN evidence
+
+Focused contracts and integration:
+
+```text
+.venv/bin/pytest \
+  tests/evaluation/test_defense_v2_preexecution.py \
+  tests/evaluation/test_defense_v2_controls.py \
+  tests/evaluation/test_defense_v2_selection.py \
+  tests/evaluation/test_defense_v2_preregistration.py \
+  tests/evaluation/test_defense_v2_reporting.py \
+  tests/integration/test_defense_v2_preexecution.py -q
+75 passed in 4.02s
+
+.venv/bin/pytest tests/api/test_defense.py -q -k v2_scorecard
+5 passed, 25 deselected in 1.29s
+```
+
+Static validation:
+
+```text
+.venv/bin/ruff check <all changed Python source and tests>
+All checks passed!
+
+.venv/bin/mypy \
+  src/apar/evaluation/v2_preexecution.py \
+  src/apar/evaluation/v2_preregistration.py \
+  src/apar/evaluation/v2_controls.py \
+  src/apar/evaluation/v2_selection.py \
+  src/apar/evaluation/v2_reporting.py \
+  src/apar/api/routes/defense.py \
+  scripts/verify_defense_v2_preexecution.py
+Success: no issues found in 7 source files
+```
+
+Read-only preexecution and complete suite:
+
+```text
+.venv/bin/python scripts/verify_defense_v2_preexecution.py
+{"admissible":true,"codes":[],"status":"not_executed"}
+
+.venv/bin/pytest -q
+1846 passed, 1 skipped in 482.63s (0:08:02)
+```
+
+`git diff --exit-code` over `fixtures/defense/v1` and the three frozen V1
+experiment documents returned zero, and no `.apar` V2 receipt/result file was
+created.

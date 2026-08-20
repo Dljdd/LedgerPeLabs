@@ -21,6 +21,10 @@ from pydantic import ValidationError, field_validator, model_validator
 from apar.contracts._validation import ExternalContract
 from apar.evaluation.v2_preregistration import (
     SYNTHETIC_NON_CLAIM,
+    TRUSTED_V2_EVALUATOR_KEY_ID,
+    TRUSTED_V2_EVALUATOR_PUBLIC_KEY_BASE64,
+    TRUSTED_V2_EXECUTION_NONCE,
+    TRUSTED_V2_PREREGISTRATION_ID,
     ExecutionReceipt,
     SyntheticScope,
 )
@@ -225,6 +229,7 @@ def load_current_v2_scorecard(root: Path, *, fallback: DefenseV2Scorecard) -> De
         raise V2ReportingContractError("current scorecard lookup requires exact inputs")
     if fallback.protocol_digest != _DEFAULT_PROTOCOL_DIGEST:
         raise V2ReportingContractError("fallback scorecard protocol digest is invalid")
+    _require_trusted_publication_signer(fallback)
     state_root = root / ".apar"
     scorecard_path = state_root / "defense-v2" / "defense-v2-scorecard.json"
     try:
@@ -240,9 +245,17 @@ def load_current_v2_scorecard(root: Path, *, fallback: DefenseV2Scorecard) -> De
                     receipt = ExecutionReceipt.model_validate(document)
                 except (OSError, WireContractError, ValidationError, ValueError, TypeError):
                     continue
-                if receipt.preregistration_id == "apar-defend-v2":
+                if receipt.preregistration_id == TRUSTED_V2_PREREGISTRATION_ID:
+                    if receipt.execution_nonce != TRUSTED_V2_EXECUTION_NONCE:
+                        raise V2ReportingContractError(
+                            "execution receipt does not match the committed nonce"
+                        )
                     receipt_present = True
                     break
+                if receipt.execution_nonce == TRUSTED_V2_EXECUTION_NONCE:
+                    raise V2ReportingContractError(
+                        "execution receipt does not match the committed preregistration"
+                    )
 
         current = (
             DefenseV2Scorecard.from_json(scorecard_path.read_bytes())
@@ -251,6 +264,8 @@ def load_current_v2_scorecard(root: Path, *, fallback: DefenseV2Scorecard) -> De
         )
         if current is not None and current.protocol_digest != _DEFAULT_PROTOCOL_DIGEST:
             raise V2ReportingContractError("current scorecard protocol digest is invalid")
+        if current is not None:
+            _require_trusted_publication_signer(current)
         if receipt_present:
             if current is None or current.status == _NOT_EXECUTED:
                 raise V2ReportingContractError(
@@ -268,6 +283,16 @@ def load_current_v2_scorecard(root: Path, *, fallback: DefenseV2Scorecard) -> De
         if isinstance(error, V2ReportingContractError):
             raise
         raise V2ReportingContractError("current V2 scorecard state is invalid") from error
+
+
+def _require_trusted_publication_signer(card: DefenseV2Scorecard) -> None:
+    if (
+        card.signer_key_id != TRUSTED_V2_EVALUATOR_KEY_ID
+        or card.public_key_base64 != TRUSTED_V2_EVALUATOR_PUBLIC_KEY_BASE64
+    ):
+        raise V2ReportingContractError(
+            "scorecard signer is not the committed V2 publication authority"
+        )
 
 
 def render_v2_scorecard(

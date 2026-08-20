@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from pathlib import Path
 
+import pytest
+
 from apar.evaluation.gates import EvaluatorSigningIdentity
-from apar.evaluation.v2_preexecution import verify_v2_preexecution
+from apar.evaluation.v2_preexecution import verify_manifest_registry, verify_v2_preexecution
 from apar.evaluation.v2_preregistration import V2Preregistration, sign_v2_preregistration
 from apar.runs.wire import canonical_json_bytes
 
@@ -175,6 +178,36 @@ def test_getattr_builtins_import_alias_is_rejected(tmp_path: Path) -> None:
     assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
 
 
+@pytest.mark.parametrize(
+    "source",
+    (
+        "import builtins\nmodule = 'apar.evaluation_hidden'\n"
+        "getattr(builtins, '__import__')(module)\n",
+        "import builtins\nmodule = 'apar.evaluation_hidden'\n"
+        "builtins.__dict__['__import__'](module)\n",
+        "import importlib\nmodule = 'apar.evaluation_hidden'\n"
+        "getattr(importlib, 'import_module')(module)\n",
+        "import importlib\nmodule = 'apar.evaluation_hidden'\n"
+        "importlib.__dict__['import_module'](module)\n",
+        "import builtins\nruntime = builtins\nmodule = 'apar.evaluation_hidden'\n"
+        "runtime.__import__(module)\n",
+        "import importlib\nnamespace = importlib.__dict__\n"
+        "module = 'apar.evaluation_hidden'\nnamespace['import_module'](module)\n",
+        "import builtins\nnamespace = builtins.__dict__\n"
+        "module = 'apar.evaluation_hidden'\nnamespace['__import__'](module)\n",
+        "import importlib\nnamespace = vars(importlib)\n"
+        "module = 'apar.evaluation_hidden'\nnamespace['import_module'](module)\n",
+    ),
+)
+def test_reflective_dynamic_import_capabilities_fail_closed(tmp_path: Path, source: str) -> None:
+    """Reflective access to either import capability cannot evade inspection."""
+    _write_defender_source(tmp_path, source)
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
 def test_transitive_defender_feature_import_is_scanned(tmp_path: Path) -> None:
     """A hidden import in a defender-reachable feature module must fail closed."""
     _write_defender_source(tmp_path, "from apar.features import bridge\n")
@@ -185,6 +218,37 @@ def test_transitive_defender_feature_import_is_scanned(tmp_path: Path) -> None:
         "from apar.features import hidden_bridge\n", encoding="utf-8"
     )
     (features / "hidden_bridge.py").write_text(
+        "from apar.evaluation_hidden import worker\n", encoding="utf-8"
+    )
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
+def test_constant_dynamic_feature_import_enters_transitive_scan(tmp_path: Path) -> None:
+    """A literal dynamic feature import must not hide that module's imports."""
+    _write_defender_source(tmp_path, "__import__('apar.features.dynamic_bridge')\n")
+    features = tmp_path / "src/apar/features"
+    features.mkdir(parents=True)
+    (features / "dynamic_bridge.py").write_text(
+        "from apar.evaluation_hidden import worker\n", encoding="utf-8"
+    )
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
+def test_feature_reachable_local_package_enters_transitive_scan(tmp_path: Path) -> None:
+    """Feature dependencies outside apar.features remain defender-reachable code."""
+    _write_defender_source(tmp_path, "from apar.features import bridge\n")
+    features = tmp_path / "src/apar/features"
+    features.mkdir(parents=True)
+    (features / "bridge.py").write_text("from apar.shared import bridge\n", encoding="utf-8")
+    shared = tmp_path / "src/apar/shared"
+    shared.mkdir(parents=True)
+    (shared / "bridge.py").write_text(
         "from apar.evaluation_hidden import worker\n", encoding="utf-8"
     )
 
@@ -350,6 +414,29 @@ def test_each_required_component_manifest_is_load_bearing() -> None:
     assert "MANIFEST_BINDINGS_INVALID" in report.codes
 
 
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "src/apar/defense/policy.py",
+        "config/defense/feature-catalog.json",
+        "fixtures/defense/v1/defender-bundle.json",
+        "fixtures/defense/v1/split-manifest.json",
+        "fixtures/defense/v1/thresholds.json",
+    ),
+)
+def test_manifest_registry_rejects_modified_frozen_input(
+    tmp_path: Path, relative_path: str
+) -> None:
+    """Every named source, catalog, bundle, ledger, and threshold byte is load-bearing."""
+    _copy_manifest_inputs(tmp_path)
+    target = tmp_path / relative_path
+    target.write_bytes(target.read_bytes() + b"\n")
+
+    check = verify_manifest_registry(tmp_path, signed_preregistration())
+
+    assert check.passed is False
+
+
 def signed_preregistration() -> V2Preregistration:
     signer = EvaluatorSigningIdentity.from_private_bytes(b"v" * 32)
     return sign_v2_preregistration(_preregistration_payload(), signer=signer)
@@ -402,3 +489,19 @@ def _write_defender_source(root: Path, source: str) -> None:
     path = root / "src/apar/defense/bad.py"
     path.parent.mkdir(parents=True)
     path.write_text(source, encoding="utf-8")
+
+
+def _copy_manifest_inputs(root: Path) -> None:
+    for directory in ("src/apar/defense", "src/apar/features"):
+        shutil.copytree(ROOT / directory, root / directory)
+    for relative in (
+        "config/defense/competition-v2-manifests.json",
+        "config/defense/feature-catalog.json",
+        "fixtures/defense/v1/defender-bundle.json",
+        "fixtures/defense/v1/split-manifest.json",
+        "fixtures/defense/v1/thresholds.json",
+        "fixtures/defense/v1/calibration.json",
+    ):
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / relative, target)

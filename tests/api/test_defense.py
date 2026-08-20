@@ -33,7 +33,11 @@ from apar.evaluation.service import (
     _install_child_audit_hook,
     _parse_index_payload,
 )
-from apar.evaluation.v2_preregistration import ExecutionReceipt
+from apar.evaluation.v2_preregistration import (
+    TRUSTED_V2_EXECUTION_NONCE,
+    TRUSTED_V2_PREREGISTRATION_ID,
+    ExecutionReceipt,
+)
 from apar.evaluation.v2_reporting import (
     DefenseV2GateReport,
     V2ArmScorecard,
@@ -735,9 +739,7 @@ def test_index_rejects_duplicate_evaluation_id_for_a_different_input_pair(
 
     restarted, _, _, _, _, _ = _client(tmp_path, bundle_fixture)
     try:
-        fetched = restarted.get(
-            f"/api/v1/defense/evaluations/{created.json()['evaluation_id']}"
-        )
+        fetched = restarted.get(f"/api/v1/defense/evaluations/{created.json()['evaluation_id']}")
         assert fetched.status_code == 422
         assert fetched.json()["detail"]["code"] == "DEFENSE_ARTIFACT_INVALID"
     finally:
@@ -816,7 +818,7 @@ def test_v2_scorecard_reads_verified_current_state_after_receipt(tmp_path: Path)
     """A durable receipt makes the verified signed result the only current status."""
     state = tmp_path / ".apar/defense-v2"
     state.mkdir(parents=True)
-    signer = RunSigningIdentity.from_private_bytes(b"s" * 32)
+    signer = RunSigningIdentity.from_private_bytes(b"v" * 32)
     arms = tuple(
         V2ArmScorecard(
             arm=arm,
@@ -832,8 +834,8 @@ def test_v2_scorecard_reads_verified_current_state_after_receipt(tmp_path: Path)
     card, _ = render_v2_scorecard(result, signer=signer)
     (state / "defense-v2-scorecard.json").write_bytes(card.to_json())
     receipt = ExecutionReceipt(
-        preregistration_id="apar-defend-v2",
-        execution_nonce="receipt-present",
+        preregistration_id=TRUSTED_V2_PREREGISTRATION_ID,
+        execution_nonce=TRUSTED_V2_EXECUTION_NONCE,
     )
     (state / "execution-receipt.json").write_bytes(
         canonical_json_bytes(receipt.model_dump(mode="json"))
@@ -852,8 +854,74 @@ def test_v2_scorecard_fails_closed_when_receipt_has_no_signed_result(tmp_path: P
     state = tmp_path / ".apar/defense-v2"
     state.mkdir(parents=True)
     receipt = ExecutionReceipt(
-        preregistration_id="apar-defend-v2",
-        execution_nonce="receipt-present",
+        preregistration_id=TRUSTED_V2_PREREGISTRATION_ID,
+        execution_nonce=TRUSTED_V2_EXECUTION_NONCE,
+    )
+    (state / "execution-receipt.json").write_bytes(
+        canonical_json_bytes(receipt.model_dump(mode="json"))
+    )
+
+    with TestClient(create_app(Settings.from_root(tmp_path))) as client:
+        response = client.get("/defense/v2/scorecard")
+
+    assert response.status_code == 422
+
+
+def test_v2_scorecard_rejects_receipt_with_mismatched_execution_nonce(tmp_path: Path) -> None:
+    """A receipt for the preregistration ID cannot consume a different execution nonce."""
+    state = tmp_path / ".apar/defense-v2"
+    state.mkdir(parents=True)
+    signer = RunSigningIdentity.from_private_bytes(b"v" * 32)
+    arms = tuple(
+        V2ArmScorecard(
+            arm=arm,
+            status="no_promotion",
+            gate=DefenseV2GateReport(
+                arm=arm,
+                outcome=V2GateOutcome(passed=False, codes=("CONTROL_INVALID",)),
+            ),
+        )
+        for arm in ("rules_only", "gbdt_only", "layered_hybrid")
+    )
+    result = not_executed_result().model_copy(update={"status": "no_promotion", "arms": arms})
+    card, _ = render_v2_scorecard(result, signer=signer)
+    (state / "defense-v2-scorecard.json").write_bytes(card.to_json())
+    receipt = ExecutionReceipt(
+        preregistration_id=TRUSTED_V2_PREREGISTRATION_ID,
+        execution_nonce="0" * 64,
+    )
+    (state / "execution-receipt.json").write_bytes(
+        canonical_json_bytes(receipt.model_dump(mode="json"))
+    )
+
+    with TestClient(create_app(Settings.from_root(tmp_path))) as client:
+        response = client.get("/defense/v2/scorecard")
+
+    assert response.status_code == 422
+
+
+def test_v2_scorecard_rejects_fresh_self_declared_signer(tmp_path: Path) -> None:
+    """A valid signature from an uncommitted key is not publication authority."""
+    state = tmp_path / ".apar/defense-v2"
+    state.mkdir(parents=True)
+    outsider = RunSigningIdentity.from_private_bytes(b"x" * 32)
+    arms = tuple(
+        V2ArmScorecard(
+            arm=arm,
+            status="no_promotion",
+            gate=DefenseV2GateReport(
+                arm=arm,
+                outcome=V2GateOutcome(passed=False, codes=("CONTROL_INVALID",)),
+            ),
+        )
+        for arm in ("rules_only", "gbdt_only", "layered_hybrid")
+    )
+    result = not_executed_result().model_copy(update={"status": "no_promotion", "arms": arms})
+    card, _ = render_v2_scorecard(result, signer=outsider)
+    (state / "defense-v2-scorecard.json").write_bytes(card.to_json())
+    receipt = ExecutionReceipt(
+        preregistration_id=TRUSTED_V2_PREREGISTRATION_ID,
+        execution_nonce=TRUSTED_V2_EXECUTION_NONCE,
     )
     (state / "execution-receipt.json").write_bytes(
         canonical_json_bytes(receipt.model_dump(mode="json"))

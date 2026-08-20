@@ -20,10 +20,17 @@ def test_preexecution_cli_reports_not_executed_without_writing_artifacts(tmp_pat
         "config/defense/competition-v2-profile.json",
         "config/defense/competition-v2-manifests.json",
         "config/defense/competition-v2-preregistration.json",
+        "config/defense/feature-catalog.json",
+        "fixtures/defense/v1/defender-bundle.json",
+        "fixtures/defense/v1/split-manifest.json",
+        "fixtures/defense/v1/thresholds.json",
+        "fixtures/defense/v1/calibration.json",
     ):
         target = tmp_path / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ROOT / relative, target)
+    shutil.copytree(ROOT / "src/apar/defense", tmp_path / "src/apar/defense")
+    shutil.copytree(ROOT / "src/apar/features", tmp_path / "src/apar/features")
     before = tuple(sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*")))
 
     completed = subprocess.run(
