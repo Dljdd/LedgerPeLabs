@@ -49,6 +49,8 @@ class CreateDefenseEvaluationRequest(ExternalContract):
         404: {"model": ErrorEnvelope, "description": "Input artifact not found"},
         409: {"model": ErrorEnvelope, "description": "Evaluation conflict"},
         422: {"model": ErrorEnvelope, "description": "Invalid artifact or request"},
+        413: {"model": ErrorEnvelope, "description": "Request body too large"},
+        503: {"model": ErrorEnvelope, "description": "Defense service unavailable"},
     },
 )
 def create_evaluation(
@@ -94,9 +96,7 @@ def get_evaluation(evaluation_id: str, service: Service) -> DefenseScorecard:
     try:
         return service.get(evaluation_id)
     except DefenseResourceNotFound:
-        raise ApiError(
-            404, DEFENSE_EVALUATION_NOT_FOUND, "defense evaluation not found"
-        ) from None
+        raise ApiError(404, DEFENSE_EVALUATION_NOT_FOUND, "defense evaluation not found") from None
     except DefenseArtifactInvalid:
         raise ApiError(
             422,
@@ -164,9 +164,7 @@ def _raw_name_is_exact(request: Request, name: str) -> bool:
 
 
 def _artifact_not_found() -> Never:
-    raise ApiError(
-        404, DEFENSE_ARTIFACT_NOT_FOUND, "public artifact not found"
-    )
+    raise ApiError(404, DEFENSE_ARTIFACT_NOT_FOUND, "public artifact not found")
 
 
 __all__ = ["CreateDefenseEvaluationRequest", "router"]

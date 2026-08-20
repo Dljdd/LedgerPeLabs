@@ -12,7 +12,7 @@ import unicodedata
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Literal, cast
+from typing import Literal, NamedTuple, Never, cast
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -38,6 +38,7 @@ from apar.evaluation.metrics import (
     MetricDerivationEvidence,
     MetricReport,
 )
+from apar.evaluation.publication_inputs import VerifiedEvaluationInputs
 from apar.runs.runner import RunSigningIdentity
 from apar.runs.wire import WireContractError, canonical_json_bytes, strict_json_loads
 from apar.storage.artifacts import ArtifactRef, ArtifactStore
@@ -45,6 +46,9 @@ from apar.storage.artifacts import ArtifactRef, ArtifactStore
 SCORECARD_ARTIFACT_NAME = "defense-scorecard.json"
 SCORECARD_MEDIA_TYPE = "application/vnd.apar.defense-scorecard+json"
 EVALUATION_BUNDLE_MEDIA_TYPE = "application/vnd.apar.evaluation-artifact-bundle+json"
+RESTRICTED_PUBLICATION_RECEIPT_MEDIA_TYPE = (
+    "application/vnd.apar.restricted-publication-receipt+json"
+)
 PUBLIC_ARTIFACT_MEDIA_TYPES: dict[str, str] = {
     "calibration.csv": "text/csv; charset=utf-8",
     "data-card.md": "text/markdown; charset=utf-8",
@@ -92,6 +96,12 @@ _FORBIDDEN_PUBLIC_TOKENS = tuple(
         "bootstrapderivationevidence",
         "evaluated_result_digests",
         "decision_digest",
+        "promotion_envelope_digest",
+        "metric_report_digest",
+        "report_digest",
+        "attestation_digest",
+        "split_digest",
+        "corpus_content_digest",
         "evaluator_input_digest",
         "derivation_evidence_digest",
         "decision_event_ids",
@@ -129,6 +139,80 @@ _FORBIDDEN_PUBLIC_TOKENS = tuple(
 
 class ReportingContractError(ValueError):
     """Judge evidence failed canonical, signature, lineage, or privacy validation."""
+
+
+class _PublicationVerifierState(NamedTuple):
+    key_id: str
+    public_key_base64: str
+    public_key: bytes
+
+
+class PublicArtifactVerifier(tuple[_PublicationVerifierState]):
+    """Sealed public-only Ed25519 authority for report and index reloads."""
+
+    __slots__ = ()
+
+    def __new__(cls, *, signer_key_id: str, public_key_base64: str) -> PublicArtifactVerifier:
+        _validate_digest(signer_key_id, label="publication signer key ID")
+        try:
+            public = base64.b64decode(public_key_base64, validate=True)
+        except (ValueError, binascii.Error) as error:
+            raise ReportingContractError("publication public key is invalid") from error
+        if len(public) != 32 or _digest_bytes(public) != signer_key_id:
+            raise ReportingContractError("publication verifier identity is inconsistent")
+        return tuple.__new__(
+            cls, (_PublicationVerifierState(signer_key_id, public_key_base64, public),)
+        )
+
+    def __init__(self, *, signer_key_id: str, public_key_base64: str) -> None:
+        del signer_key_id, public_key_base64
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise TypeError("publication verifier is immutable")
+
+    def __delattr__(self, name: str) -> None:
+        del name
+        raise TypeError("publication verifier is immutable")
+
+    def __reduce__(self) -> Never:
+        raise TypeError("publication verifier cannot be serialized")
+
+    @classmethod
+    def from_signer(cls, signer: RunSigningIdentity) -> PublicArtifactVerifier:
+        if type(signer) is not RunSigningIdentity:
+            raise ReportingContractError("publication signer must be exact")
+        return cls(
+            signer_key_id=signer.key_id,
+            public_key_base64=signer.public_key_base64,
+        )
+
+    @property
+    def _state(self) -> _PublicationVerifierState:
+        if type(self) is not PublicArtifactVerifier or tuple.__len__(self) != 1:
+            raise ReportingContractError("publication verifier state is invalid")
+        state = tuple.__getitem__(self, 0)
+        if type(state) is not _PublicationVerifierState:
+            raise ReportingContractError("publication verifier state is invalid")
+        return state
+
+    @property
+    def key_id(self) -> str:
+        return self._state.key_id
+
+    @property
+    def public_key_base64(self) -> str:
+        return self._state.public_key_base64
+
+    def verify(self, document: object, signature_base64: str) -> bool:
+        try:
+            signature = base64.b64decode(signature_base64, validate=True)
+            Ed25519PublicKey.from_public_bytes(self._state.public_key).verify(
+                signature, canonical_json_bytes(document)
+            )
+        except (InvalidSignature, TypeError, ValueError, binascii.Error):
+            return False
+        return True
 
 
 def _validate_digest(value: object, *, label: str = "digest") -> str:
@@ -181,10 +265,7 @@ class PublicArtifactReference:
         _validate_digest(self.sha256, label="public artifact digest")
         if self.media_type != _ALL_PUBLIC_MEDIA_TYPES[self.name]:
             raise ValueError("public artifact media type differs from the allowlist")
-        if (
-            type(self.size_bytes) is not int
-            or not 0 <= self.size_bytes <= _MAX_SCORECARD_BYTES
-        ):
+        if type(self.size_bytes) is not int or not 0 <= self.size_bytes <= _MAX_SCORECARD_BYTES:
             raise ValueError("public artifact size is outside its resource cap")
 
     @classmethod
@@ -231,9 +312,7 @@ class PublicArtifactIndex(ExternalContract, Mapping[str, PublicArtifactReference
         return self
 
     @classmethod
-    def from_refs(
-        cls, references: Mapping[str, ArtifactRef]
-    ) -> PublicArtifactIndex:
+    def from_refs(cls, references: Mapping[str, ArtifactRef]) -> PublicArtifactIndex:
         try:
             return cls(
                 entries=tuple(
@@ -305,19 +384,9 @@ class ScorecardPublicationRequest(ExternalContract):
     """Closed evaluator result plus deterministic public handoff inputs."""
 
     schema_version: Literal["1.0.0"] = "1.0.0"
-    corpus_artifact_digest: str
-    defender_artifact_digest: str
     promotion_envelope: VerifiedPromotionEnvelope
     champion_decision: ChampionDecision
     metric_evidence: tuple[MetricPublicationEvidence, ...]
-    feature_manifest: bytes
-    thresholds: bytes
-    latency_environment: bytes
-
-    @field_validator("corpus_artifact_digest", "defender_artifact_digest")
-    @classmethod
-    def artifact_digests_are_sha256(cls, value: str) -> str:
-        return _validate_digest(value, label="evaluation input digest")
 
     @field_validator("metric_evidence", mode="before")
     @classmethod
@@ -325,21 +394,6 @@ class ScorecardPublicationRequest(ExternalContract):
         if type(value) is not tuple:
             raise ValueError("metric publication evidence must be an exact tuple")
         return value
-
-    @field_validator("feature_manifest", "thresholds", "latency_environment", mode="before")
-    @classmethod
-    def public_documents_are_canonical_bytes(cls, value: object) -> bytes:
-        if type(value) is dict:
-            payload = canonical_json_bytes(value)
-        elif type(value) is bytes:
-            payload = value
-        else:
-            raise ValueError("public input documents must be exact objects or bytes")
-        if not 0 < len(payload) <= _MAX_PUBLIC_ARTIFACT_BYTES:
-            raise ValueError("public input document exceeds its resource cap")
-        _validate_canonical_json(payload)
-        _privacy_scan(payload)
-        return payload
 
     @model_validator(mode="after")
     def request_is_closed(self) -> ScorecardPublicationRequest:
@@ -362,6 +416,135 @@ class ScorecardPublicationRequest(ExternalContract):
         fields.update(updates)
         return ScorecardPublicationRequest.model_validate(fields)
 
+    def to_worker_json(self) -> bytes:
+        """Serialize a bounded canonical evaluator-only child-process result."""
+        rows = []
+        for item in self.metric_evidence:
+            rows.append(
+                {
+                    "arm": item.arm.value,
+                    "result_digest": item.result_digest,
+                    "metric_report": base64.b64encode(item.metric_report.to_json()).decode("ascii"),
+                    "metric_derivation_evidence": base64.b64encode(
+                        cast(MetricDerivationEvidence, item.metric_derivation_evidence).to_bytes()
+                    ).decode("ascii"),
+                    "confidence_intervals": base64.b64encode(
+                        item.confidence_intervals.to_json()
+                    ).decode("ascii"),
+                    "bootstrap_derivation_evidence": base64.b64encode(
+                        cast(
+                            BootstrapDerivationEvidence,
+                            item.bootstrap_derivation_evidence,
+                        ).to_bytes()
+                    ).decode("ascii"),
+                }
+            )
+        payload = canonical_json_bytes(
+            {
+                "schema_version": "1.0.0",
+                "promotion_envelope": base64.b64encode(self.promotion_envelope.to_json()).decode(
+                    "ascii"
+                ),
+                "champion_decision": base64.b64encode(self.champion_decision.to_json()).decode(
+                    "ascii"
+                ),
+                "metric_evidence": rows,
+            }
+        )
+        if len(payload) > 128 * 1024 * 1024:
+            raise ReportingContractError("executor result exceeds its resource cap")
+        return payload
+
+    @classmethod
+    def from_worker_json(cls, payload: bytes) -> ScorecardPublicationRequest:
+        """Load only a canonical bounded child-process result with restricted replay."""
+        if type(payload) is not bytes or not 0 < len(payload) <= 128 * 1024 * 1024:
+            raise ReportingContractError("executor result payload is invalid")
+        try:
+            document = strict_json_loads(payload)
+            if type(document) is not dict or set(document) != {
+                "schema_version",
+                "promotion_envelope",
+                "champion_decision",
+                "metric_evidence",
+            }:
+                raise ReportingContractError("executor result fields differ")
+            if document["schema_version"] != "1.0.0":
+                raise ReportingContractError("executor result schema is unsupported")
+
+            def decoded(name: str, value: object, cap: int) -> bytes:
+                if type(value) is not str:
+                    raise ReportingContractError(f"executor {name} is invalid")
+                raw = base64.b64decode(value, validate=True)
+                if not 0 < len(raw) <= cap:
+                    raise ReportingContractError(f"executor {name} exceeds its cap")
+                return raw
+
+            envelope = VerifiedPromotionEnvelope.from_json(
+                decoded("promotion envelope", document["promotion_envelope"], 64_000_000)
+            )
+            decision = ChampionDecision.from_json(
+                decoded("champion decision", document["champion_decision"], 2_000_000)
+            )
+            raw_rows = document["metric_evidence"]
+            if type(raw_rows) is not list or len(raw_rows) != len(DefenseArm):
+                raise ReportingContractError("executor metric evidence is incomplete")
+            rows: list[MetricPublicationEvidence] = []
+            for raw in raw_rows:
+                if type(raw) is not dict or set(raw) != {
+                    "arm",
+                    "result_digest",
+                    "metric_report",
+                    "metric_derivation_evidence",
+                    "confidence_intervals",
+                    "bootstrap_derivation_evidence",
+                }:
+                    raise ReportingContractError("executor metric evidence fields differ")
+                metric_evidence = MetricDerivationEvidence.from_bytes(
+                    decoded(
+                        "metric derivation evidence",
+                        raw["metric_derivation_evidence"],
+                        64_000_000,
+                    )
+                )
+                bootstrap_evidence = BootstrapDerivationEvidence.from_bytes(
+                    decoded(
+                        "bootstrap derivation evidence",
+                        raw["bootstrap_derivation_evidence"],
+                        64_000_000,
+                    )
+                )
+                report = MetricReport.from_json(
+                    decoded("metric report", raw["metric_report"], 64_000_000),
+                    evidence=metric_evidence,
+                )
+                intervals = ConfidenceIntervals.from_json(
+                    decoded("confidence intervals", raw["confidence_intervals"], 64_000_000),
+                    evidence=bootstrap_evidence,
+                )
+                rows.append(
+                    MetricPublicationEvidence(
+                        arm=raw["arm"],
+                        result_digest=raw["result_digest"],
+                        metric_report=report,
+                        metric_derivation_evidence=metric_evidence,
+                        confidence_intervals=intervals,
+                        bootstrap_derivation_evidence=bootstrap_evidence,
+                    )
+                )
+            request = cls(
+                promotion_envelope=envelope,
+                champion_decision=decision,
+                metric_evidence=tuple(rows),
+            )
+            if request.to_worker_json() != payload:
+                raise ReportingContractError("executor result is not canonical")
+            return request
+        except ReportingContractError:
+            raise
+        except (ValueError, TypeError, ValidationError, WireContractError, binascii.Error) as error:
+            raise ReportingContractError("executor result failed closed validation") from error
+
 
 class LeaderboardRow(ExternalContract):
     """One matched-budget primary arm summary with immutable metric lineage."""
@@ -375,7 +558,6 @@ class LeaderboardRow(ExternalContract):
     pr_auc: float | None
     roc_auc: float | None
     ece: float | None
-    p95_latency_ms: float | None
     time_to_alert_p50_seconds: float | None
     time_to_alert_p95_seconds: float | None
     challenge_rate: float
@@ -400,7 +582,6 @@ class LeaderboardRow(ExternalContract):
         "pr_auc",
         "roc_auc",
         "ece",
-        "p95_latency_ms",
         "time_to_alert_p50_seconds",
         "time_to_alert_p95_seconds",
         "challenge_rate",
@@ -445,6 +626,152 @@ class LeaderboardRow(ExternalContract):
     @classmethod
     def artifact_digest_is_sha256(cls, value: str) -> str:
         return _validate_digest(value, label="leaderboard artifact digest")
+
+
+class PublicCorpusSummary(ExternalContract):
+    """Non-identifying aggregate projection of authenticated synthetic corpus lineage."""
+
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    synthetic_only: Literal[True] = True
+    observation_count: int
+    truth_count: int
+
+    @field_validator("observation_count", "truth_count", mode="before")
+    @classmethod
+    def counts_are_exact(cls, value: object) -> object:
+        if type(value) is not int or value <= 0:
+            raise ValueError("public corpus counts must be exact positive integers")
+        return value
+
+
+class PublicBundleSummary(ExternalContract):
+    """Safe model identity projected from the authenticated defender bundle."""
+
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    bundle_id: str
+    model_family: Literal["catboost_gbdt"] = "catboost_gbdt"
+    compared_arms: tuple[DefenseArm, ...]
+    fallback_mode: Literal["rules_only"] = "rules_only"
+    rollback_available: bool
+
+    @model_validator(mode="after")
+    def arms_are_complete(self) -> PublicBundleSummary:
+        if self.compared_arms != tuple(DefenseArm):
+            raise ValueError("public bundle arms must be complete and ordered")
+        return self
+
+
+class PublicFeatureManifest(ExternalContract):
+    """Closed judge projection derived from the authenticated feature catalog."""
+
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    catalog_version: str
+    feature_count: int
+    ordered_feature_names: tuple[str, ...]
+    family_counts: tuple[tuple[str, int], ...]
+    strictly_past_only: Literal[True] = True
+
+    @model_validator(mode="after")
+    def feature_projection_is_closed(self) -> PublicFeatureManifest:
+        if self.feature_count != len(self.ordered_feature_names) or self.feature_count != 48:
+            raise ValueError("public feature count differs from the competition catalog")
+        if self.family_counts != tuple(sorted(self.family_counts)):
+            raise ValueError("public feature family counts are not canonical")
+        if sum(count for _, count in self.family_counts) != self.feature_count:
+            raise ValueError("public feature family counts do not balance")
+        return self
+
+
+class PublicThresholdManifest(ExternalContract):
+    """Digest-free operating-point projection from authenticated threshold evidence."""
+
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    challenge_threshold: float
+    decline_threshold: float
+    challenge_rate_max: float
+    false_decline_rate_max: float
+    review_case_rate_max: float
+    objective_kind: Literal["fraud_recall", "fraud_value_captured"]
+    matched_budget: Literal[True] = True
+
+    @field_validator(
+        "challenge_threshold",
+        "decline_threshold",
+        "challenge_rate_max",
+        "false_decline_rate_max",
+        "review_case_rate_max",
+        mode="before",
+    )
+    @classmethod
+    def finite_rates(cls, value: object) -> object:
+        if type(value) is not float or not math.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError("public threshold values must be finite rates")
+        return value
+
+    @model_validator(mode="after")
+    def thresholds_are_ordered(self) -> PublicThresholdManifest:
+        if self.challenge_threshold > self.decline_threshold:
+            raise ValueError("public thresholds are reversed")
+        return self
+
+
+class PublicLatencyEnvironment(ExternalContract):
+    """Closed environment allowlist with no host, path, process, or private fields."""
+
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    python_version: str
+    python_implementation: str
+    machine: str
+    platform: str
+    catboost_version: str
+    scikit_learn_version: str
+    numpy_version: str
+    pyarrow_version: str
+    pydantic_version: str
+    cryptography_version: str
+    pandas_version: str
+
+    @field_validator(
+        "python_version",
+        "python_implementation",
+        "machine",
+        "platform",
+        "catboost_version",
+        "scikit_learn_version",
+        "numpy_version",
+        "pyarrow_version",
+        "pydantic_version",
+        "cryptography_version",
+        "pandas_version",
+    )
+    @classmethod
+    def identifiers_are_bounded(cls, value: str) -> str:
+        if type(value) is not str or not value or len(value) > 256 or value.strip() != value:
+            raise ValueError("public latency environment value is invalid")
+        lowered = value.casefold()
+        if (
+            not value.isascii()
+            or any(
+                character
+                not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._+()- "
+                for character in value
+            )
+            or any(
+                token in lowered
+                for token in (
+                    "private",
+                    "hostname",
+                    "localhost",
+                    "process",
+                    "pid=",
+                    "user=",
+                    "home=",
+                    "tmp",
+                )
+            )
+        ):
+            raise ValueError("public latency environment contains private host semantics")
+        return value
 
 
 class SliceSummary(ExternalContract):
@@ -521,10 +848,10 @@ class DefenseScorecard(ExternalContract):
 
     schema_version: Literal["1.0.0"] = "1.0.0"
     evaluation_id: str
-    defender_bundle_id: str
-    corpus_digest: str
-    split_digest: str
-    promotion_envelope_digest: str
+    corpus_summary: PublicCorpusSummary
+    bundle_summary: PublicBundleSummary
+    feature_manifest: PublicFeatureManifest
+    threshold_manifest: PublicThresholdManifest
     champion_decision: PublicChampionDecision
     leaderboard: tuple[LeaderboardRow, ...]
     slice_summaries: tuple[SliceSummary, ...]
@@ -539,9 +866,6 @@ class DefenseScorecard(ExternalContract):
 
     @field_validator(
         "evaluation_id",
-        "corpus_digest",
-        "split_digest",
-        "promotion_envelope_digest",
         "core_digest",
         "signer_key_id",
     )
@@ -562,12 +886,19 @@ class DefenseScorecard(ExternalContract):
     def scorecard_is_closed(self) -> DefenseScorecard:
         if type(self.champion_decision) is not PublicChampionDecision:
             raise ValueError("scorecard champion decision must be exact")
+        if (
+            type(self.corpus_summary) is not PublicCorpusSummary
+            or type(self.bundle_summary) is not PublicBundleSummary
+            or type(self.feature_manifest) is not PublicFeatureManifest
+            or type(self.threshold_manifest) is not PublicThresholdManifest
+        ):
+            raise ValueError("scorecard public projections must be exact")
         if tuple(item.arm for item in self.leaderboard) != tuple(DefenseArm):
             raise ValueError("scorecard leaderboard must contain all arms in exact order")
         slice_keys = tuple((item.arm, item.kind, item.value) for item in self.slice_summaries)
-        if slice_keys != tuple(sorted(slice_keys, key=_slice_sort_key)) or len(
-            slice_keys
-        ) != len(set(slice_keys)):
+        if slice_keys != tuple(sorted(slice_keys, key=_slice_sort_key)) or len(slice_keys) != len(
+            set(slice_keys)
+        ):
             raise ValueError("scorecard slices must be canonical and unique")
         if set(self.public_artifacts) != set(PUBLIC_ARTIFACT_MEDIA_TYPES):
             raise ValueError("scorecard public artifact allowlist is incomplete")
@@ -589,8 +920,7 @@ class DefenseScorecard(ExternalContract):
         if any(item.metric_artifact_sha256 not in artifact_digests for item in self.leaderboard):
             raise ValueError("leaderboard metric lineage is unresolved")
         if any(
-            item.metric_artifact_sha256 not in artifact_digests
-            for item in self.slice_summaries
+            item.metric_artifact_sha256 not in artifact_digests for item in self.slice_summaries
         ):
             raise ValueError("slice metric lineage is unresolved")
         return self
@@ -603,7 +933,8 @@ class DefenseScorecard(ExternalContract):
         return {
             key: value
             for key, value in document.items()
-            if key not in {
+            if key
+            not in {
                 "core_digest",
                 "public_artifacts",
                 "signer_key_id",
@@ -622,13 +953,11 @@ class DefenseScorecard(ExternalContract):
     def unsigned_document(self) -> dict[str, object]:
         return self.model_dump(mode="json", exclude={"signature_base64"})
 
-    def to_json(self) -> bytes:
+    def to_json(self, *, restricted_identifiers: tuple[bytes, ...] = ()) -> bytes:
         try:
             checked = DefenseScorecard.model_validate(
                 {
-                    **self.model_dump(
-                        mode="python", warnings=False, exclude={"public_artifacts"}
-                    ),
+                    **self.model_dump(mode="python", warnings=False, exclude={"public_artifacts"}),
                     "public_artifacts": self.public_artifacts,
                 },
                 strict=True,
@@ -638,7 +967,7 @@ class DefenseScorecard(ExternalContract):
             raise ReportingContractError("scorecard failed semantic revalidation") from error
         if len(payload) > _MAX_SCORECARD_BYTES:
             raise ReportingContractError("scorecard exceeds its resource cap")
-        _privacy_scan(payload)
+        _privacy_scan(payload, restricted_identifiers=restricted_identifiers)
         return payload
 
     @classmethod
@@ -647,7 +976,7 @@ class DefenseScorecard(ExternalContract):
         payload: bytes,
         *,
         artifact_store: ArtifactStore,
-        signer: RunSigningIdentity,
+        verifier: PublicArtifactVerifier,
     ) -> DefenseScorecard:
         if type(payload) is not bytes or not 0 < len(payload) <= _MAX_SCORECARD_BYTES:
             raise ReportingContractError("scorecard payload is invalid")
@@ -657,7 +986,7 @@ class DefenseScorecard(ExternalContract):
                 raise ReportingContractError("scorecard must be a JSON object")
             _tupleize_scorecard_document(document)
             scorecard = cls.model_validate(document)
-            _verify_pinned_signer(scorecard, signer)
+            _verify_pinned_signer(scorecard, verifier)
             if scorecard.to_json() != payload:
                 raise ReportingContractError("scorecard JSON is not canonical")
             _validate_public_artifacts(
@@ -707,9 +1036,7 @@ class EvaluationArtifactBundle(ExternalContract):
         return self
 
     def signing_document(self) -> dict[str, object]:
-        return self.model_dump(
-            mode="json", exclude={"signature_base64", "bundle_digest"}
-        )
+        return self.model_dump(mode="json", exclude={"signature_base64", "bundle_digest"})
 
     def unsigned_document(self) -> dict[str, object]:
         return self.model_dump(mode="json", exclude={"bundle_digest"})
@@ -718,9 +1045,7 @@ class EvaluationArtifactBundle(ExternalContract):
         try:
             checked = EvaluationArtifactBundle.model_validate(
                 {
-                    **self.model_dump(
-                        mode="python", warnings=False, exclude={"public_artifacts"}
-                    ),
+                    **self.model_dump(mode="python", warnings=False, exclude={"public_artifacts"}),
                     "public_artifacts": self.public_artifacts,
                 },
                 strict=True,
@@ -741,7 +1066,7 @@ class EvaluationArtifactBundle(ExternalContract):
         payload: bytes,
         *,
         artifact_store: ArtifactStore,
-        signer: RunSigningIdentity,
+        verifier: PublicArtifactVerifier,
     ) -> EvaluationArtifactBundle:
         if type(payload) is not bytes or not 0 < len(payload) <= _MAX_BUNDLE_BYTES:
             raise ReportingContractError("evaluation bundle payload is invalid")
@@ -755,7 +1080,7 @@ class EvaluationArtifactBundle(ExternalContract):
                     _reference_from_document(item) for item in artifacts["entries"]
                 )
             bundle = cls.model_validate(document)
-            _verify_pinned_signer(bundle, signer)
+            _verify_pinned_signer(bundle, verifier)
             if bundle.to_json() != payload:
                 raise ReportingContractError("evaluation bundle JSON is not canonical")
             _validate_public_artifacts(
@@ -763,7 +1088,7 @@ class EvaluationArtifactBundle(ExternalContract):
                 artifact_store=artifact_store,
                 include_scorecard=True,
             )
-            scorecard = bundle.scorecard(artifact_store=artifact_store, signer=signer)
+            scorecard = bundle.scorecard(artifact_store=artifact_store, verifier=verifier)
             if scorecard.evaluation_id != bundle.evaluation_id:
                 raise ReportingContractError("bundle and scorecard evaluation IDs differ")
             return bundle
@@ -783,20 +1108,20 @@ class EvaluationArtifactBundle(ExternalContract):
         )
 
     def scorecard(
-        self, *, artifact_store: ArtifactStore, signer: RunSigningIdentity
+        self, *, artifact_store: ArtifactStore, verifier: PublicArtifactVerifier
     ) -> DefenseScorecard:
         reference = self.public_artifacts[SCORECARD_ARTIFACT_NAME]
         payload = artifact_store.read(reference.as_artifact_ref())
-        return DefenseScorecard.from_json(
-            payload, artifact_store=artifact_store, signer=signer
-        )
+        return DefenseScorecard.from_json(payload, artifact_store=artifact_store, verifier=verifier)
 
 
 def publish_scorecard(
     request: ScorecardPublicationRequest,
     *,
+    verified_inputs: VerifiedEvaluationInputs,
     artifact_store: ArtifactStore,
     signer: RunSigningIdentity,
+    publication_verifier: PublicArtifactVerifier,
     evaluator_verifier: EvaluatorReplayVerifier,
     hidden_proof_verifier: EvaluatorReplayVerifier,
 ) -> tuple[DefenseScorecard, EvaluationArtifactBundle]:
@@ -804,34 +1129,43 @@ def publish_scorecard(
     try:
         checked = _validate_publication_request(
             request,
+            verified_inputs=verified_inputs,
             evaluator_verifier=evaluator_verifier,
             hidden_proof_verifier=hidden_proof_verifier,
         )
-        if type(artifact_store) is not ArtifactStore or type(signer) is not RunSigningIdentity:
+        if (
+            type(artifact_store) is not ArtifactStore
+            or type(signer) is not RunSigningIdentity
+            or type(publication_verifier) is not PublicArtifactVerifier
+            or publication_verifier.key_id != signer.key_id
+            or publication_verifier.public_key_base64 != signer.public_key_base64
+        ):
             raise ReportingContractError("publication dependencies must have exact types")
         signer_key_id = signer.key_id
         signer_public_key = signer.public_key_base64
         _validate_signature_identity(signer_key_id, signer_public_key)
         primary_results = _primary_results(checked.promotion_envelope)
         report_by_arm = _validated_metric_evidence(checked.metric_evidence, primary_results)
-        _validate_defender_binding(checked, primary_results)
+        _validate_defender_binding(verified_inputs, primary_results)
+        public_documents = _derive_public_documents(verified_inputs)
+        restricted_identifiers = _restricted_identifiers(checked.metric_evidence)
         artifact_payloads = _render_public_artifacts(
             checked,
+            public_documents=public_documents,
             primary_results=primary_results,
             report_by_arm=report_by_arm,
         )
         stored: dict[str, ArtifactRef] = {}
         for name in sorted(artifact_payloads):
             payload = artifact_payloads[name]
-            _privacy_scan(payload)
+            _privacy_scan(payload, restricted_identifiers=restricted_identifiers)
             if len(payload) > _MAX_PUBLIC_ARTIFACT_BYTES:
                 raise ReportingContractError("public artifact exceeds resource cap")
-            stored[name] = artifact_store.put_bytes(
-                payload, PUBLIC_ARTIFACT_MEDIA_TYPES[name]
-            )
+            stored[name] = artifact_store.put_bytes(payload, PUBLIC_ARTIFACT_MEDIA_TYPES[name])
         artifact_index = PublicArtifactIndex.from_refs(stored)
         scorecard = _build_scorecard(
             checked,
+            public_documents=public_documents,
             primary_results=primary_results,
             report_by_arm=report_by_arm,
             public_artifacts=artifact_index,
@@ -839,7 +1173,7 @@ def publish_scorecard(
             signer_key_id=signer_key_id,
             signer_public_key=signer_public_key,
         )
-        scorecard_payload = scorecard.to_json()
+        scorecard_payload = scorecard.to_json(restricted_identifiers=restricted_identifiers)
         scorecard_ref = artifact_store.put_bytes(scorecard_payload, SCORECARD_MEDIA_TYPE)
         full_refs = {**stored, SCORECARD_ARTIFACT_NAME: scorecard_ref}
         full_index = PublicArtifactIndex.from_refs(full_refs)
@@ -853,7 +1187,20 @@ def publish_scorecard(
         bundle_ref = artifact_store.put_bytes(bundle.to_json(), EVALUATION_BUNDLE_MEDIA_TYPE)
         if bundle_ref != bundle.bundle_ref():
             raise ReportingContractError("stored evaluation bundle reference differs")
-        loaded = load_evaluation_bundle(bundle_ref, artifact_store=artifact_store, signer=signer)
+        receipt_ref = store_restricted_publication_receipt(
+            checked,
+            verified_inputs=verified_inputs,
+            scorecard=scorecard,
+            bundle=bundle,
+            artifact_store=artifact_store,
+            signer=signer,
+        )
+        del receipt_ref
+        loaded = load_evaluation_bundle(
+            bundle_ref,
+            artifact_store=artifact_store,
+            verifier=publication_verifier,
+        )
         if loaded != bundle:
             raise ReportingContractError("published evaluation bundle did not reload exactly")
         return scorecard, bundle
@@ -875,7 +1222,7 @@ def load_evaluation_bundle(
     ref: ArtifactRef,
     *,
     artifact_store: ArtifactStore,
-    signer: RunSigningIdentity,
+    verifier: PublicArtifactVerifier,
 ) -> EvaluationArtifactBundle:
     """Re-read and fully revalidate one signed public evaluation bundle."""
     if type(ref) is not ArtifactRef or ref.media_type != EVALUATION_BUNDLE_MEDIA_TYPE:
@@ -887,21 +1234,26 @@ def load_evaluation_bundle(
     except (TypeError, ValueError) as error:
         raise ReportingContractError("evaluation bundle artifact is invalid") from error
     return EvaluationArtifactBundle.from_json(
-        payload, artifact_store=artifact_store, signer=signer
+        payload, artifact_store=artifact_store, verifier=verifier
     )
 
 
 def _validate_publication_request(
     request: object,
     *,
+    verified_inputs: VerifiedEvaluationInputs,
     evaluator_verifier: EvaluatorReplayVerifier,
     hidden_proof_verifier: EvaluatorReplayVerifier,
 ) -> ScorecardPublicationRequest:
-    if type(request) is not ScorecardPublicationRequest:
+    if (
+        type(request) is not ScorecardPublicationRequest
+        or type(verified_inputs) is not VerifiedEvaluationInputs
+    ):
         raise ReportingContractError("publication request must have its exact type")
-    if type(evaluator_verifier) is not EvaluatorReplayVerifier or type(
-        hidden_proof_verifier
-    ) is not EvaluatorReplayVerifier:
+    if (
+        type(evaluator_verifier) is not EvaluatorReplayVerifier
+        or type(hidden_proof_verifier) is not EvaluatorReplayVerifier
+    ):
         raise ReportingContractError("publication requires exact pinned evaluator verifiers")
     try:
         checked = ScorecardPublicationRequest.model_validate(
@@ -933,6 +1285,12 @@ def _validate_publication_request(
     )
     if checked.champion_decision != expected:
         raise ReportingContractError("champion decision differs from verified promotion evidence")
+    primary = _primary_results(checked.promotion_envelope)
+    if any(
+        row.evaluation_lineage.split_digest != verified_inputs.corpus.split_digest
+        for row in primary
+    ):
+        raise ReportingContractError("authenticated corpus split differs from replay")
     return checked
 
 
@@ -1034,7 +1392,7 @@ def _validate_report_projection(report: MetricReport, result: ReplayResult) -> N
 
 
 def _validate_defender_binding(
-    request: ScorecardPublicationRequest, primary: tuple[ReplayResult, ...]
+    verified_inputs: VerifiedEvaluationInputs, primary: tuple[ReplayResult, ...]
 ) -> None:
     identities = {
         (
@@ -1046,17 +1404,154 @@ def _validate_defender_binding(
     }
     if len(identities) != 1:
         raise ReportingContractError("primary defender identity is inconsistent")
-    _, manifest_digest, top_ref_digest = next(iter(identities))
+    bundle_id, manifest_digest, top_ref_digest = next(iter(identities))
     if (
-        manifest_digest != request.defender_artifact_digest
-        or top_ref_digest != request.defender_artifact_digest
+        manifest_digest != verified_inputs.defender.top_ref.sha256
+        or top_ref_digest != verified_inputs.defender.top_ref.sha256
+        or bundle_id != verified_inputs.defender.bundle_id
     ):
         raise ReportingContractError("requested defender artifact differs from signed replay")
+
+
+class _PublicDocuments(NamedTuple):
+    corpus: PublicCorpusSummary
+    bundle: PublicBundleSummary
+    features: PublicFeatureManifest
+    thresholds: PublicThresholdManifest
+    latency_environment: PublicLatencyEnvironment
+
+
+def _derive_public_documents(inputs: VerifiedEvaluationInputs) -> _PublicDocuments:
+    catalog = inputs.catalog
+    threshold = inputs.thresholds
+    if threshold.thresholds is None:
+        raise ReportingContractError("authenticated thresholds are not feasible")
+    counts: dict[str, int] = {}
+    for definition in catalog.features:
+        counts[definition.family] = counts.get(definition.family, 0) + 1
+    environment = inputs.environment
+    return _PublicDocuments(
+        corpus=PublicCorpusSummary(
+            observation_count=inputs.corpus.observation_count,
+            truth_count=inputs.corpus.truth_count,
+        ),
+        bundle=PublicBundleSummary(
+            bundle_id=inputs.defender.bundle_id,
+            compared_arms=tuple(DefenseArm),
+            rollback_available=inputs.defender.rollback_available,
+        ),
+        features=PublicFeatureManifest(
+            catalog_version=catalog.version,
+            feature_count=len(catalog.features),
+            ordered_feature_names=catalog.names,
+            family_counts=tuple(sorted(counts.items())),
+        ),
+        thresholds=PublicThresholdManifest(
+            challenge_threshold=threshold.thresholds.challenge,
+            decline_threshold=threshold.thresholds.decline,
+            challenge_rate_max=threshold.budget.challenge_rate_max,
+            false_decline_rate_max=threshold.budget.false_decline_rate_max,
+            review_case_rate_max=threshold.budget.review_case_rate_max,
+            objective_kind=threshold.objective_kind,
+        ),
+        latency_environment=PublicLatencyEnvironment(
+            python_version=environment.python_version,
+            python_implementation=environment.python_implementation,
+            machine=environment.machine,
+            platform=environment.platform,
+            catboost_version=environment.catboost_version,
+            scikit_learn_version=environment.scikit_learn_version,
+            numpy_version=environment.numpy_version,
+            pyarrow_version=environment.pyarrow_version,
+            pydantic_version=environment.pydantic_version,
+            cryptography_version=environment.cryptography_version,
+            pandas_version=environment.pandas_version,
+        ),
+    )
+
+
+def _restricted_identifiers(rows: tuple[MetricPublicationEvidence, ...]) -> tuple[bytes, ...]:
+    identifiers: set[str] = set()
+    for row in rows:
+        evidence = cast(MetricDerivationEvidence, row.metric_derivation_evidence)
+        inputs = evidence.inputs
+        for truth in inputs.truth:
+            identifiers.update((truth.event_id, truth.payment_id, truth.campaign_id))
+        for observation in inputs.observations:
+            identifiers.update((observation.event_id, observation.payment_id))
+        for decision in inputs.decisions:
+            identifiers.add(decision.event_id)
+    return tuple(value.encode("utf-8") for value in sorted(identifiers))
+
+
+def store_restricted_publication_receipt(
+    request: ScorecardPublicationRequest,
+    *,
+    verified_inputs: VerifiedEvaluationInputs,
+    scorecard: DefenseScorecard,
+    bundle: EvaluationArtifactBundle,
+    artifact_store: ArtifactStore,
+    signer: RunSigningIdentity,
+) -> ArtifactRef:
+    """Store the signed full evaluator lineage outside every public manifest/API."""
+    metric_lineage = [
+        {
+            "arm": row.arm.value,
+            "result_digest": row.result_digest,
+            "metric_report_digest": row.metric_report.report_digest,
+            "metric_evidence_digest": cast(
+                MetricDerivationEvidence, row.metric_derivation_evidence
+            ).evidence_digest,
+            "confidence_intervals_digest": row.confidence_intervals.intervals_digest,
+            "bootstrap_evidence_digest": cast(
+                BootstrapDerivationEvidence, row.bootstrap_derivation_evidence
+            ).evidence_digest,
+        }
+        for row in request.metric_evidence
+    ]
+    fields: dict[str, object] = {
+        "schema_version": "1.0.0",
+        "privacy_classification": "restricted_evaluation_evidence",
+        "evaluation_id": scorecard.evaluation_id,
+        "corpus_attestation_ref": _ref_json(
+            ArtifactRef(
+                _digest_bytes(verified_inputs.corpus.to_json()),
+                "application/vnd.apar.verified-corpus-attestation+json",
+                len(verified_inputs.corpus.to_json()),
+                f"{_digest_bytes(verified_inputs.corpus.to_json())}/payload",
+            )
+        ),
+        "corpus_evidence_ref": _ref_json(verified_inputs.corpus.evidence_ref),
+        "corpus_content_digest": verified_inputs.corpus.corpus_digest,
+        "split_digest": verified_inputs.corpus.split_digest,
+        "defender_attestation": strict_json_loads(verified_inputs.defender.to_json()),
+        "promotion_envelope_digest": request.promotion_envelope.envelope_digest,
+        "champion_decision_digest": request.champion_decision.decision_digest,
+        "metric_lineage": metric_lineage,
+        "public_bundle_digest": bundle.bundle_digest,
+        "public_bundle_ref": _ref_json(bundle.bundle_ref()),
+        "signer_key_id": signer.key_id,
+        "public_key_base64": signer.public_key_base64,
+    }
+    signature = signer.sign(fields)
+    signed = {**fields, "signature_base64": signature}
+    payload = canonical_json_bytes({**signed, "receipt_digest": _digest_document(signed)})
+    return artifact_store.put_bytes(payload, RESTRICTED_PUBLICATION_RECEIPT_MEDIA_TYPE)
+
+
+def _ref_json(ref: ArtifactRef) -> dict[str, object]:
+    return {
+        "media_type": ref.media_type,
+        "relative_path": ref.relative_path,
+        "sha256": ref.sha256,
+        "size_bytes": ref.size_bytes,
+    }
 
 
 def _render_public_artifacts(
     request: ScorecardPublicationRequest,
     *,
+    public_documents: _PublicDocuments,
     primary_results: tuple[ReplayResult, ...],
     report_by_arm: dict[DefenseArm, tuple[MetricReport, ConfidenceIntervals]],
 ) -> dict[str, bytes]:
@@ -1080,7 +1575,6 @@ def _render_public_artifacts(
                 _float_text(classification.pr_auc.value),
                 _float_text(classification.roc_auc.value),
                 _float_text(report.calibration.ece.value),
-                _float_text(report.engineering.end_to_end_ms.p95.value),
                 _float_text(report.alerts.p50_seconds.value),
                 _float_text(report.alerts.p95_seconds.value),
                 _float_text(result.metrics.challenge_rate),
@@ -1093,7 +1587,6 @@ def _render_public_artifacts(
                 str(operations.analyst_minutes),
                 str(report.value.preventable_settled_value),
                 str(report.value.value_escaped),
-                result.metric_report_digest,
                 canonical_json_bytes(
                     [item.model_dump(mode="json") for item in confidence.intervals]
                 ).decode("utf-8"),
@@ -1165,7 +1658,6 @@ def _render_public_artifacts(
                 "pr_auc",
                 "roc_auc",
                 "ece",
-                "p95_latency_ms",
                 "time_to_alert_p50_seconds",
                 "time_to_alert_p95_seconds",
                 "challenge_rate",
@@ -1178,7 +1670,6 @@ def _render_public_artifacts(
                 "analyst_minutes",
                 "preventable_settled_value",
                 "value_escaped",
-                "metric_report_digest",
                 "confidence_intervals_json",
             ),
             tuple(leaderboard_rows),
@@ -1228,12 +1719,16 @@ def _render_public_artifacts(
             ),
             tuple(value_rows),
         ),
-        "feature-manifest.json": request.feature_manifest,
-        "thresholds.json": request.thresholds,
+        "feature-manifest.json": canonical_json_bytes(
+            public_documents.features.model_dump(mode="json")
+        ),
+        "thresholds.json": canonical_json_bytes(
+            public_documents.thresholds.model_dump(mode="json")
+        ),
         "latency-evidence.json": canonical_json_bytes(
             {
                 "schema_version": "1.0.0",
-                "environment": strict_json_loads(request.latency_environment),
+                "environment": public_documents.latency_environment.model_dump(mode="json"),
                 "observational_evidence": latency_rows,
                 "raw_samples_published": False,
             }
@@ -1242,7 +1737,11 @@ def _render_public_artifacts(
             "APAR synthetic defense data card",
             (
                 _EXTERNAL_VALIDITY,
-                "The corpus contains authorized APAR-generated synthetic events only.",
+                "The evaluator authenticated a synthetic-only frozen corpus before execution.",
+                (
+                    f"Aggregate corpus scale: {public_documents.corpus.observation_count} "
+                    f"observations and {public_documents.corpus.truth_count} truth rows."
+                ),
                 "Prevalence, identity mix, and value distributions are simulator evidence.",
             ),
         ),
@@ -1250,23 +1749,43 @@ def _render_public_artifacts(
             "APAR defense model card",
             (
                 _EXTERNAL_VALIDITY,
-                "The compared arms are deterministic rules, calibrated GBDT, and a layered hybrid.",
-                "Promotion is controlled by the frozen signed evaluation envelope and hard gates.",
+                (
+                    f"Authenticated model family: CatBoost GBDT with "
+                    f"{public_documents.features.feature_count} strictly past-only features."
+                ),
+                "Compared arms: deterministic rules, calibrated GBDT, and layered hybrid.",
+                (
+                    "Frozen matched budgets cap challenge, false-decline, and review rates at "
+                    f"{_float_text(public_documents.thresholds.challenge_rate_max)}, "
+                    f"{_float_text(public_documents.thresholds.false_decline_rate_max)}, and "
+                    f"{_float_text(public_documents.thresholds.review_case_rate_max)}."
+                ),
             ),
         ),
         "limitations.md": _markdown("Limitations", (_EXTERNAL_VALIDITY, *_LIMITATIONS)),
     }
-    evidence_lines = tuple(
-        f"- {name}: `{_digest_bytes(payloads[name])}`"
-        for name in sorted(payloads)
+    metric_lines = tuple(
+        (
+            f"- {result.arm.value}: "
+            f"recall={_float_text(report_by_arm[result.arm][0].classification.recall.value)}, "
+            f"PR-AUC={_float_text(report_by_arm[result.arm][0].classification.pr_auc.value)}, "
+            f"preventable value={report_by_arm[result.arm][0].value.preventable_settled_value}, "
+            f"review cases={report_by_arm[result.arm][0].operations.review_case_count}."
+        )
+        for result in primary_results
     )
     payloads["defense-scorecard.md"] = _markdown(
         "APAR Defend judge scorecard",
         (
             _EXTERNAL_VALIDITY,
             f"Champion status: `{request.champion_decision.status.value}`.",
-            "All displayed metrics are in the signed immutable artifacts below.",
-            *evidence_lines,
+            (
+                "Failed gates: "
+                + (", ".join(request.champion_decision.failed_gate_codes) or "none")
+                + "."
+            ),
+            "All displayed metrics resolve to signed immutable public projections.",
+            *metric_lines,
         ),
     )
     if set(payloads) != set(PUBLIC_ARTIFACT_MEDIA_TYPES):
@@ -1277,6 +1796,7 @@ def _render_public_artifacts(
 def _build_scorecard(
     request: ScorecardPublicationRequest,
     *,
+    public_documents: _PublicDocuments,
     primary_results: tuple[ReplayResult, ...],
     report_by_arm: dict[DefenseArm, tuple[MetricReport, ConfidenceIntervals]],
     public_artifacts: PublicArtifactIndex,
@@ -1295,19 +1815,12 @@ def _build_scorecard(
             false_positive_rate=(
                 report_by_arm[result.arm][0].classification.false_positive_rate.value
             ),
-            campaign_recall=(
-                report_by_arm[result.arm][0].classification.campaign_recall.value
-            ),
+            campaign_recall=(report_by_arm[result.arm][0].classification.campaign_recall.value),
             pr_auc=report_by_arm[result.arm][0].classification.pr_auc.value,
             roc_auc=report_by_arm[result.arm][0].classification.roc_auc.value,
             ece=report_by_arm[result.arm][0].calibration.ece.value,
-            p95_latency_ms=report_by_arm[result.arm][0].engineering.end_to_end_ms.p95.value,
-            time_to_alert_p50_seconds=(
-                report_by_arm[result.arm][0].alerts.p50_seconds.value
-            ),
-            time_to_alert_p95_seconds=(
-                report_by_arm[result.arm][0].alerts.p95_seconds.value
-            ),
+            time_to_alert_p50_seconds=(report_by_arm[result.arm][0].alerts.p50_seconds.value),
+            time_to_alert_p95_seconds=(report_by_arm[result.arm][0].alerts.p95_seconds.value),
             challenge_rate=result.metrics.challenge_rate,
             false_decline_rate=result.metrics.false_decline.value,
             review_case_rate=result.metrics.review_case_rate,
@@ -1315,8 +1828,7 @@ def _build_scorecard(
                 report_by_arm[result.arm][0].operations.false_intervention_count
             ),
             false_interventions_per_10k=(
-                report_by_arm[result.arm][0]
-                .operations.false_interventions_per_10k.value
+                report_by_arm[result.arm][0].operations.false_interventions_per_10k.value
             ),
             challenge_count=report_by_arm[result.arm][0].operations.challenge_count,
             review_case_count=report_by_arm[result.arm][0].operations.review_case_count,
@@ -1346,8 +1858,6 @@ def _build_scorecard(
             key=lambda item: _slice_sort_key((item.arm, item.kind, item.value)),
         )
     )
-    primary_identity = primary_results[0].candidate_role
-    split_digest = primary_results[0].evaluation_lineage.split_digest
     public_decision = PublicChampionDecision(
         status=request.champion_decision.status,
         champion=request.champion_decision.champion,
@@ -1356,10 +1866,10 @@ def _build_scorecard(
     )
     core_fields: dict[str, object] = {
         "schema_version": "1.0.0",
-        "defender_bundle_id": primary_identity.bundle_id,
-        "corpus_digest": request.corpus_artifact_digest,
-        "split_digest": split_digest,
-        "promotion_envelope_digest": request.promotion_envelope.envelope_digest,
+        "corpus_summary": public_documents.corpus,
+        "bundle_summary": public_documents.bundle,
+        "feature_manifest": public_documents.features,
+        "threshold_manifest": public_documents.thresholds,
         "champion_decision": public_decision,
         "leaderboard": leaderboard,
         "slice_summaries": slice_summaries,
@@ -1367,18 +1877,7 @@ def _build_scorecard(
         "limitations": _LIMITATIONS,
         "external_validity_statement": _EXTERNAL_VALIDITY,
     }
-    evaluation_id = _digest_document(
-        {
-            "schema_version": "1.0.0",
-            "corpus_digest": request.corpus_artifact_digest,
-            "defender_digest": request.defender_artifact_digest,
-            "promotion_envelope_digest": request.promotion_envelope.envelope_digest,
-            "public_champion_decision": _json_tree(public_decision),
-            "metric_report_digests": [row.metric_report_digest for row in primary_results],
-            "feature_manifest_digest": _digest_bytes(request.feature_manifest),
-            "thresholds_digest": _digest_bytes(request.thresholds),
-        }
-    )
+    evaluation_id = _digest_document(_json_tree(core_fields))
     core_fields["evaluation_id"] = evaluation_id
     json_core = _json_tree(core_fields)
     core_digest = _digest_document(json_core)
@@ -1391,9 +1890,7 @@ def _build_scorecard(
     }
     signature = signer.sign(_json_tree(unsigned))
     _verify_signer_snapshot(signer, signer_key_id, signer_public_key, unsigned, signature)
-    return DefenseScorecard.model_validate(
-        {**unsigned, "signature_base64": signature}
-    )
+    return DefenseScorecard.model_validate({**unsigned, "signature_base64": signature})
 
 
 def _build_evaluation_bundle(
@@ -1422,20 +1919,20 @@ def _build_evaluation_bundle(
 
 def _verify_pinned_signer(
     value: DefenseScorecard | EvaluationArtifactBundle,
-    signer: RunSigningIdentity,
+    verifier: PublicArtifactVerifier,
 ) -> None:
-    if type(signer) is not RunSigningIdentity:
+    if type(verifier) is not PublicArtifactVerifier:
         raise ReportingContractError("public artifact signer is not exact")
     if (
-        value.signer_key_id != signer.key_id
-        or value.public_key_base64 != signer.public_key_base64
+        value.signer_key_id != verifier.key_id
+        or value.public_key_base64 != verifier.public_key_base64
     ):
         raise ReportingContractError("public artifact signer differs from pinned authority")
     if type(value) is DefenseScorecard:
         document = value.unsigned_document()
     else:
         document = cast(EvaluationArtifactBundle, value).signing_document()
-    if not signer.verify(document, value.signature_base64):
+    if not verifier.verify(document, value.signature_base64):
         raise ReportingContractError("pinned public artifact signature is invalid")
 
 
@@ -1470,9 +1967,7 @@ def _verify_signature(public_key_base64: str, document: object, signature_base64
     try:
         public = base64.b64decode(public_key_base64, validate=True)
         signature = base64.b64decode(signature_base64, validate=True)
-        Ed25519PublicKey.from_public_bytes(public).verify(
-            signature, canonical_json_bytes(document)
-        )
+        Ed25519PublicKey.from_public_bytes(public).verify(signature, canonical_json_bytes(document))
     except (InvalidSignature, TypeError, ValueError, binascii.Error):
         return False
     return True
@@ -1543,7 +2038,7 @@ def _validate_markdown(payload: bytes) -> None:
         raise ReportingContractError("public Markdown is not canonical")
 
 
-def _privacy_scan(payload: bytes) -> None:
+def _privacy_scan(payload: bytes, *, restricted_identifiers: tuple[bytes, ...] = ()) -> None:
     if type(payload) is not bytes:
         raise ReportingContractError("public payload must be exact bytes")
     lowered = payload.lower()
@@ -1555,19 +2050,16 @@ def _privacy_scan(payload: bytes) -> None:
     semantic = b""
     if payload.startswith((b"{", b"[")):
         try:
-            semantic = repr(strict_json_loads(payload)).lower().encode(
-                "utf-8", errors="ignore"
-            )
+            semantic = repr(strict_json_loads(payload)).lower().encode("utf-8", errors="ignore")
         except WireContractError:
             semantic = decoded
     if any(
-        token in lowered
-        or token in representation
-        or token in decoded
-        or token in semantic
+        token in lowered or token in representation or token in decoded or token in semantic
         for token in _FORBIDDEN_PUBLIC_TOKENS
     ):
         raise ReportingContractError("public payload contains restricted evaluator semantics")
+    if any(identifier and identifier in payload for identifier in restricted_identifiers):
+        raise ReportingContractError("public payload contains a restricted row identifier")
 
 
 def _csv_bytes(header: tuple[str, ...], rows: tuple[tuple[str, ...], ...]) -> bytes:
@@ -1608,6 +2100,19 @@ def _tupleize_scorecard_document(document: dict[str, object]) -> None:
         for item in leaderboard:
             if type(item) is dict and type(item.get("confidence_intervals")) is list:
                 item["confidence_intervals"] = tuple(item["confidence_intervals"])
+    bundle_summary = document.get("bundle_summary")
+    if type(bundle_summary) is dict and type(bundle_summary.get("compared_arms")) is list:
+        bundle_summary["compared_arms"] = tuple(bundle_summary["compared_arms"])
+    feature_manifest = document.get("feature_manifest")
+    if type(feature_manifest) is dict:
+        if type(feature_manifest.get("ordered_feature_names")) is list:
+            feature_manifest["ordered_feature_names"] = tuple(
+                feature_manifest["ordered_feature_names"]
+            )
+        if type(feature_manifest.get("family_counts")) is list:
+            feature_manifest["family_counts"] = tuple(
+                tuple(item) for item in feature_manifest["family_counts"]
+            )
     artifacts = document.get("public_artifacts")
     if type(artifacts) is dict and type(artifacts.get("entries")) is list:
         artifacts["entries"] = tuple(
@@ -1615,7 +2120,7 @@ def _tupleize_scorecard_document(document: dict[str, object]) -> None:
         )
     champion = document.get("champion_decision")
     if type(champion) is dict:
-        for name in ("failed_gate_codes", "arm_gate_results", "evaluated_result_digests"):
+        for name in ("failed_gate_codes", "arm_gate_results"):
             if type(champion.get(name)) is list:
                 champion[name] = tuple(champion[name])
         arm_results = champion.get("arm_gate_results")
@@ -1659,18 +2164,26 @@ def _json_tree(value: object) -> object:
 __all__ = [
     "EVALUATION_BUNDLE_MEDIA_TYPE",
     "PUBLIC_ARTIFACT_MEDIA_TYPES",
+    "RESTRICTED_PUBLICATION_RECEIPT_MEDIA_TYPE",
     "SCORECARD_ARTIFACT_NAME",
     "SCORECARD_MEDIA_TYPE",
     "DefenseScorecard",
     "EvaluationArtifactBundle",
     "LeaderboardRow",
     "MetricPublicationEvidence",
+    "PublicArtifactVerifier",
     "PublicArtifactIndex",
     "PublicArtifactReference",
+    "PublicBundleSummary",
     "PublicChampionDecision",
+    "PublicCorpusSummary",
+    "PublicFeatureManifest",
+    "PublicLatencyEnvironment",
+    "PublicThresholdManifest",
     "ReportingContractError",
     "ScorecardPublicationRequest",
     "SliceSummary",
     "load_evaluation_bundle",
     "publish_scorecard",
+    "store_restricted_publication_receipt",
 ]
