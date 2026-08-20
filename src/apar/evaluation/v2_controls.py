@@ -8,33 +8,57 @@ or construct an evaluation population.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
 from typing import Callable, Literal
 
 import numpy as np
+from pydantic import model_validator
 
 from apar.contracts.decisions import Action
+from apar.contracts._validation import ExternalContract
 from apar.evaluation.contracts import EvaluationTruthRow
 
 
-@dataclass(frozen=True, slots=True)
-class ControlResult:
+class ControlResult(ExternalContract):
     """Closed result of one mandatory negative control."""
 
     valid: bool
+    kind: Literal["benign_only", "score_permutation"]
     reason: str | None = None
     intervention_count: int = 0
     true_positive_count: int = 0
     efficacy_auc: float | None = None
 
+    @classmethod
+    def invalid(cls, kind: Literal["benign_only", "score_permutation"], reason: str) -> "ControlResult":
+        return cls(valid=False, kind=kind, reason=reason)
 
-@dataclass(frozen=True, slots=True)
-class ControlAdmission:
+    @model_validator(mode="after")
+    def _coherent(self) -> "ControlResult":
+        values = self
+        if values.valid != (values.reason is None):
+            raise ValueError("control validity and reason disagree")
+        if values.true_positive_count < 0 or values.intervention_count < 0:
+            raise ValueError("control counts must be nonnegative")
+        return values
+
+
+class ControlAdmission(ExternalContract):
     """Typed boundary between controls and v2 evaluation admission."""
 
     valid: bool
     status: Literal["admitted", "no_promotion"]
     reason: str | None = None
+
+    @model_validator(mode="after")
+    def _coherent(self) -> "ControlAdmission":
+        values = self
+        if values.valid != (values.status == "admitted"):
+            raise ValueError("admission status and validity disagree")
+        if values.status == "admitted" and values.reason is not None:
+            raise ValueError("admitted control cannot carry a reason")
+        if values.status == "no_promotion" and not values.reason:
+            raise ValueError("no-promotion admission requires a reason")
+        return values
 
 
 ControlEvaluator = Callable[[np.ndarray, tuple[EvaluationTruthRow, ...], tuple[str, ...]], bool]
@@ -43,10 +67,14 @@ ControlEvaluator = Callable[[np.ndarray, tuple[EvaluationTruthRow, ...], tuple[s
 def admit_control_result(control: ControlResult) -> ControlAdmission:
     """Convert a control result into a load-bearing whole-run admission."""
     if type(control) is not ControlResult:
-        return ControlAdmission(False, "no_promotion", "malformed_control_result")
-    if not control.valid:
-        return ControlAdmission(False, "no_promotion", control.reason or "control_invalid")
-    return ControlAdmission(True, "admitted")
+        return ControlAdmission(valid=False, status="no_promotion", reason="malformed_control_result")
+    try:
+        checked = ControlResult.model_validate(control)
+    except Exception:
+        return ControlAdmission(valid=False, status="no_promotion", reason="malformed_control_result")
+    if not checked.valid:
+        return ControlAdmission(valid=False, status="no_promotion", reason=checked.reason or "control_invalid")
+    return ControlAdmission(valid=True, status="admitted")
 
 
 def run_benign_only_control(
@@ -63,15 +91,15 @@ def run_benign_only_control(
         rows = _validated_truth(truth)
         action_values = _validated_actions(actions, rows)
         if any(row.is_fraud for row in rows):
-            return ControlResult(False, "malformed_benign_control")
+            return ControlResult.invalid("benign_only", "malformed_benign_control")
         interventions = sum(action is not Action.APPROVE for action in action_values)
         return ControlResult(
-            valid=True,
+            valid=True, kind="benign_only",
             intervention_count=interventions,
             true_positive_count=0,
         )
     except (TypeError, ValueError):
-        return ControlResult(False, "malformed_benign_control")
+        return ControlResult.invalid("benign_only", "malformed_benign_control")
 
 
 def run_score_permutation_control(
@@ -90,6 +118,10 @@ def run_score_permutation_control(
 
     try:
         rows = _validated_truth(truth)
+        if evaluator is None:
+            return ControlResult.invalid("score_permutation", "evaluator_missing")
+        if not callable(evaluator):
+            return ControlResult.invalid("score_permutation", "malformed_evaluator")
         values = _validated_scores(scores, len(rows))
         block_values = _validated_blocks(blocks, len(rows))
         if type(seed) is not int:
@@ -98,15 +130,18 @@ def run_score_permutation_control(
             np.unique(np.asarray(block_values, dtype=object))
         )
         permuted = _permute_scores_by_block(values, block_values, permutation)
-        if evaluator is not None:
-            if not callable(evaluator):
-                raise TypeError("evaluator must be callable")
-            if evaluator(permuted.copy(), rows, block_values):
-                return ControlResult(False, "permuted_scores_qualified")
+        try:
+            qualified = evaluator(permuted.copy(), rows, block_values)
+        except Exception:
+            return ControlResult.invalid("score_permutation", "evaluator_failed")
+        if type(qualified) is not bool:
+            return ControlResult.invalid("score_permutation", "malformed_evaluator_result")
+        if qualified:
+                return ControlResult.invalid("score_permutation", "permuted_scores_qualified")
         auc = _auc(permuted, np.asarray([row.is_fraud for row in rows], dtype=bool))
-        return ControlResult(True, efficacy_auc=auc)
+        return ControlResult(valid=True, kind="score_permutation", efficacy_auc=auc)
     except (TypeError, ValueError):
-        return ControlResult(False, "malformed_permutation_control")
+        return ControlResult.invalid("score_permutation", "malformed_permutation_control")
 
 
 def _validated_truth(truth: Sequence[EvaluationTruthRow]) -> tuple[EvaluationTruthRow, ...]:

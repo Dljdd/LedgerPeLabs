@@ -8,6 +8,7 @@ import numpy as np
 from apar.contracts.decisions import Action
 from apar.evaluation.contracts import EvaluationTruthRow
 from apar.evaluation.v2_controls import (
+    ControlResult,
     admit_control_result,
     run_benign_only_control,
     run_score_permutation_control,
@@ -77,6 +78,31 @@ def test_invalid_control_is_a_typed_no_promotion_admission() -> None:
 
 def test_malformed_control_invalidates_the_whole_run() -> None:
     result = run_score_permutation_control(
-        scores=np.array([0.5]), truth=(truth_row("row-1", fraud=False),), blocks=(), seed=7
+        scores=np.array([0.5]), truth=(truth_row("row-1", fraud=False),), blocks=(), seed=7,
+        evaluator=lambda scores, truth, blocks: False,
     )
     assert (result.valid, result.reason) == (False, "malformed_permutation_control")
+
+
+def test_missing_evaluator_is_invalid() -> None:
+    result = run_score_permutation_control(
+        scores=np.array([0.5]), truth=(truth_row("row-1", fraud=False),), blocks=("case",), seed=7
+    )
+    assert (result.valid, result.reason) == (False, "evaluator_missing")
+
+
+def test_evaluator_exception_is_fail_closed() -> None:
+    def explode(scores, truth, blocks):
+        raise RuntimeError("gate unavailable")
+
+    result = run_score_permutation_control(
+        scores=np.array([0.5]), truth=(truth_row("row-1", fraud=False),), blocks=("case",), seed=7,
+        evaluator=explode,
+    )
+    assert (result.valid, result.reason) == (False, "evaluator_failed")
+
+
+def test_forged_valid_control_cannot_be_admitted() -> None:
+    forged = ControlResult.model_construct(valid=True, kind="benign_only", reason="forged")
+    admission = admit_control_result(forged)
+    assert (admission.valid, admission.status) == (False, "no_promotion")
