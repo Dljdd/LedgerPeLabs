@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Callable, Literal
 
 import numpy as np
 
@@ -25,6 +26,27 @@ class ControlResult:
     intervention_count: int = 0
     true_positive_count: int = 0
     efficacy_auc: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ControlAdmission:
+    """Typed boundary between controls and v2 evaluation admission."""
+
+    valid: bool
+    status: Literal["admitted", "no_promotion"]
+    reason: str | None = None
+
+
+ControlEvaluator = Callable[[np.ndarray, tuple[EvaluationTruthRow, ...], tuple[str, ...]], bool]
+
+
+def admit_control_result(control: ControlResult) -> ControlAdmission:
+    """Convert a control result into a load-bearing whole-run admission."""
+    if type(control) is not ControlResult:
+        return ControlAdmission(False, "no_promotion", "malformed_control_result")
+    if not control.valid:
+        return ControlAdmission(False, "no_promotion", control.reason or "control_invalid")
+    return ControlAdmission(True, "admitted")
 
 
 def run_benign_only_control(
@@ -58,6 +80,7 @@ def run_score_permutation_control(
     truth: Sequence[EvaluationTruthRow],
     blocks: Sequence[str],
     seed: int,
+    evaluator: ControlEvaluator | None = None,
 ) -> ControlResult:
     """Permute score blocks and reject any apparently qualifying efficacy.
 
@@ -75,9 +98,12 @@ def run_score_permutation_control(
             np.unique(np.asarray(block_values, dtype=object))
         )
         permuted = _permute_scores_by_block(values, block_values, permutation)
+        if evaluator is not None:
+            if not callable(evaluator):
+                raise TypeError("evaluator must be callable")
+            if evaluator(permuted.copy(), rows, block_values):
+                return ControlResult(False, "permuted_scores_qualified")
         auc = _auc(permuted, np.asarray([row.is_fraud for row in rows], dtype=bool))
-        if auc is not None and auc == 1.0:
-            return ControlResult(False, "permuted_scores_qualified", efficacy_auc=auc)
         return ControlResult(True, efficacy_auc=auc)
     except (TypeError, ValueError):
         return ControlResult(False, "malformed_permutation_control")
@@ -156,4 +182,11 @@ def _auc(scores: np.ndarray, labels: np.ndarray) -> float | None:
     return float((np.sum(comparisons > 0) + 0.5 * np.sum(comparisons == 0)) / comparisons.size)
 
 
-__all__ = ["ControlResult", "run_benign_only_control", "run_score_permutation_control"]
+__all__ = [
+    "ControlAdmission",
+    "ControlEvaluator",
+    "ControlResult",
+    "admit_control_result",
+    "run_benign_only_control",
+    "run_score_permutation_control",
+]

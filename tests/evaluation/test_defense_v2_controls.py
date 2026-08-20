@@ -8,6 +8,7 @@ import numpy as np
 from apar.contracts.decisions import Action
 from apar.evaluation.contracts import EvaluationTruthRow
 from apar.evaluation.v2_controls import (
+    admit_control_result,
     run_benign_only_control,
     run_score_permutation_control,
 )
@@ -42,20 +43,36 @@ def test_benign_control_reports_interventions_without_true_positives() -> None:
 def test_qualifying_permuted_scores_invalidates_run() -> None:
     rows = (truth_row("fraud", fraud=True), truth_row("benign", fraud=False))
     result = run_score_permutation_control(
-        scores=np.array([1.0, 0.0]), truth=rows, blocks=("same-case", "same-case"), seed=7
+        scores=np.array([1.0, 0.0]), truth=rows, blocks=("same-case", "same-case"), seed=7,
+        evaluator=lambda scores, truth, blocks: True,
     )
     assert (result.valid, result.reason) == (False, "permuted_scores_qualified")
 
 
 def test_score_permutation_keeps_blocks_intact() -> None:
     rows = tuple(truth_row(f"row-{index}", fraud=index % 2 == 0) for index in range(4))
+    observed: list[tuple[float, ...]] = []
     result = run_score_permutation_control(
         scores=np.array([0.9, 0.8, 0.2, 0.1]),
         truth=rows,
         blocks=("case-a", "case-a", "case-b", "case-b"),
-        seed=7,
+        seed=3,
+        evaluator=lambda scores, truth, blocks: observed.append(tuple(scores)) or False,
     )
     assert result.valid is True
+    assert observed == [(0.2, 0.1, 0.9, 0.8)]
+
+
+def test_invalid_control_is_a_typed_no_promotion_admission() -> None:
+    control = run_benign_only_control(
+        actions=(Action.CHALLENGE,), truth=(truth_row("row-1", fraud=True),)
+    )
+    admission = admit_control_result(control)
+    assert (admission.valid, admission.status, admission.reason) == (
+        False,
+        "no_promotion",
+        "malformed_benign_control",
+    )
 
 
 def test_malformed_control_invalidates_the_whole_run() -> None:
