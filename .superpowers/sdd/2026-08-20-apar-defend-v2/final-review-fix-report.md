@@ -837,3 +837,86 @@ The final read-only preexecution script returned
 `{"admissible":true,"codes":[],"status":"not_executed"}`. Frozen V1 source,
 feature, fixture, and experiment-document paths have no diff; `git diff --check`
 is clean. No V2 evaluation or durable receipt/result was created.
+
+## Final hardening round 9
+
+### Scope and implementation
+
+- Replaced recovery-path patching for non-frozen defender code with a positive
+  language capability policy. Only byte-exact path/SHA-256 source named by the
+  sealed defender/feature manifest retains the audited compatibility surface.
+- Every other defender-reachable module must consist solely of explicitly
+  admitted AST node types, static imports, attributes, and call targets. Lambdas,
+  comprehensions, dunder attributes, dynamic importing/code, arbitrary builtins,
+  introspection modules such as `gc`, and every unlisted capability fail closed.
+- Applied that strict policy through the existing transitive feature/local-package
+  traversal, while retaining exact-hash frozen V1 evaluator-import compatibility.
+- Documented the independent runtime boundary required before any future v2
+  execution: defender code must run in a fresh OS process with no evaluator
+  modules, signing/seed material, module cache, shared Python objects, writable
+  evaluator source, or network. Only preregistration/nonce-bound canonical bytes
+  may cross the process boundary. The read-only verifier does not claim this
+  execution boundary has run.
+
+### RED evidence
+
+The exact runtime-object probes initially remained admissible:
+
+```text
+.venv/bin/pytest -q tests/evaluation/test_defense_v2_preexecution.py \
+  -k 'runtime_object_graph'
+3 failed, 94 deselected in 0.50s
+```
+
+Those failures were the direct `(lambda: None).__globals__` recovery, bare
+`import gc; gc.get_objects()`, and the same lambda recovery in a transitively
+reachable feature module. After the syntax/import policy was in place, a
+separate arbitrary-builtin capability probe demonstrated that `open(...)` was
+still accepted:
+
+```text
+.venv/bin/pytest -q tests/evaluation/test_defense_v2_preexecution.py \
+  -k 'runtime_object_graph'
+1 failed, 3 passed, 94 deselected in 0.35s
+```
+
+### GREEN evidence
+
+Exact object-graph, introspection-module, file-capability, transitive feature,
+and sealed-root probes:
+
+```text
+.venv/bin/pytest -q tests/evaluation/test_defense_v2_preexecution.py \
+  -k 'runtime_object_graph or signed_preregistration_and_frozen_v1_roots_are_not_executed'
+5 passed, 93 deselected in 1.20s
+```
+
+Complete preexecution scanner, static checks, and read-only verifier:
+
+```text
+.venv/bin/pytest -q tests/evaluation/test_defense_v2_preexecution.py
+98 passed in 9.35s
+
+.venv/bin/ruff check \
+  src/apar/evaluation/v2_preexecution.py \
+  tests/evaluation/test_defense_v2_preexecution.py
+All checks passed!
+
+.venv/bin/mypy src/apar/evaluation/v2_preexecution.py
+Success: no issues found in 1 source file
+
+.venv/bin/python scripts/verify_defense_v2_preexecution.py
+{"admissible":true,"codes":[],"status":"not_executed"}
+```
+
+Complete repository regression suite:
+
+```text
+.venv/bin/pytest -q
+1914 passed, 1 skipped in 557.97s (0:09:17)
+```
+
+`git diff --exit-code` confirmed no changes under `src/apar/defense`,
+`src/apar/features`, `fixtures/defense/v1`, or the three frozen V1 experiment
+documents. `git diff --check` is clean. No V2 evaluation or durable execution
+receipt/result was created.

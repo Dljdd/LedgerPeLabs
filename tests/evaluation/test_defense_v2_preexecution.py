@@ -541,6 +541,46 @@ def test_namespace_and_code_execution_primitives_fail_closed(
     assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
 
 
+@pytest.mark.parametrize(
+    "source",
+    (
+        "namespace = (lambda: None).__globals__\n"
+        "evaluator = namespace['__builtins__']['__import__']('sys').modules[\n"
+        "    'apar.evaluation.v2_preexecution'\n]\n",
+        "import gc\nobjects = gc.get_objects()\n",
+        "secret = open('/evaluator/authority/private-key', 'rb')\n",
+    ),
+)
+def test_runtime_object_graph_recovery_fails_strict_capability_policy(
+    tmp_path: Path, source: str
+) -> None:
+    """Reachable code cannot recover evaluator state from Python runtime objects."""
+    _write_defender_source(tmp_path, source)
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
+def test_transitive_feature_runtime_object_graph_recovery_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """The strict capability policy applies throughout the reachable feature graph."""
+    _write_defender_source(tmp_path, "from apar.features import object_graph\n")
+    features = tmp_path / "src/apar/features"
+    features.mkdir(parents=True)
+    (features / "object_graph.py").write_text(
+        "namespace = (lambda: None).__globals__\n"
+        "evaluator = namespace['__builtins__']['__import__']('sys').modules[\n"
+        "    'apar.evaluation.v2_preexecution'\n]\n",
+        encoding="utf-8",
+    )
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
 def test_transitive_feature_python_symlink_fails_closed(tmp_path: Path) -> None:
     """Reachable Python inventory cannot hide behind a same-content symlink."""
     _write_defender_source(tmp_path, "from apar.features import linked\n")

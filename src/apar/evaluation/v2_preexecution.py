@@ -84,6 +84,102 @@ _FROZEN_SAFE_GETATTR_SOURCES = {
     "apar/defense/bundle.py": "a31a513f7754580ee25f19351c0ad08d54ba4d9641fcad3369f428335ea9a992",
     "apar/features/state.py": "ee189dd341fcfd1f9e758ab5889b37278178a9fedba50c474f5dca829970532e",
 }
+_FROZEN_DEFENDER_SOURCE_SHA256 = {
+    "apar/defense/__init__.py": "8b9f9087080ae482d0a4eaebf2203b6d71ad3b3bae3438d31a33c0cc3293d6d6",
+    "apar/defense/bundle.py": "a31a513f7754580ee25f19351c0ad08d54ba4d9641fcad3369f428335ea9a992",
+    "apar/defense/calibration.py": (
+        "cfc37e5ecc00caa0250c5d64f5817c2102ca0a67dd06cdb117363a06b905ac8f"
+    ),
+    "apar/defense/contracts.py": (
+        "3dc2407f176c20b8afd3985859aabaf3818d74dac7c104e5f7e6c1c38cb44e53"
+    ),
+    "apar/defense/gbdt.py": "f715a3186106a6a53caf8fd8b4e40e7913f000aff1710b210481a9fa49db35aa",
+    "apar/defense/orchestration.py": (
+        "a3c72342a20afc7fab257137584d0509e0e276415e3552c17559db613687ba69"
+    ),
+    "apar/defense/policy.py": "003b16bb366fb43751c00f65faa18bbc4582d2f820eccdae1510c5ed2c731391",
+    "apar/defense/rules.py": "d41f60168ea6d9a07a5705f377addcaaaa54465a8fc3baf59a19d93bd8585aaf",
+    "apar/defense/thresholds.py": (
+        "761455996886d89acec1392a16c826bc74231b7d8bee1d128e6bddd8fdb2734c"
+    ),
+    "apar/features/__init__.py": "e6e294bf20a5fabba6e8a8068e2ed9d81d62d96427714dbebdf53acf02aa2657",
+    "apar/features/builders.py": "9d8b29bceb4bd752c402073db07724a5d8a8795fe0b6746448802cf84319a031",
+    "apar/features/catalog.py": "b58382fa4530a12fad7c614fc9107f30be0495f1f18a42e8ca01f476b0bd2a6d",
+    "apar/features/parity.py": "36ad87aae7dbbbb3238321a766135ab4230c1b88072d3ab41762638bfb42f029",
+    "apar/features/state.py": "ee189dd341fcfd1f9e758ab5889b37278178a9fedba50c474f5dca829970532e",
+}
+_STRICT_DEFENDER_IMPORTS = frozenset(
+    {
+        "__future__",
+        "datetime",
+        "decimal",
+        "enum",
+        "pydantic",
+        "re",
+        "typing",
+        "uuid",
+        "apar.evaluation.v2_protocol",
+    }
+)
+_STRICT_DEFENDER_IMPORT_PREFIXES = ("apar.contracts", "apar.features")
+_STRICT_DEFENDER_ATTRIBUTES = frozenset(
+    {
+        "amount",
+        "available_at",
+        "compile",
+        "decision_at",
+        "event_time",
+        "fullmatch",
+        "group",
+        "ingested_at",
+        "tzinfo",
+        "tzname",
+        "utcoffset",
+    }
+)
+_STRICT_DEFENDER_AST_NODES = frozenset(
+    {
+        ast.And,
+        ast.AnnAssign,
+        ast.Assert,
+        ast.Assign,
+        ast.Attribute,
+        ast.BinOp,
+        ast.BitOr,
+        ast.BoolOp,
+        ast.Call,
+        ast.ClassDef,
+        ast.Compare,
+        ast.Constant,
+        ast.ExceptHandler,
+        ast.Expr,
+        ast.FormattedValue,
+        ast.FunctionDef,
+        ast.If,
+        ast.IfExp,
+        ast.Import,
+        ast.ImportFrom,
+        ast.Is,
+        ast.IsNot,
+        ast.JoinedStr,
+        ast.Load,
+        ast.Lt,
+        ast.Module,
+        ast.Name,
+        ast.NotEq,
+        ast.Or,
+        ast.Raise,
+        ast.Return,
+        ast.Store,
+        ast.Subscript,
+        ast.Try,
+        ast.Tuple,
+        ast.alias,
+        ast.arg,
+        ast.arguments,
+        ast.keyword,
+    }
+)
 _FROZEN_V1_EVALUATION_IMPORTS = frozenset(
     {
         ("bundle.py", "apar.evaluation.splits"),
@@ -418,7 +514,12 @@ def verify_no_v2_execution_receipt(root: Path) -> PreexecutionCheck:
 
 
 def verify_import_boundary(root: Path, *, forbidden: str, allowed_prefix: str) -> PreexecutionCheck:
-    """Check all local modules reachable from defender code without importing them."""
+    """Apply the sealed-source/strict-capability policy without importing code.
+
+    This is admission defense in depth, not a Python sandbox.  The v2 execution
+    contract additionally requires a separate defender process with no evaluator
+    modules, authority secrets, or shared Python objects in its address space.
+    """
     project_source = root / "src"
     defender_root = project_source / "apar" / "defense"
     try:
@@ -502,6 +603,10 @@ def _contains_disallowed_import(
 ) -> bool:
     raw_source = path.read_bytes()
     tree = ast.parse(raw_source.decode("utf-8"), filename=str(path))
+    if not _is_frozen_defender_source(path, project_source, raw_source) and (
+        _violates_strict_defender_capabilities(tree, path, project_source)
+    ):
+        return True
     allowed_primitives = _frozen_primitive_allowlist(path, project_source, raw_source)
     (
         importlib_aliases,
@@ -565,6 +670,65 @@ def _contains_disallowed_import(
             ):
                 return True
     return False
+
+
+def _is_frozen_defender_source(
+    path: Path, project_source: Path, raw_source: bytes
+) -> bool:
+    """Recognize only the byte-exact source frozen by the sealed v2 manifest."""
+    try:
+        relative = path.relative_to(project_source).as_posix()
+    except ValueError:
+        return False
+    expected = _FROZEN_DEFENDER_SOURCE_SHA256.get(relative)
+    return expected is not None and hashlib.sha256(raw_source).hexdigest() == expected
+
+
+def _violates_strict_defender_capabilities(
+    tree: ast.AST, path: Path, project_source: Path
+) -> bool:
+    """Admit non-frozen code only within a small, positive Python capability set."""
+    callable_names = {"ValueError"}
+    callable_names.update(
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef))
+    )
+    callable_names.update(
+        name.asname or name.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        for name in node.names
+        if name.name != "*"
+    )
+    for node in ast.walk(tree):
+        if type(node) not in _STRICT_DEFENDER_AST_NODES:
+            return True
+        if isinstance(node, ast.Attribute) and node.attr not in _STRICT_DEFENDER_ATTRIBUTES:
+            return True
+        if isinstance(node, ast.Call) and (
+            not isinstance(node.func, (ast.Name, ast.Attribute))
+            or (isinstance(node.func, ast.Name) and node.func.id not in callable_names)
+        ):
+            return True
+        if isinstance(node, ast.Import) and any(
+            not _is_strict_defender_import(name.name) for name in node.names
+        ):
+            return True
+        if isinstance(node, ast.ImportFrom):
+            if any(name.name == "*" for name in node.names):
+                return True
+            targets = _resolved_import_targets(node, path, project_source)
+            if not targets or any(not _is_strict_defender_import(item) for item in targets):
+                return True
+    return False
+
+
+def _is_strict_defender_import(module: str) -> bool:
+    return module in _STRICT_DEFENDER_IMPORTS or any(
+        module == prefix or module.startswith(f"{prefix}.")
+        for prefix in _STRICT_DEFENDER_IMPORT_PREFIXES
+    )
 
 
 def _frozen_primitive_allowlist(

@@ -267,6 +267,28 @@ feature provenance is past-only, that all arms have identical non-decision
 inputs, that no evaluator-only import is reachable from defender code, and that
 no v2 artifact already exists under the proposed protocol identifier.
 
+### 10.1 Defender language and process boundary
+
+Source admission is a positive capability policy, not a claim that Python can
+be sandboxed by a denylist. The byte-exact defender and feature files named by
+the sealed source manifest retain their audited frozen compatibility surface.
+Every other defender-reachable Python file must use only the verifier's explicit
+AST-node, attribute, and static-import allowlists. Dynamic imports, lambdas,
+dunder access, runtime-introspection modules, reflection, dynamic code, and any
+syntax or capability absent from those allowlists fail admission. The same rule
+applies transitively to reachable feature and local package modules.
+
+An eventual v2 evaluator must also enforce an operating-system process boundary:
+defender code runs in a fresh process whose address space has never loaded
+evaluator modules and which has no evaluator signing key, seed material, receipt
+store, module cache, writable evaluator source, or network access. No Python
+object, pickle, file descriptor, shared memory, callback, or module reference may
+cross that boundary. Inputs and outputs cross only as canonical JSON/CSV bytes
+whose digests bind the sealed preregistration ID and execution nonce; the
+evaluator verifies inbound digests and signs outbound receipts and scorecards.
+The present repository performs only read-only pre-execution admission, so it
+does not claim that this runtime isolation has occurred or that v2 was executed.
+
 ## 11. Scorecard contracts
 
 V2 introduces versioned, canonical output contracts rather than changing v1
