@@ -271,9 +271,13 @@ no v2 artifact already exists under the proposed protocol identifier.
 
 Source admission is a positive capability policy, not a claim that Python can
 be sandboxed by a denylist. The byte-exact defender and feature files named by
-the sealed source manifest retain their audited frozen compatibility surface.
-Every other defender-reachable Python file must use only the verifier's explicit
-AST-node, attribute, and static-import allowlists. Dynamic imports, lambdas,
+the sealed source manifest, plus the verifier-pinned data-contract dependencies,
+retain their audited frozen compatibility surface. Non-frozen code may import
+only the exact public data-contract modules, feature namespace, and v2 protocol
+contract named by the verifier; every allowed local import is scanned
+recursively. Every other defender-reachable Python file must use only the
+verifier's explicit AST-node, attribute, and static-import allowlists. Dynamic
+imports, lambdas,
 dunder access, runtime-introspection modules, reflection, dynamic code, and any
 syntax or capability absent from those allowlists fail admission. The same rule
 applies transitively to reachable feature and local package modules.

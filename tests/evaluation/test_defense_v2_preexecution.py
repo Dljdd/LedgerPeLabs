@@ -581,6 +581,56 @@ def test_transitive_feature_runtime_object_graph_recovery_fails_closed(
     assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
 
 
+def test_direct_contract_dependency_runtime_recovery_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """Every allowed local APAR import enters the transitive capability scan."""
+    _write_defender_source(tmp_path, "from apar.contracts import evil\n")
+    contracts = tmp_path / "src/apar/contracts"
+    contracts.mkdir(parents=True)
+    (contracts / "evil.py").write_text(
+        "namespace = (lambda: None).__globals__\n"
+        "evaluator = namespace['__builtins__']['__import__']('sys').modules[\n"
+        "    'apar.evaluation.v2_preexecution'\n]\n",
+        encoding="utf-8",
+    )
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
+def test_allowed_contract_dependency_is_scanned_transitively(tmp_path: Path) -> None:
+    """An approved data-contract module is still capability-checked recursively."""
+    _write_defender_source(tmp_path, "from apar.contracts.events import PaymentEvent\n")
+    contracts = tmp_path / "src/apar/contracts"
+    contracts.mkdir(parents=True)
+    (contracts / "events.py").write_text(
+        "namespace = (lambda: None).__globals__\n",
+        encoding="utf-8",
+    )
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
+def test_allowed_contract_package_initializer_is_scanned(tmp_path: Path) -> None:
+    """Import traversal includes each executable local package initializer."""
+    _write_defender_source(tmp_path, "from apar.contracts.events import PaymentEvent\n")
+    contracts = tmp_path / "src/apar/contracts"
+    contracts.mkdir(parents=True)
+    (contracts / "__init__.py").write_text(
+        "namespace = (lambda: None).__globals__\n",
+        encoding="utf-8",
+    )
+    (contracts / "events.py").write_text("PaymentEvent = object\n", encoding="utf-8")
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
 def test_transitive_feature_python_symlink_fails_closed(tmp_path: Path) -> None:
     """Reachable Python inventory cannot hide behind a same-content symlink."""
     _write_defender_source(tmp_path, "from apar.features import linked\n")

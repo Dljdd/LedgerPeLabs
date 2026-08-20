@@ -920,3 +920,74 @@ Complete repository regression suite:
 `src/apar/features`, `fixtures/defense/v1`, or the three frozen V1 experiment
 documents. `git diff --check` is clean. No V2 evaluation or durable execution
 receipt/result was created.
+
+## Final hardening round 10
+
+### Scope and implementation
+
+- Narrowed the non-frozen local import surface from broad `apar.contracts.*`
+  admission to the exact public `_validation`, `decisions`, `events`, and
+  `scenarios` data-contract modules, the feature namespace, and public v2
+  protocol contract.
+- Made every admitted local contract/feature import enter recursive capability
+  traversal. The traversal includes each executable parent-package
+  `__init__.py`, the leaf module, and every subsequent local dependency.
+- Path/SHA-pinned the audited current contract package and exact data-contract
+  modules. Any new or modified contract loses compatibility status and must pass
+  the strict positive AST/import/attribute/call policy.
+- Kept evaluator namespaces terminal and forbidden rather than recursively
+  scanning irrelevant evaluator implementation modules.
+
+### RED evidence
+
+A direct broadly admitted local contract initially executed without traversal:
+
+```text
+.venv/bin/pytest -q tests/evaluation/test_defense_v2_preexecution.py \
+  -k direct_contract_dependency_runtime_recovery
+1 failed, 98 deselected in 0.40s
+```
+
+An approved exact data-contract import also initially skipped its modified leaf,
+and then its executable package initializer:
+
+```text
+.venv/bin/pytest -q tests/evaluation/test_defense_v2_preexecution.py \
+  -k allowed_contract_dependency_is_scanned_transitively
+1 failed, 99 deselected in 2.75s
+
+.venv/bin/pytest -q tests/evaluation/test_defense_v2_preexecution.py \
+  -k allowed_contract_package_initializer_is_scanned
+1 failed, 100 deselected in 0.34s
+```
+
+### GREEN evidence
+
+Complete preexecution scanner, static checks, and read-only verifier:
+
+```text
+.venv/bin/pytest -q tests/evaluation/test_defense_v2_preexecution.py
+101 passed in 9.00s
+
+.venv/bin/ruff check \
+  src/apar/evaluation/v2_preexecution.py \
+  tests/evaluation/test_defense_v2_preexecution.py
+All checks passed!
+
+.venv/bin/mypy src/apar/evaluation/v2_preexecution.py
+Success: no issues found in 1 source file
+
+.venv/bin/python scripts/verify_defense_v2_preexecution.py
+{"admissible":true,"codes":[],"status":"not_executed"}
+```
+
+Complete repository regression suite:
+
+```text
+.venv/bin/pytest -q
+1917 passed, 1 skipped in 563.17s (0:09:23)
+```
+
+Frozen V1 source, feature, fixture, and experiment-document paths have no diff;
+`git diff --check` is clean. No V2 evaluation or durable receipt/result was
+created.

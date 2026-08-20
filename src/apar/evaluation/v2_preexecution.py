@@ -85,6 +85,21 @@ _FROZEN_SAFE_GETATTR_SOURCES = {
     "apar/features/state.py": "ee189dd341fcfd1f9e758ab5889b37278178a9fedba50c474f5dca829970532e",
 }
 _FROZEN_DEFENDER_SOURCE_SHA256 = {
+    "apar/contracts/__init__.py": (
+        "1fb8d299efe37e76d12ae1c6da66223d8976e4861c5f6e02e773b68ca5f565f1"
+    ),
+    "apar/contracts/_validation.py": (
+        "83d5234e59b3dd5b003562b12fd09850008ea3a5535c462d349b2b7874766a64"
+    ),
+    "apar/contracts/decisions.py": (
+        "62ae405e57f0235af60ba0376be7e2f4784843a1112aade8b00134ddd39241f8"
+    ),
+    "apar/contracts/events.py": (
+        "93ef74802a57e0af536f6393f7e5ab1c9bdc49e26e615cb7aa1889001d8da960"
+    ),
+    "apar/contracts/scenarios.py": (
+        "e690e2bf14a4163e3a20dffba28b54abd96ec83de96bf576458dc35bce31ee28"
+    ),
     "apar/defense/__init__.py": "8b9f9087080ae482d0a4eaebf2203b6d71ad3b3bae3438d31a33c0cc3293d6d6",
     "apar/defense/bundle.py": "a31a513f7754580ee25f19351c0ad08d54ba4d9641fcad3369f428335ea9a992",
     "apar/defense/calibration.py": (
@@ -118,10 +133,14 @@ _STRICT_DEFENDER_IMPORTS = frozenset(
         "re",
         "typing",
         "uuid",
+        "apar.contracts._validation",
+        "apar.contracts.decisions",
+        "apar.contracts.events",
+        "apar.contracts.scenarios",
         "apar.evaluation.v2_protocol",
     }
 )
-_STRICT_DEFENDER_IMPORT_PREFIXES = ("apar.contracts", "apar.features")
+_STRICT_DEFENDER_IMPORT_PREFIXES = ("apar.features",)
 _STRICT_DEFENDER_ATTRIBUTES = frozenset(
     {
         "amount",
@@ -545,7 +564,7 @@ def verify_import_boundary(root: Path, *, forbidden: str, allowed_prefix: str) -
                 if module == "apar.evaluation" or module.startswith("apar.evaluation."):
                     continue
                 is_feature = module == "apar.features" or module.startswith("apar.features.")
-                if traverse_dependencies or is_feature:
+                if traverse_dependencies or is_feature or _is_strict_defender_import(module):
                     pending.extend(
                         (target, True) for target in _local_module_paths(project_source, module)
                     )
@@ -1320,12 +1339,17 @@ def _local_import_targets(tree: ast.AST, path: Path, project_source: Path) -> tu
 
 
 def _local_module_paths(project_source: Path, module: str) -> tuple[Path, ...]:
-    relative = Path(*module.split("."))
-    candidates = (
+    parts = module.split(".")
+    relative = Path(*parts)
+    package_initializers = tuple(
+        project_source / Path(*parts[:index]) / "__init__.py"
+        for index in range(1, len(parts))
+    )
+    candidates = (*package_initializers,
         project_source / relative.with_suffix(".py"),
         project_source / relative / "__init__.py",
     )
-    return tuple(path for path in candidates if path.is_file())
+    return tuple(dict.fromkeys(path for path in candidates if path.is_file()))
 
 
 def _has_importlib_root(
