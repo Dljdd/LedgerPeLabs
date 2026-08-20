@@ -9,7 +9,11 @@ from pathlib import Path
 
 import pytest
 
-from apar.evaluation.v2_preexecution import verify_manifest_registry, verify_v2_preexecution
+from apar.evaluation.v2_preexecution import (
+    verify_manifest_registry,
+    verify_v2_authority,
+    verify_v2_preexecution,
+)
 from apar.evaluation.v2_preregistration import V2Preregistration, sign_v2_preregistration
 from apar.runs.wire import canonical_json_bytes
 from tests.evaluation.v2_authority import ephemeral_v2_authority
@@ -31,6 +35,13 @@ def test_signed_preregistration_and_frozen_v1_roots_are_not_executed() -> None:
     report = verify_v2_preexecution(ROOT, signed_preregistration())
 
     assert (report.status, report.codes) == ("not_executed", ())
+
+
+def test_trusted_preexecution_verifier_mints_opaque_authority() -> None:
+    """Only the complete pinned preexecution verification can issue production trust."""
+    authority = verify_v2_authority(ROOT, signed_preregistration())
+
+    assert type(authority).__name__ == "V2VerifiedAuthority"
 
 
 def test_hidden_import_in_defender_fails_preexecution(tmp_path: Path) -> None:
@@ -230,6 +241,28 @@ def test_variable_reflective_authority_access_fails_closed(
     assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
 
 
+@pytest.mark.parametrize(
+    "source",
+    (
+        "import builtins\nattribute_name = '__import__'\n"
+        "builtins.getattr(builtins, attribute_name)\n",
+        "import builtins as runtime\nkey = '__import__'\n"
+        "runtime.vars(runtime)[key]\n",
+        "import builtins as runtime\nlookup = runtime.getattr\n"
+        "attribute_name = '__import__'\nlookup(runtime, attribute_name)\n",
+        "import builtins as runtime\nnamespace = runtime.vars\n"
+        "key = '__import__'\nnamespace(runtime)[key]\n",
+    ),
+)
+def test_qualified_builtins_reflection_fails_closed(tmp_path: Path, source: str) -> None:
+    """Qualified builtins getattr/vars calls and aliases remain authority reflection."""
+    _write_defender_source(tmp_path, source)
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
 def test_transitive_defender_feature_import_is_scanned(tmp_path: Path) -> None:
     """A hidden import in a defender-reachable feature module must fail closed."""
     _write_defender_source(tmp_path, "from apar.features import bridge\n")
@@ -308,6 +341,26 @@ def test_transitive_feature_variable_reflection_fails_closed(tmp_path: Path) -> 
         "import importlib as loader\n"
         "method_name = 'import_module'\n"
         "lookup(namespace(loader), method_name)\n",
+        encoding="utf-8",
+    )
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
+def test_transitive_feature_qualified_builtins_reflection_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """Qualified builtins reflection remains forbidden in reachable feature code."""
+    _write_defender_source(tmp_path, "from apar.features import qualified_reflection\n")
+    features = tmp_path / "src/apar/features"
+    features.mkdir(parents=True)
+    (features / "qualified_reflection.py").write_text(
+        "import builtins as runtime\n"
+        "lookup = runtime.getattr\n"
+        "attribute_name = '__import__'\n"
+        "lookup(runtime, attribute_name)\n",
         encoding="utf-8",
     )
 

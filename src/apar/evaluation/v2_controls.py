@@ -22,7 +22,11 @@ from apar.contracts._validation import ExternalContract
 from apar.contracts.decisions import Action
 from apar.evaluation.contracts import EvaluationTruthRow
 from apar.evaluation.gates import EvaluatorSigningIdentity
-from apar.evaluation.v2_preregistration import V2Preregistration
+from apar.evaluation.v2_preregistration import (
+    V2Preregistration,
+    V2VerifiedAuthority,
+    _verified_v2_preregistration,
+)
 from apar.runs.wire import canonical_json_bytes
 
 
@@ -99,7 +103,7 @@ class V2ControlContext(ExternalContract):
         cls,
         preregistration: V2Preregistration,
         *,
-        sealed_preregistration: V2Preregistration,
+        verified_authority: V2VerifiedAuthority,
         arm: Literal["rules_only", "gbdt_only", "layered_hybrid"],
         candidate_id: str,
         input_digest: str,
@@ -110,13 +114,14 @@ class V2ControlContext(ExternalContract):
             candidate_id=candidate_id,
             input_digest=input_digest,
         )
-        if not context.matches_sealed_preregistration(sealed_preregistration):
-            raise V2ControlError("control context does not match sealed preregistration")
+        if not context.matches_verified_authority(verified_authority):
+            raise V2ControlError("control context does not match verified authority")
         return context
 
-    def matches_sealed_preregistration(self, sealed: V2Preregistration) -> bool:
-        """Check the independent trust root and its exact evaluator public identity."""
+    def matches_verified_authority(self, authority: object) -> bool:
+        """Check opaque verifier-issued trust and its exact evaluator identity."""
         try:
+            sealed = _verified_v2_preregistration(authority)
             return (
                 type(sealed) is V2Preregistration
                 and self.preregistration.matches_sealed_preregistration(sealed)
@@ -212,24 +217,24 @@ class ControlValidity(ExternalContract):
     def valid_for(
         self,
         *,
-        sealed_preregistration: V2Preregistration,
+        verified_authority: V2VerifiedAuthority,
         expected_context: V2ControlContext,
     ) -> bool:
         """Return true only when both attestations match the exact candidate context."""
         try:
             return (
-                type(sealed_preregistration) is V2Preregistration
+                type(verified_authority) is V2VerifiedAuthority
                 and type(expected_context) is V2ControlContext
                 and type(self.benign_only) is ControlResult
                 and type(self.score_permutation) is ControlResult
                 and admit_control_result(
                     self.benign_only,
-                    sealed_preregistration=sealed_preregistration,
+                    verified_authority=verified_authority,
                     expected_context=expected_context,
                 ).valid
                 and admit_control_result(
                     self.score_permutation,
-                    sealed_preregistration=sealed_preregistration,
+                    verified_authority=verified_authority,
                     expected_context=expected_context,
                 ).valid
             )
@@ -262,7 +267,7 @@ ControlEvaluator = Callable[[np.ndarray, tuple[EvaluationTruthRow, ...], tuple[s
 def admit_control_result(
     control: ControlResult,
     *,
-    sealed_preregistration: V2Preregistration,
+    verified_authority: V2VerifiedAuthority,
     expected_context: V2ControlContext,
 ) -> ControlAdmission:
     """Convert a control result into a load-bearing whole-run admission."""
@@ -277,10 +282,11 @@ def admit_control_result(
         return ControlAdmission(
             valid=False, status="no_promotion", reason="invalid_control_attestation"
         )
+    sealed_preregistration = _verified_v2_preregistration(verified_authority)
     if (
         type(sealed_preregistration) is not V2Preregistration
         or type(expected_context) is not V2ControlContext
-        or not context.matches_sealed_preregistration(sealed_preregistration)
+        or not context.matches_verified_authority(verified_authority)
         or checked.binding != context.binding()
         or checked.binding.evaluator_key_id != sealed_preregistration.evaluator_key_id
         or checked.binding.evaluator_public_key_base64

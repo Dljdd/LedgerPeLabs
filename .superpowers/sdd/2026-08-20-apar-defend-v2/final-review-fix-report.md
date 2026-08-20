@@ -396,3 +396,97 @@ Complete repository regression suite:
 `git diff --exit-code` confirmed no change beneath the frozen V1 source, feature,
 fixture, or experiment-document paths. `git diff --check` was clean. No V2
 evaluation or durable execution receipt/result was created.
+
+## Final hardening round 4
+
+### Scope and implementation
+
+- Replaced the caller-supplied sealed-preregistration parameter with
+  `V2VerifiedAuthority`, an opaque process-local capability. Its public constructor
+  raises, it has no serializable authority fields, and only live objects recorded
+  by the verifier's private weak registry resolve to a trusted preregistration.
+- Added `verify_v2_authority(root, preregistration)` as the production issuance
+  boundary. It mints a capability only after the complete pinned preexecution suite
+  verifies the committed authority, profile, manifests, source boundary, V1 roots,
+  and unused execution admission.
+- Control context construction, control admission, gate evaluation, and threshold
+  selection now consume the opaque capability. Passing a self-signed
+  preregistration as both alleged seal and context is no longer an API path and
+  resolves to no authority; unregistered exact-type objects also carry no trust.
+- Extended alias analysis to recognize qualified `builtins.getattr` and
+  `builtins.vars` calls, qualified aliases such as `lookup = runtime.getattr` and
+  `namespace = runtime.vars`, annotated aliases, and their transitive feature use.
+  Non-constant attribute names and mapping keys fail closed.
+
+### RED evidence
+
+Qualified builtins reflection initially bypassed all exact probes:
+
+```text
+.venv/bin/pytest tests/evaluation/test_defense_v2_preexecution.py \
+  -q -k qualified_builtins
+5 failed, 50 deselected in 0.70s
+```
+
+The exact caller-self-sealing exploit also passed every gate before the capability
+change:
+
+```text
+.venv/bin/pytest tests/evaluation/test_defense_v2_selection.py \
+  -q -k own_selection_trust_root
+1 failed, 16 deselected in 0.29s
+
+AssertionError: assert 'CONTROL_INVALID' in ()
+```
+
+Finally, the first opacity/issuer probes failed collection because neither the
+capability nor the trusted verifier issuance API existed:
+
+```text
+ImportError: cannot import name 'V2VerifiedAuthority'
+ImportError: cannot import name 'verify_v2_authority'
+2 errors during collection
+```
+
+### GREEN evidence
+
+Focused V2 contracts and API regression:
+
+```text
+.venv/bin/pytest \
+  tests/evaluation/test_defense_v2_preregistration.py \
+  tests/evaluation/test_defense_v2_preexecution.py \
+  tests/evaluation/test_defense_v2_controls.py \
+  tests/evaluation/test_defense_v2_selection.py \
+  tests/evaluation/test_defense_v2_reporting.py \
+  tests/integration/test_defense_v2_preexecution.py \
+  tests/api/test_defense.py -q
+130 passed in 57.97s
+```
+
+Static and read-only admission verification:
+
+```text
+.venv/bin/ruff check <round-4 changed Python source and tests>
+All checks passed!
+
+.venv/bin/mypy \
+  src/apar/evaluation/v2_preregistration.py \
+  src/apar/evaluation/v2_preexecution.py \
+  src/apar/evaluation/v2_controls.py \
+  src/apar/evaluation/v2_selection.py
+Success: no issues found in 4 source files
+
+.venv/bin/python scripts/verify_defense_v2_preexecution.py
+{"admissible":true,"codes":[],"status":"not_executed"}
+```
+
+Complete repository regression suite:
+
+```text
+.venv/bin/pytest -q
+1869 passed, 1 skipped in 478.51s (0:07:58)
+```
+
+Frozen V1 source, feature, fixture, and experiment-document paths remain unchanged;
+`git diff --check` is clean. No V2 evaluation or durable receipt/result was created.

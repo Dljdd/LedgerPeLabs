@@ -10,6 +10,7 @@ from apar.evaluation.v2_preregistration import (
     ExecutionReceipt,
     V2Preregistration,
     V2PreregistrationError,
+    V2VerifiedAuthority,
     admit_v2_execution,
     sign_v2_preregistration,
 )
@@ -24,6 +25,12 @@ def test_missing_seed_commitments_is_rejected() -> None:
 
     with pytest.raises(V2PreregistrationError, match="seed_commitments"):
         V2Preregistration.model_validate(payload)
+
+
+def test_verified_authority_capability_has_no_public_constructor() -> None:
+    """A caller cannot mint the opaque preexecution trust capability."""
+    with pytest.raises(TypeError, match="trusted verifier"):
+        V2VerifiedAuthority()
 
 
 def test_missing_committed_protocol_profile_binding_is_rejected() -> None:

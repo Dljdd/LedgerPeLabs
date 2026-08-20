@@ -33,6 +33,28 @@ from apar.evaluation.v2_selection import (
 from tests.evaluation.v2_authority import EphemeralV2Authority, ephemeral_v2_authority
 
 AUTHORITY = ephemeral_v2_authority()
+
+
+def test_self_signed_preregistration_cannot_be_its_own_selection_trust_root() -> None:
+    """Passing one outsider object as both seal and context cannot authorize controls."""
+    evidence, copied = outsider_control_evidence("self-sealed-copy")
+    context = V2ControlContext(
+        preregistration=copied,
+        arm="layered_hybrid",
+        candidate_id=evidence.candidate_id,
+        input_digest="b" * 64,
+    )
+
+    outcome = evaluate_v2_gates(
+        evidence,
+        protocol(),
+        verified_authority=copied,
+        control_context=context,
+    )
+
+    assert "CONTROL_INVALID" in outcome.codes
+
+
 def test_outsider_self_signed_copy_cannot_supply_selection_trust() -> None:
     """Copied trusted fields signed by an outsider are not sealed control authority."""
     outsider, copied = copied_outsider_preregistration()
@@ -73,7 +95,7 @@ def test_outsider_self_signed_copy_cannot_supply_selection_trust() -> None:
     outcome = evaluate_v2_gates(
         evidence,
         protocol(),
-        sealed_preregistration=AUTHORITY.preregistration,
+        verified_authority=AUTHORITY.verified_authority,
         control_context=control_context(candidate_id),
     )
 
@@ -84,10 +106,10 @@ def test_outsider_self_signed_copy_cannot_create_trusted_context() -> None:
     """Context construction compares a presented preregistration to the sealed root."""
     _, copied = copied_outsider_preregistration()
 
-    with pytest.raises(V2ControlError, match="sealed preregistration"):
+    with pytest.raises(V2ControlError, match="verified authority"):
         V2ControlContext.from_preregistration(
             copied,
-            sealed_preregistration=AUTHORITY.preregistration,
+            verified_authority=AUTHORITY.verified_authority,
             arm="layered_hybrid",
             candidate_id="outsider-context",
             input_digest="b" * 64,
@@ -105,7 +127,7 @@ def test_selection_rejects_wrong_independent_arm_or_input(
     evidence = candidate("context-mismatch")
     context = V2ControlContext.from_preregistration(
         AUTHORITY.preregistration,
-        sealed_preregistration=AUTHORITY.preregistration,
+        verified_authority=AUTHORITY.verified_authority,
         arm=arm,
         candidate_id=evidence.candidate_id,
         input_digest=input_digest,
@@ -114,7 +136,7 @@ def test_selection_rejects_wrong_independent_arm_or_input(
     outcome = evaluate_v2_gates(
         evidence,
         protocol(),
-        sealed_preregistration=AUTHORITY.preregistration,
+        verified_authority=AUTHORITY.verified_authority,
         control_context=context,
     )
 
@@ -125,7 +147,7 @@ def test_high_stratum_review_failure_rejects_candidate() -> None:
     result = select_v2_thresholds(
         (candidate("safe"), candidate("high-review", high_review_rate=0.0101)),
         protocol(),
-        sealed_preregistration=AUTHORITY.preregistration,
+        verified_authority=AUTHORITY.verified_authority,
         control_contexts={
             name: control_context(name) for name in ("safe", "high-review")
         },
@@ -148,7 +170,7 @@ def test_every_family_requires_value_and_alert_bounds() -> None:
     outcome = evaluate_v2_gates(
         candidate("late-alert", family_time=bounded(299.0, lower=270.0, upper=301.0)),
         protocol(),
-        sealed_preregistration=AUTHORITY.preregistration,
+        verified_authority=AUTHORITY.verified_authority,
         control_context=control_context("late-alert"),
     )
 
@@ -160,7 +182,7 @@ def test_invalid_typed_control_vetoes_an_otherwise_safe_candidate() -> None:
     outcome = evaluate_v2_gates(
         candidate("invalid-control", control_valid=False),
         protocol(),
-        sealed_preregistration=AUTHORITY.preregistration,
+        verified_authority=AUTHORITY.verified_authority,
         control_context=control_context("invalid-control"),
     )
 
@@ -176,7 +198,7 @@ def test_forged_valid_control_cannot_pass_selection() -> None:
     outcome = evaluate_v2_gates(
         evidence,
         protocol(),
-        sealed_preregistration=AUTHORITY.preregistration,
+        verified_authority=AUTHORITY.verified_authority,
         control_context=control_context("forged-control"),
     )
 
@@ -192,7 +214,7 @@ def test_control_results_cannot_replay_between_candidates() -> None:
     outcome = evaluate_v2_gates(
         replayed,
         protocol(),
-        sealed_preregistration=AUTHORITY.preregistration,
+        verified_authority=AUTHORITY.verified_authority,
         control_context=control_context("candidate-b"),
     )
 
@@ -204,7 +226,7 @@ def test_undefined_metric_fails_closed() -> None:
     outcome = evaluate_v2_gates(
         candidate("undefined", ece=BoundedMetric.undefined(numerator=0.0, denominator=0.0)),
         protocol(),
-        sealed_preregistration=AUTHORITY.preregistration,
+        verified_authority=AUTHORITY.verified_authority,
         control_context=control_context("undefined"),
     )
 
@@ -216,13 +238,13 @@ def test_zero_or_non_2000_bootstrap_replicates_fail_closed() -> None:
     zero = evaluate_v2_gates(
         candidate("zero-bootstrap", ece=bootstrap_bounded(0.05, replicates=0)),
         protocol(),
-        sealed_preregistration=AUTHORITY.preregistration,
+        verified_authority=AUTHORITY.verified_authority,
         control_context=control_context("zero-bootstrap"),
     )
     wrong_count = evaluate_v2_gates(
         candidate("wrong-bootstrap", ece=bootstrap_bounded(0.05, replicates=1_999)),
         protocol(),
-        sealed_preregistration=AUTHORITY.preregistration,
+        verified_authority=AUTHORITY.verified_authority,
         control_context=control_context("wrong-bootstrap"),
     )
 
@@ -237,7 +259,7 @@ def test_partially_undefined_bootstrap_distribution_fails_closed() -> None:
             ece=bootstrap_bounded(0.05, replicates=2_000, undefined_replicates=1),
         ),
         protocol(),
-        sealed_preregistration=AUTHORITY.preregistration,
+        verified_authority=AUTHORITY.verified_authority,
         control_context=control_context("partially-undefined-bootstrap"),
     )
 
@@ -249,7 +271,7 @@ def test_tie_break_is_stable_and_lexicographic_after_matched_gates() -> None:
     result = select_v2_thresholds(
         (candidate("later", thresholds=(0.3, 0.8)), candidate("first", thresholds=(0.2, 0.9))),
         protocol(),
-        sealed_preregistration=AUTHORITY.preregistration,
+        verified_authority=AUTHORITY.verified_authority,
         control_contexts={name: control_context(name) for name in ("later", "first")},
     )
 
@@ -260,7 +282,7 @@ def test_no_promotion_when_no_candidate_qualifies() -> None:
     result = select_v2_thresholds(
         (candidate("bad", control_valid=False),),
         protocol(),
-        sealed_preregistration=AUTHORITY.preregistration,
+        verified_authority=AUTHORITY.verified_authority,
         control_contexts={"bad": control_context("bad")},
     )
 
@@ -298,7 +320,7 @@ def control_context(
 ) -> V2ControlContext:
     return V2ControlContext.from_preregistration(
         AUTHORITY.preregistration,
-        sealed_preregistration=AUTHORITY.preregistration,
+        verified_authority=AUTHORITY.verified_authority,
         arm=arm,
         candidate_id=candidate_id,
         input_digest=input_digest,
@@ -312,6 +334,45 @@ def copied_outsider_preregistration() -> tuple[EphemeralV2Authority, V2Preregist
         exclude={"evaluator_key_id", "evaluator_public_key_base64", "signature_base64"},
     )
     return outsider, sign_v2_preregistration(payload, signer=outsider.evaluator)
+
+
+def outsider_control_evidence(
+    candidate_id: str,
+) -> tuple[ArmThresholdCandidate, V2Preregistration]:
+    outsider, copied = copied_outsider_preregistration()
+    binding = V2ControlBinding.from_preregistration(
+        copied,
+        arm="layered_hybrid",
+        candidate_id=candidate_id,
+        input_digest="b" * 64,
+    )
+    benign = run_benign_only_control(
+        actions=(Action.APPROVE,),
+        truth=(_control_truth(f"{candidate_id}-benign", fraud=False),),
+        signer=outsider.evaluator,
+        binding=binding,
+    )
+    permutation = run_score_permutation_control(
+        scores=np.array([0.8, 0.2]),
+        truth=(
+            _control_truth(f"{candidate_id}-fraud", fraud=True),
+            _control_truth(f"{candidate_id}-permuted-benign", fraud=False),
+        ),
+        blocks=("case-a", "case-b"),
+        seed=5,
+        evaluator=lambda scores, truth, blocks: False,
+        signer=outsider.evaluator,
+        binding=binding,
+    )
+    evidence = candidate(candidate_id).model_copy(
+        update={
+            "control": ControlValidity.attest(
+                benign_only=benign,
+                score_permutation=permutation,
+            )
+        }
+    )
+    return evidence, copied
 
 
 def bounded(

@@ -29,7 +29,7 @@ CONTROL_BINDING = V2ControlBinding.from_preregistration(
 )
 CONTROL_CONTEXT = V2ControlContext.from_preregistration(
     AUTHORITY.preregistration,
-    sealed_preregistration=AUTHORITY.preregistration,
+    verified_authority=AUTHORITY.verified_authority,
     arm="rules_only",
     candidate_id="candidate-a",
     input_digest="a" * 64,
@@ -104,7 +104,7 @@ def test_invalid_control_is_a_typed_no_promotion_admission() -> None:
     )
     admission = admit_control_result(
         control,
-        sealed_preregistration=AUTHORITY.preregistration,
+        verified_authority=AUTHORITY.verified_authority,
         expected_context=CONTROL_CONTEXT,
     )
     assert (admission.valid, admission.status, admission.reason) == (
@@ -159,7 +159,7 @@ def test_forged_valid_control_cannot_be_admitted() -> None:
     forged = ControlResult.model_construct(valid=True, kind="benign_only", reason=None)
     admission = admit_control_result(
         forged,
-        sealed_preregistration=AUTHORITY.preregistration,
+        verified_authority=AUTHORITY.verified_authority,
         expected_context=CONTROL_CONTEXT,
     )
     assert (admission.valid, admission.status) == (False, "no_promotion")
@@ -192,7 +192,7 @@ def test_invalid_attestation_cannot_be_model_copied_to_valid() -> None:
 
     admission = admit_control_result(
         tampered,
-        sealed_preregistration=AUTHORITY.preregistration,
+        verified_authority=AUTHORITY.verified_authority,
         expected_context=CONTROL_CONTEXT,
     )
 
@@ -235,7 +235,7 @@ def test_control_attestation_cannot_replay_across_execution_bindings() -> None:
         CONTROL_CONTEXT.model_copy(update={"input_digest": "b" * 64}),
         V2ControlContext.from_preregistration(
             other_authority.preregistration,
-            sealed_preregistration=other_authority.preregistration,
+            verified_authority=other_authority.verified_authority,
             arm="rules_only",
             candidate_id="candidate-a",
             input_digest="a" * 64,
@@ -245,7 +245,7 @@ def test_control_attestation_cannot_replay_across_execution_bindings() -> None:
     admissions = tuple(
         admit_control_result(
             result,
-            sealed_preregistration=AUTHORITY.preregistration,
+            verified_authority=AUTHORITY.verified_authority,
             expected_context=alternative,
         )
         for alternative in alternatives

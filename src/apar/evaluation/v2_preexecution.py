@@ -19,6 +19,9 @@ from apar.evaluation.v2_preregistration import (
     SYNTHETIC_NON_CLAIM,
     ExecutionReceipt,
     V2Preregistration,
+    V2PreregistrationError,
+    V2VerifiedAuthority,
+    _issue_verified_v2_authority,
 )
 from apar.evaluation.v2_protocol import load_v2_protocol, verify_v1_roots
 from apar.runs.wire import WireContractError, canonical_json_bytes, strict_json_loads
@@ -97,6 +100,16 @@ def verify_v2_preexecution(root: Path, preregistration: V2Preregistration) -> Pr
             verify_preregistration(root, preregistration),
         )
     )
+
+
+def verify_v2_authority(
+    root: Path, preregistration: V2Preregistration
+) -> V2VerifiedAuthority:
+    """Mint opaque authority only after every pinned preexecution check passes."""
+    report = verify_v2_preexecution(root, preregistration)
+    if not report.admissible:
+        raise V2PreregistrationError("V2 authority failed trusted preexecution verification")
+    return _issue_verified_v2_authority(preregistration)
 
 
 def verify_protocol_digest(preregistration: object) -> PreexecutionCheck:
@@ -445,13 +458,23 @@ def _has_untrusted_authority_reflection(
     vars_aliases: set[str],
 ) -> bool:
     """Reject reflective authority access unless static syntax proves it absent."""
-    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-        if node.func.id in getattr_aliases and node.args:
+    if isinstance(node, ast.Call):
+        is_getattr = (
+            isinstance(node.func, ast.Name) and node.func.id in getattr_aliases
+        ) or _is_qualified_builtins_function(
+            node.func, builtins_aliases, vars_aliases, "getattr"
+        )
+        is_vars = (
+            isinstance(node.func, ast.Name) and node.func.id in vars_aliases
+        ) or _is_qualified_builtins_function(
+            node.func, builtins_aliases, vars_aliases, "vars"
+        )
+        if is_getattr and node.args:
             root = node.args[0]
             return _has_named_root(root, builtins_aliases, vars_aliases) or _has_importlib_root(
                 root, importlib_aliases, vars_aliases
             )
-        if node.func.id in vars_aliases and len(node.args) == 1:
+        if is_vars and len(node.args) == 1:
             root = node.args[0]
             return _has_named_root(root, builtins_aliases, vars_aliases) or _has_importlib_root(
                 root, importlib_aliases, vars_aliases
@@ -462,6 +485,19 @@ def _has_untrusted_authority_reflection(
             root, importlib_aliases, vars_aliases
         )
     return False
+
+
+def _is_qualified_builtins_function(
+    value: ast.expr,
+    builtins_aliases: set[str],
+    vars_aliases: set[str],
+    function_name: Literal["getattr", "vars"],
+) -> bool:
+    return (
+        isinstance(value, ast.Attribute)
+        and value.attr == function_name
+        and _has_named_root(value.value, builtins_aliases, vars_aliases)
+    )
 
 
 def _import_bindings(
@@ -525,15 +561,21 @@ def _import_bindings(
                     if isinstance(target, ast.Name) and target.id not in import_function_aliases:
                         import_function_aliases.add(target.id)
                         changed = True
-            elif isinstance(node, ast.Assign) and _has_named_root(
-                node.value, getattr_aliases, vars_aliases
+            elif isinstance(node, ast.Assign) and (
+                _has_named_root(node.value, getattr_aliases, vars_aliases)
+                or _is_qualified_builtins_function(
+                    node.value, builtins_aliases, vars_aliases, "getattr"
+                )
             ):
                 for target in node.targets:
                     if isinstance(target, ast.Name) and target.id not in getattr_aliases:
                         getattr_aliases.add(target.id)
                         changed = True
-            elif isinstance(node, ast.Assign) and _has_named_root(
-                node.value, vars_aliases, vars_aliases
+            elif isinstance(node, ast.Assign) and (
+                _has_named_root(node.value, vars_aliases, vars_aliases)
+                or _is_qualified_builtins_function(
+                    node.value, builtins_aliases, vars_aliases, "vars"
+                )
             ):
                 for target in node.targets:
                     if isinstance(target, ast.Name) and target.id not in vars_aliases:
@@ -577,7 +619,12 @@ def _import_bindings(
                 isinstance(node, ast.AnnAssign)
                 and node.value is not None
                 and isinstance(node.target, ast.Name)
-                and _has_named_root(node.value, getattr_aliases, vars_aliases)
+                and (
+                    _has_named_root(node.value, getattr_aliases, vars_aliases)
+                    or _is_qualified_builtins_function(
+                        node.value, builtins_aliases, vars_aliases, "getattr"
+                    )
+                )
                 and node.target.id not in getattr_aliases
             ):
                 getattr_aliases.add(node.target.id)
@@ -586,7 +633,12 @@ def _import_bindings(
                 isinstance(node, ast.AnnAssign)
                 and node.value is not None
                 and isinstance(node.target, ast.Name)
-                and _has_named_root(node.value, vars_aliases, vars_aliases)
+                and (
+                    _has_named_root(node.value, vars_aliases, vars_aliases)
+                    or _is_qualified_builtins_function(
+                        node.value, builtins_aliases, vars_aliases, "vars"
+                    )
+                )
                 and node.target.id not in vars_aliases
             ):
                 vars_aliases.add(node.target.id)
@@ -800,4 +852,5 @@ __all__ = [
     "verify_preregistration",
     "verify_protocol_digest",
     "verify_v2_preexecution",
+    "verify_v2_authority",
 ]

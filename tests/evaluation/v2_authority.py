@@ -10,6 +10,8 @@ from apar.evaluation.gates import EvaluatorSigningIdentity
 from apar.evaluation.v2_preregistration import (
     SYNTHETIC_NON_CLAIM,
     V2Preregistration,
+    V2VerifiedAuthority,
+    _issue_verified_v2_authority,
     sign_v2_preregistration,
 )
 from apar.runs import RunSigningIdentity
@@ -21,6 +23,7 @@ class EphemeralV2Authority:
     evaluator: EvaluatorSigningIdentity
     publisher: RunSigningIdentity
     preregistration: V2Preregistration
+    verified_authority: V2VerifiedAuthority
 
 
 def ephemeral_v2_authority() -> EphemeralV2Authority:
@@ -54,7 +57,8 @@ def ephemeral_v2_authority() -> EphemeralV2Authority:
         "maximum_confirmatory_attempts": 1,
     }
     preregistration = sign_v2_preregistration(payload, signer=evaluator)
-    return EphemeralV2Authority(evaluator, publisher, preregistration)
+    verified_authority = _issue_verified_v2_authority(preregistration)
+    return EphemeralV2Authority(evaluator, publisher, preregistration, verified_authority)
 
 
 def _digest(value: str) -> str:
