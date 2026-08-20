@@ -20,3 +20,11 @@
 - Focused verifier, integration CLI, and API tests passed: 22 tests.
 - Required v2/frozen-v1 safety suite passed: 81 tests.
 - `python scripts/verify_defense_v2_preexecution.py` outputs `{"admissible":true,"codes":[],"status":"not_executed"}`.
+
+## Review round 1/5 fixes
+
+- RED: regression tests failed for `from apar.evaluation import service`, a computed `__import__('apar.' + 'evaluation_hidden')`, and a schema-valid v2 receipt stored under an arbitrary non-receipt filename.
+- GREEN: defender imports now admit only the `apar.evaluation.v2_` public namespace, apart from an explicit frozen-v1 compatibility allowlist required for the pre-existing historical implementation. Computed module expressions passed to `__import__` or importlib aliases fail closed.
+- Receipt detection now scans the complete durable `.apar` state store by `ExecutionReceipt` schema and v2 preregistration identifier; it does not depend on filenames, paths below that store, or a partial-byte inspection.
+- Added coverage for an importlib alias with a variable module target and retained an allowed `apar.evaluation.v2_preexecution` import regression.
+- Focused verifier, CLI, and API tests pass; Ruff and mypy pass.

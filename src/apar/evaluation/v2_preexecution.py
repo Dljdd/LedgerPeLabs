@@ -15,9 +15,13 @@ from typing import Literal
 from pydantic import Field
 
 from apar.contracts._validation import ExternalContract
-from apar.evaluation.v2_preregistration import SYNTHETIC_NON_CLAIM, V2Preregistration
+from apar.evaluation.v2_preregistration import (
+    SYNTHETIC_NON_CLAIM,
+    ExecutionReceipt,
+    V2Preregistration,
+)
 from apar.evaluation.v2_protocol import verify_v1_roots
-from apar.runs.wire import canonical_json_bytes
+from apar.runs.wire import WireContractError, canonical_json_bytes, strict_json_loads
 
 _PROTOCOL_ID = "apar-defend-v2"
 _PROTOCOL_DIGEST = hashlib.sha256(
@@ -25,6 +29,21 @@ _PROTOCOL_DIGEST = hashlib.sha256(
         {"protocol_id": _PROTOCOL_ID, "synthetic_scope": SYNTHETIC_NON_CLAIM}
     )
 ).hexdigest()
+_FROZEN_V1_EVALUATION_IMPORTS = frozenset(
+    {
+        ("bundle.py", "apar.evaluation.splits"),
+        ("orchestration.py", "apar.evaluation.contracts"),
+        ("orchestration.py", "apar.evaluation.competition"),
+        ("orchestration.py", "apar.evaluation.corpus"),
+        ("orchestration.py", "apar.evaluation.defender_attestation"),
+        ("orchestration.py", "apar.evaluation.gates"),
+        ("orchestration.py", "apar.evaluation.hidden_source"),
+        ("orchestration.py", "apar.evaluation.regimes"),
+        ("orchestration.py", "apar.evaluation.replay"),
+        ("orchestration.py", "apar.evaluation.reporting"),
+        ("orchestration.py", "apar.evaluation.splits"),
+    }
+)
 
 
 class PreexecutionCheck(ExternalContract):
@@ -86,14 +105,22 @@ def verify_protocol_digest(preregistration: object) -> PreexecutionCheck:
 
 
 def verify_no_v2_execution_receipt(root: Path) -> PreexecutionCheck:
-    """Fail if any receipt-shaped file identifies an already-consumed v2 attempt."""
+    """Scan the complete durable application store for a schema-valid v2 receipt."""
+    receipt_store = root / ".apar"
     try:
-        for path in root.rglob("*receipt*"):
+        if not receipt_store.exists():
+            return PreexecutionCheck(code="V2_EXECUTION_RECEIPT_PRESENT", passed=True)
+        if not receipt_store.is_dir():
+            return PreexecutionCheck(code="V2_EXECUTION_RECEIPT_UNVERIFIABLE", passed=False)
+        for path in receipt_store.rglob("*"):
             if not path.is_file():
                 continue
-            relative = path.relative_to(root).as_posix().lower()
-            payload = path.read_bytes()[:262_144].lower()
-            if "v2" in relative or _PROTOCOL_ID.encode("ascii") in payload:
+            try:
+                document = strict_json_loads(path.read_bytes())
+                receipt = ExecutionReceipt.model_validate(document)
+            except (WireContractError, ValueError, TypeError):
+                continue
+            if receipt.preregistration_id == _PROTOCOL_ID:
                 return PreexecutionCheck(code="V2_EXECUTION_RECEIPT_PRESENT", passed=False)
     except (OSError, ValueError):
         return PreexecutionCheck(code="V2_EXECUTION_RECEIPT_UNVERIFIABLE", passed=False)
@@ -104,11 +131,12 @@ def verify_import_boundary(
     root: Path, *, forbidden: str, allowed_prefix: str
 ) -> PreexecutionCheck:
     """Check defender modules statically, without importing any of them."""
-    del allowed_prefix  # Public v2 contracts are separate from the forbidden namespace.
     source_root = root / "src" / "apar" / "defense"
     try:
         for path in source_root.rglob("*.py"):
-            if _contains_forbidden_import(path, forbidden):
+            if _contains_disallowed_import(
+                path, source_root, forbidden, allowed_prefix
+            ):
                 return PreexecutionCheck(code="HIDDEN_IMPORT_BOUNDARY", passed=False)
     except (OSError, UnicodeError, SyntaxError, ValueError):
         return PreexecutionCheck(code="HIDDEN_IMPORT_BOUNDARY", passed=False)
@@ -134,28 +162,78 @@ def _check_v1_roots(root: Path) -> PreexecutionCheck:
     return PreexecutionCheck(code="V1_ROOTS_INVALID", passed=True)
 
 
-def _contains_forbidden_import(path: Path, forbidden: str) -> bool:
+def _contains_disallowed_import(
+    path: Path, source_root: Path, forbidden: str, allowed_prefix: str
+) -> bool:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    importlib_aliases, import_function_aliases = _import_bindings(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Import) and any(
-            _is_forbidden(name.name, forbidden) for name in node.names
+            _is_disallowed_module(name.name, forbidden, allowed_prefix)
+            and not _is_frozen_v1_import(path, source_root, name.name)
+            for name in node.names
         ):
             return True
-        if isinstance(node, ast.ImportFrom) and _is_forbidden(node.module, forbidden):
+        if isinstance(node, ast.ImportFrom) and _is_disallowed_module(
+            node.module, forbidden, allowed_prefix
+        ) and not _is_frozen_v1_import(path, source_root, node.module):
             return True
-        if (
-            isinstance(node, ast.Call)
-            and node.args
-            and isinstance(node.args[0], ast.Constant)
-            and isinstance(node.args[0].value, str)
-            and _is_forbidden(node.args[0].value, forbidden)
+        if isinstance(node, ast.Call) and _is_dynamic_import_call(
+            node, importlib_aliases, import_function_aliases
         ):
-            return True
+            if not node.args or not isinstance(node.args[0], ast.Constant):
+                return True
+            module = node.args[0].value
+            if not isinstance(module, str) or _is_disallowed_module(
+                module, forbidden, allowed_prefix
+            ):
+                return True
     return False
 
 
-def _is_forbidden(module: str | None, forbidden: str) -> bool:
-    return module == forbidden or bool(module and module.startswith(f"{forbidden}."))
+def _import_bindings(tree: ast.AST) -> tuple[set[str], set[str]]:
+    importlib_aliases: set[str] = set()
+    import_function_aliases = {"__import__"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for name in node.names:
+                if name.name == "importlib":
+                    importlib_aliases.add(name.asname or name.name)
+        elif isinstance(node, ast.ImportFrom) and node.module == "importlib":
+            for name in node.names:
+                if name.name in {"__import__", "import_module"}:
+                    import_function_aliases.add(name.asname or name.name)
+    return importlib_aliases, import_function_aliases
+
+
+def _is_dynamic_import_call(
+    node: ast.Call, importlib_aliases: set[str], import_function_aliases: set[str]
+) -> bool:
+    if isinstance(node.func, ast.Name):
+        return node.func.id in import_function_aliases
+    return (
+        isinstance(node.func, ast.Attribute)
+        and node.func.attr in {"__import__", "import_module"}
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id in importlib_aliases
+    )
+
+
+def _is_disallowed_module(module: str | None, forbidden: str, allowed_prefix: str) -> bool:
+    if not module:
+        return False
+    return module == forbidden or module.startswith(f"{forbidden}.") or (
+        (module == "apar.evaluation" or module.startswith("apar.evaluation."))
+        and not module.startswith(allowed_prefix)
+    )
+
+
+def _is_frozen_v1_import(path: Path, source_root: Path, module: str | None) -> bool:
+    try:
+        relative = path.relative_to(source_root).as_posix()
+    except ValueError:
+        return False
+    return (relative, module) in _FROZEN_V1_EVALUATION_IMPORTS
 
 
 __all__ = [

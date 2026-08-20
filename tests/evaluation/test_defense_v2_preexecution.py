@@ -32,11 +32,69 @@ def test_hidden_import_in_defender_fails_preexecution(tmp_path: Path) -> None:
     assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
 
 
+def test_non_v2_evaluator_import_in_defender_fails_preexecution(tmp_path: Path) -> None:
+    """Only explicitly versioned public evaluator contracts are defender-visible."""
+    _write_defender_source(tmp_path, "from apar.evaluation import service\n")
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
+def test_dynamic_hidden_import_expression_fails_preexecution(tmp_path: Path) -> None:
+    """A computed module name cannot evade the static evaluator boundary."""
+    _write_defender_source(tmp_path, "__import__('apar.' + 'evaluation_hidden')\n")
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
+def test_dynamic_importlib_module_expression_fails_preexecution(tmp_path: Path) -> None:
+    """Importlib aliases cannot make a computed evaluator module admissible."""
+    _write_defender_source(
+        tmp_path,
+        "import importlib as loader\n"
+        "module = 'apar.evaluation_hidden'\n"
+        "loader.import_module(module)\n",
+    )
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
+def test_versioned_public_evaluator_import_remains_admissible(tmp_path: Path) -> None:
+    """The sealed pre-execution public contract remains an approved dependency."""
+    _write_defender_source(
+        tmp_path, "from apar.evaluation.v2_preexecution import PreexecutionReport\n"
+    )
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" not in report.codes
+
+
 def test_existing_v2_receipt_fails_preexecution(tmp_path: Path) -> None:
     """A consumed confirmatory attempt cannot be represented as pre-execution."""
     (tmp_path / ".apar/defense-v2").mkdir(parents=True)
     (tmp_path / ".apar/defense-v2/execution-receipt.json").write_text(
-        '{"preregistration_id":"apar-defend-v2"}', encoding="utf-8"
+        '{"execution_nonce":"nonce","preregistration_id":"apar-defend-v2","schema_version":"1.0.0"}',
+        encoding="utf-8",
+    )
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "V2_EXECUTION_RECEIPT_PRESENT" in report.codes
+
+
+def test_v2_receipt_schema_is_found_without_a_receipt_filename(tmp_path: Path) -> None:
+    """Durable v2 receipts are identified by schema anywhere in application state."""
+    stored = tmp_path / ".apar" / "unrelated" / "nested" / "state.bin"
+    stored.parent.mkdir(parents=True)
+    stored.write_text(
+        '{"execution_nonce":"nonce","preregistration_id":"apar-defend-v2","schema_version":"1.0.0"}',
+        encoding="utf-8",
     )
 
     report = verify_v2_preexecution(tmp_path, signed_preregistration())
@@ -92,3 +150,9 @@ def _preregistration_payload() -> dict[str, object]:
 
 def _digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _write_defender_source(root: Path, source: str) -> None:
+    path = root / "src/apar/defense/bad.py"
+    path.parent.mkdir(parents=True)
+    path.write_text(source, encoding="utf-8")
