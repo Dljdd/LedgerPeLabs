@@ -211,6 +211,26 @@ def _import_bindings(tree: ast.AST) -> tuple[set[str], set[str]]:
                     import_function_aliases.add(name.asname or name.name)
                 elif node.module == "importlib":
                     importlib_aliases.add(name.asname or name.name)
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and _has_importlib_root(
+                node.value, importlib_aliases
+            ):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id not in importlib_aliases:
+                        importlib_aliases.add(target.id)
+                        changed = True
+            elif (
+                isinstance(node, ast.AnnAssign)
+                and node.value is not None
+                and isinstance(node.target, ast.Name)
+                and _has_importlib_root(node.value, importlib_aliases)
+                and node.target.id not in importlib_aliases
+            ):
+                importlib_aliases.add(node.target.id)
+                changed = True
     return importlib_aliases, import_function_aliases
 
 
@@ -250,7 +270,7 @@ def _resolved_import_targets(
         resolved = ".".join((*base, *(node.module or "").split("."))).rstrip(".")
     if node.module is None:
         return tuple(".".join((*base, name.name)) for name in node.names)
-    if resolved == "apar.evaluation":
+    if resolved in {"apar", "apar.evaluation"}:
         return tuple(f"{resolved}.{name.name}" for name in node.names)
     if resolved:
         return (resolved,)

@@ -36,3 +36,10 @@
 - Relative `ImportFrom` nodes are resolved from the current defender package before evaluator namespace validation. The same logic rejects both evaluator bypass forms while accepting `from ..evaluation import v2_preexecution`.
 - Durable receipt scanning is unchanged and remains covered by the prior arbitrary-path schema regression.
 - Ruff, mypy, focused tests, and the requested complete v2/frozen-v1 safety suite pass.
+
+## Review round 3/5 fixes
+
+- RED: the exact `loader = importlib` computed import and `from apar import evaluation` regressions both bypassed the scanner.
+- GREEN: importlib-root aliases now propagate through ordinary and annotated assignments before call analysis, so a computed `loader.import_module(...)` target fails closed.
+- `from apar import evaluation` now resolves to `apar.evaluation` before applying the evaluator allowlist; non-evaluator package imports remain unaffected.
+- Focused verifier/CLI tests, Ruff, mypy, and the complete v2/frozen-v1 safety suite pass.
