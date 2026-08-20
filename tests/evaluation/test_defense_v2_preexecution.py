@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from apar.evaluation.v2_preexecution import (
+    _is_disallowed_module,
     verify_manifest_registry,
     verify_v2_authority,
     verify_v2_preexecution,
@@ -685,6 +686,38 @@ def test_sensitive_versioned_evaluator_import_fails_closed(tmp_path: Path) -> No
     """Defender code cannot import and mutate evaluator trust-boundary internals."""
     _write_defender_source(
         tmp_path, "from apar.evaluation.v2_preexecution import PreexecutionReport\n"
+    )
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
+def test_arbitrary_versioned_evaluator_namespace_is_forbidden() -> None:
+    """No name-shaped v2 evaluator module is defender-visible."""
+    assert _is_disallowed_module("apar.evaluation.v2_backdoor", "apar.evaluation_hidden")
+
+
+def test_direct_versioned_evaluator_backdoor_import_fails_closed(tmp_path: Path) -> None:
+    """Direct defender source cannot use the obsolete evaluator prefix allowance."""
+    _write_defender_source(
+        tmp_path, "from apar.evaluation.v2_backdoor import authority\n"
+    )
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
+def test_transitive_feature_versioned_evaluator_backdoor_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """The all-evaluator prohibition applies through feature graph traversal."""
+    _write_defender_source(tmp_path, "from apar.features import v2_backdoor_bridge\n")
+    features = tmp_path / "src/apar/features"
+    features.mkdir(parents=True)
+    (features / "v2_backdoor_bridge.py").write_text(
+        "from apar.evaluation.v2_backdoor import authority\n", encoding="utf-8"
     )
 
     report = verify_v2_preexecution(tmp_path, signed_preregistration())

@@ -1142,3 +1142,68 @@ Complete repository regression suite:
 Frozen V1 source, feature, fixture, and experiment-document paths have no diff;
 `git diff --check` is clean. No V2 evaluation or durable receipt/result was
 created.
+
+## Final hardening round 13
+
+### Scope and implementation
+
+- Removed the obsolete `allowed_prefix="apar.evaluation.v2_"` parameter from
+  preexecution admission and every scanner helper.
+- Made `apar.evaluation` and every descendant unconditionally forbidden to
+  defender code. Only exact frozen-V1 import exemptions remain at their existing
+  import sites; name-shaped v2 evaluator modules gain no capability.
+- Added exact unit, direct defender, and transitive feature regressions for
+  `apar.evaluation.v2_backdoor` while preserving admission of the isolated
+  `apar.v2_protocol` public contract.
+
+### RED evidence
+
+The obsolete prefix classified the arbitrary backdoor as allowed before the
+capability was removed; direct and transitive sources were already rejected by
+the stricter non-frozen AST layer:
+
+```text
+.venv/bin/pytest -q tests/evaluation/test_defense_v2_preexecution.py \
+  -k 'versioned_evaluator_namespace or versioned_evaluator_backdoor'
+1 failed, 2 passed, 102 deselected in 0.79s
+```
+
+### GREEN evidence
+
+Evaluator namespace, direct/transitive backdoor, legacy path, and isolated
+public protocol probes:
+
+```text
+.venv/bin/pytest -q tests/evaluation/test_defense_v2_preexecution.py \
+  -k 'versioned_evaluator_namespace or versioned_evaluator_backdoor or public_v2_protocol or legacy_evaluator'
+6 passed, 99 deselected in 2.45s
+```
+
+Complete preexecution and static verification:
+
+```text
+.venv/bin/pytest -q tests/evaluation/test_defense_v2_preexecution.py
+105 passed in 9.16s
+
+.venv/bin/ruff check \
+  src/apar/evaluation/v2_preexecution.py \
+  tests/evaluation/test_defense_v2_preexecution.py
+All checks passed!
+
+.venv/bin/mypy src/apar/evaluation/v2_preexecution.py
+Success: no issues found in 1 source file
+
+.venv/bin/python scripts/verify_defense_v2_preexecution.py
+{"admissible":true,"codes":[],"status":"not_executed"}
+```
+
+Complete repository regression suite:
+
+```text
+.venv/bin/pytest -q
+1922 passed, 1 skipped in 564.18s (0:09:24)
+```
+
+Frozen V1 source, feature, fixture, and experiment-document paths have no diff;
+`git diff --check` is clean. No V2 evaluation or durable receipt/result was
+created.

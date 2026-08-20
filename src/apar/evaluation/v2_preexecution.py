@@ -326,7 +326,6 @@ def verify_v2_preexecution(root: Path, preregistration: V2Preregistration) -> Pr
             verify_import_boundary(
                 root,
                 forbidden="apar.evaluation_hidden",
-                allowed_prefix="apar.evaluation.v2_",
             ),
             verify_preregistration(root, preregistration),
         )
@@ -541,7 +540,7 @@ def verify_no_v2_execution_receipt(root: Path) -> PreexecutionCheck:
     return PreexecutionCheck(code="V2_EXECUTION_RECEIPT_PRESENT", passed=True)
 
 
-def verify_import_boundary(root: Path, *, forbidden: str, allowed_prefix: str) -> PreexecutionCheck:
+def verify_import_boundary(root: Path, *, forbidden: str) -> PreexecutionCheck:
     """Apply the sealed-source/strict-capability policy without importing code.
 
     This is admission defense in depth, not a Python sandbox.  The v2 execution
@@ -563,7 +562,7 @@ def verify_import_boundary(root: Path, *, forbidden: str, allowed_prefix: str) -
                 continue
             seen[path] = seen.get(path, False) or traverse_dependencies
             if _contains_disallowed_import(
-                path, project_source, defender_root, forbidden, allowed_prefix
+                path, project_source, defender_root, forbidden
             ):
                 return PreexecutionCheck(code="HIDDEN_IMPORT_BOUNDARY", passed=False)
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -627,7 +626,6 @@ def _contains_disallowed_import(
     project_source: Path,
     defender_root: Path,
     forbidden: str,
-    allowed_prefix: str,
 ) -> bool:
     raw_source = path.read_bytes()
     if _has_mismatched_pinned_public_v2_source(path, project_source, raw_source):
@@ -669,7 +667,7 @@ def _contains_disallowed_import(
         ):
             return True
         if isinstance(node, ast.Import) and any(
-            (name.name == "inspect" or _is_disallowed_module(name.name, forbidden, allowed_prefix))
+            (name.name == "inspect" or _is_disallowed_module(name.name, forbidden))
             and not _is_frozen_v1_import(path, defender_root, name.name)
             for name in node.names
         ):
@@ -678,9 +676,7 @@ def _contains_disallowed_import(
             if node.module == "inspect":
                 return True
             for module in _resolved_import_targets(node, path, project_source):
-                if _is_disallowed_module(
-                    module, forbidden, allowed_prefix
-                ) and not _is_frozen_v1_import(
+                if _is_disallowed_module(module, forbidden) and not _is_frozen_v1_import(
                     path, defender_root, module
                 ):
                     return True
@@ -698,7 +694,7 @@ def _contains_disallowed_import(
             if (
                 not isinstance(module_value, str)
                 or module_value in {"inspect", "sys"}
-                or _is_disallowed_module(module_value, forbidden, allowed_prefix)
+                or _is_disallowed_module(module_value, forbidden)
             ):
                 return True
     return False
@@ -1282,7 +1278,7 @@ def _is_dynamic_import_call(
     )
 
 
-def _is_disallowed_module(module: str | None, forbidden: str, allowed_prefix: str) -> bool:
+def _is_disallowed_module(module: str | None, forbidden: str) -> bool:
     if not module:
         return False
     return (
@@ -1292,10 +1288,8 @@ def _is_disallowed_module(module: str | None, forbidden: str, allowed_prefix: st
             module == internal or module.startswith(f"{internal}.")
             for internal in _V2_EVALUATOR_INTERNALS
         )
-        or (
-            (module == "apar.evaluation" or module.startswith("apar.evaluation."))
-            and not module.startswith(allowed_prefix)
-        )
+        or module == "apar.evaluation"
+        or module.startswith("apar.evaluation.")
     )
 
 
