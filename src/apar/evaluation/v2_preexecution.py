@@ -399,6 +399,14 @@ def _contains_disallowed_import(
         vars_aliases,
     ) = _import_bindings(tree)
     for node in ast.walk(tree):
+        if _has_untrusted_authority_reflection(
+            node,
+            importlib_aliases,
+            builtins_aliases,
+            getattr_aliases,
+            vars_aliases,
+        ):
+            return True
         if isinstance(node, ast.Import) and any(
             _is_disallowed_module(name.name, forbidden, allowed_prefix)
             and not _is_frozen_v1_import(path, defender_root, name.name)
@@ -426,6 +434,33 @@ def _contains_disallowed_import(
                 module_value, forbidden, allowed_prefix
             ):
                 return True
+    return False
+
+
+def _has_untrusted_authority_reflection(
+    node: ast.AST,
+    importlib_aliases: set[str],
+    builtins_aliases: set[str],
+    getattr_aliases: set[str],
+    vars_aliases: set[str],
+) -> bool:
+    """Reject reflective authority access unless static syntax proves it absent."""
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        if node.func.id in getattr_aliases and node.args:
+            root = node.args[0]
+            return _has_named_root(root, builtins_aliases, vars_aliases) or _has_importlib_root(
+                root, importlib_aliases, vars_aliases
+            )
+        if node.func.id in vars_aliases and len(node.args) == 1:
+            root = node.args[0]
+            return _has_named_root(root, builtins_aliases, vars_aliases) or _has_importlib_root(
+                root, importlib_aliases, vars_aliases
+            )
+    if isinstance(node, ast.Subscript):
+        root = _reflection_mapping_root(node.value, vars_aliases)
+        return _has_named_root(root, builtins_aliases, vars_aliases) or _has_importlib_root(
+            root, importlib_aliases, vars_aliases
+        )
     return False
 
 

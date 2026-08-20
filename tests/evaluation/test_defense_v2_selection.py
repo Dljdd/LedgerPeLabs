@@ -6,14 +6,18 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import numpy as np
+import pytest
 
 from apar.contracts.decisions import Action
 from apar.evaluation.contracts import EvaluationTruthRow
 from apar.evaluation.v2_controls import (
+    V2ControlBinding,
     V2ControlContext,
+    V2ControlError,
     run_benign_only_control,
     run_score_permutation_control,
 )
+from apar.evaluation.v2_preregistration import V2Preregistration, sign_v2_preregistration
 from apar.evaluation.v2_protocol import V2Protocol
 from apar.evaluation.v2_selection import (
     ArmThresholdCandidate,
@@ -26,21 +30,105 @@ from apar.evaluation.v2_selection import (
     evaluate_v2_gates,
     select_v2_thresholds,
 )
-from tests.evaluation.v2_authority import ephemeral_v2_authority
+from tests.evaluation.v2_authority import EphemeralV2Authority, ephemeral_v2_authority
 
 AUTHORITY = ephemeral_v2_authority()
-CONTROL_CONTEXT = V2ControlContext.from_preregistration(
-    AUTHORITY.preregistration,
-    arm="layered_hybrid",
-    input_digest="b" * 64,
+def test_outsider_self_signed_copy_cannot_supply_selection_trust() -> None:
+    """Copied trusted fields signed by an outsider are not sealed control authority."""
+    outsider, copied = copied_outsider_preregistration()
+    candidate_id = "outsider-copy"
+    binding = V2ControlBinding.from_preregistration(
+        copied,
+        arm="layered_hybrid",
+        candidate_id=candidate_id,
+        input_digest="b" * 64,
+    )
+    benign = run_benign_only_control(
+        actions=(Action.APPROVE,),
+        truth=(_control_truth("benign-copy", fraud=False),),
+        signer=outsider.evaluator,
+        binding=binding,
+    )
+    permutation = run_score_permutation_control(
+        scores=np.array([0.8, 0.2]),
+        truth=(
+            _control_truth("fraud-copy", fraud=True),
+            _control_truth("benign-copy-2", fraud=False),
+        ),
+        blocks=("case-a", "case-b"),
+        seed=5,
+        evaluator=lambda scores, truth, blocks: False,
+        signer=outsider.evaluator,
+        binding=binding,
+    )
+    evidence = candidate(candidate_id).model_copy(
+        update={
+            "control": ControlValidity.attest(
+                benign_only=benign,
+                score_permutation=permutation,
+            )
+        }
+    )
+
+    outcome = evaluate_v2_gates(
+        evidence,
+        protocol(),
+        sealed_preregistration=AUTHORITY.preregistration,
+        control_context=control_context(candidate_id),
+    )
+
+    assert "CONTROL_INVALID" in outcome.codes
+
+
+def test_outsider_self_signed_copy_cannot_create_trusted_context() -> None:
+    """Context construction compares a presented preregistration to the sealed root."""
+    _, copied = copied_outsider_preregistration()
+
+    with pytest.raises(V2ControlError, match="sealed preregistration"):
+        V2ControlContext.from_preregistration(
+            copied,
+            sealed_preregistration=AUTHORITY.preregistration,
+            arm="layered_hybrid",
+            candidate_id="outsider-context",
+            input_digest="b" * 64,
+        )
+
+
+@pytest.mark.parametrize(
+    "arm,input_digest",
+    (("rules_only", "b" * 64), ("layered_hybrid", "c" * 64)),
 )
+def test_selection_rejects_wrong_independent_arm_or_input(
+    arm: str, input_digest: str
+) -> None:
+    """Expected arm and input come from trusted execution context, not evidence."""
+    evidence = candidate("context-mismatch")
+    context = V2ControlContext.from_preregistration(
+        AUTHORITY.preregistration,
+        sealed_preregistration=AUTHORITY.preregistration,
+        arm=arm,
+        candidate_id=evidence.candidate_id,
+        input_digest=input_digest,
+    )
+
+    outcome = evaluate_v2_gates(
+        evidence,
+        protocol(),
+        sealed_preregistration=AUTHORITY.preregistration,
+        control_context=context,
+    )
+
+    assert "CONTROL_INVALID" in outcome.codes
 
 
 def test_high_stratum_review_failure_rejects_candidate() -> None:
     result = select_v2_thresholds(
         (candidate("safe"), candidate("high-review", high_review_rate=0.0101)),
         protocol(),
-        control_context=CONTROL_CONTEXT,
+        sealed_preregistration=AUTHORITY.preregistration,
+        control_contexts={
+            name: control_context(name) for name in ("safe", "high-review")
+        },
     )
 
     assert result.selected_candidate_id == "safe"
@@ -60,7 +148,8 @@ def test_every_family_requires_value_and_alert_bounds() -> None:
     outcome = evaluate_v2_gates(
         candidate("late-alert", family_time=bounded(299.0, lower=270.0, upper=301.0)),
         protocol(),
-        control_context=CONTROL_CONTEXT,
+        sealed_preregistration=AUTHORITY.preregistration,
+        control_context=control_context("late-alert"),
     )
 
     assert outcome.passed is False
@@ -71,7 +160,8 @@ def test_invalid_typed_control_vetoes_an_otherwise_safe_candidate() -> None:
     outcome = evaluate_v2_gates(
         candidate("invalid-control", control_valid=False),
         protocol(),
-        control_context=CONTROL_CONTEXT,
+        sealed_preregistration=AUTHORITY.preregistration,
+        control_context=control_context("invalid-control"),
     )
 
     assert outcome.passed is False
@@ -83,7 +173,12 @@ def test_forged_valid_control_cannot_pass_selection() -> None:
     forged = ControlValidity.model_construct(valid=True, reason=None)
     evidence = candidate("forged-control").model_copy(update={"control": forged})
 
-    outcome = evaluate_v2_gates(evidence, protocol(), control_context=CONTROL_CONTEXT)
+    outcome = evaluate_v2_gates(
+        evidence,
+        protocol(),
+        sealed_preregistration=AUTHORITY.preregistration,
+        control_context=control_context("forged-control"),
+    )
 
     assert outcome.passed is False
     assert "CONTROL_INVALID" in outcome.codes
@@ -97,7 +192,8 @@ def test_control_results_cannot_replay_between_candidates() -> None:
     outcome = evaluate_v2_gates(
         replayed,
         protocol(),
-        control_context=CONTROL_CONTEXT,
+        sealed_preregistration=AUTHORITY.preregistration,
+        control_context=control_context("candidate-b"),
     )
 
     assert outcome.passed is False
@@ -108,7 +204,8 @@ def test_undefined_metric_fails_closed() -> None:
     outcome = evaluate_v2_gates(
         candidate("undefined", ece=BoundedMetric.undefined(numerator=0.0, denominator=0.0)),
         protocol(),
-        control_context=CONTROL_CONTEXT,
+        sealed_preregistration=AUTHORITY.preregistration,
+        control_context=control_context("undefined"),
     )
 
     assert outcome.passed is False
@@ -119,12 +216,14 @@ def test_zero_or_non_2000_bootstrap_replicates_fail_closed() -> None:
     zero = evaluate_v2_gates(
         candidate("zero-bootstrap", ece=bootstrap_bounded(0.05, replicates=0)),
         protocol(),
-        control_context=CONTROL_CONTEXT,
+        sealed_preregistration=AUTHORITY.preregistration,
+        control_context=control_context("zero-bootstrap"),
     )
     wrong_count = evaluate_v2_gates(
         candidate("wrong-bootstrap", ece=bootstrap_bounded(0.05, replicates=1_999)),
         protocol(),
-        control_context=CONTROL_CONTEXT,
+        sealed_preregistration=AUTHORITY.preregistration,
+        control_context=control_context("wrong-bootstrap"),
     )
 
     assert "BOOTSTRAP_REPLICATES" in zero.codes
@@ -138,7 +237,8 @@ def test_partially_undefined_bootstrap_distribution_fails_closed() -> None:
             ece=bootstrap_bounded(0.05, replicates=2_000, undefined_replicates=1),
         ),
         protocol(),
-        control_context=CONTROL_CONTEXT,
+        sealed_preregistration=AUTHORITY.preregistration,
+        control_context=control_context("partially-undefined-bootstrap"),
     )
 
     assert outcome.passed is False
@@ -149,7 +249,8 @@ def test_tie_break_is_stable_and_lexicographic_after_matched_gates() -> None:
     result = select_v2_thresholds(
         (candidate("later", thresholds=(0.3, 0.8)), candidate("first", thresholds=(0.2, 0.9))),
         protocol(),
-        control_context=CONTROL_CONTEXT,
+        sealed_preregistration=AUTHORITY.preregistration,
+        control_contexts={name: control_context(name) for name in ("later", "first")},
     )
 
     assert result.selected_candidate_id == "first"
@@ -159,7 +260,8 @@ def test_no_promotion_when_no_candidate_qualifies() -> None:
     result = select_v2_thresholds(
         (candidate("bad", control_valid=False),),
         protocol(),
-        control_context=CONTROL_CONTEXT,
+        sealed_preregistration=AUTHORITY.preregistration,
+        control_contexts={"bad": control_context("bad")},
     )
 
     assert result.status == "no_promotion"
@@ -186,6 +288,30 @@ def test_bootstrap_resamples_days_then_case_blocks_for_exactly_2000_replicates()
 
 def protocol() -> V2Protocol:
     return V2Protocol.fixture(transaction_count=100)
+
+
+def control_context(
+    candidate_id: str,
+    *,
+    arm: str = "layered_hybrid",
+    input_digest: str = "b" * 64,
+) -> V2ControlContext:
+    return V2ControlContext.from_preregistration(
+        AUTHORITY.preregistration,
+        sealed_preregistration=AUTHORITY.preregistration,
+        arm=arm,
+        candidate_id=candidate_id,
+        input_digest=input_digest,
+    )
+
+
+def copied_outsider_preregistration() -> tuple[EphemeralV2Authority, V2Preregistration]:
+    outsider = ephemeral_v2_authority()
+    payload = AUTHORITY.preregistration.model_dump(
+        mode="json",
+        exclude={"evaluator_key_id", "evaluator_public_key_base64", "signature_base64"},
+    )
+    return outsider, sign_v2_preregistration(payload, signer=outsider.evaluator)
 
 
 def bounded(
@@ -269,7 +395,12 @@ def candidate(
 
 def control_validity(*, valid: bool, candidate_id: str) -> ControlValidity:
     signer = AUTHORITY.evaluator
-    binding = CONTROL_CONTEXT.binding(candidate_id)
+    binding = V2ControlBinding.from_preregistration(
+        AUTHORITY.preregistration,
+        arm="layered_hybrid",
+        candidate_id=candidate_id,
+        input_digest="b" * 64,
+    )
     benign = run_benign_only_control(
         actions=(Action.APPROVE,),
         truth=(_control_truth("benign", fraud=False),),

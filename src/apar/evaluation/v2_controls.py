@@ -76,10 +76,11 @@ class V2ControlBinding(ExternalContract):
 
 
 class V2ControlContext(ExternalContract):
-    """Evaluator authority and immutable input shared by one arm's candidates."""
+    """Independent expected execution context for one exact candidate."""
 
     preregistration: V2Preregistration
     arm: Literal["rules_only", "gbdt_only", "layered_hybrid"]
+    candidate_id: str = Field(min_length=1, max_length=256)
     input_digest: str
 
     @model_validator(mode="after")
@@ -98,16 +99,40 @@ class V2ControlContext(ExternalContract):
         cls,
         preregistration: V2Preregistration,
         *,
+        sealed_preregistration: V2Preregistration,
         arm: Literal["rules_only", "gbdt_only", "layered_hybrid"],
+        candidate_id: str,
         input_digest: str,
     ) -> V2ControlContext:
-        return cls(preregistration=preregistration, arm=arm, input_digest=input_digest)
+        context = cls(
+            preregistration=preregistration,
+            arm=arm,
+            candidate_id=candidate_id,
+            input_digest=input_digest,
+        )
+        if not context.matches_sealed_preregistration(sealed_preregistration):
+            raise V2ControlError("control context does not match sealed preregistration")
+        return context
 
-    def binding(self, candidate_id: str) -> V2ControlBinding:
+    def matches_sealed_preregistration(self, sealed: V2Preregistration) -> bool:
+        """Check the independent trust root and its exact evaluator public identity."""
+        try:
+            return (
+                type(sealed) is V2Preregistration
+                and self.preregistration.matches_sealed_preregistration(sealed)
+                and self.preregistration.evaluator_key_id == sealed.evaluator_key_id
+                and self.preregistration.evaluator_public_key_base64
+                == sealed.evaluator_public_key_base64
+                and self.preregistration.execution_nonce == sealed.execution_nonce
+            )
+        except (AttributeError, TypeError, ValueError):
+            return False
+
+    def binding(self) -> V2ControlBinding:
         return V2ControlBinding.from_preregistration(
             self.preregistration,
             arm=self.arm,
-            candidate_id=candidate_id,
+            candidate_id=self.candidate_id,
             input_digest=self.input_digest,
         )
 
@@ -184,16 +209,28 @@ class ControlValidity(ExternalContract):
             raise TypeError("control validity requires exact ControlResult evidence")
         return cls(benign_only=benign_only, score_permutation=score_permutation)
 
-    def valid_for(self, expected_binding: V2ControlBinding) -> bool:
+    def valid_for(
+        self,
+        *,
+        sealed_preregistration: V2Preregistration,
+        expected_context: V2ControlContext,
+    ) -> bool:
         """Return true only when both attestations match the exact candidate context."""
         try:
             return (
-                type(expected_binding) is V2ControlBinding
+                type(sealed_preregistration) is V2Preregistration
+                and type(expected_context) is V2ControlContext
                 and type(self.benign_only) is ControlResult
                 and type(self.score_permutation) is ControlResult
-                and admit_control_result(self.benign_only, expected_binding=expected_binding).valid
                 and admit_control_result(
-                    self.score_permutation, expected_binding=expected_binding
+                    self.benign_only,
+                    sealed_preregistration=sealed_preregistration,
+                    expected_context=expected_context,
+                ).valid
+                and admit_control_result(
+                    self.score_permutation,
+                    sealed_preregistration=sealed_preregistration,
+                    expected_context=expected_context,
                 ).valid
             )
         except (AttributeError, TypeError, ValueError):
@@ -223,7 +260,10 @@ ControlEvaluator = Callable[[np.ndarray, tuple[EvaluationTruthRow, ...], tuple[s
 
 
 def admit_control_result(
-    control: ControlResult, *, expected_binding: V2ControlBinding | None = None
+    control: ControlResult,
+    *,
+    sealed_preregistration: V2Preregistration,
+    expected_context: V2ControlContext,
 ) -> ControlAdmission:
     """Convert a control result into a load-bearing whole-run admission."""
     if type(control) is not ControlResult:
@@ -232,11 +272,20 @@ def admit_control_result(
         )
     try:
         checked = ControlResult.model_validate(control.model_dump())
+        context = V2ControlContext.model_validate(expected_context.model_dump())
     except Exception:
         return ControlAdmission(
             valid=False, status="no_promotion", reason="invalid_control_attestation"
         )
-    if expected_binding is None or checked.binding != expected_binding:
+    if (
+        type(sealed_preregistration) is not V2Preregistration
+        or type(expected_context) is not V2ControlContext
+        or not context.matches_sealed_preregistration(sealed_preregistration)
+        or checked.binding != context.binding()
+        or checked.binding.evaluator_key_id != sealed_preregistration.evaluator_key_id
+        or checked.binding.evaluator_public_key_base64
+        != sealed_preregistration.evaluator_public_key_base64
+    ):
         return ControlAdmission(
             valid=False, status="no_promotion", reason="control_binding_mismatch"
         )

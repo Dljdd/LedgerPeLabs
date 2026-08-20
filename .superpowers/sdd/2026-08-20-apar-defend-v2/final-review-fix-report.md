@@ -309,3 +309,90 @@ Complete repository regression suite:
 documents. Repository searches found no remaining trusted V2 constants,
 deterministic `b"v" * 32` seed, or production `from_private_bytes` construction.
 No V2 evaluation or durable execution receipt/result was created.
+
+## Final hardening round 3
+
+### Scope and implementation
+
+- The import scanner now rejects reflective access rooted at builtins or importlib
+  itself, rather than waiting for a recognizable import call. This covers aliased
+  `getattr` and `vars`, `__dict__`/subscript access, non-constant attribute and
+  slice expressions, assigned namespace aliases, and transitive feature modules.
+- `V2ControlContext` now names one exact candidate and can be constructed from a
+  presented preregistration only when an independently supplied sealed
+  preregistration matches canonically. The match explicitly rechecks the trusted
+  evaluator key ID, public key, and execution nonce.
+- Control admission independently receives the sealed preregistration and expected
+  execution context. It revalidates both signed control results, revalidates the
+  context, calls `matches_sealed_preregistration`, compares the attested public key
+  to the trusted key, and checks the exact preregistration/nonce/arm/candidate/input
+  binding before admission.
+- Threshold selection now receives an exact candidate-indexed context map plus the
+  independent sealed preregistration. It rejects missing, extra, mismatched, or
+  caller-self-authenticated contexts instead of deriving expectations from the
+  `ControlValidity` evidence under review.
+
+### RED evidence
+
+The variable-name reflection probes failed before implementation:
+
+```text
+.venv/bin/pytest tests/evaluation/test_defense_v2_preexecution.py \
+  -q -k 'variable_reflective or transitive_feature_variable'
+5 failed, 45 deselected in 0.47s
+```
+
+They cover `attribute_name`, `method_name`, and `key` variables used through direct
+and aliased `getattr`, `vars`, and `__dict__` subscript paths, including a
+defender-reachable feature module.
+
+The first independent-control-context probe failed during collection because the
+old context factory accepted no sealed preregistration and no candidate ID:
+
+```text
+.venv/bin/pytest tests/evaluation/test_defense_v2_selection.py \
+  -q -k 'outsider or independent'
+TypeError: V2ControlContext.from_preregistration() got an unexpected keyword \
+argument 'sealed_preregistration'
+```
+
+This demonstrated that the old API could not express an independent trust root.
+
+### GREEN evidence
+
+Focused scanner, control, and selection verification:
+
+```text
+.venv/bin/pytest \
+  tests/evaluation/test_defense_v2_controls.py \
+  tests/evaluation/test_defense_v2_selection.py \
+  tests/evaluation/test_defense_v2_preexecution.py -q
+78 passed in 3.99s
+```
+
+Static and read-only admission verification:
+
+```text
+.venv/bin/ruff check <round-3 changed Python source and tests>
+All checks passed!
+
+.venv/bin/mypy \
+  src/apar/evaluation/v2_controls.py \
+  src/apar/evaluation/v2_preexecution.py \
+  src/apar/evaluation/v2_selection.py
+Success: no issues found in 3 source files
+
+.venv/bin/python scripts/verify_defense_v2_preexecution.py
+{"admissible":true,"codes":[],"status":"not_executed"}
+```
+
+Complete repository regression suite:
+
+```text
+.venv/bin/pytest -q
+1861 passed, 1 skipped in 481.48s (0:08:01)
+```
+
+`git diff --exit-code` confirmed no change beneath the frozen V1 source, feature,
+fixture, or experiment-document paths. `git diff --check` was clean. No V2
+evaluation or durable execution receipt/result was created.

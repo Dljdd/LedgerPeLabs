@@ -12,6 +12,7 @@ from apar.evaluation.gates import EvaluatorSigningIdentity
 from apar.evaluation.v2_controls import (
     ControlResult,
     V2ControlBinding,
+    V2ControlContext,
     V2ControlError,
     admit_control_result,
     run_benign_only_control,
@@ -22,6 +23,13 @@ from tests.evaluation.v2_authority import ephemeral_v2_authority
 AUTHORITY = ephemeral_v2_authority()
 CONTROL_BINDING = V2ControlBinding.from_preregistration(
     AUTHORITY.preregistration,
+    arm="rules_only",
+    candidate_id="candidate-a",
+    input_digest="a" * 64,
+)
+CONTROL_CONTEXT = V2ControlContext.from_preregistration(
+    AUTHORITY.preregistration,
+    sealed_preregistration=AUTHORITY.preregistration,
     arm="rules_only",
     candidate_id="candidate-a",
     input_digest="a" * 64,
@@ -94,7 +102,11 @@ def test_invalid_control_is_a_typed_no_promotion_admission() -> None:
         signer=evaluator_signer(),
         binding=CONTROL_BINDING,
     )
-    admission = admit_control_result(control, expected_binding=CONTROL_BINDING)
+    admission = admit_control_result(
+        control,
+        sealed_preregistration=AUTHORITY.preregistration,
+        expected_context=CONTROL_CONTEXT,
+    )
     assert (admission.valid, admission.status, admission.reason) == (
         False,
         "no_promotion",
@@ -145,7 +157,11 @@ def test_evaluator_exception_is_fail_closed() -> None:
 
 def test_forged_valid_control_cannot_be_admitted() -> None:
     forged = ControlResult.model_construct(valid=True, kind="benign_only", reason=None)
-    admission = admit_control_result(forged, expected_binding=CONTROL_BINDING)
+    admission = admit_control_result(
+        forged,
+        sealed_preregistration=AUTHORITY.preregistration,
+        expected_context=CONTROL_CONTEXT,
+    )
     assert (admission.valid, admission.status) == (False, "no_promotion")
 
 
@@ -174,7 +190,11 @@ def test_invalid_attestation_cannot_be_model_copied_to_valid() -> None:
     )
     tampered = invalid.model_copy(update={"valid": True, "reason": None})
 
-    admission = admit_control_result(tampered, expected_binding=CONTROL_BINDING)
+    admission = admit_control_result(
+        tampered,
+        sealed_preregistration=AUTHORITY.preregistration,
+        expected_context=CONTROL_CONTEXT,
+    )
 
     assert (admission.valid, admission.status, admission.reason) == (
         False,
@@ -210,11 +230,12 @@ def test_control_attestation_cannot_replay_across_execution_bindings() -> None:
     )
     other_authority = ephemeral_v2_authority()
     alternatives = (
-        CONTROL_BINDING.model_copy(update={"candidate_id": "candidate-b"}),
-        CONTROL_BINDING.model_copy(update={"arm": "gbdt_only"}),
-        CONTROL_BINDING.model_copy(update={"input_digest": "b" * 64}),
-        V2ControlBinding.from_preregistration(
+        CONTROL_CONTEXT.model_copy(update={"candidate_id": "candidate-b"}),
+        CONTROL_CONTEXT.model_copy(update={"arm": "gbdt_only"}),
+        CONTROL_CONTEXT.model_copy(update={"input_digest": "b" * 64}),
+        V2ControlContext.from_preregistration(
             other_authority.preregistration,
+            sealed_preregistration=other_authority.preregistration,
             arm="rules_only",
             candidate_id="candidate-a",
             input_digest="a" * 64,
@@ -222,7 +243,11 @@ def test_control_attestation_cannot_replay_across_execution_bindings() -> None:
     )
 
     admissions = tuple(
-        admit_control_result(result, expected_binding=alternative)
+        admit_control_result(
+            result,
+            sealed_preregistration=AUTHORITY.preregistration,
+            expected_context=alternative,
+        )
         for alternative in alternatives
     )
 

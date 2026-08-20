@@ -208,6 +208,28 @@ def test_reflective_dynamic_import_capabilities_fail_closed(tmp_path: Path, sour
     assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
 
 
+@pytest.mark.parametrize(
+    "source",
+    (
+        "import builtins\nattribute_name = '__import__'\n"
+        "getattr(builtins, attribute_name)\n",
+        "import importlib\nmethod_name = 'import_module'\n"
+        "getattr(importlib, method_name)\n",
+        "import builtins\nkey = '__import__'\nvars(builtins)[key]\n",
+        "import importlib\nkey = 'import_module'\nimportlib.__dict__[key]\n",
+    ),
+)
+def test_variable_reflective_authority_access_fails_closed(
+    tmp_path: Path, source: str
+) -> None:
+    """Variable attribute names cannot make authority reflection appear safe."""
+    _write_defender_source(tmp_path, source)
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
 def test_transitive_defender_feature_import_is_scanned(tmp_path: Path) -> None:
     """A hidden import in a defender-reachable feature module must fail closed."""
     _write_defender_source(tmp_path, "from apar.features import bridge\n")
@@ -268,6 +290,24 @@ def test_transitive_feature_reflective_builtin_alias_fails_closed(tmp_path: Path
         "dynamic_import = lookup(namespace(loader), 'import_module')\n"
         "module = 'apar.evaluation_hidden'\n"
         "dynamic_import(module)\n",
+        encoding="utf-8",
+    )
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
+def test_transitive_feature_variable_reflection_fails_closed(tmp_path: Path) -> None:
+    """Variable reflective access stays forbidden in reachable feature code."""
+    _write_defender_source(tmp_path, "from apar.features import variable_reflection\n")
+    features = tmp_path / "src/apar/features"
+    features.mkdir(parents=True)
+    (features / "variable_reflection.py").write_text(
+        "from builtins import getattr as lookup, vars as namespace\n"
+        "import importlib as loader\n"
+        "method_name = 'import_module'\n"
+        "lookup(namespace(loader), method_name)\n",
         encoding="utf-8",
     )
 

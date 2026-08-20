@@ -16,6 +16,7 @@ from pydantic import Field, field_validator, model_validator
 
 from apar.contracts._validation import ExternalContract
 from apar.evaluation.v2_controls import ControlValidity, V2ControlContext
+from apar.evaluation.v2_preregistration import V2Preregistration
 from apar.evaluation.v2_protocol import V2Protocol
 
 if TYPE_CHECKING:
@@ -426,6 +427,7 @@ def evaluate_v2_gates(
     evidence: V2MetricSet | ArmThresholdCandidate,
     protocol: V2Protocol,
     *,
+    sealed_preregistration: V2Preregistration | None = None,
     control_context: V2ControlContext | None = None,
 ) -> V2GateOutcome:
     """Apply conservative all-scope gates to already-derived metric evidence."""
@@ -461,8 +463,13 @@ def evaluate_v2_gates(
         codes.add("BOOTSTRAP_UNDEFINED")
     if type(evidence) is ArmThresholdCandidate and (
         control is None
+        or type(sealed_preregistration) is not V2Preregistration
         or type(control_context) is not V2ControlContext
-        or not control.valid_for(control_context.binding(evidence.candidate_id))
+        or control_context.candidate_id != evidence.candidate_id
+        or not control.valid_for(
+            sealed_preregistration=sealed_preregistration,
+            expected_context=control_context,
+        )
     ):
         codes.add("CONTROL_INVALID")
 
@@ -507,22 +514,37 @@ def select_v2_thresholds(
     candidates: Sequence[ArmThresholdCandidate],
     protocol: V2Protocol,
     *,
-    control_context: V2ControlContext,
+    sealed_preregistration: V2Preregistration,
+    control_contexts: Mapping[str, V2ControlContext],
 ) -> V2SelectionReport:
     """Select only a candidate that passes every matched conservative gate."""
     if type(protocol) is not V2Protocol:
         raise TypeError("protocol must be an exact V2Protocol")
-    if type(control_context) is not V2ControlContext:
-        raise TypeError("selection requires an exact control context")
+    if (
+        type(sealed_preregistration) is not V2Preregistration
+        or not sealed_preregistration.verify_signature()
+        or not sealed_preregistration.verify_manifest_bindings()
+    ):
+        raise TypeError("selection requires an exact sealed preregistration")
+    if type(control_contexts) is not dict:
+        raise TypeError("selection requires exact independent control contexts")
     checked = tuple(candidates)
     if any(type(candidate) is not ArmThresholdCandidate for candidate in checked):
         raise TypeError("candidates must be exact ArmThresholdCandidate values")
     ids = tuple(candidate.candidate_id for candidate in checked)
     if len(ids) != len(set(ids)):
         raise ValueError("candidate IDs must be unique")
+    if set(control_contexts) != set(ids) or any(
+        type(context) is not V2ControlContext or context.candidate_id != candidate_id
+        for candidate_id, context in control_contexts.items()
+    ):
+        raise ValueError("selection control contexts must match every exact candidate")
     outcomes = {
         candidate.candidate_id: evaluate_v2_gates(
-            candidate, protocol, control_context=control_context
+            candidate,
+            protocol,
+            sealed_preregistration=sealed_preregistration,
+            control_context=control_contexts[candidate.candidate_id],
         )
         for candidate in checked
     }
