@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Literal
 from pydantic import Field, field_validator, model_validator
 
 from apar.contracts._validation import ExternalContract
-from apar.evaluation.v2_controls import ControlValidity
+from apar.evaluation.v2_controls import ControlValidity, V2ControlContext
 from apar.evaluation.v2_protocol import V2Protocol
 
 if TYPE_CHECKING:
@@ -423,7 +423,10 @@ def bootstrap_v2_metrics(
 
 
 def evaluate_v2_gates(
-    evidence: V2MetricSet | ArmThresholdCandidate, protocol: V2Protocol
+    evidence: V2MetricSet | ArmThresholdCandidate,
+    protocol: V2Protocol,
+    *,
+    control_context: V2ControlContext | None = None,
 ) -> V2GateOutcome:
     """Apply conservative all-scope gates to already-derived metric evidence."""
     if type(protocol) is not V2Protocol:
@@ -456,7 +459,11 @@ def evaluate_v2_gates(
         codes.add("BOOTSTRAP_REPLICATES")
     if any(metric.undefined_replicates != 0 for metric in mandatory_metrics):
         codes.add("BOOTSTRAP_UNDEFINED")
-    if type(evidence) is ArmThresholdCandidate and (control is None or not control.valid):
+    if type(evidence) is ArmThresholdCandidate and (
+        control is None
+        or type(control_context) is not V2ControlContext
+        or not control.valid_for(control_context.binding(evidence.candidate_id))
+    ):
         codes.add("CONTROL_INVALID")
 
     if any(not _at_least(metric.recall, 0.50) for metric in families):
@@ -497,11 +504,16 @@ def _required_bound(value: float | None) -> float:
 
 
 def select_v2_thresholds(
-    candidates: Sequence[ArmThresholdCandidate], protocol: V2Protocol
+    candidates: Sequence[ArmThresholdCandidate],
+    protocol: V2Protocol,
+    *,
+    control_context: V2ControlContext,
 ) -> V2SelectionReport:
     """Select only a candidate that passes every matched conservative gate."""
     if type(protocol) is not V2Protocol:
         raise TypeError("protocol must be an exact V2Protocol")
+    if type(control_context) is not V2ControlContext:
+        raise TypeError("selection requires an exact control context")
     checked = tuple(candidates)
     if any(type(candidate) is not ArmThresholdCandidate for candidate in checked):
         raise TypeError("candidates must be exact ArmThresholdCandidate values")
@@ -509,7 +521,10 @@ def select_v2_thresholds(
     if len(ids) != len(set(ids)):
         raise ValueError("candidate IDs must be unique")
     outcomes = {
-        candidate.candidate_id: evaluate_v2_gates(candidate, protocol) for candidate in checked
+        candidate.candidate_id: evaluate_v2_gates(
+            candidate, protocol, control_context=control_context
+        )
+        for candidate in checked
     }
     feasible = tuple(candidate for candidate in checked if outcomes[candidate.candidate_id].passed)
     if not feasible:
@@ -659,6 +674,7 @@ __all__ = [
     "BootstrapMetricContribution",
     "BoundedMetric",
     "ControlValidity",
+    "V2ControlContext",
     "V2BootstrapBlock",
     "V2GateOutcome",
     "V2MetricSet",

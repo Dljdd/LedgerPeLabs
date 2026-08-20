@@ -9,8 +9,8 @@ import numpy as np
 
 from apar.contracts.decisions import Action
 from apar.evaluation.contracts import EvaluationTruthRow
-from apar.evaluation.gates import EvaluatorSigningIdentity
 from apar.evaluation.v2_controls import (
+    V2ControlContext,
     run_benign_only_control,
     run_score_permutation_control,
 )
@@ -26,11 +26,21 @@ from apar.evaluation.v2_selection import (
     evaluate_v2_gates,
     select_v2_thresholds,
 )
+from tests.evaluation.v2_authority import ephemeral_v2_authority
+
+AUTHORITY = ephemeral_v2_authority()
+CONTROL_CONTEXT = V2ControlContext.from_preregistration(
+    AUTHORITY.preregistration,
+    arm="layered_hybrid",
+    input_digest="b" * 64,
+)
 
 
 def test_high_stratum_review_failure_rejects_candidate() -> None:
     result = select_v2_thresholds(
-        (candidate("safe"), candidate("high-review", high_review_rate=0.0101)), protocol()
+        (candidate("safe"), candidate("high-review", high_review_rate=0.0101)),
+        protocol(),
+        control_context=CONTROL_CONTEXT,
     )
 
     assert result.selected_candidate_id == "safe"
@@ -48,7 +58,9 @@ def test_upper_bound_vetoes_maximum_gate() -> None:
 
 def test_every_family_requires_value_and_alert_bounds() -> None:
     outcome = evaluate_v2_gates(
-        candidate("late-alert", family_time=bounded(299.0, lower=270.0, upper=301.0)), protocol()
+        candidate("late-alert", family_time=bounded(299.0, lower=270.0, upper=301.0)),
+        protocol(),
+        control_context=CONTROL_CONTEXT,
     )
 
     assert outcome.passed is False
@@ -56,7 +68,11 @@ def test_every_family_requires_value_and_alert_bounds() -> None:
 
 
 def test_invalid_typed_control_vetoes_an_otherwise_safe_candidate() -> None:
-    outcome = evaluate_v2_gates(candidate("invalid-control", control_valid=False), protocol())
+    outcome = evaluate_v2_gates(
+        candidate("invalid-control", control_valid=False),
+        protocol(),
+        control_context=CONTROL_CONTEXT,
+    )
 
     assert outcome.passed is False
     assert outcome.codes == ("CONTROL_INVALID",)
@@ -67,7 +83,22 @@ def test_forged_valid_control_cannot_pass_selection() -> None:
     forged = ControlValidity.model_construct(valid=True, reason=None)
     evidence = candidate("forged-control").model_copy(update={"control": forged})
 
-    outcome = evaluate_v2_gates(evidence, protocol())
+    outcome = evaluate_v2_gates(evidence, protocol(), control_context=CONTROL_CONTEXT)
+
+    assert outcome.passed is False
+    assert "CONTROL_INVALID" in outcome.codes
+
+
+def test_control_results_cannot_replay_between_candidates() -> None:
+    """Selection must compare both controls with the candidate-specific binding."""
+    first = candidate("candidate-a")
+    replayed = candidate("candidate-b").model_copy(update={"control": first.control})
+
+    outcome = evaluate_v2_gates(
+        replayed,
+        protocol(),
+        control_context=CONTROL_CONTEXT,
+    )
 
     assert outcome.passed is False
     assert "CONTROL_INVALID" in outcome.codes
@@ -77,6 +108,7 @@ def test_undefined_metric_fails_closed() -> None:
     outcome = evaluate_v2_gates(
         candidate("undefined", ece=BoundedMetric.undefined(numerator=0.0, denominator=0.0)),
         protocol(),
+        control_context=CONTROL_CONTEXT,
     )
 
     assert outcome.passed is False
@@ -85,10 +117,14 @@ def test_undefined_metric_fails_closed() -> None:
 
 def test_zero_or_non_2000_bootstrap_replicates_fail_closed() -> None:
     zero = evaluate_v2_gates(
-        candidate("zero-bootstrap", ece=bootstrap_bounded(0.05, replicates=0)), protocol()
+        candidate("zero-bootstrap", ece=bootstrap_bounded(0.05, replicates=0)),
+        protocol(),
+        control_context=CONTROL_CONTEXT,
     )
     wrong_count = evaluate_v2_gates(
-        candidate("wrong-bootstrap", ece=bootstrap_bounded(0.05, replicates=1_999)), protocol()
+        candidate("wrong-bootstrap", ece=bootstrap_bounded(0.05, replicates=1_999)),
+        protocol(),
+        control_context=CONTROL_CONTEXT,
     )
 
     assert "BOOTSTRAP_REPLICATES" in zero.codes
@@ -102,6 +138,7 @@ def test_partially_undefined_bootstrap_distribution_fails_closed() -> None:
             ece=bootstrap_bounded(0.05, replicates=2_000, undefined_replicates=1),
         ),
         protocol(),
+        control_context=CONTROL_CONTEXT,
     )
 
     assert outcome.passed is False
@@ -112,13 +149,18 @@ def test_tie_break_is_stable_and_lexicographic_after_matched_gates() -> None:
     result = select_v2_thresholds(
         (candidate("later", thresholds=(0.3, 0.8)), candidate("first", thresholds=(0.2, 0.9))),
         protocol(),
+        control_context=CONTROL_CONTEXT,
     )
 
     assert result.selected_candidate_id == "first"
 
 
 def test_no_promotion_when_no_candidate_qualifies() -> None:
-    result = select_v2_thresholds((candidate("bad", control_valid=False),), protocol())
+    result = select_v2_thresholds(
+        (candidate("bad", control_valid=False),),
+        protocol(),
+        control_context=CONTROL_CONTEXT,
+    )
 
     assert result.status == "no_promotion"
     assert result.selected_candidate_id is None
@@ -221,16 +263,18 @@ def candidate(
         metrics=metrics,
         strata=strata,
         families=families,
-        control=control_validity(valid=control_valid),
+        control=control_validity(valid=control_valid, candidate_id=candidate_id),
     )
 
 
-def control_validity(*, valid: bool) -> ControlValidity:
-    signer = EvaluatorSigningIdentity.from_private_bytes(b"v" * 32)
+def control_validity(*, valid: bool, candidate_id: str) -> ControlValidity:
+    signer = AUTHORITY.evaluator
+    binding = CONTROL_CONTEXT.binding(candidate_id)
     benign = run_benign_only_control(
         actions=(Action.APPROVE,),
         truth=(_control_truth("benign", fraud=False),),
         signer=signer,
+        binding=binding,
     )
     permutation = run_score_permutation_control(
         scores=np.array([0.8, 0.2]),
@@ -242,12 +286,14 @@ def control_validity(*, valid: bool) -> ControlValidity:
         seed=7,
         evaluator=lambda scores, truth, blocks: False,
         signer=signer,
+        binding=binding,
     )
     if not valid:
         benign = run_benign_only_control(
             actions=(Action.APPROVE,),
             truth=(_control_truth("fraud-control", fraud=True),),
             signer=signer,
+            binding=binding,
         )
     return ControlValidity.attest(
         benign_only=benign,

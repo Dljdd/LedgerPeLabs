@@ -94,7 +94,7 @@ def verify_v2_preexecution(root: Path, preregistration: V2Preregistration) -> Pr
                 forbidden="apar.evaluation_hidden",
                 allowed_prefix="apar.evaluation.v2_",
             ),
-            verify_preregistration(preregistration),
+            verify_preregistration(root, preregistration),
         )
     )
 
@@ -197,10 +197,13 @@ def _verify_frozen_manifest_inputs(root: Path, manifests: dict[str, object]) -> 
         source_root = _resolved_frozen_path(root, relative_root)
         if not source_root.is_dir() or source_root.is_symlink():
             raise ValueError("source root is not a regular directory")
+        inventory = tuple(source_root.rglob("*"))
+        if any(path.is_symlink() for path in inventory):
+            raise ValueError("source inventory contains a symbolic link")
         actual_source_files.update(
             path.relative_to(root).as_posix()
-            for path in source_root.rglob("*.py")
-            if path.is_file() and not path.is_symlink()
+            for path in inventory
+            if path.suffix == ".py" and path.is_file()
         )
     if set(files) != actual_source_files:
         raise ValueError("source inventory differs from the frozen tree")
@@ -267,8 +270,15 @@ def _resolved_frozen_path(root: Path, relative_path: object) -> Path:
     relative = Path(relative_path)
     if relative.is_absolute() or not relative.parts or ".." in relative.parts:
         raise ValueError("frozen input path escapes the repository")
+    if root.is_symlink():
+        raise ValueError("repository root cannot be a symbolic link")
+    lexical = root
+    for part in relative.parts:
+        lexical = lexical / part
+        if lexical.is_symlink():
+            raise ValueError("frozen input path contains a symbolic link")
     resolved_root = root.resolve(strict=True)
-    resolved = (root / relative).resolve(strict=True)
+    resolved = lexical.resolve(strict=True)
     if not resolved.is_relative_to(resolved_root):
         raise ValueError("frozen input path escapes the repository")
     return resolved
@@ -302,10 +312,14 @@ def verify_import_boundary(root: Path, *, forbidden: str, allowed_prefix: str) -
     project_source = root / "src"
     defender_root = project_source / "apar" / "defense"
     try:
-        pending = [(path, False) for path in defender_root.rglob("*.py")]
+        inventory = tuple(defender_root.rglob("*"))
+        if defender_root.is_symlink() or any(path.is_symlink() for path in inventory):
+            raise ValueError("defender Python inventory contains a symbolic link")
+        pending = [(path, False) for path in inventory if path.suffix == ".py" and path.is_file()]
         seen: dict[Path, bool] = {}
         while pending:
             path, traverse_dependencies = pending.pop()
+            _require_regular_python_path(project_source, path)
             if path in seen and (seen[path] or not traverse_dependencies):
                 continue
             seen[path] = seen.get(path, False) or traverse_dependencies
@@ -329,17 +343,34 @@ def verify_import_boundary(root: Path, *, forbidden: str, allowed_prefix: str) -
     return PreexecutionCheck(code="HIDDEN_IMPORT_BOUNDARY", passed=True)
 
 
-def verify_preregistration(preregistration: object) -> PreexecutionCheck:
+def _require_regular_python_path(project_source: Path, path: Path) -> None:
+    """Reject symbolic links anywhere in a defender-reachable Python path."""
+    if project_source.is_symlink():
+        raise ValueError("project source root cannot be a symbolic link")
+    relative = path.relative_to(project_source)
+    lexical = project_source
+    for part in relative.parts:
+        lexical = lexical / part
+        if lexical.is_symlink():
+            raise ValueError("defender-reachable Python path contains a symbolic link")
+    if not lexical.is_file() or lexical.suffix != ".py":
+        raise ValueError("defender-reachable Python path is not a regular Python file")
+
+
+def verify_preregistration(root: Path, preregistration: object) -> PreexecutionCheck:
     """Require the exact sealed contract and its intact evaluator signature."""
     if type(preregistration) is not V2Preregistration:
         return PreexecutionCheck(code="PREREGISTRATION_INVALID", passed=False)
     try:
+        raw = (root / "config/defense/competition-v2-preregistration.json").read_bytes()
+        wire = raw[:-1] if raw.endswith(b"\n") else raw
+        sealed = V2Preregistration.from_json(wire)
         valid = (
             preregistration.verify_manifest_bindings()
             and preregistration.verify_signature()
-            and preregistration.verify_trusted_authority()
+            and preregistration.matches_sealed_preregistration(sealed)
         )
-    except (AttributeError, TypeError, ValueError):
+    except (AttributeError, OSError, TypeError, ValueError):
         valid = False
     return PreexecutionCheck(code="PREREGISTRATION_INVALID", passed=valid)
 
@@ -360,7 +391,13 @@ def _contains_disallowed_import(
     allowed_prefix: str,
 ) -> bool:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    importlib_aliases, builtins_aliases, import_function_aliases = _import_bindings(tree)
+    (
+        importlib_aliases,
+        builtins_aliases,
+        import_function_aliases,
+        getattr_aliases,
+        vars_aliases,
+    ) = _import_bindings(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Import) and any(
             _is_disallowed_module(name.name, forbidden, allowed_prefix)
@@ -379,6 +416,8 @@ def _contains_disallowed_import(
             importlib_aliases,
             builtins_aliases,
             import_function_aliases,
+            getattr_aliases,
+            vars_aliases,
         ):
             if not node.args or not isinstance(node.args[0], ast.Constant):
                 return True
@@ -390,10 +429,14 @@ def _contains_disallowed_import(
     return False
 
 
-def _import_bindings(tree: ast.AST) -> tuple[set[str], set[str], set[str]]:
+def _import_bindings(
+    tree: ast.AST,
+) -> tuple[set[str], set[str], set[str], set[str], set[str]]:
     importlib_aliases: set[str] = set()
     builtins_aliases: set[str] = {"__builtins__"}
     import_function_aliases = {"__import__"}
+    getattr_aliases = {"getattr"}
+    vars_aliases = {"vars"}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for name in node.names:
@@ -413,16 +456,24 @@ def _import_bindings(tree: ast.AST) -> tuple[set[str], set[str], set[str]]:
             for name in node.names:
                 if name.name == "__import__":
                     import_function_aliases.add(name.asname or name.name)
+                elif name.name == "getattr":
+                    getattr_aliases.add(name.asname or name.name)
+                elif name.name == "vars":
+                    vars_aliases.add(name.asname or name.name)
     changed = True
     while changed:
         changed = False
         for node in ast.walk(tree):
-            if isinstance(node, ast.Assign) and _has_importlib_root(node.value, importlib_aliases):
+            if isinstance(node, ast.Assign) and _has_importlib_root(
+                node.value, importlib_aliases, vars_aliases
+            ):
                 for target in node.targets:
                     if isinstance(target, ast.Name) and target.id not in importlib_aliases:
                         importlib_aliases.add(target.id)
                         changed = True
-            elif isinstance(node, ast.Assign) and _has_named_root(node.value, builtins_aliases):
+            elif isinstance(node, ast.Assign) and _has_named_root(
+                node.value, builtins_aliases, vars_aliases
+            ):
                 for target in node.targets:
                     if isinstance(target, ast.Name) and target.id not in builtins_aliases:
                         builtins_aliases.add(target.id)
@@ -432,16 +483,32 @@ def _import_bindings(tree: ast.AST) -> tuple[set[str], set[str], set[str]]:
                 importlib_aliases,
                 builtins_aliases,
                 import_function_aliases,
+                getattr_aliases,
+                vars_aliases,
             ):
                 for target in node.targets:
                     if isinstance(target, ast.Name) and target.id not in import_function_aliases:
                         import_function_aliases.add(target.id)
                         changed = True
+            elif isinstance(node, ast.Assign) and _has_named_root(
+                node.value, getattr_aliases, vars_aliases
+            ):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id not in getattr_aliases:
+                        getattr_aliases.add(target.id)
+                        changed = True
+            elif isinstance(node, ast.Assign) and _has_named_root(
+                node.value, vars_aliases, vars_aliases
+            ):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id not in vars_aliases:
+                        vars_aliases.add(target.id)
+                        changed = True
             elif (
                 isinstance(node, ast.AnnAssign)
                 and node.value is not None
                 and isinstance(node.target, ast.Name)
-                and _has_importlib_root(node.value, importlib_aliases)
+                and _has_importlib_root(node.value, importlib_aliases, vars_aliases)
                 and node.target.id not in importlib_aliases
             ):
                 importlib_aliases.add(node.target.id)
@@ -450,7 +517,7 @@ def _import_bindings(tree: ast.AST) -> tuple[set[str], set[str], set[str]]:
                 isinstance(node, ast.AnnAssign)
                 and node.value is not None
                 and isinstance(node.target, ast.Name)
-                and _has_named_root(node.value, builtins_aliases)
+                and _has_named_root(node.value, builtins_aliases, vars_aliases)
                 and node.target.id not in builtins_aliases
             ):
                 builtins_aliases.add(node.target.id)
@@ -464,12 +531,38 @@ def _import_bindings(tree: ast.AST) -> tuple[set[str], set[str], set[str]]:
                     importlib_aliases,
                     builtins_aliases,
                     import_function_aliases,
+                    getattr_aliases,
+                    vars_aliases,
                 )
                 and node.target.id not in import_function_aliases
             ):
                 import_function_aliases.add(node.target.id)
                 changed = True
-    return importlib_aliases, builtins_aliases, import_function_aliases
+            elif (
+                isinstance(node, ast.AnnAssign)
+                and node.value is not None
+                and isinstance(node.target, ast.Name)
+                and _has_named_root(node.value, getattr_aliases, vars_aliases)
+                and node.target.id not in getattr_aliases
+            ):
+                getattr_aliases.add(node.target.id)
+                changed = True
+            elif (
+                isinstance(node, ast.AnnAssign)
+                and node.value is not None
+                and isinstance(node.target, ast.Name)
+                and _has_named_root(node.value, vars_aliases, vars_aliases)
+                and node.target.id not in vars_aliases
+            ):
+                vars_aliases.add(node.target.id)
+                changed = True
+    return (
+        importlib_aliases,
+        builtins_aliases,
+        import_function_aliases,
+        getattr_aliases,
+        vars_aliases,
+    )
 
 
 def _is_dynamic_import_call(
@@ -477,12 +570,16 @@ def _is_dynamic_import_call(
     importlib_aliases: set[str],
     builtins_aliases: set[str],
     import_function_aliases: set[str],
+    getattr_aliases: set[str],
+    vars_aliases: set[str],
 ) -> bool:
     return _is_import_function_reference(
         node.func,
         importlib_aliases,
         builtins_aliases,
         import_function_aliases,
+        getattr_aliases,
+        vars_aliases,
     )
 
 
@@ -529,7 +626,13 @@ def _source_package(path: Path, project_source: Path) -> tuple[str, ...]:
 
 def _local_import_targets(tree: ast.AST, path: Path, project_source: Path) -> tuple[str, ...]:
     modules: set[str] = set()
-    importlib_aliases, builtins_aliases, import_function_aliases = _import_bindings(tree)
+    (
+        importlib_aliases,
+        builtins_aliases,
+        import_function_aliases,
+        getattr_aliases,
+        vars_aliases,
+    ) = _import_bindings(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             modules.update(name.name for name in node.names)
@@ -541,7 +644,12 @@ def _local_import_targets(tree: ast.AST, path: Path, project_source: Path) -> tu
         elif (
             isinstance(node, ast.Call)
             and _is_dynamic_import_call(
-                node, importlib_aliases, builtins_aliases, import_function_aliases
+                node,
+                importlib_aliases,
+                builtins_aliases,
+                import_function_aliases,
+                getattr_aliases,
+                vars_aliases,
             )
             and node.args
             and isinstance(node.args[0], ast.Constant)
@@ -562,13 +670,17 @@ def _local_module_paths(project_source: Path, module: str) -> tuple[Path, ...]:
     return tuple(path for path in candidates if path.is_file())
 
 
-def _has_importlib_root(value: ast.expr, importlib_aliases: set[str]) -> bool:
-    reflected = _reflection_mapping_root(value)
+def _has_importlib_root(
+    value: ast.expr, importlib_aliases: set[str], vars_aliases: set[str]
+) -> bool:
+    reflected = _reflection_mapping_root(value, vars_aliases)
     if reflected is not value:
-        return _has_importlib_root(reflected, importlib_aliases)
+        return _has_importlib_root(reflected, importlib_aliases, vars_aliases)
     if isinstance(value, ast.Name):
         return value.id in importlib_aliases
-    return isinstance(value, ast.Attribute) and _has_importlib_root(value.value, importlib_aliases)
+    return isinstance(value, ast.Attribute) and _has_importlib_root(
+        value.value, importlib_aliases, vars_aliases
+    )
 
 
 def _is_import_function_reference(
@@ -576,54 +688,64 @@ def _is_import_function_reference(
     importlib_aliases: set[str],
     builtins_aliases: set[str],
     import_function_aliases: set[str],
+    getattr_aliases: set[str],
+    vars_aliases: set[str],
 ) -> bool:
     if isinstance(value, ast.Name):
         return value.id in import_function_aliases
     if isinstance(value, ast.Attribute):
         return (
-            value.attr == "import_module" and _has_importlib_root(value.value, importlib_aliases)
-        ) or (value.attr == "__import__" and _has_named_root(value.value, builtins_aliases))
+            value.attr == "import_module"
+            and _has_importlib_root(value.value, importlib_aliases, vars_aliases)
+        ) or (
+            value.attr == "__import__"
+            and _has_named_root(value.value, builtins_aliases, vars_aliases)
+        )
     if isinstance(value, ast.Call):
         if (
             isinstance(value.func, ast.Name)
-            and value.func.id == "getattr"
+            and value.func.id in getattr_aliases
             and len(value.args) >= 2
             and isinstance(value.args[1], ast.Constant)
         ):
             attribute = value.args[1].value
             return (
-                attribute == "__import__" and _has_named_root(value.args[0], builtins_aliases)
+                attribute == "__import__"
+                and _has_named_root(value.args[0], builtins_aliases, vars_aliases)
             ) or (
                 attribute == "import_module"
-                and _has_importlib_root(value.args[0], importlib_aliases)
+                and _has_importlib_root(value.args[0], importlib_aliases, vars_aliases)
             )
         return False
     if not isinstance(value, ast.Subscript) or not isinstance(value.slice, ast.Constant):
         return False
     attribute = value.slice.value
-    root = _reflection_mapping_root(value.value)
-    return (attribute == "__import__" and _has_named_root(root, builtins_aliases)) or (
-        attribute == "import_module" and _has_importlib_root(root, importlib_aliases)
+    root = _reflection_mapping_root(value.value, vars_aliases)
+    return (
+        attribute == "__import__" and _has_named_root(root, builtins_aliases, vars_aliases)
+    ) or (
+        attribute == "import_module"
+        and _has_importlib_root(root, importlib_aliases, vars_aliases)
     )
 
 
-def _reflection_mapping_root(value: ast.expr) -> ast.expr:
+def _reflection_mapping_root(value: ast.expr, vars_aliases: set[str]) -> ast.expr:
     if isinstance(value, ast.Attribute) and value.attr == "__dict__":
         return value.value
     if (
         isinstance(value, ast.Call)
         and isinstance(value.func, ast.Name)
-        and value.func.id == "vars"
+        and value.func.id in vars_aliases
         and len(value.args) == 1
     ):
         return value.args[0]
     return value
 
 
-def _has_named_root(value: ast.expr, aliases: set[str]) -> bool:
-    reflected = _reflection_mapping_root(value)
+def _has_named_root(value: ast.expr, aliases: set[str], vars_aliases: set[str]) -> bool:
+    reflected = _reflection_mapping_root(value, vars_aliases)
     if reflected is not value:
-        return _has_named_root(reflected, aliases)
+        return _has_named_root(reflected, aliases, vars_aliases)
     return isinstance(value, ast.Name) and value.id in aliases
 
 

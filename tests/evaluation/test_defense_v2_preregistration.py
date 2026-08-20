@@ -6,7 +6,6 @@ import hashlib
 
 import pytest
 
-from apar.evaluation.gates import EvaluatorSigningIdentity
 from apar.evaluation.v2_preregistration import (
     ExecutionReceipt,
     V2Preregistration,
@@ -15,6 +14,7 @@ from apar.evaluation.v2_preregistration import (
     sign_v2_preregistration,
 )
 from apar.runs.wire import canonical_json_bytes
+from tests.evaluation.v2_authority import ephemeral_v2_authority
 
 
 def test_missing_seed_commitments_is_rejected() -> None:
@@ -30,7 +30,7 @@ def test_missing_committed_protocol_profile_binding_is_rejected() -> None:
     """A digest-only preregistration cannot float free of the frozen V2 profile."""
     payload = complete_preregistration_payload()
     del payload["protocol_profile_sha256"]
-    signer = EvaluatorSigningIdentity.from_private_bytes(b"v" * 32)
+    signer = ephemeral_v2_authority().evaluator
 
     with pytest.raises(V2PreregistrationError, match="protocol_profile_sha256"):
         sign_v2_preregistration(payload, signer=signer)
@@ -55,7 +55,11 @@ def test_second_admission_is_denied() -> None:
         execution_nonce=preregistration.execution_nonce,
     )
 
-    admission = admit_v2_execution(preregistration, existing_receipts=(receipt,))
+    admission = admit_v2_execution(
+        preregistration,
+        existing_receipts=(receipt,),
+        sealed_preregistration=preregistration,
+    )
 
     assert (admission.admitted, admission.reason) == (
         False,
@@ -67,7 +71,11 @@ def test_empty_general_sequence_is_admitted() -> None:
     """An empty non-list Sequence must leave the confirmatory admission available."""
     preregistration = signed_preregistration()
 
-    admission = admit_v2_execution(preregistration, existing_receipts=range(0))
+    admission = admit_v2_execution(
+        preregistration,
+        existing_receipts=range(0),
+        sealed_preregistration=preregistration,
+    )
 
     assert (admission.admitted, admission.reason, admission.execution_nonce) == (
         True,
@@ -78,7 +86,12 @@ def test_empty_general_sequence_is_admitted() -> None:
 
 def test_nonempty_general_sequence_exhausts_admission() -> None:
     """A prior receipt represented by a non-list Sequence must consume the attempt."""
-    admission = admit_v2_execution(signed_preregistration(), existing_receipts=range(1))
+    preregistration = signed_preregistration()
+    admission = admit_v2_execution(
+        preregistration,
+        existing_receipts=range(1),
+        sealed_preregistration=preregistration,
+    )
 
     assert (admission.admitted, admission.reason) == (
         False,
@@ -96,8 +109,7 @@ def test_caller_approval_flag_is_not_an_admission_path() -> None:
 
 
 def signed_preregistration() -> V2Preregistration:
-    signer = EvaluatorSigningIdentity.from_private_bytes(b"v" * 32)
-    return sign_v2_preregistration(complete_preregistration_payload(), signer=signer)
+    return ephemeral_v2_authority().preregistration
 
 
 def complete_preregistration_payload() -> dict[str, object]:

@@ -9,24 +9,107 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 from collections.abc import Callable, Sequence
 from typing import Literal
 
 import numpy as np
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-from pydantic import model_validator
+from pydantic import Field, model_validator
 
 from apar.contracts._validation import ExternalContract
 from apar.contracts.decisions import Action
 from apar.evaluation.contracts import EvaluationTruthRow
 from apar.evaluation.gates import EvaluatorSigningIdentity
-from apar.evaluation.v2_preregistration import trusted_v2_evaluator_identity
+from apar.evaluation.v2_preregistration import V2Preregistration
 from apar.runs.wire import canonical_json_bytes
 
 
 class V2ControlError(ValueError):
     """A mandatory control could not produce trusted evaluator evidence."""
+
+
+class V2ControlBinding(ExternalContract):
+    """Exact execution and candidate context covered by a control signature."""
+
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    preregistration_id: str = Field(min_length=1)
+    execution_nonce: str
+    arm: Literal["rules_only", "gbdt_only", "layered_hybrid"]
+    candidate_id: str = Field(min_length=1, max_length=256)
+    input_digest: str
+    evaluator_key_id: str
+    evaluator_public_key_base64: str
+
+    @model_validator(mode="after")
+    def binding_is_closed(self) -> V2ControlBinding:
+        _require_digest(self.execution_nonce, field="execution_nonce")
+        _require_digest(self.input_digest, field="input_digest")
+        _require_public_identity(self.evaluator_key_id, self.evaluator_public_key_base64)
+        return self
+
+    @classmethod
+    def from_preregistration(
+        cls,
+        preregistration: V2Preregistration,
+        *,
+        arm: Literal["rules_only", "gbdt_only", "layered_hybrid"],
+        candidate_id: str,
+        input_digest: str,
+    ) -> V2ControlBinding:
+        if (
+            type(preregistration) is not V2Preregistration
+            or not preregistration.verify_signature()
+            or not preregistration.verify_manifest_bindings()
+        ):
+            raise V2ControlError("control binding requires a signed preregistration")
+        return cls(
+            preregistration_id=preregistration.preregistration_id,
+            execution_nonce=preregistration.execution_nonce,
+            arm=arm,
+            candidate_id=candidate_id,
+            input_digest=input_digest,
+            evaluator_key_id=preregistration.evaluator_key_id,
+            evaluator_public_key_base64=preregistration.evaluator_public_key_base64,
+        )
+
+
+class V2ControlContext(ExternalContract):
+    """Evaluator authority and immutable input shared by one arm's candidates."""
+
+    preregistration: V2Preregistration
+    arm: Literal["rules_only", "gbdt_only", "layered_hybrid"]
+    input_digest: str
+
+    @model_validator(mode="after")
+    def context_is_closed(self) -> V2ControlContext:
+        _require_digest(self.input_digest, field="input_digest")
+        if (
+            type(self.preregistration) is not V2Preregistration
+            or not self.preregistration.verify_signature()
+            or not self.preregistration.verify_manifest_bindings()
+        ):
+            raise ValueError("control context requires an intact signed preregistration")
+        return self
+
+    @classmethod
+    def from_preregistration(
+        cls,
+        preregistration: V2Preregistration,
+        *,
+        arm: Literal["rules_only", "gbdt_only", "layered_hybrid"],
+        input_digest: str,
+    ) -> V2ControlContext:
+        return cls(preregistration=preregistration, arm=arm, input_digest=input_digest)
+
+    def binding(self, candidate_id: str) -> V2ControlBinding:
+        return V2ControlBinding.from_preregistration(
+            self.preregistration,
+            arm=self.arm,
+            candidate_id=candidate_id,
+            input_digest=self.input_digest,
+        )
 
 
 class ControlResult(ExternalContract):
@@ -39,8 +122,7 @@ class ControlResult(ExternalContract):
     intervention_count: int = 0
     true_positive_count: int = 0
     efficacy_auc: float | None = None
-    evaluator_key_id: str
-    evaluator_public_key_base64: str
+    binding: V2ControlBinding
     signature_base64: str
 
     @model_validator(mode="after")
@@ -57,13 +139,11 @@ class ControlResult(ExternalContract):
     def unsigned_document(self) -> dict[str, object]:
         return self.model_dump(mode="json", exclude={"signature_base64"})
 
-    def verify_attestation(self) -> bool:
-        if not trusted_v2_evaluator_identity(
-            self.evaluator_key_id, self.evaluator_public_key_base64
-        ):
+    def verify_attestation(self, expected_binding: V2ControlBinding | None = None) -> bool:
+        if expected_binding is not None and self.binding != expected_binding:
             return False
         try:
-            public = base64.b64decode(self.evaluator_public_key_base64, validate=True)
+            public = base64.b64decode(self.binding.evaluator_public_key_base64, validate=True)
             signature = base64.b64decode(self.signature_base64, validate=True)
             Ed25519PublicKey.from_public_bytes(public).verify(
                 signature, canonical_json_bytes(self.unsigned_document())
@@ -88,6 +168,8 @@ class ControlValidity(ExternalContract):
             or self.score_permutation.kind != "score_permutation"
         ):
             raise ValueError("score-permutation control result is missing")
+        if self.benign_only.binding != self.score_permutation.binding:
+            raise ValueError("mandatory controls must share one exact binding")
         return self
 
     @classmethod
@@ -102,15 +184,17 @@ class ControlValidity(ExternalContract):
             raise TypeError("control validity requires exact ControlResult evidence")
         return cls(benign_only=benign_only, score_permutation=score_permutation)
 
-    @property
-    def valid(self) -> bool:
-        """Return true only while both results retain evaluator-owned attestations."""
+    def valid_for(self, expected_binding: V2ControlBinding) -> bool:
+        """Return true only when both attestations match the exact candidate context."""
         try:
             return (
-                type(self.benign_only) is ControlResult
+                type(expected_binding) is V2ControlBinding
+                and type(self.benign_only) is ControlResult
                 and type(self.score_permutation) is ControlResult
-                and admit_control_result(self.benign_only).valid
-                and admit_control_result(self.score_permutation).valid
+                and admit_control_result(self.benign_only, expected_binding=expected_binding).valid
+                and admit_control_result(
+                    self.score_permutation, expected_binding=expected_binding
+                ).valid
             )
         except (AttributeError, TypeError, ValueError):
             return False
@@ -138,7 +222,9 @@ class ControlAdmission(ExternalContract):
 ControlEvaluator = Callable[[np.ndarray, tuple[EvaluationTruthRow, ...], tuple[str, ...]], bool]
 
 
-def admit_control_result(control: ControlResult) -> ControlAdmission:
+def admit_control_result(
+    control: ControlResult, *, expected_binding: V2ControlBinding | None = None
+) -> ControlAdmission:
     """Convert a control result into a load-bearing whole-run admission."""
     if type(control) is not ControlResult:
         return ControlAdmission(
@@ -149,6 +235,10 @@ def admit_control_result(control: ControlResult) -> ControlAdmission:
     except Exception:
         return ControlAdmission(
             valid=False, status="no_promotion", reason="invalid_control_attestation"
+        )
+    if expected_binding is None or checked.binding != expected_binding:
+        return ControlAdmission(
+            valid=False, status="no_promotion", reason="control_binding_mismatch"
         )
     if not checked.valid:
         return ControlAdmission(
@@ -162,6 +252,7 @@ def run_benign_only_control(
     actions: Sequence[Action | object],
     truth: Sequence[EvaluationTruthRow],
     signer: EvaluatorSigningIdentity,
+    binding: V2ControlBinding,
 ) -> ControlResult:
     """Verify that an all-benign operating control makes no fraud claim.
 
@@ -169,13 +260,14 @@ def run_benign_only_control(
     evidence, even though true-positive count must be zero.
     """
 
-    _require_trusted_signer(signer)
+    _require_bound_signer(signer, binding)
     try:
         rows = _validated_truth(truth)
         action_values = _validated_actions(actions, rows)
         if any(row.is_fraud for row in rows):
             return _attest_control_result(
                 signer=signer,
+                binding=binding,
                 valid=False,
                 kind="benign_only",
                 reason="malformed_benign_control",
@@ -183,6 +275,7 @@ def run_benign_only_control(
         interventions = sum(action is not Action.APPROVE for action in action_values)
         return _attest_control_result(
             signer=signer,
+            binding=binding,
             valid=True,
             kind="benign_only",
             intervention_count=interventions,
@@ -191,6 +284,7 @@ def run_benign_only_control(
     except Exception:
         return _attest_control_result(
             signer=signer,
+            binding=binding,
             valid=False,
             kind="benign_only",
             reason="malformed_benign_control",
@@ -205,6 +299,7 @@ def run_score_permutation_control(
     seed: int,
     evaluator: ControlEvaluator | None = None,
     signer: EvaluatorSigningIdentity,
+    binding: V2ControlBinding,
 ) -> ControlResult:
     """Permute score blocks and reject any apparently qualifying efficacy.
 
@@ -212,11 +307,12 @@ def run_score_permutation_control(
     complete blocks move; row order within each block is retained.
     """
 
-    _require_trusted_signer(signer)
+    _require_bound_signer(signer, binding)
 
     def invalid(reason: str) -> ControlResult:
         return _attest_control_result(
             signer=signer,
+            binding=binding,
             valid=False,
             kind="score_permutation",
             reason=reason,
@@ -247,6 +343,7 @@ def run_score_permutation_control(
         auc = _auc(permuted, np.asarray([row.is_fraud for row in rows], dtype=bool))
         return _attest_control_result(
             signer=signer,
+            binding=binding,
             valid=True,
             kind="score_permutation",
             efficacy_auc=auc,
@@ -255,16 +352,20 @@ def run_score_permutation_control(
         return invalid("malformed_permutation_control")
 
 
-def _require_trusted_signer(signer: EvaluatorSigningIdentity) -> None:
-    if not EvaluatorSigningIdentity.is_exact(signer) or not trusted_v2_evaluator_identity(
-        signer.key_id, signer.public_key_base64
+def _require_bound_signer(signer: EvaluatorSigningIdentity, binding: V2ControlBinding) -> None:
+    if (
+        not EvaluatorSigningIdentity.is_exact(signer)
+        or type(binding) is not V2ControlBinding
+        or signer.key_id != binding.evaluator_key_id
+        or signer.public_key_base64 != binding.evaluator_public_key_base64
     ):
-        raise V2ControlError("control signer is not the trusted evaluator authority")
+        raise V2ControlError("control signer does not match the bound evaluator authority")
 
 
 def _attest_control_result(
     *,
     signer: EvaluatorSigningIdentity,
+    binding: V2ControlBinding,
     valid: bool,
     kind: Literal["benign_only", "score_permutation"],
     reason: str | None = None,
@@ -272,7 +373,7 @@ def _attest_control_result(
     true_positive_count: int = 0,
     efficacy_auc: float | None = None,
 ) -> ControlResult:
-    _require_trusted_signer(signer)
+    _require_bound_signer(signer, binding)
     unsigned: dict[str, object] = {
         "schema_version": "1.0.0",
         "valid": valid,
@@ -281,10 +382,31 @@ def _attest_control_result(
         "intervention_count": intervention_count,
         "true_positive_count": true_positive_count,
         "efficacy_auc": efficacy_auc,
-        "evaluator_key_id": signer.key_id,
-        "evaluator_public_key_base64": signer.public_key_base64,
+        "binding": binding.model_dump(mode="json"),
     }
     return ControlResult.model_validate({**unsigned, "signature_base64": signer._sign(unsigned)})
+
+
+def _require_digest(value: object, *, field: str) -> str:
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{field} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _require_public_identity(key_id: object, public_key_base64: object) -> None:
+    _require_digest(key_id, field="evaluator_key_id")
+    if type(public_key_base64) is not str:
+        raise ValueError("evaluator public key is invalid")
+    try:
+        public = base64.b64decode(public_key_base64, validate=True)
+    except (ValueError, binascii.Error) as error:
+        raise ValueError("evaluator public key is invalid") from error
+    if len(public) != 32 or hashlib.sha256(public).hexdigest() != key_id:
+        raise ValueError("evaluator public key identity is inconsistent")
 
 
 def _validated_truth(truth: Sequence[EvaluationTruthRow]) -> tuple[EvaluationTruthRow, ...]:
@@ -365,6 +487,8 @@ __all__ = [
     "ControlEvaluator",
     "ControlResult",
     "ControlValidity",
+    "V2ControlBinding",
+    "V2ControlContext",
     "V2ControlError",
     "admit_control_result",
     "run_benign_only_control",

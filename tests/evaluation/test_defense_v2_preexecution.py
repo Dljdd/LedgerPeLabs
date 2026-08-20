@@ -9,10 +9,10 @@ from pathlib import Path
 
 import pytest
 
-from apar.evaluation.gates import EvaluatorSigningIdentity
 from apar.evaluation.v2_preexecution import verify_manifest_registry, verify_v2_preexecution
 from apar.evaluation.v2_preregistration import V2Preregistration, sign_v2_preregistration
 from apar.runs.wire import canonical_json_bytes
+from tests.evaluation.v2_authority import ephemeral_v2_authority
 
 ROOT = Path(__file__).resolve().parents[2]
 PROFILE = json.loads((ROOT / "config/defense/competition-v2-profile.json").read_bytes())
@@ -257,6 +257,39 @@ def test_feature_reachable_local_package_enters_transitive_scan(tmp_path: Path) 
     assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
 
 
+def test_transitive_feature_reflective_builtin_alias_fails_closed(tmp_path: Path) -> None:
+    """Aliases of getattr and vars remain import capabilities in reachable features."""
+    _write_defender_source(tmp_path, "from apar.features import reflective_bridge\n")
+    features = tmp_path / "src/apar/features"
+    features.mkdir(parents=True)
+    (features / "reflective_bridge.py").write_text(
+        "from builtins import getattr as lookup, vars as namespace\n"
+        "import importlib as loader\n"
+        "dynamic_import = lookup(namespace(loader), 'import_module')\n"
+        "module = 'apar.evaluation_hidden'\n"
+        "dynamic_import(module)\n",
+        encoding="utf-8",
+    )
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
+def test_transitive_feature_python_symlink_fails_closed(tmp_path: Path) -> None:
+    """Reachable Python inventory cannot hide behind a same-content symlink."""
+    _write_defender_source(tmp_path, "from apar.features import linked\n")
+    features = tmp_path / "src/apar/features"
+    features.mkdir(parents=True)
+    backing = features / "backing.py"
+    backing.write_text("VALUE = 1\n", encoding="utf-8")
+    (features / "linked.py").symlink_to(backing.name)
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
 def test_relative_evaluator_import_fails_preexecution(tmp_path: Path) -> None:
     """Relative imports cannot reach an evaluator module outside the v2 namespace."""
     _write_defender_source(tmp_path, "from ..evaluation import hidden_source\n")
@@ -346,7 +379,7 @@ def test_profile_digest_mismatch_fails_preexecution() -> None:
     payload["protocol_profile_sha256"] = _digest("substituted-profile")
     preregistration = sign_v2_preregistration(
         payload,
-        signer=EvaluatorSigningIdentity.from_private_bytes(b"v" * 32),
+        signer=ephemeral_v2_authority().evaluator,
     )
 
     report = verify_v2_preexecution(ROOT, preregistration)
@@ -360,7 +393,7 @@ def test_digest_shaped_bindings_without_real_manifest_fail_preexecution() -> Non
     payload["manifest_registry_sha256"] = _digest("missing-manifest-registry")
     preregistration = sign_v2_preregistration(
         payload,
-        signer=EvaluatorSigningIdentity.from_private_bytes(b"v" * 32),
+        signer=ephemeral_v2_authority().evaluator,
     )
 
     report = verify_v2_preexecution(ROOT, preregistration)
@@ -377,7 +410,7 @@ def test_seed_commitments_must_match_the_committed_profile() -> None:
     )
     preregistration = sign_v2_preregistration(
         payload,
-        signer=EvaluatorSigningIdentity.from_private_bytes(b"v" * 32),
+        signer=ephemeral_v2_authority().evaluator,
     )
 
     report = verify_v2_preexecution(ROOT, preregistration)
@@ -391,7 +424,7 @@ def test_budget_binding_must_match_the_committed_profile() -> None:
     payload["budget_manifest_sha256"] = _digest("weaker-budget")
     preregistration = sign_v2_preregistration(
         payload,
-        signer=EvaluatorSigningIdentity.from_private_bytes(b"v" * 32),
+        signer=ephemeral_v2_authority().evaluator,
     )
 
     report = verify_v2_preexecution(ROOT, preregistration)
@@ -406,7 +439,7 @@ def test_each_required_component_manifest_is_load_bearing() -> None:
     payload["controls_manifest_sha256"] = _digest("substituted-controls")
     preregistration = sign_v2_preregistration(
         payload,
-        signer=EvaluatorSigningIdentity.from_private_bytes(b"v" * 32),
+        signer=ephemeral_v2_authority().evaluator,
     )
 
     report = verify_v2_preexecution(ROOT, preregistration)
@@ -437,9 +470,25 @@ def test_manifest_registry_rejects_modified_frozen_input(
     assert check.passed is False
 
 
+def test_manifest_registry_rejects_same_content_symlink_before_resolution(
+    tmp_path: Path,
+) -> None:
+    """A same-byte symlink cannot satisfy a frozen file binding."""
+    _copy_manifest_inputs(tmp_path)
+    catalog = tmp_path / "config/defense/feature-catalog.json"
+    backing = tmp_path / "config/defense/feature-catalog.backing.json"
+    backing.write_bytes(catalog.read_bytes())
+    catalog.unlink()
+    catalog.symlink_to(backing.name)
+
+    check = verify_manifest_registry(tmp_path, signed_preregistration())
+
+    assert check.passed is False
+
+
 def signed_preregistration() -> V2Preregistration:
-    signer = EvaluatorSigningIdentity.from_private_bytes(b"v" * 32)
-    return sign_v2_preregistration(_preregistration_payload(), signer=signer)
+    raw = (ROOT / "config/defense/competition-v2-preregistration.json").read_bytes()
+    return V2Preregistration.from_json(raw[:-1] if raw.endswith(b"\n") else raw)
 
 
 def _preregistration_payload() -> dict[str, object]:

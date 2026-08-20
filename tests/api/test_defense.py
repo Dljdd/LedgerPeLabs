@@ -33,11 +33,7 @@ from apar.evaluation.service import (
     _install_child_audit_hook,
     _parse_index_payload,
 )
-from apar.evaluation.v2_preregistration import (
-    TRUSTED_V2_EXECUTION_NONCE,
-    TRUSTED_V2_PREREGISTRATION_ID,
-    ExecutionReceipt,
-)
+from apar.evaluation.v2_preregistration import ExecutionReceipt
 from apar.evaluation.v2_reporting import (
     DefenseV2GateReport,
     V2ArmScorecard,
@@ -45,7 +41,6 @@ from apar.evaluation.v2_reporting import (
     render_v2_scorecard,
 )
 from apar.evaluation.v2_selection import V2GateOutcome
-from apar.runs import RunSigningIdentity
 from apar.runs.wire import canonical_json_bytes
 from apar.storage.artifacts import ArtifactStore
 from tests.evaluation.test_replay import (
@@ -60,8 +55,25 @@ from tests.evaluation.test_reporting import (
     HIDDEN_VERIFIER,
     _request,
 )
+from tests.evaluation.v2_authority import EphemeralV2Authority, ephemeral_v2_authority
 
 pytest_plugins = ("tests.defense.test_bundle",)
+
+
+def _v2_test_app(root: Path) -> tuple[object, EphemeralV2Authority]:
+    authority = ephemeral_v2_authority()
+    fallback, _ = render_v2_scorecard(
+        not_executed_result(preregistration=authority.preregistration),
+        signer=authority.publisher,
+    )
+    return (
+        create_app(
+            Settings.from_root(root),
+            v2_preregistration=authority.preregistration,
+            v2_scorecard=fallback,
+        ),
+        authority,
+    )
 
 
 WORKER_SOURCE = Path(__file__).parents[1] / "fixtures" / "defense_evaluator_worker.py"
@@ -818,7 +830,7 @@ def test_v2_scorecard_reads_verified_current_state_after_receipt(tmp_path: Path)
     """A durable receipt makes the verified signed result the only current status."""
     state = tmp_path / ".apar/defense-v2"
     state.mkdir(parents=True)
-    signer = RunSigningIdentity.from_private_bytes(b"v" * 32)
+    app, authority = _v2_test_app(tmp_path)
     arms = tuple(
         V2ArmScorecard(
             arm=arm,
@@ -830,18 +842,20 @@ def test_v2_scorecard_reads_verified_current_state_after_receipt(tmp_path: Path)
         )
         for arm in ("rules_only", "gbdt_only", "layered_hybrid")
     )
-    result = not_executed_result().model_copy(update={"status": "no_promotion", "arms": arms})
-    card, _ = render_v2_scorecard(result, signer=signer)
+    result = not_executed_result(preregistration=authority.preregistration).model_copy(
+        update={"status": "no_promotion", "arms": arms}
+    )
+    card, _ = render_v2_scorecard(result, signer=authority.publisher)
     (state / "defense-v2-scorecard.json").write_bytes(card.to_json())
     receipt = ExecutionReceipt(
-        preregistration_id=TRUSTED_V2_PREREGISTRATION_ID,
-        execution_nonce=TRUSTED_V2_EXECUTION_NONCE,
+        preregistration_id=authority.preregistration.preregistration_id,
+        execution_nonce=authority.preregistration.execution_nonce,
     )
     (state / "execution-receipt.json").write_bytes(
         canonical_json_bytes(receipt.model_dump(mode="json"))
     )
 
-    with TestClient(create_app(Settings.from_root(tmp_path))) as client:
+    with TestClient(app) as client:
         response = client.get("/defense/v2/scorecard")
 
     assert response.status_code == 200
@@ -853,15 +867,16 @@ def test_v2_scorecard_fails_closed_when_receipt_has_no_signed_result(tmp_path: P
     """A consumed execution cannot be hidden behind the initial compiled-in status."""
     state = tmp_path / ".apar/defense-v2"
     state.mkdir(parents=True)
+    app, authority = _v2_test_app(tmp_path)
     receipt = ExecutionReceipt(
-        preregistration_id=TRUSTED_V2_PREREGISTRATION_ID,
-        execution_nonce=TRUSTED_V2_EXECUTION_NONCE,
+        preregistration_id=authority.preregistration.preregistration_id,
+        execution_nonce=authority.preregistration.execution_nonce,
     )
     (state / "execution-receipt.json").write_bytes(
         canonical_json_bytes(receipt.model_dump(mode="json"))
     )
 
-    with TestClient(create_app(Settings.from_root(tmp_path))) as client:
+    with TestClient(app) as client:
         response = client.get("/defense/v2/scorecard")
 
     assert response.status_code == 422
@@ -871,7 +886,7 @@ def test_v2_scorecard_rejects_receipt_with_mismatched_execution_nonce(tmp_path: 
     """A receipt for the preregistration ID cannot consume a different execution nonce."""
     state = tmp_path / ".apar/defense-v2"
     state.mkdir(parents=True)
-    signer = RunSigningIdentity.from_private_bytes(b"v" * 32)
+    app, authority = _v2_test_app(tmp_path)
     arms = tuple(
         V2ArmScorecard(
             arm=arm,
@@ -883,18 +898,20 @@ def test_v2_scorecard_rejects_receipt_with_mismatched_execution_nonce(tmp_path: 
         )
         for arm in ("rules_only", "gbdt_only", "layered_hybrid")
     )
-    result = not_executed_result().model_copy(update={"status": "no_promotion", "arms": arms})
-    card, _ = render_v2_scorecard(result, signer=signer)
+    result = not_executed_result(preregistration=authority.preregistration).model_copy(
+        update={"status": "no_promotion", "arms": arms}
+    )
+    card, _ = render_v2_scorecard(result, signer=authority.publisher)
     (state / "defense-v2-scorecard.json").write_bytes(card.to_json())
     receipt = ExecutionReceipt(
-        preregistration_id=TRUSTED_V2_PREREGISTRATION_ID,
+        preregistration_id=authority.preregistration.preregistration_id,
         execution_nonce="0" * 64,
     )
     (state / "execution-receipt.json").write_bytes(
         canonical_json_bytes(receipt.model_dump(mode="json"))
     )
 
-    with TestClient(create_app(Settings.from_root(tmp_path))) as client:
+    with TestClient(app) as client:
         response = client.get("/defense/v2/scorecard")
 
     assert response.status_code == 422
@@ -904,7 +921,8 @@ def test_v2_scorecard_rejects_fresh_self_declared_signer(tmp_path: Path) -> None
     """A valid signature from an uncommitted key is not publication authority."""
     state = tmp_path / ".apar/defense-v2"
     state.mkdir(parents=True)
-    outsider = RunSigningIdentity.from_private_bytes(b"x" * 32)
+    app, authority = _v2_test_app(tmp_path)
+    outsider = ephemeral_v2_authority()
     arms = tuple(
         V2ArmScorecard(
             arm=arm,
@@ -916,18 +934,20 @@ def test_v2_scorecard_rejects_fresh_self_declared_signer(tmp_path: Path) -> None
         )
         for arm in ("rules_only", "gbdt_only", "layered_hybrid")
     )
-    result = not_executed_result().model_copy(update={"status": "no_promotion", "arms": arms})
-    card, _ = render_v2_scorecard(result, signer=outsider)
+    result = not_executed_result(preregistration=authority.preregistration).model_copy(
+        update={"status": "no_promotion", "arms": arms}
+    )
+    card, _ = render_v2_scorecard(result, signer=outsider.publisher)
     (state / "defense-v2-scorecard.json").write_bytes(card.to_json())
     receipt = ExecutionReceipt(
-        preregistration_id=TRUSTED_V2_PREREGISTRATION_ID,
-        execution_nonce=TRUSTED_V2_EXECUTION_NONCE,
+        preregistration_id=authority.preregistration.preregistration_id,
+        execution_nonce=authority.preregistration.execution_nonce,
     )
     (state / "execution-receipt.json").write_bytes(
         canonical_json_bytes(receipt.model_dump(mode="json"))
     )
 
-    with TestClient(create_app(Settings.from_root(tmp_path))) as client:
+    with TestClient(app) as client:
         response = client.get("/defense/v2/scorecard")
 
     assert response.status_code == 422

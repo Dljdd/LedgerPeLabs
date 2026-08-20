@@ -203,3 +203,109 @@ Read-only preexecution and complete suite:
 `git diff --exit-code` over `fixtures/defense/v1` and the three frozen V1
 experiment documents returned zero, and no `.apar` V2 receipt/result file was
 created.
+
+## Final hardening round 2
+
+### Scope and implementation
+
+- Removed the repository-held deterministic V2 authority seed and every committed
+  `b"v" * 32` signing literal. Production now contains only a canonical sealed
+  preregistration, its pinned Ed25519 public key/key ID, and a scorecard signed by
+  that public authority. Test code creates isolated random ephemeral authorities;
+  no generated private seed was printed or persisted.
+- Extended the import boundary to propagate aliases of `getattr` and `vars`, detect
+  reflective builtins/importlib import capability through those aliases, and follow
+  constant local imports through transitive feature dependencies.
+- Added lexical symbolic-link rejection before resolution for every frozen content
+  reference, every source inventory entry, and every defender-reachable Python path.
+  Symlinked Python is rejected rather than omitted from inventory or scanned through.
+- Bound each control signature to the signed preregistration ID, execution nonce,
+  arm, candidate ID, exact input digest, and evaluator public identity. Selection
+  derives its expected binding from an intact signed preregistration and rejects
+  evidence replayed across any of those dimensions.
+- Added preregistration ID and execution nonce to the scorecard's signed payload.
+  The API verifies the card signer against the sealed preregistration and compares
+  those signed fields to the exact durable receipt, creating one cryptographic
+  linkage rather than accepting independent valid objects.
+- The API factory accepts a preregistration/scorecard pair only for explicit test
+  injection. Its production default remains the compiled public-only sealed pair,
+  and the GET route remains read-only and unable to start evaluation work.
+
+### RED evidence
+
+The first scanner/manifest regression run failed exactly the new alias and symlink
+probes:
+
+```text
+.venv/bin/pytest tests/evaluation/test_defense_v2_preexecution.py -q
+2 failed, 42 passed
+```
+
+The failures were the transitive `from builtins import getattr as lookup, vars as
+namespace` reflective import path and a same-content frozen-input symlink. Control
+and selection tests initially failed collection because the exact binding contracts
+`V2ControlBinding` and `V2ControlContext` did not yet exist.
+
+After closing the frozen-file case, a separate transitive Python-inventory probe
+demonstrated the remaining reachable-feature symlink bypass:
+
+```text
+.venv/bin/pytest tests/evaluation/test_defense_v2_preexecution.py \
+  -q -k transitive_feature_python_symlink
+1 failed, 44 deselected
+```
+
+API/reporting regressions also initially referenced the removed deterministic
+authority constants and old unbound scorecard shape, so a card signature could not
+yet be checked as one object bound to the receipt nonce.
+
+### GREEN evidence
+
+Focused final hardening contracts:
+
+```text
+.venv/bin/pytest \
+  tests/evaluation/test_defense_v2_preregistration.py \
+  tests/evaluation/test_defense_v2_preexecution.py \
+  tests/evaluation/test_defense_v2_controls.py \
+  tests/evaluation/test_defense_v2_selection.py \
+  tests/evaluation/test_defense_v2_reporting.py \
+  tests/api/test_defense.py \
+  -q -k 'v2 or preregistration or control or selection'
+87 passed, 25 deselected in 5.78s
+
+.venv/bin/pytest tests/api/test_defense.py -q -k v2_scorecard
+5 passed, 25 deselected in 2.51s
+```
+
+Static and read-only admission verification:
+
+```text
+.venv/bin/ruff check <all changed Python source and tests>
+All checks passed!
+
+.venv/bin/mypy \
+  src/apar/evaluation/v2_controls.py \
+  src/apar/evaluation/v2_preexecution.py \
+  src/apar/evaluation/v2_preregistration.py \
+  src/apar/evaluation/v2_reporting.py \
+  src/apar/evaluation/v2_selection.py \
+  src/apar/api/app.py src/apar/api/routes/defense.py
+Success: no issues found in 7 source files
+
+.venv/bin/python scripts/verify_defense_v2_preexecution.py
+{"admissible":true,"codes":[],"status":"not_executed"}
+```
+
+Complete repository regression suite:
+
+```text
+.venv/bin/pytest -q
+1852 passed, 1 skipped in 493.86s (0:08:13)
+```
+
+`git diff --exit-code` confirmed no change beneath `src/apar/defense`,
+`src/apar/features`, `fixtures/defense/v1`, or the three frozen V1 experiment
+documents. Repository searches found no remaining trusted V2 constants,
+deterministic `b"v" * 32` seed, or production `from_private_bytes` construction.
+No V2 evaluation or durable execution receipt/result was created.

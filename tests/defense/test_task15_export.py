@@ -8,6 +8,7 @@ import hashlib
 import inspect
 import json
 import os
+import secrets
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -1928,7 +1929,7 @@ def test_hidden_export_writes_exact_public_graph_result_then_hash_last(
     directory = tmp_path / "fixtures"
     directory.mkdir()
     store = ArtifactStore(tmp_path / "store")
-    signer = RunSigningIdentity.from_private_bytes(b"v" * 32)
+    signer = RunSigningIdentity.from_private_bytes(secrets.token_bytes(32))
     hidden_signer = EvaluatorSigningIdentity.from_private_bytes(b"h" * 32)
     development_signer = EvaluatorSigningIdentity.from_private_bytes(b"d" * 32)
     hidden_source_signer = RunSigningIdentity.from_private_bytes(b"s" * 32)

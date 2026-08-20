@@ -30,10 +30,6 @@ _SEED_NAMES = ("operating_population", "campaign_injection")
 SYNTHETIC_NON_CLAIM: SyntheticScope = (
     "Synthetic-only evaluation; not a real-world prevalence or external-validity claim."
 )
-TRUSTED_V2_PREREGISTRATION_ID = "apar-defend-v2"
-TRUSTED_V2_EXECUTION_NONCE = "4b4a92405a8c84ae5035bcbc510e06e1729238ffe0e78f106515d78d3c63c98a"
-TRUSTED_V2_EVALUATOR_KEY_ID = "de52c5b7d396405990b8df80875bad49a2e845b06a576e668fb1ea292a55ee7e"
-TRUSTED_V2_EVALUATOR_PUBLIC_KEY_BASE64 = "tfkAlTGPPwRM2OQLWEJT2Gd3vmK/ByITNOX9IZnPp/c="
 
 
 class V2PreregistrationError(ValueError):
@@ -173,15 +169,17 @@ class V2Preregistration(ExternalContract):
             return False
         return True
 
-    def verify_trusted_authority(self) -> bool:
-        """Bind the sealed production preregistration to its committed authority."""
-        return (
-            self.preregistration_id == TRUSTED_V2_PREREGISTRATION_ID
-            and self.execution_nonce == TRUSTED_V2_EXECUTION_NONCE
-            and trusted_v2_evaluator_identity(
-                self.evaluator_key_id, self.evaluator_public_key_base64
+    def matches_sealed_preregistration(self, sealed: V2Preregistration) -> bool:
+        """Verify exact equality with a separately supplied sealed trust root."""
+        try:
+            return (
+                type(sealed) is V2Preregistration
+                and sealed.verify_signature()
+                and sealed.verify_manifest_bindings()
+                and self.canonical_bytes() == sealed.canonical_bytes()
             )
-        )
+        except (AttributeError, TypeError, ValueError):
+            return False
 
     def verify_manifest_bindings(self) -> bool:
         """Recheck all binding semantics after unsafe model copying or deserialization."""
@@ -312,6 +310,7 @@ def admit_v2_execution(
     preregistration: V2Preregistration,
     *,
     existing_receipts: Sequence[ExecutionReceipt],
+    sealed_preregistration: V2Preregistration,
 ) -> ExecutionAdmission:
     """Admit only the first confirmatory execution of a valid sealed contract."""
     if type(preregistration) is not V2Preregistration:
@@ -325,18 +324,10 @@ def admit_v2_execution(
     if (
         not preregistration.verify_signature()
         or not preregistration.verify_manifest_bindings()
-        or not preregistration.verify_trusted_authority()
+        or not preregistration.matches_sealed_preregistration(sealed_preregistration)
     ):
         return ExecutionAdmission.denied("invalid_preregistration")
     return ExecutionAdmission.admitted_once(preregistration.execution_nonce)
-
-
-def trusted_v2_evaluator_identity(key_id: object, public_key_base64: object) -> bool:
-    """Return whether a key pair is the committed V2 evaluator/publication authority."""
-    return (
-        key_id == TRUSTED_V2_EVALUATOR_KEY_ID
-        and public_key_base64 == TRUSTED_V2_EVALUATOR_PUBLIC_KEY_BASE64
-    )
 
 
 __all__ = [
@@ -344,13 +335,8 @@ __all__ = [
     "ExecutionReceipt",
     "SYNTHETIC_NON_CLAIM",
     "SyntheticScope",
-    "TRUSTED_V2_EVALUATOR_KEY_ID",
-    "TRUSTED_V2_EVALUATOR_PUBLIC_KEY_BASE64",
-    "TRUSTED_V2_EXECUTION_NONCE",
-    "TRUSTED_V2_PREREGISTRATION_ID",
     "V2Preregistration",
     "V2PreregistrationError",
     "admit_v2_execution",
     "sign_v2_preregistration",
-    "trusted_v2_evaluator_identity",
 ]

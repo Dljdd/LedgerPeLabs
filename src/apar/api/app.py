@@ -23,6 +23,8 @@ from apar.evaluation.service import (
     DefenseServiceUnavailable,
     EvaluationExecutor,
 )
+from apar.evaluation.v2_preregistration import V2Preregistration
+from apar.evaluation.v2_reporting import DefenseV2Scorecard
 from apar.registry.repository import ThreatRepository
 from apar.runs import RunRunner, RunSigningIdentity
 from apar.storage.artifacts import ArtifactStore
@@ -216,6 +218,8 @@ def create_app(
     publication_verifier: PublicArtifactVerifier | None = None,
     defender_signer_key_id: str | None = None,
     defender_public_key_base64: str | None = None,
+    v2_preregistration: V2Preregistration | None = None,
+    v2_scorecard: DefenseV2Scorecard | None = None,
 ) -> FastAPI:
     """Build an unbound local API application for the supplied settings."""
     from apar.api.routes.defense import public_router
@@ -262,6 +266,13 @@ def create_app(
             != 3
         ):
             raise TypeError("defense trust roots must be independent")
+    if (v2_preregistration is None) != (v2_scorecard is None):
+        raise TypeError("V2 preregistration and scorecard must be supplied together")
+    if v2_preregistration is not None and (
+        type(v2_preregistration) is not V2Preregistration
+        or type(v2_scorecard) is not DefenseV2Scorecard
+    ):
+        raise TypeError("V2 public authority inputs must be exact")
     app = FastAPI(
         title="APAR API",
         version=__version__,
@@ -279,6 +290,8 @@ def create_app(
     app.state.publication_verifier = publication_verifier
     app.state.defender_signer_key_id = defender_signer_key_id
     app.state.defender_public_key_base64 = defender_public_key_base64
+    app.state.v2_preregistration = v2_preregistration
+    app.state.v2_scorecard = v2_scorecard
     app.add_middleware(_DefenseBodyLimitMiddleware)
     app.add_exception_handler(ApiError, _api_error_handler)
     app.add_exception_handler(RequestValidationError, _validation_error_handler)

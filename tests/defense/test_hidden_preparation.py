@@ -6,6 +6,7 @@ import base64
 import hashlib
 import inspect
 import os
+import secrets
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -92,7 +93,7 @@ def test_hidden_source_public_identity_is_descriptor_pinned_and_closes_fds(
 
 
 def test_hidden_authority_snapshots_source_binding_before_low_level_mutation() -> None:
-    source = RunSigningIdentity.from_private_bytes(b"v" * 32)
+    source = RunSigningIdentity.from_private_bytes(secrets.token_bytes(32))
     digest = "1" * 64
     receipt_ref = ArtifactRef(
         digest,

@@ -11,10 +11,20 @@ from apar.evaluation.contracts import EvaluationTruthRow
 from apar.evaluation.gates import EvaluatorSigningIdentity
 from apar.evaluation.v2_controls import (
     ControlResult,
+    V2ControlBinding,
     V2ControlError,
     admit_control_result,
     run_benign_only_control,
     run_score_permutation_control,
+)
+from tests.evaluation.v2_authority import ephemeral_v2_authority
+
+AUTHORITY = ephemeral_v2_authority()
+CONTROL_BINDING = V2ControlBinding.from_preregistration(
+    AUTHORITY.preregistration,
+    arm="rules_only",
+    candidate_id="candidate-a",
+    input_digest="a" * 64,
 )
 
 
@@ -40,6 +50,7 @@ def test_benign_control_reports_interventions_without_true_positives() -> None:
         actions=(Action.CHALLENGE,),
         truth=(truth_row("row-1", fraud=False),),
         signer=evaluator_signer(),
+        binding=CONTROL_BINDING,
     )
     assert result.valid is True
     assert result.intervention_count == 1
@@ -55,6 +66,7 @@ def test_qualifying_permuted_scores_invalidates_run() -> None:
         seed=7,
         evaluator=lambda scores, truth, blocks: True,
         signer=evaluator_signer(),
+        binding=CONTROL_BINDING,
     )
     assert (result.valid, result.reason) == (False, "permuted_scores_qualified")
 
@@ -69,6 +81,7 @@ def test_score_permutation_keeps_blocks_intact() -> None:
         seed=3,
         evaluator=lambda scores, truth, blocks: observed.append(tuple(scores)) or False,
         signer=evaluator_signer(),
+        binding=CONTROL_BINDING,
     )
     assert result.valid is True
     assert observed == [(0.2, 0.1, 0.9, 0.8)]
@@ -79,8 +92,9 @@ def test_invalid_control_is_a_typed_no_promotion_admission() -> None:
         actions=(Action.CHALLENGE,),
         truth=(truth_row("row-1", fraud=True),),
         signer=evaluator_signer(),
+        binding=CONTROL_BINDING,
     )
-    admission = admit_control_result(control)
+    admission = admit_control_result(control, expected_binding=CONTROL_BINDING)
     assert (admission.valid, admission.status, admission.reason) == (
         False,
         "no_promotion",
@@ -96,6 +110,7 @@ def test_malformed_control_invalidates_the_whole_run() -> None:
         seed=7,
         evaluator=lambda scores, truth, blocks: False,
         signer=evaluator_signer(),
+        binding=CONTROL_BINDING,
     )
     assert (result.valid, result.reason) == (False, "malformed_permutation_control")
 
@@ -107,6 +122,7 @@ def test_missing_evaluator_is_invalid() -> None:
         blocks=("case",),
         seed=7,
         signer=evaluator_signer(),
+        binding=CONTROL_BINDING,
     )
     assert (result.valid, result.reason) == (False, "evaluator_missing")
 
@@ -122,13 +138,14 @@ def test_evaluator_exception_is_fail_closed() -> None:
         seed=7,
         evaluator=explode,
         signer=evaluator_signer(),
+        binding=CONTROL_BINDING,
     )
     assert (result.valid, result.reason) == (False, "evaluator_failed")
 
 
 def test_forged_valid_control_cannot_be_admitted() -> None:
     forged = ControlResult.model_construct(valid=True, kind="benign_only", reason=None)
-    admission = admit_control_result(forged)
+    admission = admit_control_result(forged, expected_binding=CONTROL_BINDING)
     assert (admission.valid, admission.status) == (False, "no_promotion")
 
 
@@ -142,6 +159,7 @@ def test_benign_action_property_exception_is_fail_closed() -> None:
         actions=(BrokenAction(),),
         truth=(truth_row("row-1", fraud=False),),
         signer=evaluator_signer(),
+        binding=CONTROL_BINDING,
     )
     assert (result.valid, result.reason) == (False, "malformed_benign_control")
 
@@ -152,10 +170,11 @@ def test_invalid_attestation_cannot_be_model_copied_to_valid() -> None:
         actions=(Action.APPROVE,),
         truth=(truth_row("fraud", fraud=True),),
         signer=evaluator_signer(),
+        binding=CONTROL_BINDING,
     )
     tampered = invalid.model_copy(update={"valid": True, "reason": None})
 
-    admission = admit_control_result(tampered)
+    admission = admit_control_result(tampered, expected_binding=CONTROL_BINDING)
 
     assert (admission.valid, admission.status, admission.reason) == (
         False,
@@ -166,15 +185,47 @@ def test_invalid_attestation_cannot_be_model_copied_to_valid() -> None:
 
 def test_external_signer_cannot_mint_control_attestation() -> None:
     """A self-declared fresh key is not the committed evaluator authority."""
-    outsider = EvaluatorSigningIdentity.from_private_bytes(b"x" * 32)
+    outsider = ephemeral_v2_authority().evaluator
 
-    with pytest.raises(V2ControlError, match="trusted evaluator"):
+    with pytest.raises(V2ControlError, match="bound evaluator"):
         run_benign_only_control(
             actions=(Action.APPROVE,),
             truth=(truth_row("benign", fraud=False),),
             signer=outsider,
+            binding=CONTROL_BINDING,
         )
 
 
 def evaluator_signer() -> EvaluatorSigningIdentity:
-    return EvaluatorSigningIdentity.from_private_bytes(b"v" * 32)
+    return AUTHORITY.evaluator
+
+
+def test_control_attestation_cannot_replay_across_execution_bindings() -> None:
+    """Valid evidence cannot cross candidate, arm, input, preregistration, or nonce."""
+    result = run_benign_only_control(
+        actions=(Action.APPROVE,),
+        truth=(truth_row("benign", fraud=False),),
+        signer=AUTHORITY.evaluator,
+        binding=CONTROL_BINDING,
+    )
+    other_authority = ephemeral_v2_authority()
+    alternatives = (
+        CONTROL_BINDING.model_copy(update={"candidate_id": "candidate-b"}),
+        CONTROL_BINDING.model_copy(update={"arm": "gbdt_only"}),
+        CONTROL_BINDING.model_copy(update={"input_digest": "b" * 64}),
+        V2ControlBinding.from_preregistration(
+            other_authority.preregistration,
+            arm="rules_only",
+            candidate_id="candidate-a",
+            input_digest="a" * 64,
+        ),
+    )
+
+    admissions = tuple(
+        admit_control_result(result, expected_binding=alternative)
+        for alternative in alternatives
+    )
+
+    assert tuple((item.valid, item.reason) for item in admissions) == (
+        (False, "control_binding_mismatch"),
+    ) * len(alternatives)
