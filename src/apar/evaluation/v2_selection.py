@@ -139,9 +139,9 @@ class V2MetricSet(ExternalContract):
         """Project precomputed evidence without recalculating or executing a replay.
 
         Existing reports contain point estimates and exact numerator/denominator
-        evidence.  Until a two-level bootstrap is supplied, their point estimate
-        is deliberately used as a degenerate interval; callers may replace every
-        field with a ``bootstrap_v2_metrics`` result before gating.
+        evidence. Until two-level bootstrap bounds are supplied, the projected
+        metrics remain reporting-only evidence: their zero bootstrap count makes
+        them ineligible for promotion.
         """
         from apar.cases.v2_workload import ActionWorkload
         from apar.evaluation.metrics import MetricReport
@@ -450,13 +450,18 @@ def evaluate_v2_gates(
         raise TypeError("gates require exact V2MetricSet or ArmThresholdCandidate evidence")
 
     all_sets = (aggregate, *strata, *families)
+    mandatory_metrics = tuple(metric for metric_set in all_sets for metric in metric_set.metrics)
     codes: set[str] = set()
     if type(evidence) is ArmThresholdCandidate and set(evidence.families) != set(
         protocol.operating.family_names
     ):
         codes.add("FAMILY_SCOPE_INVALID")
-    if not all(metric.defined for metric_set in all_sets for metric in metric_set.metrics):
+    if not all(metric.defined for metric in mandatory_metrics):
         codes.add("METRIC_UNDEFINED")
+    if any(metric.bootstrap_replicates != V2_BOOTSTRAP_REPLICATES for metric in mandatory_metrics):
+        codes.add("BOOTSTRAP_REPLICATES")
+    if any(metric.undefined_replicates != 0 for metric in mandatory_metrics):
+        codes.add("BOOTSTRAP_UNDEFINED")
     if control is not None and not control.valid:
         codes.add("CONTROL_INVALID")
 

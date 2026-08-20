@@ -62,6 +62,31 @@ def test_undefined_metric_fails_closed() -> None:
     assert "METRIC_UNDEFINED" in outcome.codes
 
 
+def test_zero_or_non_2000_bootstrap_replicates_fail_closed() -> None:
+    zero = evaluate_v2_gates(
+        candidate("zero-bootstrap", ece=bootstrap_bounded(0.05, replicates=0)), protocol()
+    )
+    wrong_count = evaluate_v2_gates(
+        candidate("wrong-bootstrap", ece=bootstrap_bounded(0.05, replicates=1_999)), protocol()
+    )
+
+    assert "BOOTSTRAP_REPLICATES" in zero.codes
+    assert "BOOTSTRAP_REPLICATES" in wrong_count.codes
+
+
+def test_partially_undefined_bootstrap_distribution_fails_closed() -> None:
+    outcome = evaluate_v2_gates(
+        candidate(
+            "partially-undefined-bootstrap",
+            ece=bootstrap_bounded(0.05, replicates=2_000, undefined_replicates=1),
+        ),
+        protocol(),
+    )
+
+    assert outcome.passed is False
+    assert "BOOTSTRAP_UNDEFINED" in outcome.codes
+
+
 def test_tie_break_is_stable_and_lexicographic_after_matched_gates() -> None:
     result = select_v2_thresholds(
         (candidate("later", thresholds=(0.3, 0.8)), candidate("first", thresholds=(0.2, 0.9))),
@@ -109,6 +134,23 @@ def bounded(
         upper=point if upper is None else upper,
         numerator=point * 100.0,
         denominator=100.0,
+        bootstrap_replicates=2_000,
+        valid_replicates=2_000,
+    )
+
+
+def bootstrap_bounded(
+    point: float, *, replicates: int, undefined_replicates: int = 0
+) -> BoundedMetric:
+    return BoundedMetric(
+        point=point,
+        lower=point,
+        upper=point,
+        numerator=point * 100.0,
+        denominator=100.0,
+        bootstrap_replicates=replicates,
+        valid_replicates=replicates - undefined_replicates,
+        undefined_replicates=undefined_replicates,
     )
 
 
