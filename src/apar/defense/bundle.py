@@ -40,7 +40,7 @@ from apar.contracts.decisions import Action
 from apar.defense.calibration import ProbabilityCalibrator, select_calibrator
 from apar.defense.contracts import ObservedEvent
 from apar.defense.gbdt import CatBoostScorer, TrainingReceipt
-from apar.defense.rules import RuleManifest, rule_manifest_digest
+from apar.defense.rules import RuleEngine, RuleManifest, rule_manifest_digest
 from apar.defense.thresholds import ThresholdReport, select_policy_thresholds
 from apar.evaluation.splits import EvaluationSplit
 from apar.features.builders import FeatureMatrix
@@ -1307,6 +1307,17 @@ class DefenderBundlePublisher:
             )
         threshold_probabilities = reloaded_scorer.predict(threshold_matrix)
         threshold_calibrated = calibrator.predict(threshold_probabilities)
+        rule_engine = RuleEngine(rule_manifest)
+        threshold_rule_scores = np.asarray(
+            [
+                rule_engine.evaluate(event, row).score
+                for event, row in zip(
+                    threshold_matrix.events, threshold_matrix.rows, strict=True
+                )
+            ],
+            dtype=np.float64,
+        )
+        layered_scores = np.maximum(threshold_rule_scores, threshold_calibrated)
         if type(threshold_mandatory_actions) is not np.ndarray:
             raise BundleContractError("threshold mandatory actions must be an exact array")
         actions = threshold_mandatory_actions.copy()
@@ -1314,7 +1325,7 @@ class DefenderBundlePublisher:
         if checked_values is not None:
             _require_split_values(split, threshold_matrix, checked_values)
         derived_threshold = select_policy_thresholds(
-            threshold_calibrated,
+            layered_scores,
             checked_threshold_labels,
             actions,
             review_case_counter,
@@ -1393,7 +1404,7 @@ class DefenderBundlePublisher:
             matrix_semantic_digest=threshold_semantic,
             row_ids_digest=_row_ids_digest(tuple(row.event_id for row in threshold_matrix.rows)),
             model_probability_scores_digest=_numeric_array_digest(threshold_probabilities),
-            calibrated_scores_digest=_numeric_array_digest(threshold_calibrated),
+            calibrated_scores_digest=_numeric_array_digest(layered_scores),
             labels_digest=_numeric_array_digest(checked_threshold_labels),
             mandatory_actions=tuple(cast(Action, action) for action in actions),
             mandatory_actions_digest=_actions_digest(actions),
@@ -1570,6 +1581,7 @@ class DefenderBundlePublisher:
             split_semantic,
             scorer,
             calibrator,
+            rules,
             threshold,
             threshold_matrix,
             split,
@@ -2152,6 +2164,7 @@ def _verify_threshold_binding(
     split_semantic: str,
     scorer: CatBoostScorer,
     calibrator: ProbabilityCalibrator,
+    rules: RuleManifest,
     threshold: ThresholdReport,
     matrix: FeatureMatrix,
     split: EvaluationSplit,
@@ -2159,6 +2172,15 @@ def _verify_threshold_binding(
 ) -> None:
     probabilities = scorer.predict(matrix)
     calibrated = calibrator.predict(probabilities)
+    rule_engine = RuleEngine(rules)
+    rule_scores = np.asarray(
+        [
+            rule_engine.evaluate(event, row).score
+            for event, row in zip(matrix.events, matrix.rows, strict=True)
+        ],
+        dtype=np.float64,
+    )
+    layered = np.maximum(rule_scores, calibrated)
     labels = np.asarray(
         [int(split.row_is_fraud[row.event_id]) for row in matrix.rows], dtype=np.int64
     )
@@ -2177,7 +2199,7 @@ def _verify_threshold_binding(
         "matrix_semantic_digest": manifest.threshold_matrix_semantic_digest,
         "row_ids_digest": _row_ids_digest(tuple(row.event_id for row in matrix.rows)),
         "model_probability_scores_digest": _numeric_array_digest(probabilities),
-        "calibrated_scores_digest": _numeric_array_digest(calibrated),
+        "calibrated_scores_digest": _numeric_array_digest(layered),
         "labels_digest": _numeric_array_digest(labels),
         "values_digest": values_digest,
         "threshold_artifact_digest": _digest(component_bytes["threshold"]),

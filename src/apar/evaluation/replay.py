@@ -6,6 +6,7 @@ import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from enum import StrEnum
 from typing import Any, Literal, NamedTuple, cast
 
@@ -22,6 +23,7 @@ from apar.cases import (
 )
 from apar.contracts._validation import ExternalContract, validate_utc_timestamp
 from apar.contracts.decisions import Action
+from apar.contracts.events import Rail
 from apar.defense.bundle import DefenderBundleManifest, LoadedDefenderBundle
 from apar.defense.contracts import ObservedEvent, PolicyThresholds
 from apar.defense.policy import ActionPolicy, DefenseDecision
@@ -63,6 +65,7 @@ from apar.evaluation.metrics import (
 )
 from apar.evaluation.regimes import (
     DerivedRegimeManifest,
+    RegimeKind,
     RegimeSpec,
     derive_regime,
     frozen_corpus_digest,
@@ -85,6 +88,12 @@ from apar.storage.artifacts import ArtifactRef
 _MAX_REPLAY_ROWS = 100_000
 _MAX_REPLAY_BYTES = 32_000_000
 _MODEL_FAILURES = {DefenseReason.MODEL_UNAVAILABLE, DefenseReason.MODEL_TIMEOUT}
+_FAMILIES: tuple[Family, ...] = (
+    "agentic_intent_abuse",
+    "app_scam_mule",
+    "card_testing_cnp",
+    "synthetic_merchant_refund",
+)
 
 
 class ReplayContractError(ValueError):
@@ -575,13 +584,16 @@ class ReplayThresholdSet(ExternalContract):
         raw_rule = np.asarray([item.score for item in rule_results], dtype=np.float64)
         raw_model = defender.scorer.predict(matrix)
         calibrated = defender.calibrator.predict(raw_model)
-        if _numeric_array_digest(calibrated) != binding.calibrated_scores_digest:
-            raise ReplayContractError("calibrated scores differ from signed selection evidence")
         raw_by_arm = {
             DefenseArm.RULES_ONLY: raw_rule,
             DefenseArm.GBDT_ONLY: calibrated,
             DefenseArm.LAYERED_HYBRID: np.maximum(raw_rule, calibrated),
         }
+        if (
+            _numeric_array_digest(raw_by_arm[DefenseArm.LAYERED_HYBRID])
+            != binding.calibrated_scores_digest
+        ):
+            raise ReplayContractError("layered scores differ from signed selection evidence")
         signed_report = defender.threshold_report
         checked = tuple(
             ArmThresholdEvidence(
@@ -945,6 +957,182 @@ def replay_defense_arms(
         raise ReplayContractError("defense replay failed deterministically") from error
 
 
+def replay_empty_cold_entity(
+    *,
+    matrix: FeatureMatrix,
+    defender: LoadedDefenderBundle,
+    defender_verifier: DefenderBundleVerifier,
+    defender_attestation: VerifiedDefenderAttestation,
+    thresholds: ReplayThresholdSet,
+    threshold_labels: np.ndarray,
+    threshold_values: np.ndarray | None,
+    evaluation_split: EvaluationSplit,
+    corpus_evidence: ReplayCorpusEvidence,
+    evaluation: ReplayEvaluationContext,
+    evaluator_signer: EvaluatorSigningIdentity,
+    evaluator_verifier: EvaluatorReplayVerifier,
+) -> VerifiedReplayBatch:
+    """Sign exact zero-row nonapplicability for an empty cold-entity cohort only."""
+    try:
+        if (
+            type(matrix) is not FeatureMatrix
+            or matrix.rows
+            or matrix.events
+            or type(evaluation) is not ReplayEvaluationContext
+            or evaluation.evaluation.kind is not EvaluationKind.COLD_ENTITY
+            or evaluation.truth
+            or evaluation.observations
+            or evaluation.slice_assignments
+            or any(item.samples for item in evaluation.latency_samples)
+        ):
+            raise ReplayContractError(
+                "zero-row replay is restricted to an exact empty cold cohort"
+            )
+        if not EvaluatorSigningIdentity.is_exact(evaluator_signer) or (
+            type(evaluator_verifier) is not EvaluatorReplayVerifier
+            or evaluator_verifier.key_id != evaluator_signer.key_id
+        ):
+            raise ReplayContractError("empty cold replay requires a pinned evaluator")
+        if (
+            type(corpus_evidence) is not ReplayCorpusEvidence
+            or not corpus_evidence.verify(evaluator_verifier)
+        ):
+            raise ReplayContractError("empty cold replay requires signed corpus evidence")
+        cohort = EntityCohort(evaluation.evaluation.value)
+        expected = tuple(
+            event_id
+            for event_id in evaluation_split.row_ids["development"]
+            if cohort in evaluation_split.entity_cohorts[event_id]
+        )
+        if expected:
+            raise ReplayContractError("nonempty cold cohort cannot claim nonapplicability")
+        selection_ids = tuple(row.event_id for row in defender.threshold_matrix.rows)
+        selection_binding = bind_replay_case_counter(
+            defender.threshold_matrix.events,
+            selection_ids,
+            as_of=thresholds.selection_as_of,
+        )
+        _freeze_replay_inputs(
+            _HiddenReplayInvocation(
+                defender.threshold_matrix,
+                defender,
+                defender_verifier,
+                defender_attestation,
+                thresholds,
+                threshold_labels,
+                threshold_values,
+                selection_binding,
+                None,
+            ),
+            pinned_verifier=defender_verifier,
+            pinned_attestation=defender_attestation,
+        )
+        lineage = _validate_descriptor_lineage(
+            evaluation.evaluation,
+            (),
+            defender,
+            evaluation_split,
+            matrix,
+            defender_attestation,
+            evaluation,
+            None,
+            corpus_evidence,
+        )
+        slices = tuple(
+            sorted(
+                (
+                    *(
+                        SlicePerformance(kind="family", value=family, recall=None)
+                        for family in _FAMILIES
+                    ),
+                    *(
+                        SlicePerformance(kind="rail", value=rail.value, recall=None)
+                        for rail in Rail
+                    ),
+                    *(
+                        SlicePerformance(kind="regime", value=value, recall=None)
+                        for value in sorted(("baseline", *(item.value for item in RegimeKind)))
+                    ),
+                    *(
+                        SlicePerformance(
+                            kind="entity_cohort", value=item.value, recall=None
+                        )
+                        for item in EntityCohort
+                    ),
+                ),
+                key=lambda item: (item.kind, item.value),
+            )
+        )
+        metrics = PromotionMetrics(
+            row_count=0,
+            recall=None,
+            ece=None,
+            p95_latency_ms=None,
+            preventable_settled_value=Decimal("0.00"),
+            value_escaped=Decimal("0.00"),
+            review_case_count=0,
+            challenge_rate=0.0,
+            false_decline=RateEvidence(
+                numerator=0, denominator=0, value=None, defined=False
+            ),
+            review_case_rate=0.0,
+            slice_performance=slices,
+        )
+        context_digest = _evaluator_context_digest(evaluation.to_json())
+        callback_digest = _digest_document(
+            {
+                "schema_version": "1.0.0",
+                "kind": "cold_entity_nonapplicable",
+                "cohort": cohort.value,
+            }
+        )
+        assurance = AssuranceEvidence(
+            leakage_passed=evaluation.feature_assurance.leakage_passed,
+            parity_passed=evaluation.feature_assurance.parity_passed,
+            artifact_signature_valid=True,
+            rollback_available=defender_attestation.rollback_available,
+            hidden_access_clean=True,
+            campaign_family_ownership_valid=True,
+        )
+        results = tuple(
+            ReplayResult.create(
+                arm=arm,
+                evaluation=evaluation.evaluation,
+                evaluation_lineage=lineage,
+                candidate_role=CandidateRoleEvidence.create(
+                    role=CandidateBundleRole.POOLED,
+                    held_family=None,
+                    bundle_id=defender.manifest.bundle_id,
+                    bundle_manifest_digest=_manifest_digest(defender.manifest),
+                    defender_top_ref_digest=defender_attestation.top_ref.sha256,
+                    threshold_set_digest=thresholds.threshold_set_digest,
+                ),
+                decision_event_ids=(),
+                decision_rows_digest=_digest_document(()),
+                common_integrity_digest=_digest_document(()),
+                action_digest=_digest_document(()),
+                score_digest=_array_digest(np.asarray([], dtype=np.float64)),
+                threshold_report_digest=thresholds.report_for(arm).report_digest,
+                threshold_set_digest=thresholds.threshold_set_digest,
+                bundle_manifest_digest=_manifest_digest(defender.manifest),
+                case_callback_digest=callback_digest,
+                evaluation_context_digest=context_digest,
+                hidden_public_proof_id=None,
+                metric_report_digest=_digest_document(
+                    {"kind": "cold_entity_nonapplicable", "arm": arm.value}
+                ),
+                metrics=metrics,
+                assurance=assurance,
+            )
+            for arm in DefenseArm
+        )
+        return evaluator_signer.sign_batch(results)
+    except ReplayContractError:
+        raise
+    except (TypeError, ValidationError, ValueError) as error:
+        raise ReplayContractError("empty cold cohort replay failed closed") from error
+
+
 def _freeze_hidden_invocation(
     invocation: object,
     *,
@@ -996,7 +1184,8 @@ def _freeze_replay_inputs(
     )
     rows, events = _validated_replay_rows(matrix_value, defender)
     event_ids = tuple(row.event_id for row in rows)
-    case_counter.reconstruct(matrix_value.events, event_ids, case_counter.as_of)
+    if case_counter.event_ids != event_ids:
+        raise ReplayContractError("case callback lineage rows differ from replay rows")
     selection_ids = tuple(row.event_id for row in defender.threshold_matrix.rows)
     selection_binding = bind_replay_case_counter(
         defender.threshold_matrix.events,
@@ -1031,7 +1220,11 @@ def _freeze_replay_inputs(
         raise ReplayContractError(
             "threshold selection lineage does not match the signed defender"
         )
-    audit = audit_feature_matrix(matrix_value.events, matrix_value, defender.catalog)
+    feature_claim_is_past_only = all(
+        row.max_source_available_at is None
+        or row.max_source_available_at < row.decision_at
+        for row in rows
+    )
     defender.verify_reload()
     rule_engine = RuleEngine(defender.rule_manifest)
     rule_results = tuple(
@@ -1089,7 +1282,7 @@ def _freeze_replay_inputs(
         mandatory,
         decisions_by_arm,
         arm_scores,
-        audit.passed,
+        feature_claim_is_past_only,
         actual_failure,
         manifest_digest,
     )
@@ -1177,6 +1370,7 @@ def _hidden_worker_frozen_document(
     return {
         "schema_version": "1.0.0",
         "proof_id": proof_id,
+        "matrix": frozen.matrix.model_dump(mode="json"),
         "observations": [
             item.model_dump(mode="json") for item in frozen.matrix.events
         ],
@@ -1311,6 +1505,7 @@ def _evaluate_hidden_worker_document(
     required = {
         "schema_version",
         "proof_id",
+        "matrix",
         "observations",
         "decision_event_ids",
         "mandatory",
@@ -1393,15 +1588,49 @@ def _evaluate_hidden_worker_document(
         scores_by_arm[arm] = scores
         report_digests[arm] = cast(str, report_digest)
     case_as_of = _parse_utc_wire(document["case_as_of"])
-    case_counter = bind_replay_case_counter(observations, event_ids, as_of=case_as_of)
-    if case_counter.callback_digest != document["case_callback_digest"]:
-        raise ReplayContractError("isolated hidden case callback lineage changed")
+    try:
+        matrix = FeatureMatrix.model_validate(document["matrix"])
+    except ValidationError as error:
+        raise ReplayContractError("isolated hidden feature matrix is invalid") from error
+    matrix = matrix.model_copy(
+        update={
+            "rows": tuple(
+                row.model_copy(
+                    update={
+                        "values": {
+                            name: row.values[name] for name in matrix.catalog.names
+                        }
+                    }
+                )
+                for row in matrix.rows
+            )
+        }
+    )
+    if matrix.events != observations or tuple(row.event_id for row in matrix.rows) != event_ids:
+        raise ReplayContractError("isolated hidden feature matrix rows changed")
     context = ReplayEvaluationContext.from_json(payload)
     if context.evaluation.kind is not EvaluationKind.HIDDEN:
         raise ReplayContractError("restricted context is not a hidden descriptor")
     _validate_evaluator_context(context, event_ids)
+    case_counter = bind_replay_case_counter(
+        context.observations, event_ids, as_of=context.as_of
+    )
+    if (
+        case_as_of != context.as_of
+        or case_counter.callback_digest != document["case_callback_digest"]
+    ):
+        raise ReplayContractError("isolated hidden case callback lineage changed")
     case_counter.validate_context(context.observations, event_ids, context.as_of)
-    if document["feature_audit_passed"] is not context.feature_assurance.leakage_passed:
+    audit = audit_feature_matrix(
+        context.observations,
+        matrix,
+        matrix.catalog,
+        allow_decision_event_subset=True,
+    )
+    if (
+        document["feature_audit_passed"] is not audit.passed
+        or audit.passed is not context.feature_assurance.leakage_passed
+    ):
         raise ReplayContractError("hidden feature assurance differs from frozen audit")
     cohort_document = {
         row.event_id: [item.value for item in row.entity_cohorts]
@@ -1531,7 +1760,16 @@ def _evaluate_frozen_context(
     frozen.case_counter.validate_context(
         context.observations, frozen.event_ids, context.as_of
     )
-    if frozen.feature_audit_passed != context.feature_assurance.leakage_passed:
+    audit = audit_feature_matrix(
+        context.observations,
+        frozen.matrix,
+        frozen.defender.catalog,
+        allow_decision_event_subset=True,
+    )
+    if (
+        frozen.feature_audit_passed != audit.passed
+        or audit.passed != context.feature_assurance.leakage_passed
+    ):
         raise ReplayContractError("feature leakage evidence disagrees with replay audit")
     context_digest = _evaluator_context_digest(context.to_json())
     evaluated = tuple(
@@ -1678,6 +1916,10 @@ def _validate_descriptor_lineage(
         or binding.split_artifact_digest != manifest.split_artifact_digest
     ):
         raise ReplayContractError("evaluation descriptor lineage differs from signed split")
+    if binding.requested_row_ids != training_split.training_row_ids:
+        raise ReplayContractError(
+            "defender training population differs from the signed split"
+        )
     if descriptor.kind is EvaluationKind.CHRONOLOGICAL:
         expected = checked.row_ids["development"]
     elif descriptor.kind is EvaluationKind.COLD_ENTITY:
@@ -1712,21 +1954,12 @@ def _validate_descriptor_lineage(
                 "regime descriptor lineage differs from its signed parent corpus"
             )
         expected = checked.row_ids["development"]
-        derived_truth = {
-            row.event_id: row for row in checked_regime.derived_corpus.truth
-        }
-        expected_observation_ids = {
-            lifecycle_id
-            for event_id in expected
-            for lifecycle_id in derived_truth[event_id].lifecycle_event_ids
+        derived_by_id = {
+            row.event_id: row for row in checked_regime.derived_corpus.observations
         }
         expected_events = tuple(
             sorted(
-                (
-                    row
-                    for row in checked_regime.derived_corpus.observations
-                    if row.event_id in expected_observation_ids
-                ),
+                (derived_by_id[event_id] for event_id in expected),
                 key=lambda row: row.event_id,
             )
         )
@@ -1786,6 +2019,44 @@ def _validate_descriptor_lineage(
             raise ReplayContractError(
                 "evaluator context differs from signed corpus truth or observations"
             )
+    source_corpus = (
+        checked_regime.derived_corpus
+        if checked_regime is not None
+        else checked_corpus.corpus
+    )
+    source_observations = {row.event_id: row for row in source_corpus.observations}
+    selected_ids = set(event_ids)
+    for row in context.observations:
+        source = source_observations.get(row.event_id)
+        expected_observation = (
+            source
+            if source is not None
+            and (
+                (source.event_id in selected_ids and source.is_decision_point)
+                or (not source.is_decision_point and source.decision_at is None)
+            )
+            else (
+                None
+                if source is None
+                else source.model_copy(
+                    update={"is_decision_point": False, "decision_at": None}
+                )
+            )
+        )
+        if row != expected_observation or row.available_at > context.as_of:
+            raise ReplayContractError(
+                "evaluator lifecycle context differs from signed corpus observations"
+            )
+    required_lifecycle = {
+        lifecycle_id
+        for truth in context.truth
+        for lifecycle_id in truth.lifecycle_event_ids
+        if source_observations[lifecycle_id].available_at <= context.as_of
+    }
+    if not required_lifecycle <= {row.event_id for row in context.observations}:
+        raise ReplayContractError(
+            "evaluator lifecycle context is incomplete at the evaluation cutoff"
+        )
     if any(
         assignment_by_id[event_id].entity_cohorts
         != checked.entity_cohorts[event_id]
@@ -2389,4 +2660,5 @@ __all__ = [
     "ReplayThresholdSet",
     "bind_replay_case_counter",
     "replay_defense_arms",
+    "replay_empty_cold_entity",
 ]

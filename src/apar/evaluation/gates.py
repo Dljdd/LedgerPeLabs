@@ -289,7 +289,7 @@ class PromotionMetrics(ExternalContract):
     """Aggregate-only metrics needed by promotion, without evaluator truth."""
 
     schema_version: Literal["1.1.0"] = "1.1.0"
-    row_count: int = Field(ge=1, le=1_000_000)
+    row_count: int = Field(ge=0, le=1_000_000)
     recall: float | None
     ece: float | None
     p95_latency_ms: float | None
@@ -494,8 +494,8 @@ class ReplayResult(ExternalContract):
     @field_validator("decision_event_ids")
     @classmethod
     def rows_are_canonical_unique(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if not value or any(type(item) is not str or not item for item in value):
-            raise ValueError("decision event IDs must be nonempty exact text")
+        if any(type(item) is not str or not item for item in value):
+            raise ValueError("decision event IDs must be exact text")
         if len(value) != len(set(value)):
             raise ValueError("decision event IDs must be unique")
         return value
@@ -540,6 +540,11 @@ class ReplayResult(ExternalContract):
 
     @model_validator(mode="after")
     def result_is_self_consistent(self) -> ReplayResult:
+        if not self.decision_event_ids and (
+            self.evaluation.kind is not EvaluationKind.COLD_ENTITY
+            or self.metrics.row_count != 0
+        ):
+            raise ValueError("only cold-entity nonapplicability may use zero rows")
         if self.metrics.row_count != len(self.decision_event_ids):
             raise ValueError("replay metrics and decision rows differ")
         if (
@@ -1879,6 +1884,10 @@ def _hard_failure_codes(
         if row.failure is not None:
             codes.add("MODEL_FAILURE")
         metrics = row.metrics
+        if metrics.row_count == 0:
+            if row.evaluation.kind is not EvaluationKind.COLD_ENTITY:
+                codes.add("EVALUATION_COVERAGE")
+            continue
         if not metrics.false_decline.defined:
             codes.add("FALSE_DECLINE_COVERAGE")
         if (

@@ -1548,7 +1548,6 @@ def _validate_threshold_set(
         threshold_set.bundle_manifest_digest != inputs.defender.top_ref.sha256
         or any(
             row.threshold_set_digest != threshold_set.threshold_set_digest
-            or row.case_callback_digest != threshold_set.case_callback_digest
             for row in primary
         )
     ):

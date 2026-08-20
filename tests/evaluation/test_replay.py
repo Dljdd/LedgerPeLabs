@@ -5,13 +5,15 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+import apar.evaluation.competition as competition
 from apar.contracts.decisions import Action
 from apar.contracts.events import Rail
 from apar.defense.contracts import PolicyThresholds
@@ -24,6 +26,8 @@ from apar.evaluation.gates import (
     EvaluationKind,
     EvaluatorReplayVerifier,
     EvaluatorSigningIdentity,
+    GateContractError,
+    VerifiedReplayBatch,
 )
 from apar.evaluation.metrics import LatencySample, SliceAssignment, SliceManifest
 from apar.evaluation.regimes import RegimeSpec, derive_regime, frozen_corpus_digest
@@ -40,6 +44,7 @@ from apar.evaluation.replay import (
     ReplayThresholdSet,
     bind_replay_case_counter,
     replay_defense_arms,
+    replay_empty_cold_entity,
 )
 from apar.evaluation.splits import EntityCohort, make_evaluation_split
 from apar.evaluation_hidden.defense_authority import (
@@ -47,7 +52,8 @@ from apar.evaluation_hidden.defense_authority import (
     HIDDEN_FREEZE_RECEIPT_MEDIA_TYPE,
     HiddenEvaluationAuthority,
 )
-from apar.features.builders import build_feature_matrix
+from apar.features.builders import FeatureMatrix, build_feature_matrix
+from apar.features.parity import FeatureLeakageError, audit_feature_matrix
 from apar.runs.wire import canonical_json_bytes
 from apar.storage.artifacts import ArtifactRef, ArtifactStore
 from tests.defense.test_bundle import BundleFixture
@@ -266,6 +272,280 @@ def _selection_binding(loaded: object) -> ReplayCaseCounterBinding:
         tuple(row.event_id for row in loaded.threshold_matrix.rows),
         as_of=AS_OF,
     )
+
+
+def test_empty_cold_entity_is_signed_nonapplicable_and_all_tampering_fails(
+    bundle_fixture: BundleFixture,
+) -> None:
+    """Only a genuinely empty cold cohort may emit signed zero rows."""
+    loaded, _ = _loaded(bundle_fixture)
+    empty_cohort = next(
+        cohort
+        for cohort in EntityCohort
+        if not any(
+            cohort in bundle_fixture.split.entity_cohorts[event_id]
+            for event_id in bundle_fixture.split.row_ids["development"]
+        )
+    )
+    labels, values = _selection_evidence(bundle_fixture, loaded)
+    thresholds = _thresholds(bundle_fixture, loaded, _selection_binding(loaded))
+    verifier = _verifier(bundle_fixture)
+    context = ReplayEvaluationContext(
+        evaluation=EvaluationDescriptor(
+            kind=EvaluationKind.COLD_ENTITY, value=empty_cohort.value
+        ),
+        truth=(),
+        observations=(),
+        as_of=AS_OF,
+        slice_assignments=(),
+        slice_manifest=SliceManifest.closed(),
+        latency_samples=tuple(
+            ReplayLatencySamples(arm=arm, samples=()) for arm in DefenseArm
+        ),
+        feature_assurance=ReplayFeatureAssurance(
+            leakage_passed=True,
+            parity_passed=True,
+            leakage_evidence_digest="a" * 64,
+            parity_evidence_digest="b" * 64,
+        ),
+    )
+    matrix = FeatureMatrix(
+        events=(),
+        catalog=loaded.catalog,
+        catalog_digest=loaded.reload_matrix.catalog_digest,
+        rows=(),
+    )
+    corpus_evidence = _corpus_evidence(bundle_fixture)
+    common = {
+        "matrix": matrix,
+        "defender": loaded,
+        "defender_verifier": verifier,
+        "defender_attestation": _attestation(bundle_fixture),
+        "thresholds": thresholds,
+        "threshold_labels": labels,
+        "threshold_values": values,
+        "evaluation_split": bundle_fixture.split,
+        "corpus_evidence": corpus_evidence,
+        "evaluation": context,
+        "evaluator_signer": EVALUATOR_SIGNER,
+        "evaluator_verifier": EVALUATOR_VERIFIER,
+    }
+    batch = replay_empty_cold_entity(**common)
+    assert EVALUATOR_VERIFIER.verify_batch(batch)
+    assert tuple(item.arm for item in batch.results) == tuple(DefenseArm)
+    assert all(item.metrics.row_count == 0 for item in batch.results)
+    assert all(item.decision_event_ids == () for item in batch.results)
+
+    tampered = json.loads(batch.to_json())
+    tampered["signature_base64"] = "A" * len(tampered["signature_base64"])
+    with pytest.raises(GateContractError):
+        VerifiedReplayBatch.from_json(canonical_json_bytes(tampered))
+
+    nonempty = next(
+        cohort
+        for cohort in EntityCohort
+        if any(
+            cohort in bundle_fixture.split.entity_cohorts[event_id]
+            for event_id in bundle_fixture.split.row_ids["development"]
+        )
+    )
+    with pytest.raises(ReplayContractError, match="nonempty"):
+        replay_empty_cold_entity(
+            **{
+                **common,
+                "evaluation": context.model_copy(
+                    update={
+                        "evaluation": EvaluationDescriptor(
+                            kind=EvaluationKind.COLD_ENTITY, value=nonempty.value
+                        )
+                    }
+                ),
+            }
+        )
+    with pytest.raises(ReplayContractError, match="restricted"):
+        replay_empty_cold_entity(
+            **{
+                **common,
+                "evaluation": context.model_copy(
+                    update={
+                        "evaluation": EvaluationDescriptor(
+                            kind=EvaluationKind.CHRONOLOGICAL,
+                            value="development",
+                        )
+                    }
+                ),
+            }
+        )
+    with pytest.raises(ReplayContractError, match="restricted"):
+        replay_empty_cold_entity(**{**common, "matrix": bundle_fixture.reload_matrix})
+    with pytest.raises(ReplayContractError):
+        replay_empty_cold_entity(
+            **{
+                **common,
+                "corpus_evidence": corpus_evidence.model_copy(
+                    update={"signature_base64": "A" * 88}
+                ),
+            }
+        )
+    forged_split = bundle_fixture.split.model_copy(
+        update={"split_digest": "0" * 64}
+    )
+    with pytest.raises(ReplayContractError):
+        replay_empty_cold_entity(
+            **{**common, "evaluation_split": forged_split}
+        )
+    other_signer = EvaluatorSigningIdentity.from_private_bytes(b"x" * 32)
+    with pytest.raises(ReplayContractError, match="pinned|signed"):
+        replay_empty_cold_entity(
+            **{
+                **common,
+                "evaluator_signer": other_signer,
+                "evaluator_verifier": EvaluatorReplayVerifier.from_signer(
+                    other_signer
+                ),
+            }
+        )
+
+
+def test_competition_selected_matrix_preserves_full_prefix_feature_history(
+    bundle_fixture: BundleFixture,
+) -> None:
+    """Scoring rows stay CatBoost-valid without erasing causal graph history."""
+    loaded, _ = _loaded(bundle_fixture)
+    corpus = _corpus_evidence(bundle_fixture).corpus
+    selected = bundle_fixture.split.row_ids["development"][-2:]
+    matrix = competition._evaluation_matrix(
+        corpus=corpus,
+        split=bundle_fixture.split,
+        event_ids=selected,
+        catalog=loaded.catalog,
+    )
+    truth_by_id = {row.event_id: row for row in corpus.truth}
+    as_of = max(
+        bundle_fixture.split.config.development_end + timedelta(days=7),
+        *(truth_by_id[event_id].label_mature_at for event_id in selected),
+    )
+    prefix = tuple(row for row in corpus.observations if row.available_at <= as_of)
+    complete = build_feature_matrix(prefix, loaded.catalog)
+    complete_by_id = {row.event_id: row for row in complete.rows}
+
+    assert tuple(row.event_id for row in matrix.rows) == selected
+    assert matrix.rows == tuple(complete_by_id[event_id] for event_id in selected)
+    assert tuple(row.event_id for row in matrix.events) == tuple(
+        sorted(selected)
+    )
+    assert any(
+        row.values["dq_history_count"] > 0
+        and row.values["graph_component_size"] > 0
+        for row in matrix.rows
+    )
+
+    context = competition._descriptor_context(
+        descriptor=EvaluationDescriptor(
+            kind=EvaluationKind.COLD_ENTITY,
+            value=EntityCohort.RETURNING_PRIOR_CAMPAIGN.value,
+        ),
+        corpus=corpus,
+        split=bundle_fixture.split,
+        event_ids=selected,
+        matrix=matrix,
+        defender=loaded,
+    )
+    decision_ids = {
+        row.event_id for row in context.observations if row.is_decision_point
+    }
+    assert decision_ids == set(selected)
+    assert any(
+        row.event_id not in decision_ids
+        and row.event_id not in selected
+        and row.decision_at is None
+        for row in context.observations
+    )
+    audit_feature_matrix(
+        context.observations,
+        matrix,
+        loaded.catalog,
+        allow_decision_event_subset=True,
+    )
+    referenced = next(
+        source
+        for row in matrix.rows
+        for source in row.source_event_ids
+        if source not in selected
+    )
+    omitted = tuple(
+        row for row in context.observations if row.event_id != referenced
+    )
+    with pytest.raises(FeatureLeakageError, match="resolve"):
+        audit_feature_matrix(
+            omitted,
+            matrix,
+            loaded.catalog,
+            allow_decision_event_subset=True,
+        )
+
+
+def test_competition_latency_preserves_a_real_slow_sample_in_p95(
+    bundle_fixture: BundleFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow inference must not disappear into a repeated batch average."""
+    loaded, _ = _loaded(bundle_fixture)
+    corpus = _corpus_evidence(bundle_fixture).corpus
+    event_ids = bundle_fixture.split.row_ids["development"]
+    matrix = competition._evaluation_matrix(
+        corpus=corpus,
+        split=bundle_fixture.split,
+        event_ids=event_ids,
+        catalog=loaded.catalog,
+    )
+    truth_by_id = {row.event_id: row for row in corpus.truth}
+    as_of = max(
+        bundle_fixture.split.config.development_end + timedelta(days=7),
+        *(truth_by_id[event_id].label_mature_at for event_id in event_ids),
+    )
+    observations = tuple(
+        row for row in corpus.observations if row.available_at <= as_of
+    )
+    baseline = competition._measured_latency_samples(
+        matrix=matrix,
+        defender=loaded,
+        observations=observations,
+        event_ids=event_ids,
+    )
+    scorer_type = type(loaded.scorer)
+    real_predict = scorer_type.predict
+    slow_event_id = event_ids[-1]
+
+    def slow_predict(self: object, row_matrix: FeatureMatrix) -> np.ndarray:
+        if row_matrix.rows[0].event_id == slow_event_id:
+            time.sleep(0.05)
+        return real_predict(self, row_matrix)
+
+    monkeypatch.setattr(scorer_type, "predict", slow_predict)
+    slowed = competition._measured_latency_samples(
+        matrix=matrix,
+        defender=loaded,
+        observations=observations,
+        event_ids=event_ids,
+    )
+    baseline_hybrid = next(
+        row.samples for row in baseline if row.arm is DefenseArm.LAYERED_HYBRID
+    )
+    slowed_hybrid = next(
+        row.samples for row in slowed if row.arm is DefenseArm.LAYERED_HYBRID
+    )
+    baseline_p95 = float(
+        np.quantile([row.end_to_end_ms for row in baseline_hybrid], 0.95)
+    )
+    slowed_p95 = float(
+        np.quantile([row.end_to_end_ms for row in slowed_hybrid], 0.95)
+    )
+    slow_sample = next(row for row in slowed_hybrid if row.event_id == slow_event_id)
+
+    assert slow_sample.model_ms >= 45.0
+    assert slowed_p95 >= baseline_p95 + 20.0
+    assert len({round(row.end_to_end_ms, 3) for row in slowed_hybrid}) > 1
 
 
 def _replay(fixture: BundleFixture, *, flip_truth: bool = False, model_failure=None):
@@ -1423,21 +1703,30 @@ def test_regime_replay_uses_derived_split_and_rejects_cohort_substitution(
     derived_split = make_evaluation_split(derived, bundle_fixture.split.config)
     evaluation_ids = derived_split.row_ids["development"]
     truth_by_id = {row.event_id: row for row in derived.truth}
-    lifecycle_ids = {
-        lifecycle_id
-        for event_id in evaluation_ids
-        for lifecycle_id in truth_by_id[event_id].lifecycle_event_ids
-    }
     evaluation_observations = tuple(
-        row for row in derived.observations if row.event_id in lifecycle_ids
+        row for row in derived.observations if row.available_at <= AS_OF
     )
     all_features = build_feature_matrix(evaluation_observations, loaded.catalog)
-    matrix = all_features.model_copy(
-        update={
-            "rows": tuple(
-                row for row in all_features.rows if row.event_id in set(evaluation_ids)
-            )
-        }
+    evaluation_id_set = set(evaluation_ids)
+    matrix = FeatureMatrix(
+        events=tuple(
+            row for row in all_features.events if row.event_id in evaluation_id_set
+        ),
+        catalog=all_features.catalog,
+        catalog_digest=all_features.catalog_digest,
+        rows=tuple(
+            {row.event_id: row for row in all_features.rows}[event_id]
+            for event_id in evaluation_ids
+        ),
+    )
+    selected_ids = set(evaluation_ids)
+    context_observations = tuple(
+        row
+        if (row.event_id in selected_ids and row.is_decision_point) or (
+            not row.is_decision_point and row.decision_at is None
+        )
+        else row.model_copy(update={"is_decision_point": False, "decision_at": None})
+        for row in evaluation_observations
     )
     context = ReplayEvaluationContext(
         evaluation=EvaluationDescriptor(
@@ -1445,7 +1734,7 @@ def test_regime_replay_uses_derived_split_and_rejects_cohort_substitution(
             value=spec.kind.value,
         ),
         truth=tuple(truth_by_id[event_id] for event_id in evaluation_ids),
-        observations=matrix.events,
+        observations=context_observations,
         as_of=AS_OF,
         slice_assignments=tuple(
             SliceAssignment(
@@ -1494,7 +1783,7 @@ def test_regime_replay_uses_derived_split_and_rejects_cohort_substitution(
         "threshold_labels": labels,
         "threshold_values": values,
         "case_counter": bind_replay_case_counter(
-            matrix.events,
+            context.observations,
             evaluation_ids,
             as_of=AS_OF,
         ),

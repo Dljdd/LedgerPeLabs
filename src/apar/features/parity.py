@@ -77,7 +77,11 @@ class FeatureAuditReport:
 
 
 def audit_feature_matrix(
-    events: Sequence[ObservedEvent], matrix: FeatureMatrix, catalog: FeatureCatalog
+    events: Sequence[ObservedEvent],
+    matrix: FeatureMatrix,
+    catalog: FeatureCatalog,
+    *,
+    allow_decision_event_subset: bool = False,
 ) -> FeatureAuditReport:
     """Audit a matrix without trusting feature-state histories or embedded observations."""
     forbidden_sources = _forbidden_catalog_sources(matrix.catalog)
@@ -121,17 +125,56 @@ def audit_feature_matrix(
         if source_ids_resolve and row.max_source_available_at != expected_maximum:
             maximums_match = False
 
+    replay_row_ids = frozenset(row.event_id for row in matrix.rows)
     expected_rows = tuple(
         event.event_id
         for event in sorted(
-            (event for event in observations.values() if event.is_decision_point),
+            (
+                event
+                for event in observations.values()
+                if event.is_decision_point and event.event_id in replay_row_ids
+            ),
             key=_decision_sort_key,
+        )
+    )
+    expected_matrix_events = tuple(
+        sorted(
+            (
+                observations[event_id]
+                for event_id in replay_row_ids
+                if event_id in observations
+            ),
+            key=attrgetter("event_id"),
+        )
+    )
+    full_context_events = tuple(
+        sorted(observations.values(), key=attrgetter("event_id"))
+    )
+    neutralized_matrix_events = tuple(
+        sorted(
+            (
+                event
+                if event.event_id in replay_row_ids
+                or (not event.is_decision_point and event.decision_at is None)
+                else event.model_copy(
+                    update={"is_decision_point": False, "decision_at": None}
+                )
+                for event in matrix.events
+            ),
+            key=attrgetter("event_id"),
+        )
+    )
+    event_contract_matches = matrix.events == full_context_events or (
+        allow_decision_event_subset
+        and (
+            matrix.events == expected_matrix_events
+            or neutralized_matrix_events == full_context_events
         )
     )
     feature_order_matches = (
         matrix.catalog == catalog
         and matrix.catalog_digest == expected_digest
-        and matrix.events == tuple(sorted(events, key=attrgetter("event_id")))
+        and event_contract_matches
         and tuple(row.event_id for row in matrix.rows) == expected_rows
         and all(row.catalog_digest == expected_digest for row in matrix.rows)
         and all(tuple(row.values) == catalog.names for row in matrix.rows)

@@ -446,7 +446,13 @@ def train_gbdt(
         selected,
         final_weights,
         config.seed,
-        metadata={"apar_training_contract_digest": training_contract_digest},
+        metadata={
+            "apar_training_contract_digest": training_contract_digest,
+            "model_guid": training_contract_digest,
+            "train_finish_time": training_cutoff.isoformat().replace(
+                "+00:00", "Z"
+            ),
+        },
     )
     final_data = _data_for_ids(rows, final_ids)
     final_labels = _labels_for_ids(clean_labels, final_ids)
@@ -788,6 +794,12 @@ def _validate_loaded_model_inner(model: CatBoostClassifier, receipt: TrainingRec
     metadata = model.get_metadata()
     if metadata.get("apar_training_contract_digest") != receipt.training_contract_digest:
         raise ModelContractError("native model training contract does not match the receipt")
+    if metadata.get("model_guid") != receipt.training_contract_digest:
+        raise ModelContractError("native model GUID does not match the training contract")
+    if metadata.get("train_finish_time") != receipt.training_cutoff.isoformat().replace(
+        "+00:00", "Z"
+    ):
+        raise ModelContractError("native model finish time does not match the training cutoff")
     params = cast(dict[str, object], model.get_all_params())
     _validate_deterministic_native_settings(params, metadata, receipt)
     if int(cast(int, params.get("depth"))) != receipt.selected_params.depth:

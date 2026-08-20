@@ -271,6 +271,8 @@ def test_native_model_persists_every_declared_deterministic_setting() -> None:
     assert flat["thread_count"] == 1
     assert flat["allow_writing_files"] is False
     assert flat["verbose"] == 0
+    assert model.get_metadata()["model_guid"] == scorer.receipt.training_contract_digest
+    assert model.get_metadata()["train_finish_time"] == "2026-01-01T19:00:00Z"
 
 
 @pytest.mark.parametrize(
@@ -325,6 +327,8 @@ def test_seeded_cpu_training_and_native_reload_reproduce_scores() -> None:
     second = _train()
     np.testing.assert_allclose(first.predict(matrix), second.predict(matrix), rtol=0.0, atol=1e-12)
     assert first.receipt.fold_results == second.receipt.fold_results
+    assert first.to_bytes() == second.to_bytes()
+    assert first.receipt == second.receipt
 
     payload = first.to_bytes()
     assert payload.startswith(b"CBM1")
