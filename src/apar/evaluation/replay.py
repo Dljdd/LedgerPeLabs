@@ -1213,6 +1213,7 @@ def _hidden_worker_frozen_document(
         "decision_content_digest": _digest_document(
             frozen.matrix.model_dump(mode="json")
         ),
+        "corpus_digest": frozen.defender.manifest.corpus_digest,
         "split_digest": frozen.defender.manifest.split_manifest_digest,
         "training_population_digest": _digest_document(training_document),
     }
@@ -1326,6 +1327,7 @@ def _evaluate_hidden_worker_document(
         "bundle_manifest_digest",
         "defender_top_ref_digest",
         "decision_content_digest",
+        "corpus_digest",
         "split_digest",
         "training_population_digest",
     }
@@ -1407,6 +1409,7 @@ def _evaluate_hidden_worker_document(
     }
     for name in (
         "decision_content_digest",
+        "corpus_digest",
         "split_digest",
         "training_population_digest",
         "bundle_manifest_digest",
@@ -1420,6 +1423,7 @@ def _evaluate_hidden_worker_document(
         "descriptor": context.evaluation,
         "decision_rows_digest": _digest_document(event_ids),
         "decision_content_digest": cast(str, document["decision_content_digest"]),
+        "corpus_digest": cast(str, document["corpus_digest"]),
         "split_digest": cast(str, document["split_digest"]),
         "training_population_digest": cast(
             str, document["training_population_digest"]
@@ -1805,6 +1809,11 @@ def _validate_descriptor_lineage(
         descriptor=descriptor,
         decision_rows_digest=_digest_document(event_ids),
         decision_content_digest=_digest_document(matrix.model_dump(mode="json")),
+        corpus_digest=(
+            checked_regime.manifest.output_corpus_digest
+            if checked_regime is not None
+            else checked_corpus.corpus_digest
+        ),
         split_digest=checked.split_digest,
         cohort_mapping_digest=_digest_document(cohort_document),
         training_population_digest=_digest_document(training_document),
@@ -1928,6 +1937,7 @@ def _hidden_descriptor_lineage(
         descriptor=descriptor,
         decision_rows_digest=_digest_document(event_ids),
         decision_content_digest=_digest_document(matrix.model_dump(mode="json")),
+        corpus_digest=defender.manifest.corpus_digest,
         split_digest=defender.manifest.split_manifest_digest,
         cohort_mapping_digest=_digest_document(cohort_document),
         training_population_digest=_digest_document(training_document),

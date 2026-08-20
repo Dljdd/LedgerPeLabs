@@ -18,6 +18,7 @@ from apar.evaluation.gates import EvaluatorReplayVerifier
 from apar.evaluation.reporting import PublicArtifactVerifier
 from apar.evaluation.service import (
     DefenseArtifactInvalid,
+    DefenseEvaluationExecutor,
     DefenseEvaluationService,
     DefenseServiceUnavailable,
     EvaluationExecutor,
@@ -208,7 +209,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app(
     settings: Settings,
     *,
-    defense_executor: EvaluationExecutor | None = None,
+    defense_executor: DefenseEvaluationExecutor | None = None,
     evaluator_verifier: EvaluatorReplayVerifier | None = None,
     hidden_proof_verifier: EvaluatorReplayVerifier | None = None,
     publication_signer: RunSigningIdentity | None = None,

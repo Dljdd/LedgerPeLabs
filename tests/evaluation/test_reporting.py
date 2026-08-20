@@ -34,9 +34,11 @@ from apar.evaluation.metrics import (
     compute_metric_report,
 )
 from apar.evaluation.publication_inputs import (
+    PublicationInputError,
     publish_corpus_attestation,
     verify_evaluation_inputs,
 )
+from apar.evaluation.replay import ReplayThresholdSet
 from apar.evaluation.reporting import (
     PUBLIC_ARTIFACT_MEDIA_TYPES,
     SCORECARD_ARTIFACT_NAME,
@@ -46,6 +48,7 @@ from apar.evaluation.reporting import (
     PublicArtifactVerifier,
     ReportingContractError,
     ScorecardPublicationRequest,
+    _privacy_scan,
     load_evaluation_bundle,
     publish_scorecard,
 )
@@ -57,7 +60,7 @@ from tests.evaluation.test_gates import (
     _results,
 )
 from tests.evaluation.test_metrics_classification import four_row_inputs
-from tests.evaluation.test_replay import _corpus_evidence
+from tests.evaluation.test_replay import _corpus_evidence, _selection_binding, _thresholds
 
 pytest_plugins = ("tests.defense.test_bundle",)
 
@@ -126,11 +129,13 @@ def _request(
     *,
     defender_digest: str = "7" * 64,
     defender_bundle_id: str = "pooled-candidate",
+    corpus_digest: str = "0" * 64,
     split_digest: str | None = None,
     evaluator_signer: EvaluatorSigningIdentity = EVALUATOR_SIGNER,
     evaluator_verifier: EvaluatorReplayVerifier = EVALUATOR_VERIFIER,
     hidden_signer: EvaluatorSigningIdentity = HIDDEN_SIGNER,
     hidden_verifier: EvaluatorReplayVerifier = HIDDEN_VERIFIER,
+    threshold_set: ReplayThresholdSet,
     latency_multiplier: float = 1.0,
 ) -> tuple[ScorecardPublicationRequest, ChampionDecision]:
     inputs = four_row_inputs()
@@ -172,7 +177,9 @@ def _request(
         }
         if split_digest is not None:
             lineage_fields["split_digest"] = split_digest
+        lineage_fields["corpus_digest"] = corpus_digest
         role_fields = row.candidate_role.model_dump(mode="python", exclude={"role_digest"})
+        role_fields["threshold_set_digest"] = threshold_set.threshold_set_digest
         if non_held:
             lineage_fields["bundle_manifest_digest"] = defender_digest
             lineage_fields["defender_top_ref_digest"] = defender_digest
@@ -190,6 +197,9 @@ def _request(
                 ),
                 metrics=metrics,
                 metric_report_digest=report.report_digest,
+                threshold_set_digest=threshold_set.threshold_set_digest,
+                threshold_report_digest=threshold_set.report_for(row.arm).report_digest,
+                case_callback_digest=threshold_set.case_callback_digest,
             ),
         )
     results = tuple(rebuilt_results)
@@ -245,14 +255,21 @@ def _request(
         promotion_envelope=envelope,
         champion_decision=decision,
         metric_evidence=evidence,
+        threshold_set=threshold_set,
     )
     assert evaluator_verifier.verify_promotion_envelope(envelope)
     return request, decision
 
 
 def _authenticated_inputs(bundle_fixture):
-    _manifest, defender_ref = bundle_fixture.publisher.freeze(**bundle_fixture.kwargs)
     evidence = _corpus_evidence(bundle_fixture)
+    kwargs = {
+        **bundle_fixture.kwargs,
+        "lineage": bundle_fixture.kwargs["lineage"].model_copy(
+            update={"corpus_digest": evidence.corpus_digest}
+        ),
+    }
+    _manifest, defender_ref = bundle_fixture.publisher.freeze(**kwargs)
     _attestation, corpus_ref = publish_corpus_attestation(
         evidence,
         artifact_store=bundle_fixture.store,
@@ -270,7 +287,43 @@ def _authenticated_inputs(bundle_fixture):
         evaluator_verifier=EVALUATOR_VERIFIER,
         defender_verifier=defender_verifier,
     )
-    return verified, corpus_ref, defender_ref
+    loaded = bundle_fixture.publisher.load(defender_ref)
+    threshold_set = _thresholds(
+        bundle_fixture, loaded, _selection_binding(loaded)
+    )
+    return verified, corpus_ref, defender_ref, threshold_set
+
+
+def test_corpus_content_mismatch_with_matching_split_rejects_before_publication(
+    bundle_fixture,
+) -> None:
+    """A shared split digest cannot authenticate a different frozen corpus."""
+    _manifest, defender_ref = bundle_fixture.publisher.freeze(**bundle_fixture.kwargs)
+    evidence = _corpus_evidence(bundle_fixture)
+    assert evidence.split_digest == bundle_fixture.kwargs["lineage"].split_manifest_digest
+    assert evidence.corpus_digest != bundle_fixture.kwargs["lineage"].corpus_digest
+    attestation, corpus_ref = publish_corpus_attestation(
+        evidence,
+        artifact_store=bundle_fixture.store,
+        signer=EVALUATOR_SIGNER,
+    )
+    verifier = DefenderBundleVerifier(
+        bundle_fixture.store,
+        signer_key_id=bundle_fixture.signer.key_id,
+        public_key_base64=bundle_fixture.signer.public_key_base64,
+    )
+
+    with pytest.raises(PublicationInputError, match="corpus.*lineage"):
+        verify_evaluation_inputs(
+            corpus_ref=corpus_ref,
+            defender_ref=defender_ref,
+            artifact_store=bundle_fixture.store,
+            evaluator_verifier=EVALUATOR_VERIFIER,
+            defender_verifier=verifier,
+        )
+    for restricted in (attestation,):
+        assert repr(restricted) == "<restricted verified corpus attestation>"
+        assert str(restricted) == "<restricted verified corpus attestation>"
 
 
 @pytest.fixture
@@ -278,11 +331,13 @@ def publication(bundle_fixture):
     store = bundle_fixture.store
     signer = bundle_fixture.signer
     verifier = PublicArtifactVerifier.from_signer(signer)
-    verified, _corpus_ref, defender_ref = _authenticated_inputs(bundle_fixture)
+    verified, _corpus_ref, defender_ref, threshold_set = _authenticated_inputs(bundle_fixture)
     request, decision = _request(
         defender_digest=defender_ref.sha256,
         defender_bundle_id=verified.defender.bundle_id,
+        corpus_digest=verified.corpus.corpus_digest,
         split_digest=verified.corpus.split_digest,
+        threshold_set=threshold_set,
     )
     scorecard, bundle = publish_scorecard(
         request,
@@ -327,6 +382,76 @@ def test_every_displayed_metric_resolves_to_an_allowlisted_signed_artifact(
     loaded = load_evaluation_bundle(bundle.bundle_ref(), artifact_store=store, verifier=verifier)
     assert loaded == bundle
     assert loaded.scorecard(artifact_store=store, verifier=verifier) == scorecard
+
+
+def test_signed_replay_lineage_binds_the_authenticated_corpus(publication) -> None:
+    """The signed replay descriptor must bind content, not only the split."""
+    _store, _signer, _verifier, verified, request, *_ = publication
+    primary = tuple(
+        row
+        for row in request.promotion_envelope.combined_batch.results
+        if row.evaluation.value == "development"
+    )
+    assert {row.evaluation_lineage.corpus_digest for row in primary} == {
+        verified.corpus.corpus_digest
+    }
+
+
+def test_public_feature_and_threshold_manifests_are_full_safe_projections(publication) -> None:
+    """Judge artifacts expose useful schema/operating facts for every feature and arm."""
+    store, _signer, _verifier, _verified, _request_value, *_, bundle = publication
+    feature_ref = bundle.public_artifacts["feature-manifest.json"]
+    threshold_ref = bundle.public_artifacts["thresholds.json"]
+    features = json.loads(store.read(feature_ref.as_artifact_ref()))
+    thresholds = json.loads(store.read(threshold_ref.as_artifact_ref()))
+
+    assert len(features["features"]) == features["feature_count"] == 48
+    assert tuple(row["name"] for row in features["features"]) == tuple(
+        features["ordered_feature_names"]
+    )
+    assert set(features["features"][0]) == {
+        "data_quality_behavior",
+        "dtype",
+        "family",
+        "missing_sentinel",
+        "name",
+        "past_only_state_keys",
+        "past_only_window_seconds",
+        "provenance_category",
+        "rail_applicability",
+        "source_path_ids",
+    }
+    assert [row["arm"] for row in thresholds["arms"]] == [
+        "rules_only",
+        "gbdt_only",
+        "layered_hybrid",
+    ]
+    assert thresholds["normalized_score_policy_version"] == "clip-open-unit-interval-v1"
+    assert all(row["feasible"] is True for row in thresholds["arms"])
+
+
+def test_privacy_scan_rejects_casefold_and_unicode_equivalent_restricted_ids() -> None:
+    """Restricted IDs cannot escape through case or Unicode-equivalent spellings."""
+    with pytest.raises(ReportingContractError, match="restricted row identifier"):
+        _privacy_scan(b"STRASSE", restricted_identifiers=("Straße".encode(),))
+    with pytest.raises(ReportingContractError, match="restricted row identifier"):
+        _privacy_scan("Cafe\u0301".encode(), restricted_identifiers=("Café".encode(),))
+
+
+def test_restricted_handles_have_constant_nonrevealing_representations(publication) -> None:
+    _store, _signer, _verifier, verified, *_ = publication
+    assert repr(verified) == str(verified) == "<restricted verified evaluation inputs>"
+    assert repr(verified.corpus) == str(verified.corpus) == (
+        "<restricted verified corpus attestation>"
+    )
+    assert repr(verified.defender) == str(verified.defender) == (
+        "<restricted verified defender attestation>"
+    )
+    for value in (verified, verified.corpus, verified.defender):
+        with pytest.raises(TypeError):
+            copy.deepcopy(value)
+        with pytest.raises(TypeError):
+            tuple.__repr__(value)  # type: ignore[arg-type]
 
 
 def test_publication_is_byte_reproducible_and_excludes_restricted_evidence(
@@ -379,17 +504,21 @@ def test_latency_observation_changes_do_not_change_reproducible_core(
     store = bundle_fixture.store
     signer = bundle_fixture.signer
     verifier = PublicArtifactVerifier.from_signer(signer)
-    verified, _corpus_ref, defender_ref = _authenticated_inputs(bundle_fixture)
+    verified, _corpus_ref, defender_ref, threshold_set = _authenticated_inputs(bundle_fixture)
     baseline, _ = _request(
         defender_digest=defender_ref.sha256,
         defender_bundle_id=verified.defender.bundle_id,
+        corpus_digest=verified.corpus.corpus_digest,
         split_digest=verified.corpus.split_digest,
+        threshold_set=threshold_set,
         latency_multiplier=1.0,
     )
     changed, _ = _request(
         defender_digest=defender_ref.sha256,
         defender_bundle_id=verified.defender.bundle_id,
+        corpus_digest=verified.corpus.corpus_digest,
         split_digest=verified.corpus.split_digest,
+        threshold_set=threshold_set,
         latency_multiplier=2.0,
     )
     first, first_bundle = publish_scorecard(
@@ -466,11 +595,13 @@ def test_publication_requires_verified_task11_and_task12_evidence(bundle_fixture
     store = bundle_fixture.store
     signer = bundle_fixture.signer
     verifier = PublicArtifactVerifier.from_signer(signer)
-    verified, _corpus_ref, defender_ref = _authenticated_inputs(bundle_fixture)
+    verified, _corpus_ref, defender_ref, threshold_set = _authenticated_inputs(bundle_fixture)
     request, _ = _request(
         defender_digest=defender_ref.sha256,
         defender_bundle_id=verified.defender.bundle_id,
+        corpus_digest=verified.corpus.corpus_digest,
         split_digest=verified.corpus.split_digest,
+        threshold_set=threshold_set,
     )
     report_evidence = request.metric_evidence[0]
     forged_report = MetricReport.model_construct(

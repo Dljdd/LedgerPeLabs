@@ -92,10 +92,11 @@ class EvaluationDescriptor(ExternalContract):
 class EvaluationLineage(ExternalContract):
     """Aggregate descriptor provenance derived from evaluator-owned source receipts."""
 
-    schema_version: Literal["1.0.0"] = "1.0.0"
+    schema_version: Literal["1.1.0"] = "1.1.0"
     descriptor: EvaluationDescriptor
     decision_rows_digest: str
     decision_content_digest: str
+    corpus_digest: str
     split_digest: str
     cohort_mapping_digest: str
     training_population_digest: str
@@ -112,6 +113,7 @@ class EvaluationLineage(ExternalContract):
     @field_validator(
         "decision_rows_digest",
         "decision_content_digest",
+        "corpus_digest",
         "split_digest",
         "cohort_mapping_digest",
         "training_population_digest",

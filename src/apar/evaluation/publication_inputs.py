@@ -37,6 +37,16 @@ class PublicationInputError(ValueError):
     """A corpus or defender failed its pinned authentication boundary."""
 
 
+class _SealedRestrictedType(type):
+    def __setattr__(cls, name: str, value: object) -> None:
+        del cls, name, value
+        raise TypeError("verified restricted capability type is sealed")
+
+    def __delattr__(cls, name: str) -> None:
+        del cls, name
+        raise TypeError("verified restricted capability type is sealed")
+
+
 def _digest(value: object, *, label: str) -> str:
     if (
         type(value) is not str
@@ -80,6 +90,7 @@ def _ref_from_document(value: object, *, media_type: str, size_cap: int) -> Arti
 
 class _CorpusState(NamedTuple):
     payload: bytes
+    top_ref: ArtifactRef
     evidence_ref: ArtifactRef
     corpus_digest: str
     split_digest: str
@@ -88,15 +99,17 @@ class _CorpusState(NamedTuple):
     signer_key_id: str
 
 
-class VerifiedCorpusAttestation(tuple[_CorpusState]):
+class VerifiedCorpusAttestation(metaclass=_SealedRestrictedType):
     """Immutable evaluator-authenticated handle to restricted frozen-corpus evidence."""
 
-    __slots__ = ()
+    __slots__ = ("__state",)
 
     def __new__(cls, state: _CorpusState, token: object = None) -> VerifiedCorpusAttestation:
         if token is not _TOKEN or type(state) is not _CorpusState:
             raise PublicationInputError("corpus attestations require pinned verification")
-        return tuple.__new__(cls, (state,))
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "_VerifiedCorpusAttestation__state", state)
+        return instance
 
     def __init__(self, state: _CorpusState, token: object = None) -> None:
         del state
@@ -114,6 +127,25 @@ class VerifiedCorpusAttestation(tuple[_CorpusState]):
     def __reduce__(self) -> Never:
         raise TypeError("verified corpus attestations must be reloaded")
 
+    def __copy__(self) -> Never:
+        raise TypeError("verified corpus attestations must be reloaded")
+
+    def __deepcopy__(self, memo: object) -> Never:
+        del memo
+        raise TypeError("verified corpus attestations must be reloaded")
+
+    def __repr__(self) -> str:
+        return "<restricted verified corpus attestation>"
+
+    def __str__(self) -> str:
+        return "<restricted verified corpus attestation>"
+
+    def __eq__(self, other: object) -> bool:
+        return type(other) is VerifiedCorpusAttestation and self.to_json() == other.to_json()
+
+    def __hash__(self) -> int:
+        return hash(self.to_json())
+
     @classmethod
     def model_construct(cls, **values: object) -> Never:
         del values
@@ -121,9 +153,9 @@ class VerifiedCorpusAttestation(tuple[_CorpusState]):
 
     @property
     def _state(self) -> _CorpusState:
-        if type(self) is not VerifiedCorpusAttestation or tuple.__len__(self) != 1:
+        if type(self) is not VerifiedCorpusAttestation:
             raise PublicationInputError("corpus attestation state is invalid")
-        state = tuple.__getitem__(self, 0)
+        state = object.__getattribute__(self, "_VerifiedCorpusAttestation__state")
         if type(state) is not _CorpusState:
             raise PublicationInputError("corpus attestation state is invalid")
         return state
@@ -134,6 +166,10 @@ class VerifiedCorpusAttestation(tuple[_CorpusState]):
     @property
     def evidence_ref(self) -> ArtifactRef:
         return self._state.evidence_ref
+
+    @property
+    def top_ref(self) -> ArtifactRef:
+        return self._state.top_ref
 
     @property
     def corpus_digest(self) -> str:
@@ -306,6 +342,12 @@ def _load_corpus_attestation_payload(
         raise PublicationInputError("corpus attestation evidence binding differs")
     state = _CorpusState(
         payload=payload,
+        top_ref=ArtifactRef(
+            hashlib.sha256(payload).hexdigest(),
+            CORPUS_ATTESTATION_MEDIA_TYPE,
+            len(payload),
+            f"{hashlib.sha256(payload).hexdigest()}/payload",
+        ),
         evidence_ref=evidence_ref,
         corpus_digest=document["corpus_digest"],
         split_digest=document["split_digest"],
@@ -325,15 +367,17 @@ class _VerifiedInputState:
     environment: EnvironmentLock
 
 
-class VerifiedEvaluationInputs(tuple[_VerifiedInputState]):
+class VerifiedEvaluationInputs(metaclass=_SealedRestrictedType):
     """Sealed exact corpus/defender capability passed to the isolated executor."""
 
-    __slots__ = ()
+    __slots__ = ("__state",)
 
     def __new__(cls, state: _VerifiedInputState, token: object = None) -> VerifiedEvaluationInputs:
         if token is not _TOKEN or type(state) is not _VerifiedInputState:
             raise PublicationInputError("evaluation inputs require pinned verification")
-        return tuple.__new__(cls, (state,))
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "_VerifiedEvaluationInputs__state", state)
+        return instance
 
     def __init__(self, state: _VerifiedInputState, token: object = None) -> None:
         del state
@@ -351,11 +395,27 @@ class VerifiedEvaluationInputs(tuple[_VerifiedInputState]):
     def __reduce__(self) -> Never:
         raise TypeError("verified evaluation inputs cannot be serialized")
 
+    def __copy__(self) -> Never:
+        raise TypeError("verified evaluation inputs cannot be copied")
+
+    def __deepcopy__(self, memo: object) -> Never:
+        del memo
+        raise TypeError("verified evaluation inputs cannot be copied")
+
+    def __repr__(self) -> str:
+        return "<restricted verified evaluation inputs>"
+
+    def __str__(self) -> str:
+        return "<restricted verified evaluation inputs>"
+
+    def __eq__(self, other: object) -> bool:
+        return type(other) is VerifiedEvaluationInputs and self._state == other._state
+
     @property
     def _state(self) -> _VerifiedInputState:
-        if type(self) is not VerifiedEvaluationInputs or tuple.__len__(self) != 1:
+        if type(self) is not VerifiedEvaluationInputs:
             raise PublicationInputError("verified evaluation input state is invalid")
-        state = tuple.__getitem__(self, 0)
+        state = object.__getattribute__(self, "_VerifiedEvaluationInputs__state")
         if type(state) is not _VerifiedInputState:
             raise PublicationInputError("verified evaluation input state is invalid")
         return state
@@ -406,6 +466,8 @@ def verify_evaluation_inputs(
     document = cast(dict[str, object], manifest)
     if corpus.split_digest != document.get("split_manifest_digest"):
         raise PublicationInputError("corpus and defender split lineage differ")
+    if corpus.corpus_digest != document.get("corpus_digest"):
+        raise PublicationInputError("corpus and defender corpus lineage differ")
     components = document.get("components")
     if type(components) is not list:
         raise PublicationInputError("defender components are unavailable")

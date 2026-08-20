@@ -138,10 +138,20 @@ class _VerifierState(NamedTuple):
     public_key: bytes
 
 
-class VerifiedDefenderAttestation(tuple[bytes]):
+class _SealedAttestationType(type):
+    def __setattr__(cls, name: str, value: object) -> None:
+        del cls, name, value
+        raise TypeError("verified defender attestation type is sealed")
+
+    def __delattr__(cls, name: str) -> None:
+        del cls, name
+        raise TypeError("verified defender attestation type is sealed")
+
+
+class VerifiedDefenderAttestation(metaclass=_SealedAttestationType):
     """Intrinsically immutable canonical proof of one authenticated bundle."""
 
-    __slots__ = ()
+    __slots__ = ("__payload",)
 
     def __new__(
         cls, payload: bytes, token: object = None
@@ -151,7 +161,11 @@ class VerifiedDefenderAttestation(tuple[bytes]):
                 "attestations must come from the exact neutral verifier"
             )
         _attestation_document(payload)
-        return tuple.__new__(cls, (bytes(payload),))
+        instance = object.__new__(cls)
+        object.__setattr__(
+            instance, "_VerifiedDefenderAttestation__payload", bytes(payload)
+        )
+        return instance
 
     def __init__(self, payload: bytes, token: object = None) -> None:
         del payload
@@ -180,10 +194,35 @@ class VerifiedDefenderAttestation(tuple[bytes]):
         return verifier.attestation_from_json(payload)
 
     def to_json(self) -> bytes:
-        return bytes(tuple.__getitem__(self, 0))
+        if type(self) is not VerifiedDefenderAttestation:
+            raise DefenderAttestationError("attestation identity is invalid")
+        return bytes(
+            object.__getattribute__(
+                self, "_VerifiedDefenderAttestation__payload"
+            )
+        )
 
     def __reduce__(self) -> Never:
         raise TypeError("attestations must be reloaded through their pinned verifier")
+
+    def __copy__(self) -> Never:
+        raise TypeError("attestations must be reloaded through their pinned verifier")
+
+    def __deepcopy__(self, memo: object) -> Never:
+        del memo
+        raise TypeError("attestations must be reloaded through their pinned verifier")
+
+    def __repr__(self) -> str:
+        return "<restricted verified defender attestation>"
+
+    def __str__(self) -> str:
+        return "<restricted verified defender attestation>"
+
+    def __eq__(self, other: object) -> bool:
+        return type(other) is VerifiedDefenderAttestation and self.to_json() == other.to_json()
+
+    def __hash__(self) -> int:
+        return hash(self.to_json())
 
     @property
     def top_ref(self) -> ArtifactRef:

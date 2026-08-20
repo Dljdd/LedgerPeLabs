@@ -2,29 +2,37 @@
 
 from __future__ import annotations
 
+import ast
 import fcntl
 import hashlib
 import multiprocessing
 import os
 import resource
+import select
 import socket
 import stat
+import struct
 import threading
-import weakref
-from collections.abc import Callable, Iterator
+import time
+from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from pathlib import Path
-from typing import NamedTuple, Never, cast
+from typing import NamedTuple, Never, Protocol, cast
+from weakref import WeakKeyDictionary
 
 from apar.evaluation.defender_attestation import DefenderBundleVerifier
-from apar.evaluation.gates import EvaluatorReplayVerifier
+from apar.evaluation.gates import (
+    EvaluatorReplayVerifier,
+    EvaluatorSigningIdentity,
+)
 from apar.evaluation.publication_inputs import (
     PublicationInputError,
     VerifiedEvaluationInputs,
     verify_evaluation_inputs,
 )
+from apar.evaluation.replay import ReplayThresholdSet
 from apar.evaluation.reporting import (
     PUBLIC_ARTIFACT_MEDIA_TYPES,
     RESTRICTED_PUBLICATION_RECEIPT_MEDIA_TYPE,
@@ -73,75 +81,15 @@ class DefenseServiceUnavailable(DefenseServiceError):
 
 
 class _ExecutorState(NamedTuple):
-    worker: Callable[[VerifiedEvaluationInputs], ScorecardPublicationRequest]
+    source: bytes
+    config: bytes
+    capability: bytes
     timeout_seconds: float
 
 
-_EXECUTOR_STATES: weakref.WeakKeyDictionary[object, _ExecutorState] = weakref.WeakKeyDictionary()
-_EXECUTOR_STATE_LOCK = threading.RLock()
-
-
-class EvaluationExecutor:
-    """Sealed capability that executes exact verified inputs in a bounded child."""
-
-    __slots__ = ("__weakref__",)
-
-    def __init__(self, *args: object, **kwargs: object) -> None:
-        del args, kwargs
-        raise TypeError("evaluation executors require the sealed factory")
-
-    def __setattr__(self, name: str, value: object) -> None:
-        del name, value
-        raise TypeError("evaluation executor is immutable")
-
-    def __delattr__(self, name: str) -> None:
-        del name
-        raise TypeError("evaluation executor is immutable")
-
-    def __reduce__(self) -> Never:
-        raise TypeError("evaluation executor cannot be serialized")
-
-    def __copy__(self) -> Never:
-        raise TypeError("evaluation executor cannot be copied")
-
-    def __deepcopy__(self, memo: object) -> Never:
-        del memo
-        raise TypeError("evaluation executor cannot be copied")
-
-    @classmethod
-    def from_worker(
-        cls,
-        worker: Callable[[VerifiedEvaluationInputs], ScorecardPublicationRequest],
-        *,
-        timeout_seconds: float = MAX_EXECUTION_SECONDS,
-    ) -> EvaluationExecutor:
-        if not callable(worker):
-            raise TypeError("evaluation executor worker must be callable")
-        if (
-            type(timeout_seconds) is not float
-            or not 0.01 <= timeout_seconds <= MAX_EXECUTION_SECONDS
-        ):
-            raise ValueError("evaluation executor timeout is outside its cap")
-        if cls is not EvaluationExecutor:
-            raise TypeError("evaluation executor factory must have its exact type")
-        instance = object.__new__(EvaluationExecutor)
-        with _EXECUTOR_STATE_LOCK:
-            _EXECUTOR_STATES[instance] = _ExecutorState(worker, timeout_seconds)
-        return instance
-
+class DefenseEvaluationExecutor(Protocol):
     @property
-    def timeout_seconds(self) -> float:
-        return self._state.timeout_seconds
-
-    @property
-    def _state(self) -> _ExecutorState:
-        if type(self) is not EvaluationExecutor:
-            raise DefenseExecutionConflict("evaluation executor state is invalid")
-        with _EXECUTOR_STATE_LOCK:
-            state = _EXECUTOR_STATES.get(self)
-        if type(state) is not _ExecutorState or not callable(state.worker):
-            raise DefenseExecutionConflict("evaluation executor state is invalid")
-        return state
+    def timeout_seconds(self) -> float: ...
 
     def execute(
         self,
@@ -149,87 +97,457 @@ class EvaluationExecutor:
         *,
         artifact_root: Path,
         evaluator_verifier: EvaluatorReplayVerifier,
-    ) -> ScorecardPublicationRequest:
-        """Reverify inside a spawned child and hard-stop it at the deadline."""
-        if type(inputs) is not VerifiedEvaluationInputs:
-            raise DefenseExecutionConflict("executor input capability is invalid")
-        if (
-            not isinstance(artifact_root, Path)
-            or type(evaluator_verifier) is not EvaluatorReplayVerifier
-        ):
-            raise DefenseExecutionConflict("executor trust capability is invalid")
-        state = self._state
-        try:
-            defender_document = strict_json_loads(inputs.defender.to_json())
-        except WireContractError as error:
-            raise DefenseExecutionConflict("verified defender input is invalid") from error
-        if type(defender_document) is not dict:
-            raise DefenseExecutionConflict("verified defender input is invalid")
-        defender_identity = cast(dict[str, object], defender_document)
-        defender_key_id = defender_identity.get("signer_key_id")
-        defender_public_key = defender_identity.get("public_key_base64")
-        if type(defender_key_id) is not str or type(defender_public_key) is not str:
-            raise DefenseExecutionConflict("verified defender identity is invalid")
-        corpus_payload = inputs.corpus.to_json()
-        corpus_digest = hashlib.sha256(corpus_payload).hexdigest()
-        corpus_ref = ArtifactRef(
-            corpus_digest,
-            "application/vnd.apar.verified-corpus-attestation+json",
-            len(corpus_payload),
-            f"{corpus_digest}/payload",
+    ) -> ScorecardPublicationRequest: ...
+
+
+class _SealedExecutorType(type):
+    def __setattr__(cls, name: str, value: object) -> None:
+        del cls, name, value
+        raise TypeError("evaluation executor type is sealed")
+
+    def __delattr__(cls, name: str) -> None:
+        del cls, name
+        raise TypeError("evaluation executor type is sealed")
+
+
+def _build_executor_type() -> type:
+    states: WeakKeyDictionary[object, _ExecutorState] = WeakKeyDictionary()
+    lock = threading.RLock()
+    exact_type: type | None = None
+
+    def state_for(instance: object) -> _ExecutorState:
+        if exact_type is None or type(instance) is not exact_type:
+            raise DefenseExecutionConflict("evaluation executor state is invalid")
+        with lock:
+            try:
+                state = states[instance]
+            except KeyError as error:
+                raise DefenseExecutionConflict(
+                    "evaluation executor state is invalid"
+                ) from error
+        if type(state) is not _ExecutorState:
+            raise DefenseExecutionConflict("evaluation executor state is invalid")
+        return state
+
+    class _EvaluationExecutor(metaclass=_SealedExecutorType):
+        __slots__ = ("__weakref__",)
+
+        def __new__(cls, *args: object, **kwargs: object) -> Never:
+            del cls, args, kwargs
+            raise TypeError("evaluation executors require the sealed factory")
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del self, args, kwargs
+            raise TypeError("evaluation executor cannot be reinitialized")
+
+        def __setattr__(self, name: str, value: object) -> None:
+            del self, name, value
+            raise TypeError("evaluation executor is immutable")
+
+        def __delattr__(self, name: str) -> None:
+            del self, name
+            raise TypeError("evaluation executor is immutable")
+
+        def __reduce__(self) -> Never:
+            raise TypeError("evaluation executor cannot be serialized")
+
+        def __copy__(self) -> Never:
+            raise TypeError("evaluation executor cannot be copied")
+
+        def __deepcopy__(self, memo: object) -> Never:
+            del memo
+            raise TypeError("evaluation executor cannot be copied")
+
+        def __repr__(self) -> str:
+            return "<sealed evaluator worker capability>"
+
+        @classmethod
+        def from_signed_source(
+            cls,
+            *,
+            source_path: Path,
+            callable_qualname: str,
+            version: str,
+            config: dict[str, object],
+            signer: EvaluatorSigningIdentity,
+            timeout_seconds: float = MAX_EXECUTION_SECONDS,
+        ) -> object:
+            if cls is not exact_type or not EvaluatorSigningIdentity.is_exact(signer):
+                raise TypeError("evaluation worker requires the exact evaluator authority")
+            if (
+                not isinstance(source_path, Path)
+                or source_path.is_symlink()
+                or not source_path.is_file()
+            ):
+                raise TypeError("evaluation worker source must be one exact regular file")
+            source = source_path.read_bytes()
+            _audit_worker_source(source)
+            if (
+                type(callable_qualname) is not str
+                or not callable_qualname.isidentifier()
+                or type(version) is not str
+                or not _semantic_version(version)
+            ):
+                raise ValueError("evaluation worker identity is invalid")
+            if type(config) is not dict:
+                raise TypeError("evaluation worker config must be an exact object")
+            config_payload = canonical_json_bytes(config)
+            if not 0 < len(config_payload) <= MAX_EXECUTOR_RESULT_BYTES:
+                raise ValueError("evaluation worker config exceeds its cap")
+            if (
+                type(timeout_seconds) is not float
+                or not 0.01 <= timeout_seconds <= MAX_EXECUTION_SECONDS
+            ):
+                raise ValueError("evaluation executor timeout is outside its cap")
+            source_digest = hashlib.sha256(source).hexdigest()
+            inventory = [
+                {
+                    "module_id": "evaluator_worker.py",
+                    "sha256": source_digest,
+                    "size_bytes": len(source),
+                }
+            ]
+            fields: dict[str, object] = {
+                "schema_version": "1.0.0",
+                "callable_qualname": callable_qualname,
+                "worker_version": version,
+                "input_schema": "apar.verified-evaluation-inputs.v1",
+                "output_schema": "apar.scorecard-publication-request.v1",
+                "source_inventory": inventory,
+                "source_inventory_digest": _digest_document(inventory),
+                "config_digest": hashlib.sha256(config_payload).hexdigest(),
+                "signer_key_id": signer.key_id,
+                "public_key_base64": signer.public_key_base64,
+            }
+            signature = signer._sign(fields)
+            capability = canonical_json_bytes(
+                {
+                    **fields,
+                    "signature_base64": signature,
+                    "capability_digest": _digest_document(
+                        {**fields, "signature_base64": signature}
+                    ),
+                }
+            )
+            instance: _EvaluationExecutor = object.__new__(cast(type, exact_type))
+            with lock:
+                states[instance] = _ExecutorState(
+                    bytes(source), bytes(config_payload), capability, timeout_seconds
+                )
+            return instance
+
+        @property
+        def timeout_seconds(self) -> float:
+            return state_for(self).timeout_seconds
+
+        def execute(
+            self,
+            inputs: VerifiedEvaluationInputs,
+            *,
+            artifact_root: Path,
+            evaluator_verifier: EvaluatorReplayVerifier,
+        ) -> ScorecardPublicationRequest:
+            if type(inputs) is not VerifiedEvaluationInputs:
+                raise DefenseExecutionConflict("executor input capability is invalid")
+            if not isinstance(artifact_root, Path) or type(
+                evaluator_verifier
+            ) is not EvaluatorReplayVerifier:
+                raise DefenseExecutionConflict("executor trust capability is invalid")
+            state = state_for(self)
+            capability = _verify_worker_capability(state, evaluator_verifier)
+            snapshot = _snapshot_worker_source(
+                artifact_root, state.source, cast(str, capability["source_inventory_digest"])
+            )
+            try:
+                defender_document = strict_json_loads(inputs.defender.to_json())
+            except WireContractError as error:
+                raise DefenseExecutionConflict("verified defender input is invalid") from error
+            if type(defender_document) is not dict:
+                raise DefenseExecutionConflict("verified defender input is invalid")
+            defender_identity = cast(dict[str, object], defender_document)
+            defender_key_id = defender_identity.get("signer_key_id")
+            defender_public_key = defender_identity.get("public_key_base64")
+            if type(defender_key_id) is not str or type(defender_public_key) is not str:
+                raise DefenseExecutionConflict("verified defender identity is invalid")
+            deadline = time.monotonic() + state.timeout_seconds
+            try:
+                context = multiprocessing.get_context("spawn")
+                parent, child = context.Pipe(duplex=False)
+                process = context.Process(
+                    target=_executor_child,
+                    args=(
+                        child,
+                        str(snapshot),
+                        state.source,
+                        state.config,
+                        state.capability,
+                        str(artifact_root),
+                        inputs.corpus.top_ref,
+                        inputs.defender.top_ref,
+                        evaluator_verifier.key_id,
+                        evaluator_verifier.public_key_base64,
+                        defender_key_id,
+                        defender_public_key,
+                    ),
+                    daemon=True,
+                )
+                process.start()
+                child.close()
+            except Exception as error:
+                raise DefenseExecutionConflict("defense evaluation could not start") from error
+            try:
+                payload = _read_framed_result(parent, process, deadline)
+                remaining = max(0.0, deadline - time.monotonic())
+                process.join(timeout=min(1.0, remaining))
+                if process.is_alive():
+                    _terminate_process(process)
+                    raise DefenseExecutionConflict("defense evaluation did not exit")
+                if process.exitcode != 0 or not payload.startswith(b"O"):
+                    raise DefenseExecutionConflict("defense evaluation was rejected")
+                raw = payload[1:]
+                if not 0 < len(raw) <= MAX_EXECUTOR_RESULT_BYTES:
+                    raise DefenseExecutionConflict(
+                        "defense evaluation result exceeds its cap"
+                    )
+                try:
+                    return ScorecardPublicationRequest.from_worker_json(raw)
+                except (ReportingContractError, TypeError, ValueError) as error:
+                    raise DefenseExecutionConflict(
+                        "defense evaluation result is invalid"
+                    ) from error
+            finally:
+                parent.close()
+                if process.is_alive():
+                    _terminate_process(process)
+
+    exact_type = _EvaluationExecutor
+    return _EvaluationExecutor
+
+
+EvaluationExecutor = _build_executor_type()
+
+
+def _semantic_version(value: str) -> bool:
+    parts = value.split(".")
+    return len(parts) == 3 and all(part.isascii() and part.isdigit() for part in parts)
+
+
+def _audit_worker_source(source: bytes) -> None:
+    if type(source) is not bytes or not 0 < len(source) <= 2 * 1024 * 1024:
+        raise ValueError("evaluation worker source exceeds its cap")
+    try:
+        text = source.decode("utf-8")
+        tree = ast.parse(text, filename="evaluator_worker.py", mode="exec")
+    except (UnicodeDecodeError, SyntaxError) as error:
+        raise ValueError("evaluation worker source is invalid") from error
+    banned_modules = {
+        "asyncio",
+        "ctypes",
+        "ftplib",
+        "http",
+        "importlib",
+        "multiprocessing",
+        "requests",
+        "socket",
+        "subprocess",
+        "sys",
+        "telnetlib",
+        "urllib",
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            names = (
+                tuple(alias.name for alias in node.names)
+                if isinstance(node, ast.Import)
+                else ((node.module or ""),)
+            )
+            if any(name.split(".", 1)[0] in banned_modules for name in names):
+                raise ValueError("evaluation worker imports a forbidden capability")
+            if any(
+                alias.name.split(".", 1)[0] in banned_modules
+                or any(
+                    token in alias.name.casefold()
+                    for token in ("socket", "subprocess", "urlopen", "network")
+                )
+                for alias in node.names
+            ):
+                raise ValueError("evaluation worker imports a prebound capability")
+        if isinstance(node, (ast.Name, ast.Attribute)):
+            identifier = (
+                node.id if isinstance(node, ast.Name) else node.attr
+            ).casefold()
+            if any(
+                token in identifier
+                for token in (
+                    "create_connection",
+                    "fork",
+                    "popen",
+                    "socket",
+                    "spawn",
+                    "subprocess",
+                    "urlopen",
+                )
+            ):
+                raise ValueError("evaluation worker references a forbidden capability")
+        if isinstance(node, ast.Call):
+            target = node.func
+            if isinstance(target, ast.Name) and target.id in {
+                "__import__",
+                "compile",
+                "eval",
+                "exec",
+            }:
+                raise ValueError("evaluation worker uses dynamic code loading")
+            if (
+                isinstance(target, ast.Attribute)
+                and target.attr in {"import_module", "exec_module", "load_module"}
+            ):
+                raise ValueError("evaluation worker uses dynamic module loading")
+
+
+def _verify_worker_capability(
+    state: _ExecutorState, verifier: EvaluatorReplayVerifier
+) -> dict[str, object]:
+    try:
+        raw = strict_json_loads(state.capability)
+    except WireContractError as error:
+        raise DefenseExecutionConflict("evaluation worker capability is invalid") from error
+    fields = {
+        "schema_version",
+        "callable_qualname",
+        "worker_version",
+        "input_schema",
+        "output_schema",
+        "source_inventory",
+        "source_inventory_digest",
+        "config_digest",
+        "signer_key_id",
+        "public_key_base64",
+        "signature_base64",
+        "capability_digest",
+    }
+    if type(raw) is not dict or set(raw) != fields or canonical_json_bytes(raw) != state.capability:
+        raise DefenseExecutionConflict("evaluation worker capability fields differ")
+    document = cast(dict[str, object], raw)
+    signed = {key: value for key, value in document.items() if key != "capability_digest"}
+    unsigned = {key: value for key, value in signed.items() if key != "signature_base64"}
+    signature = document["signature_base64"]
+    inventory = document["source_inventory"]
+    source_digest = hashlib.sha256(state.source).hexdigest()
+    if (
+        document["schema_version"] != "1.0.0"
+        or document["input_schema"] != "apar.verified-evaluation-inputs.v1"
+        or document["output_schema"] != "apar.scorecard-publication-request.v1"
+        or document["signer_key_id"] != verifier.key_id
+        or document["public_key_base64"] != verifier.public_key_base64
+        or type(signature) is not str
+        or not verifier.verify_document(unsigned, signature)
+        or document["capability_digest"] != _digest_document(signed)
+        or document["config_digest"] != hashlib.sha256(state.config).hexdigest()
+        or type(inventory) is not list
+        or inventory
+        != [
+            {
+                "module_id": "evaluator_worker.py",
+                "sha256": source_digest,
+                "size_bytes": len(state.source),
+            }
+        ]
+        or document["source_inventory_digest"] != _digest_document(inventory)
+    ):
+        raise DefenseExecutionConflict("evaluation worker capability signature is invalid")
+    _audit_worker_source(state.source)
+    return document
+
+
+def _snapshot_worker_source(root: Path, source: bytes, inventory_digest: str) -> Path:
+    directory = root / ".defense-evaluator-workers-v1"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    if directory.is_symlink() or not directory.is_dir():
+        raise DefenseExecutionConflict("evaluation worker snapshot root is invalid")
+    directory.chmod(0o700)
+    snapshot_directory = directory / inventory_digest
+    snapshot_directory.mkdir(mode=0o700, exist_ok=True)
+    if snapshot_directory.is_symlink() or not snapshot_directory.is_dir():
+        raise DefenseExecutionConflict("evaluation worker snapshot is invalid")
+    snapshot_directory.chmod(0o700)
+    path = snapshot_directory / "worker.py"
+    if path.exists():
+        if path.is_symlink() or path.read_bytes() != source:
+            raise DefenseExecutionConflict("evaluation worker snapshot differs")
+    else:
+        temporary = snapshot_directory / f".tmp-{os.getpid()}-{threading.get_ident()}"
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
         )
         try:
-            context = multiprocessing.get_context("spawn")
-            parent, child = context.Pipe(duplex=False)
-            process = context.Process(
-                target=_executor_child,
-                args=(
-                    child,
-                    state.worker,
-                    str(artifact_root),
-                    corpus_ref,
-                    inputs.defender.top_ref,
-                    evaluator_verifier.key_id,
-                    evaluator_verifier.public_key_base64,
-                    defender_key_id,
-                    defender_public_key,
-                ),
-                daemon=True,
-            )
-            process.start()
-            child.close()
-        except Exception as error:
-            raise DefenseExecutionConflict("defense evaluation could not start") from error
-        try:
-            if not parent.poll(state.timeout_seconds):
-                _terminate_process(process)
-                raise DefenseExecutionConflict("defense evaluation timed out")
-            try:
-                payload = parent.recv_bytes(MAX_EXECUTOR_RESULT_BYTES + 2)
-            except (EOFError, OSError, ValueError) as error:
-                raise DefenseExecutionConflict("defense evaluation returned no result") from error
-            process.join(timeout=1.0)
-            if process.is_alive():
-                _terminate_process(process)
-                raise DefenseExecutionConflict("defense evaluation did not exit")
-            if process.exitcode != 0 or not payload.startswith(b"O"):
-                raise DefenseExecutionConflict("defense evaluation was rejected")
-            raw = payload[1:]
-            if not 0 < len(raw) <= MAX_EXECUTOR_RESULT_BYTES:
-                raise DefenseExecutionConflict("defense evaluation result exceeds its cap")
-            try:
-                return ScorecardPublicationRequest.from_worker_json(raw)
-            except (ReportingContractError, TypeError, ValueError) as error:
-                raise DefenseExecutionConflict("defense evaluation result is invalid") from error
+            offset = 0
+            while offset < len(source):
+                written = os.write(descriptor, source[offset:])
+                if written <= 0:
+                    raise OSError("worker snapshot write made no progress")
+                offset += written
+            os.fsync(descriptor)
         finally:
-            parent.close()
-            if process.is_alive():
+            os.close(descriptor)
+        try:
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError:
+            if path.is_symlink() or path.read_bytes() != source:
+                raise DefenseExecutionConflict("concurrent worker snapshot differs") from None
+        finally:
+            with suppress(FileNotFoundError):
+                temporary.unlink()
+    path.chmod(0o400)
+    if path.read_bytes() != source:
+        raise DefenseExecutionConflict("evaluation worker snapshot digest differs")
+    return path
+
+
+def _read_framed_result(
+    pipe: Connection, process: BaseProcess, deadline: float
+) -> bytes:
+    descriptor = pipe.fileno()
+    os.set_blocking(descriptor, False)
+    buffer = bytearray()
+    expected: int | None = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _terminate_process(process)
+            raise DefenseExecutionConflict("defense evaluation timed out")
+        readable, _, _ = select.select((descriptor,), (), (), remaining)
+        if not readable:
+            _terminate_process(process)
+            raise DefenseExecutionConflict("defense evaluation timed out")
+        try:
+            chunk = os.read(descriptor, min(64 * 1024, MAX_EXECUTOR_RESULT_BYTES + 9))
+        except BlockingIOError:
+            continue
+        if not chunk:
+            raise DefenseExecutionConflict("defense evaluation returned no result")
+        buffer.extend(chunk)
+        if expected is None and len(buffer) >= 8:
+            expected = struct.unpack(">Q", bytes(buffer[:8]))[0]
+            del buffer[:8]
+            if not 0 < expected <= MAX_EXECUTOR_RESULT_BYTES + 1:
                 _terminate_process(process)
+                raise DefenseExecutionConflict("defense evaluation frame exceeds its cap")
+        if expected is not None and len(buffer) == expected:
+            return bytes(buffer)
+        if expected is not None and len(buffer) > expected:
+            _terminate_process(process)
+            raise DefenseExecutionConflict("defense evaluation frame is malformed")
 
 
 def _executor_child(
     pipe: Connection,
-    worker: Callable[[VerifiedEvaluationInputs], ScorecardPublicationRequest],
+    snapshot_path: str,
+    expected_source: bytes,
+    config_payload: bytes,
+    capability_payload: bytes,
     artifact_root: str,
     corpus_ref: ArtifactRef,
     defender_ref: ArtifactRef,
@@ -240,11 +558,19 @@ def _executor_child(
 ) -> None:
     try:
         _apply_child_limits()
+        _close_inherited_fds(pipe.fileno())
+        _disable_child_network()
         store = ArtifactStore(Path(artifact_root))
         evaluator_verifier = EvaluatorReplayVerifier(
             signer_key_id=evaluator_key_id,
             public_key_base64=evaluator_public_key,
         )
+        state = _ExecutorState(expected_source, config_payload, capability_payload, 1.0)
+        capability = _verify_worker_capability(state, evaluator_verifier)
+        path = Path(snapshot_path)
+        source = path.read_bytes()
+        if source != expected_source or path.is_symlink():
+            raise ValueError("worker source snapshot changed")
         defender_verifier = DefenderBundleVerifier(
             store,
             signer_key_id=defender_key_id,
@@ -257,26 +583,85 @@ def _executor_child(
             evaluator_verifier=evaluator_verifier,
             defender_verifier=defender_verifier,
         )
-        _disable_child_network()
-        result = worker(inputs)
-        if type(result) is not ScorecardPublicationRequest:
-            raise TypeError("executor output must be the exact publication request")
-        payload = result.to_worker_json()
+        config = strict_json_loads(config_payload)
+        if type(config) is not dict:
+            raise ValueError("worker config is not an object")
+        namespace: dict[str, object] = {
+            "__builtins__": __builtins__,
+            "__file__": str(path),
+            "__name__": "_apar_verified_evaluator_worker",
+        }
+        code = compile(source, "evaluator_worker.py", "exec")
+        exec(code, namespace)
+        _audit_worker_namespace(namespace)
+        worker = namespace.get(cast(str, capability["callable_qualname"]))
+        if (
+            type(worker).__name__ != "function"
+            or getattr(worker, "__module__", None) != namespace["__name__"]
+        ):
+            raise TypeError("worker callable identity differs")
+        payload = worker(inputs, config)  # type: ignore[operator]
+        if type(payload) is not bytes:
+            raise TypeError("executor output must be exact canonical request bytes")
+        ScorecardPublicationRequest.from_worker_json(payload)
         if len(payload) > MAX_EXECUTOR_RESULT_BYTES:
             raise ValueError("executor output is too large")
-        pipe.send_bytes(b"O" + payload)
+        _write_frame(pipe.fileno(), b"O" + payload)
     except BaseException:
         with suppress(Exception):
-            pipe.send_bytes(b"E")
+            _write_frame(pipe.fileno(), b"E")
         raise SystemExit(1) from None
     finally:
         pipe.close()
+
+
+def _write_frame(descriptor: int, payload: bytes) -> None:
+    framed = struct.pack(">Q", len(payload)) + payload
+    offset = 0
+    while offset < len(framed):
+        written = os.write(descriptor, framed[offset : offset + 64 * 1024])
+        if written <= 0:
+            raise OSError("executor frame write made no progress")
+        offset += written
+
+
+def _audit_worker_namespace(namespace: dict[str, object]) -> None:
+    banned = ("socket", "subprocess", "requests", "urllib", "http.client", "ftplib")
+    for name, value in namespace.items():
+        if name.startswith("__"):
+            continue
+        origins = (
+            getattr(value, "__module__", ""),
+            getattr(value, "__name__", ""),
+            type(value).__module__,
+        )
+        if any(
+            type(origin) is str
+            and any(
+                origin == token or origin.startswith(f"{token}.")
+                for token in banned
+            )
+            for origin in origins
+        ):
+            raise TypeError("worker namespace contains a prebound forbidden capability")
+
+
+def _close_inherited_fds(preserve: int) -> None:
+    try:
+        maximum = min(4096, int(resource.getrlimit(resource.RLIMIT_NOFILE)[0]))
+    except (OSError, ValueError):
+        maximum = 256
+    for descriptor in range(3, maximum):
+        if descriptor != preserve:
+            with suppress(OSError):
+                os.close(descriptor)
 
 
 def _apply_child_limits() -> None:
     """Apply portable hard limits independent of caller-controlled values."""
     limits = (
         (resource.RLIMIT_CPU, 901),
+        (resource.RLIMIT_AS, 2 * 1024 * 1024 * 1024),
         (resource.RLIMIT_DATA, 2 * 1024 * 1024 * 1024),
         (resource.RLIMIT_FSIZE, MAX_EXECUTOR_RESULT_BYTES + 1),
         (resource.RLIMIT_NOFILE, 64),
@@ -388,6 +773,8 @@ class _IndexRepository:
             records.append(record)
         if len({record.input_key for record in records}) != len(records):
             raise DefenseArtifactInvalid("defense evaluation index is duplicated")
+        if len({record.evaluation_id for record in records}) != len(records):
+            raise DefenseArtifactInvalid("defense evaluation index is ambiguous")
         return tuple(records)
 
     def _discard_interrupted_temporary(self, name: str) -> None:
@@ -414,6 +801,14 @@ class _IndexRepository:
     def publish(self, record: _IndexRecord) -> None:
         name = f"{record.input_key}.json"
         payload = _index_payload(record, self._signer)
+        for existing_record in self.all():
+            if (
+                existing_record.evaluation_id == record.evaluation_id
+                and existing_record != record
+            ):
+                raise DefenseExecutionConflict(
+                    "evaluation identity is already bound to another input"
+                )
         existing = self._try_read(name)
         if existing is not None:
             if existing != record:
@@ -689,7 +1084,7 @@ class DefenseEvaluationService:
         evaluator_verifier: EvaluatorReplayVerifier,
         hidden_proof_verifier: EvaluatorReplayVerifier,
         defender_verifier: DefenderBundleVerifier,
-        executor: EvaluationExecutor,
+        executor: DefenseEvaluationExecutor,
     ) -> None:
         if type(artifact_store) is not ArtifactStore:
             raise TypeError("defense service requires an exact ArtifactStore")
@@ -739,7 +1134,7 @@ class DefenseEvaluationService:
         defender_digest = _validate_digest(defender_artifact_digest)
         key = _input_key(corpus_digest, defender_digest)
         with self._lock, self._index.locked():
-            records = self._load_records()
+            records = self._load_records(validate_publications=True)
             existing = records.get(key)
             if existing is not None:
                 return self._load_record(existing)[1]
@@ -799,8 +1194,9 @@ class DefenseEvaluationService:
     def get(self, evaluation_id: str) -> DefenseScorecard:
         digest = _validate_digest(evaluation_id)
         with self._lock, self._index.locked():
-            records = self._load_records()
-            record = next((item for item in records.values() if item.evaluation_id == digest), None)
+            records = self._load_records(validate_publications=True)
+            by_evaluation = {item.evaluation_id: item for item in records.values()}
+            record = by_evaluation.get(digest)
             if record is None:
                 raise DefenseResourceNotFound("defense evaluation not found")
             return self._load_record(record)[1]
@@ -813,8 +1209,9 @@ class DefenseEvaluationService:
             raise DefenseResourceNotFound("public artifact not found")
         digest = _validate_digest(evaluation_id)
         with self._lock, self._index.locked():
-            records = self._load_records()
-            record = next((item for item in records.values() if item.evaluation_id == digest), None)
+            records = self._load_records(validate_publications=True)
+            by_evaluation = {item.evaluation_id: item for item in records.values()}
+            record = by_evaluation.get(digest)
             if record is None:
                 raise DefenseResourceNotFound("defense evaluation not found")
             bundle, _scorecard = self._load_record(record)
@@ -835,6 +1232,8 @@ class DefenseEvaluationService:
 
     def _load_records(self, *, validate_publications: bool = False) -> dict[str, _IndexRecord]:
         records = self._index.all()
+        if len({record.evaluation_id for record in records}) != len(records):
+            raise DefenseArtifactInvalid("defense evaluation index is ambiguous")
         output = {record.input_key: record for record in records}
         if validate_publications:
             for record in records:
@@ -871,6 +1270,8 @@ class DefenseEvaluationService:
             "defender_attestation",
             "promotion_envelope_digest",
             "champion_decision_digest",
+            "threshold_set_digest",
+            "threshold_set",
             "metric_lineage",
             "public_bundle_digest",
             "public_bundle_ref",
@@ -892,6 +1293,56 @@ class DefenseEvaluationService:
             or document.get("public_bundle_digest") != bundle.bundle_digest
         ):
             raise DefenseArtifactInvalid("restricted publication receipt cross-link differs")
+        try:
+            corpus_ref = self._artifact_store.resolve(record.corpus_digest)
+            defender_ref = self._artifact_store.resolve(record.defender_digest)
+            verified = verify_evaluation_inputs(
+                corpus_ref=corpus_ref,
+                defender_ref=defender_ref,
+                artifact_store=self._artifact_store,
+                evaluator_verifier=self._evaluator_verifier,
+                defender_verifier=self._defender_verifier,
+            )
+        except (PublicationInputError, TypeError, ValueError) as error:
+            raise DefenseArtifactInvalid(
+                "original evaluation inputs failed reauthentication"
+            ) from error
+        corpus_attestation_ref = document.get("corpus_attestation_ref")
+        corpus_evidence_ref = document.get("corpus_evidence_ref")
+        defender_attestation = document.get("defender_attestation")
+        threshold_document = document.get("threshold_set")
+        try:
+            if type(threshold_document) is not dict or type(
+                threshold_document.get("reports")
+            ) is not list:
+                raise ValueError("threshold receipt fields differ")
+            threshold_document = dict(threshold_document)
+            threshold_document["reports"] = tuple(threshold_document["reports"])
+            threshold_set = ReplayThresholdSet.model_validate(threshold_document)
+        except (TypeError, ValueError) as error:
+            raise DefenseArtifactInvalid(
+                "restricted threshold receipt is invalid"
+            ) from error
+        if (
+            type(corpus_attestation_ref) is not dict
+            or cast(dict[str, object], corpus_attestation_ref).get("sha256")
+            != record.corpus_digest
+            or type(corpus_evidence_ref) is not dict
+            or cast(dict[str, object], corpus_evidence_ref).get("sha256")
+            != verified.corpus.evidence_ref.sha256
+            or document.get("corpus_content_digest") != verified.corpus.corpus_digest
+            or document.get("split_digest") != verified.corpus.split_digest
+            or type(defender_attestation) is not dict
+            or canonical_json_bytes(defender_attestation) != verified.defender.to_json()
+            or verified.defender.top_ref.sha256 != record.defender_digest
+            or document.get("threshold_set_digest")
+            != threshold_set.threshold_set_digest
+            or threshold_set.bundle_manifest_digest != record.defender_digest
+            or threshold_set.reports[-1].report != verified.thresholds
+        ):
+            raise DefenseArtifactInvalid(
+                "restricted publication input lineage differs"
+            )
 
     def _load_record(
         self, record: _IndexRecord
@@ -928,6 +1379,7 @@ def _validate_digest(value: object) -> str:
 
 __all__ = [
     "DefenseArtifactInvalid",
+    "DefenseEvaluationExecutor",
     "DefenseEvaluationService",
     "DefenseExecutionConflict",
     "DefenseResourceNotFound",

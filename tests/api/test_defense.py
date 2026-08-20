@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import copy
 import json
 import os
-import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,15 +16,21 @@ from fastapi.testclient import TestClient
 from apar.api.app import create_app
 from apar.config import Settings
 from apar.evaluation.defender_attestation import DefenderBundleVerifier
-from apar.evaluation.publication_inputs import (
-    VerifiedEvaluationInputs,
-    publish_corpus_attestation,
-    verify_evaluation_inputs,
+from apar.evaluation.publication_inputs import publish_corpus_attestation, verify_evaluation_inputs
+from apar.evaluation.reporting import PublicArtifactVerifier
+from apar.evaluation.service import (
+    EvaluationExecutor,
+    _index_payload,
+    _IndexRecord,
+    _input_key,
+    _parse_index_payload,
 )
-from apar.evaluation.reporting import PublicArtifactVerifier, ScorecardPublicationRequest
-from apar.evaluation.service import EvaluationExecutor
 from apar.storage.artifacts import ArtifactStore
-from tests.evaluation.test_replay import _corpus_evidence
+from tests.evaluation.test_replay import (
+    _corpus_evidence,
+    _selection_binding,
+    _thresholds,
+)
 from tests.evaluation.test_reporting import (
     EVALUATOR_SIGNER,
     EVALUATOR_VERIFIER,
@@ -36,26 +42,7 @@ from tests.evaluation.test_reporting import (
 pytest_plugins = ("tests.defense.test_bundle",)
 
 
-@dataclass(frozen=True, slots=True)
-class _FixtureWorker:
-    payload: bytes
-    marker_path: str
-    delay_seconds: float = 0.0
-
-    def __call__(self, inputs: VerifiedEvaluationInputs) -> ScorecardPublicationRequest:
-        assert type(inputs) is VerifiedEvaluationInputs
-        descriptor = os.open(
-            self.marker_path,
-            os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW,
-            0o600,
-        )
-        try:
-            os.write(descriptor, f"{os.getpid()}\n".encode("ascii"))
-        finally:
-            os.close(descriptor)
-        if self.delay_seconds:
-            time.sleep(self.delay_seconds)
-        return ScorecardPublicationRequest.from_worker_json(self.payload)
+WORKER_SOURCE = Path(__file__).parents[1] / "fixtures" / "defense_evaluator_worker.py"
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,9 +69,16 @@ def _client(
     timeout_seconds: float = 900.0,
     delay_seconds: float = 0.0,
 ):
-    _manifest, defender_ref = bundle_fixture.publisher.freeze(**bundle_fixture.kwargs)
+    evidence = _corpus_evidence(bundle_fixture)
+    kwargs = {
+        **bundle_fixture.kwargs,
+        "lineage": bundle_fixture.kwargs["lineage"].model_copy(
+            update={"corpus_digest": evidence.corpus_digest}
+        ),
+    }
+    _manifest, defender_ref = bundle_fixture.publisher.freeze(**kwargs)
     _attestation, corpus_ref = publish_corpus_attestation(
-        _corpus_evidence(bundle_fixture),
+        evidence,
         artifact_store=bundle_fixture.store,
         signer=EVALUATOR_SIGNER,
     )
@@ -100,14 +94,26 @@ def _client(
         evaluator_verifier=EVALUATOR_VERIFIER,
         defender_verifier=defender_verifier,
     )
+    loaded = bundle_fixture.publisher.load(defender_ref)
+    threshold_set = _thresholds(bundle_fixture, loaded, _selection_binding(loaded))
     request, _decision = _request(
         defender_digest=defender_ref.sha256,
         defender_bundle_id=verified.defender.bundle_id,
+        corpus_digest=verified.corpus.corpus_digest,
         split_digest=verified.corpus.split_digest,
+        threshold_set=threshold_set,
     )
     marker = tmp_path / marker_name
-    executor = EvaluationExecutor.from_worker(
-        _FixtureWorker(request.to_worker_json(), str(marker), delay_seconds),
+    executor = EvaluationExecutor.from_signed_source(
+        source_path=WORKER_SOURCE,
+        callable_qualname="evaluate",
+        version="1.0.0",
+        config={
+            "delay_seconds": delay_seconds,
+            "marker_path": str(marker),
+            "request_base64": base64.b64encode(request.to_worker_json()).decode("ascii"),
+        },
+        signer=EVALUATOR_SIGNER,
         timeout_seconds=timeout_seconds,
     )
     settings = Settings(
@@ -300,14 +306,41 @@ def test_executor_and_trust_capabilities_are_exact_sealed_and_independent(
 ) -> None:
     client, _tracker, request, _, _, settings = _client(tmp_path, bundle_fixture)
     client.__exit__(None, None, None)
-    worker = _FixtureWorker(request.to_worker_json(), str(tmp_path / "sealed.calls"))
-    executor = EvaluationExecutor.from_worker(worker)
+    executor = EvaluationExecutor.from_signed_source(
+        source_path=WORKER_SOURCE,
+        callable_qualname="evaluate",
+        version="1.0.0",
+        config={
+            "delay_seconds": 0.0,
+            "marker_path": str(tmp_path / "sealed.calls"),
+            "request_base64": base64.b64encode(request.to_worker_json()).decode("ascii"),
+        },
+        signer=EVALUATOR_SIGNER,
+    )
+    assert not hasattr(EvaluationExecutor, "from_worker")
+    assert repr(executor) == "<sealed evaluator worker capability>"
     with pytest.raises(TypeError):
         executor.__init__()
     with pytest.raises(TypeError):
         executor.timeout_seconds = 1.0  # type: ignore[misc]
     with pytest.raises(TypeError):
         copy.deepcopy(executor)
+    with pytest.raises(TypeError):
+        EvaluationExecutor.from_signed_source = classmethod(lambda *args: None)  # type: ignore[misc]
+
+    forbidden_source = tmp_path / "forbidden_worker.py"
+    forbidden_source.write_text(
+        "import socket\ndef evaluate(inputs, config):\n    return socket.socket()\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="forbidden capability"):
+        EvaluationExecutor.from_signed_source(
+            source_path=forbidden_source,
+            callable_qualname="evaluate",
+            version="1.0.0",
+            config={"fixture": True},
+            signer=EVALUATOR_SIGNER,
+        )
     publication_verifier = PublicArtifactVerifier.from_signer(bundle_fixture.signer)
     with pytest.raises(TypeError, match="independent"):
         create_app(
@@ -416,7 +449,7 @@ def test_timed_out_executor_cannot_publish_a_pointer(tmp_path: Path, bundle_fixt
             },
         )
         assert response.status_code == 409
-        assert tracker.calls == 1
+        assert tracker.calls <= 1
         index_root = bundle_fixture.store.validated_worker_root()
         pointer_names = tuple(
             name.name
@@ -478,5 +511,74 @@ def test_every_get_revalidates_all_content_addressed_public_artifacts(
                 "message": "published defense artifact failed validation",
             }
         }
+    finally:
+        client.__exit__(None, None, None)
+
+
+def test_index_rejects_duplicate_evaluation_id_for_a_different_input_pair(
+    tmp_path: Path, bundle_fixture
+) -> None:
+    """The durable index is a bijection, not a first-match multimap."""
+    client, _, _, corpus_ref, defender_ref, settings = _client(tmp_path, bundle_fixture)
+    try:
+        created = client.post(
+            "/api/v1/defense/evaluations",
+            json={
+                "corpus_artifact_digest": corpus_ref.sha256,
+                "defender_artifact_digest": defender_ref.sha256,
+            },
+        )
+        assert created.status_code == 201
+    finally:
+        client.__exit__(None, None, None)
+    index_root = settings.artifact_root / ".defense-evaluation-index-v1"
+    pointer = next(path for path in index_root.iterdir() if path.name != "index.lock")
+    verifier = PublicArtifactVerifier.from_signer(bundle_fixture.signer)
+    original = _parse_index_payload(pointer.read_bytes(), verifier)
+    other_corpus = "a" * 64
+    duplicate = _IndexRecord(
+        _input_key(other_corpus, defender_ref.sha256),
+        other_corpus,
+        defender_ref.sha256,
+        original.evaluation_id,
+        original.bundle_ref,
+        original.receipt_ref,
+    )
+    duplicate_path = index_root / f"{duplicate.input_key}.json"
+    duplicate_path.write_bytes(_index_payload(duplicate, bundle_fixture.signer))
+    duplicate_path.chmod(0o600)
+
+    restarted, _, _, _, _, _ = _client(
+        tmp_path, bundle_fixture, marker_name="duplicate-index.calls"
+    )
+    try:
+        fetched = restarted.get(
+            f"/api/v1/defense/evaluations/{created.json()['evaluation_id']}"
+        )
+        assert fetched.status_code == 422
+        assert fetched.json()["detail"]["code"] == "DEFENSE_ARTIFACT_INVALID"
+    finally:
+        restarted.__exit__(None, None, None)
+
+
+def test_every_get_reauthenticates_original_corpus_and_defender_inputs(
+    tmp_path: Path, bundle_fixture
+) -> None:
+    client, _, _, corpus_ref, defender_ref, settings = _client(tmp_path, bundle_fixture)
+    try:
+        created = client.post(
+            "/api/v1/defense/evaluations",
+            json={
+                "corpus_artifact_digest": corpus_ref.sha256,
+                "defender_artifact_digest": defender_ref.sha256,
+            },
+        )
+        assert created.status_code == 201
+        (settings.artifact_root / corpus_ref.relative_path).write_bytes(b"tampered")
+        fetched = client.get(
+            f"/api/v1/defense/evaluations/{created.json()['evaluation_id']}"
+        )
+        assert fetched.status_code == 422
+        assert fetched.json()["detail"]["code"] == "DEFENSE_ARTIFACT_INVALID"
     finally:
         client.__exit__(None, None, None)

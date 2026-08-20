@@ -19,6 +19,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from pydantic import ValidationError, field_validator, model_validator
 
 from apar.contracts._validation import ExternalContract
+from apar.defense.contracts import PolicyThresholds
 from apar.evaluation.gates import (
     ArmGateResult,
     ChampionDecision,
@@ -39,6 +40,8 @@ from apar.evaluation.metrics import (
     MetricReport,
 )
 from apar.evaluation.publication_inputs import VerifiedEvaluationInputs
+from apar.evaluation.replay import ReplayThresholdSet
+from apar.features.state import feature_catalog_digest
 from apar.runs.runner import RunSigningIdentity
 from apar.runs.wire import WireContractError, canonical_json_bytes, strict_json_loads
 from apar.storage.artifacts import ArtifactRef, ArtifactStore
@@ -383,10 +386,11 @@ class MetricPublicationEvidence(ExternalContract):
 class ScorecardPublicationRequest(ExternalContract):
     """Closed evaluator result plus deterministic public handoff inputs."""
 
-    schema_version: Literal["1.0.0"] = "1.0.0"
+    schema_version: Literal["1.1.0"] = "1.1.0"
     promotion_envelope: VerifiedPromotionEnvelope
     champion_decision: ChampionDecision
     metric_evidence: tuple[MetricPublicationEvidence, ...]
+    threshold_set: ReplayThresholdSet
 
     @field_validator("metric_evidence", mode="before")
     @classmethod
@@ -405,6 +409,8 @@ class ScorecardPublicationRequest(ExternalContract):
             raise ValueError("metric evidence must contain the three arms in exact order")
         if any(type(item) is not MetricPublicationEvidence for item in self.metric_evidence):
             raise ValueError("metric publication evidence must have exact contracts")
+        if type(self.threshold_set) is not ReplayThresholdSet:
+            raise ValueError("threshold set must have its exact verified type")
         return self
 
     def rebuild(self, **updates: object) -> ScorecardPublicationRequest:
@@ -441,13 +447,16 @@ class ScorecardPublicationRequest(ExternalContract):
             )
         payload = canonical_json_bytes(
             {
-                "schema_version": "1.0.0",
+                "schema_version": "1.1.0",
                 "promotion_envelope": base64.b64encode(self.promotion_envelope.to_json()).decode(
                     "ascii"
                 ),
                 "champion_decision": base64.b64encode(self.champion_decision.to_json()).decode(
                     "ascii"
                 ),
+                "threshold_set": base64.b64encode(
+                    canonical_json_bytes(self.threshold_set.model_dump(mode="json"))
+                ).decode("ascii"),
                 "metric_evidence": rows,
             }
         )
@@ -466,10 +475,11 @@ class ScorecardPublicationRequest(ExternalContract):
                 "schema_version",
                 "promotion_envelope",
                 "champion_decision",
+                "threshold_set",
                 "metric_evidence",
             }:
                 raise ReportingContractError("executor result fields differ")
-            if document["schema_version"] != "1.0.0":
+            if document["schema_version"] != "1.1.0":
                 raise ReportingContractError("executor result schema is unsupported")
 
             def decoded(name: str, value: object, cap: int) -> bytes:
@@ -486,6 +496,15 @@ class ScorecardPublicationRequest(ExternalContract):
             decision = ChampionDecision.from_json(
                 decoded("champion decision", document["champion_decision"], 2_000_000)
             )
+            threshold_document = strict_json_loads(
+                decoded("threshold set", document["threshold_set"], 2_000_000)
+            )
+            if type(threshold_document) is not dict or type(
+                threshold_document.get("reports")
+            ) is not list:
+                raise ReportingContractError("executor threshold set is invalid")
+            threshold_document["reports"] = tuple(threshold_document["reports"])
+            threshold_set = ReplayThresholdSet.model_validate(threshold_document)
             raw_rows = document["metric_evidence"]
             if type(raw_rows) is not list or len(raw_rows) != len(DefenseArm):
                 raise ReportingContractError("executor metric evidence is incomplete")
@@ -536,6 +555,7 @@ class ScorecardPublicationRequest(ExternalContract):
                 promotion_envelope=envelope,
                 champion_decision=decision,
                 metric_evidence=tuple(rows),
+                threshold_set=threshold_set,
             )
             if request.to_worker_json() != payload:
                 raise ReportingContractError("executor result is not canonical")
@@ -661,20 +681,57 @@ class PublicBundleSummary(ExternalContract):
         return self
 
 
+class PublicFeatureRow(ExternalContract):
+    """One digest-free, schema-safe projection of an authenticated catalog row."""
+
+    name: str
+    family: Literal["transaction", "temporal", "entity", "graph", "data_quality"]
+    rail_applicability: tuple[str, ...]
+    source_path_ids: tuple[str, ...]
+    provenance_category: tuple[Literal["observed", "state", "provenance"], ...]
+    past_only_state_keys: tuple[str, ...]
+    past_only_window_seconds: int | None
+    dtype: Literal["float64"] = "float64"
+    missing_sentinel: Literal["zero", "negative_one", "indicator"]
+    data_quality_behavior: Literal["zero", "sentinel", "indicator"]
+
+    @model_validator(mode="after")
+    def projection_is_canonical(self) -> PublicFeatureRow:
+        tuple_fields = (
+            self.rail_applicability,
+            self.source_path_ids,
+            self.provenance_category,
+            self.past_only_state_keys,
+        )
+        if any(type(value) is not tuple or not value for value in tuple_fields[:2]):
+            raise ValueError("public feature row requires exact rail and source tuples")
+        if self.provenance_category != tuple(dict.fromkeys(self.provenance_category)):
+            raise ValueError("public feature provenance categories are not canonical")
+        return self
+
+
 class PublicFeatureManifest(ExternalContract):
     """Closed judge projection derived from the authenticated feature catalog."""
 
     schema_version: Literal["1.0.0"] = "1.0.0"
     catalog_version: str
+    catalog_digest: str
     feature_count: int
     ordered_feature_names: tuple[str, ...]
     family_counts: tuple[tuple[str, int], ...]
+    features: tuple[PublicFeatureRow, ...]
     strictly_past_only: Literal[True] = True
 
     @model_validator(mode="after")
     def feature_projection_is_closed(self) -> PublicFeatureManifest:
-        if self.feature_count != len(self.ordered_feature_names) or self.feature_count != 48:
+        if (
+            self.feature_count != len(self.ordered_feature_names)
+            or self.feature_count != len(self.features)
+            or self.feature_count != 48
+        ):
             raise ValueError("public feature count differs from the competition catalog")
+        if tuple(row.name for row in self.features) != self.ordered_feature_names:
+            raise ValueError("public feature rows differ from authenticated catalog order")
         if self.family_counts != tuple(sorted(self.family_counts)):
             raise ValueError("public feature family counts are not canonical")
         if sum(count for _, count in self.family_counts) != self.feature_count:
@@ -682,17 +739,24 @@ class PublicFeatureManifest(ExternalContract):
         return self
 
 
-class PublicThresholdManifest(ExternalContract):
-    """Digest-free operating-point projection from authenticated threshold evidence."""
+class PublicThresholdArm(ExternalContract):
+    """One safe matched-budget operating point with realized aggregates."""
 
-    schema_version: Literal["1.0.0"] = "1.0.0"
+    arm: DefenseArm
     challenge_threshold: float
     decline_threshold: float
     challenge_rate_max: float
     false_decline_rate_max: float
     review_case_rate_max: float
     objective_kind: Literal["fraud_recall", "fraud_value_captured"]
-    matched_budget: Literal[True] = True
+    objective_value: float
+    realized_false_decline_rate: float
+    realized_challenge_rate: float
+    realized_review_case_rate: float
+    false_intervention_count: int
+    intervention_count: int
+    review_case_count: int
+    feasible: Literal[True] = True
 
     @field_validator(
         "challenge_threshold",
@@ -700,6 +764,9 @@ class PublicThresholdManifest(ExternalContract):
         "challenge_rate_max",
         "false_decline_rate_max",
         "review_case_rate_max",
+        "realized_false_decline_rate",
+        "realized_challenge_rate",
+        "realized_review_case_rate",
         mode="before",
     )
     @classmethod
@@ -708,10 +775,53 @@ class PublicThresholdManifest(ExternalContract):
             raise ValueError("public threshold values must be finite rates")
         return value
 
+    @field_validator("objective_value", mode="before")
+    @classmethod
+    def objective_is_finite(cls, value: object) -> object:
+        if type(value) is not float or not math.isfinite(value) or value < 0:
+            raise ValueError("public threshold objective must be finite and nonnegative")
+        return value
+
+    @field_validator(
+        "false_intervention_count", "intervention_count", "review_case_count", mode="before"
+    )
+    @classmethod
+    def counts_are_exact(cls, value: object) -> object:
+        if type(value) is not int or value < 0:
+            raise ValueError("public threshold counts must be exact nonnegative integers")
+        return value
+
     @model_validator(mode="after")
-    def thresholds_are_ordered(self) -> PublicThresholdManifest:
+    def thresholds_are_ordered(self) -> PublicThresholdArm:
         if self.challenge_threshold > self.decline_threshold:
             raise ValueError("public thresholds are reversed")
+        return self
+
+
+class PublicThresholdManifest(ExternalContract):
+    """Digest-free three-arm projection from exact replay threshold evidence."""
+
+    schema_version: Literal["1.1.0"] = "1.1.0"
+    normalized_score_policy_version: Literal["clip-open-unit-interval-v1"] = (
+        "clip-open-unit-interval-v1"
+    )
+    matched_budget: Literal[True] = True
+    arms: tuple[PublicThresholdArm, ...]
+
+    @model_validator(mode="after")
+    def arms_are_complete_and_matched(self) -> PublicThresholdManifest:
+        if tuple(item.arm for item in self.arms) != tuple(DefenseArm):
+            raise ValueError("public thresholds require every arm in canonical order")
+        budgets = {
+            (
+                row.challenge_rate_max,
+                row.false_decline_rate_max,
+                row.review_case_rate_max,
+            )
+            for row in self.arms
+        }
+        if len(budgets) != 1:
+            raise ValueError("public threshold budgets are not matched")
         return self
 
 
@@ -1147,7 +1257,10 @@ def publish_scorecard(
         primary_results = _primary_results(checked.promotion_envelope)
         report_by_arm = _validated_metric_evidence(checked.metric_evidence, primary_results)
         _validate_defender_binding(verified_inputs, primary_results)
-        public_documents = _derive_public_documents(verified_inputs)
+        _validate_threshold_set(checked.threshold_set, verified_inputs, primary_results)
+        public_documents = _derive_public_documents(
+            verified_inputs, checked.threshold_set
+        )
         restricted_identifiers = _restricted_identifiers(checked.metric_evidence)
         artifact_payloads = _render_public_artifacts(
             checked,
@@ -1265,11 +1378,13 @@ def _validate_publication_request(
                         "promotion_envelope",
                         "champion_decision",
                         "metric_evidence",
+                        "threshold_set",
                     },
                 ),
                 "promotion_envelope": request.promotion_envelope,
                 "champion_decision": request.champion_decision,
                 "metric_evidence": request.metric_evidence,
+                "threshold_set": request.threshold_set,
             },
             strict=True,
         )
@@ -1288,9 +1403,10 @@ def _validate_publication_request(
     primary = _primary_results(checked.promotion_envelope)
     if any(
         row.evaluation_lineage.split_digest != verified_inputs.corpus.split_digest
+        or row.evaluation_lineage.corpus_digest != verified_inputs.corpus.corpus_digest
         for row in primary
     ):
-        raise ReportingContractError("authenticated corpus split differs from replay")
+        raise ReportingContractError("authenticated corpus lineage differs from replay")
     return checked
 
 
@@ -1421,11 +1537,31 @@ class _PublicDocuments(NamedTuple):
     latency_environment: PublicLatencyEnvironment
 
 
-def _derive_public_documents(inputs: VerifiedEvaluationInputs) -> _PublicDocuments:
+def _validate_threshold_set(
+    threshold_set: ReplayThresholdSet,
+    inputs: VerifiedEvaluationInputs,
+    primary: tuple[ReplayResult, ...],
+) -> None:
+    if type(threshold_set) is not ReplayThresholdSet:
+        raise ReportingContractError("publication threshold evidence is not exact")
+    if (
+        threshold_set.bundle_manifest_digest != inputs.defender.top_ref.sha256
+        or any(
+            row.threshold_set_digest != threshold_set.threshold_set_digest
+            or row.case_callback_digest != threshold_set.case_callback_digest
+            for row in primary
+        )
+    ):
+        raise ReportingContractError("threshold evidence lineage differs from replay")
+    layered = threshold_set.reports[-1].report
+    if layered != inputs.thresholds:
+        raise ReportingContractError("layered threshold differs from signed defender evidence")
+
+
+def _derive_public_documents(
+    inputs: VerifiedEvaluationInputs, threshold_set: ReplayThresholdSet
+) -> _PublicDocuments:
     catalog = inputs.catalog
-    threshold = inputs.thresholds
-    if threshold.thresholds is None:
-        raise ReportingContractError("authenticated thresholds are not feasible")
     counts: dict[str, int] = {}
     for definition in catalog.features:
         counts[definition.family] = counts.get(definition.family, 0) + 1
@@ -1442,17 +1578,72 @@ def _derive_public_documents(inputs: VerifiedEvaluationInputs) -> _PublicDocumen
         ),
         features=PublicFeatureManifest(
             catalog_version=catalog.version,
+            catalog_digest=feature_catalog_digest(catalog),
             feature_count=len(catalog.features),
             ordered_feature_names=catalog.names,
             family_counts=tuple(sorted(counts.items())),
+            features=tuple(
+                PublicFeatureRow(
+                    name=definition.name,
+                    family=definition.family,
+                    rail_applicability=tuple(rail.value for rail in definition.rails),
+                    source_path_ids=definition.source_paths,
+                    provenance_category=tuple(
+                        dict.fromkeys(
+                            cast(
+                                Literal["observed", "state", "provenance"],
+                                path.split(".", 1)[0],
+                            )
+                            for path in definition.source_paths
+                        )
+                    ),
+                    past_only_state_keys=definition.state_keys,
+                    past_only_window_seconds=definition.window_seconds,
+                    missing_sentinel=cast(
+                        Literal["zero", "negative_one", "indicator"],
+                        {
+                            "zero": "zero",
+                            "sentinel": "negative_one",
+                            "indicator": "indicator",
+                        }[definition.missing_behavior],
+                    ),
+                    data_quality_behavior=definition.missing_behavior,
+                )
+                for definition in catalog.features
+            ),
         ),
         thresholds=PublicThresholdManifest(
-            challenge_threshold=threshold.thresholds.challenge,
-            decline_threshold=threshold.thresholds.decline,
-            challenge_rate_max=threshold.budget.challenge_rate_max,
-            false_decline_rate_max=threshold.budget.false_decline_rate_max,
-            review_case_rate_max=threshold.budget.review_case_rate_max,
-            objective_kind=threshold.objective_kind,
+            arms=tuple(
+                PublicThresholdArm(
+                    arm=item.arm,
+                    challenge_threshold=cast(
+                        PolicyThresholds, item.report.thresholds
+                    ).challenge,
+                    decline_threshold=cast(
+                        PolicyThresholds, item.report.thresholds
+                    ).decline,
+                    challenge_rate_max=item.report.budget.challenge_rate_max,
+                    false_decline_rate_max=item.report.budget.false_decline_rate_max,
+                    review_case_rate_max=item.report.budget.review_case_rate_max,
+                    objective_kind=item.report.objective_kind,
+                    objective_value=cast(float, item.report.objective_value),
+                    realized_false_decline_rate=cast(
+                        float, item.report.calibration_false_decline_rate
+                    ),
+                    realized_challenge_rate=cast(
+                        float, item.report.calibration_challenge_rate
+                    ),
+                    realized_review_case_rate=cast(
+                        float, item.report.calibration_review_case_rate
+                    ),
+                    false_intervention_count=cast(
+                        int, item.report.false_intervention_count
+                    ),
+                    intervention_count=cast(int, item.report.intervention_count),
+                    review_case_count=cast(int, item.report.review_case_count),
+                )
+                for item in threshold_set.reports
+            )
         ),
         latency_environment=PublicLatencyEnvironment(
             python_version=environment.python_version,
@@ -1476,11 +1667,49 @@ def _restricted_identifiers(rows: tuple[MetricPublicationEvidence, ...]) -> tupl
         evidence = cast(MetricDerivationEvidence, row.metric_derivation_evidence)
         inputs = evidence.inputs
         for truth in inputs.truth:
-            identifiers.update((truth.event_id, truth.payment_id, truth.campaign_id))
+            identifiers.update(
+                (
+                    truth.event_id,
+                    truth.payment_id,
+                    truth.campaign_id,
+                    *truth.lifecycle_event_ids,
+                )
+            )
         for observation in inputs.observations:
-            identifiers.update((observation.event_id, observation.payment_id))
+            identifiers.update(
+                (
+                    observation.event_id,
+                    observation.payment_id,
+                    observation.actor_id,
+                    observation.counterparty_id,
+                    *observation.optional_refs.values(),
+                )
+            )
         for decision in inputs.decisions:
-            identifiers.add(decision.event_id)
+            identifiers.update((decision.event_id, *decision.evidence_source_ids))
+        for case in inputs.cases:
+            identifiers.update(
+                (
+                    case.case_id,
+                    *case.event_ids,
+                    *case.actor_ids,
+                    *case.counterparty_ids,
+                    *case.first_evidence_ids,
+                )
+            )
+            for alert in case.alert_evidence:
+                identifiers.update(
+                    (
+                        alert.event_id,
+                        alert.actor_id,
+                        alert.counterparty_id,
+                        *alert.evidence_source_ids,
+                    )
+                )
+        identifiers.update(case.case_id for case in inputs.queue_report.case_inputs)
+        identifiers.update(snapshot.case_id for snapshot in inputs.queue_report.snapshots)
+        identifiers.update(sample.event_id for sample in inputs.latency_samples)
+        identifiers.update(assignment.event_id for assignment in inputs.slice_assignments)
     return tuple(value.encode("utf-8") for value in sorted(identifiers))
 
 
@@ -1513,20 +1742,15 @@ def store_restricted_publication_receipt(
         "schema_version": "1.0.0",
         "privacy_classification": "restricted_evaluation_evidence",
         "evaluation_id": scorecard.evaluation_id,
-        "corpus_attestation_ref": _ref_json(
-            ArtifactRef(
-                _digest_bytes(verified_inputs.corpus.to_json()),
-                "application/vnd.apar.verified-corpus-attestation+json",
-                len(verified_inputs.corpus.to_json()),
-                f"{_digest_bytes(verified_inputs.corpus.to_json())}/payload",
-            )
-        ),
+        "corpus_attestation_ref": _ref_json(verified_inputs.corpus.top_ref),
         "corpus_evidence_ref": _ref_json(verified_inputs.corpus.evidence_ref),
         "corpus_content_digest": verified_inputs.corpus.corpus_digest,
         "split_digest": verified_inputs.corpus.split_digest,
         "defender_attestation": strict_json_loads(verified_inputs.defender.to_json()),
         "promotion_envelope_digest": request.promotion_envelope.envelope_digest,
         "champion_decision_digest": request.champion_decision.decision_digest,
+        "threshold_set_digest": request.threshold_set.threshold_set_digest,
+        "threshold_set": request.threshold_set.model_dump(mode="json"),
         "metric_lineage": metric_lineage,
         "public_bundle_digest": bundle.bundle_digest,
         "public_bundle_ref": _ref_json(bundle.bundle_ref()),
@@ -1756,9 +1980,10 @@ def _render_public_artifacts(
                 "Compared arms: deterministic rules, calibrated GBDT, and layered hybrid.",
                 (
                     "Frozen matched budgets cap challenge, false-decline, and review rates at "
-                    f"{_float_text(public_documents.thresholds.challenge_rate_max)}, "
-                    f"{_float_text(public_documents.thresholds.false_decline_rate_max)}, and "
-                    f"{_float_text(public_documents.thresholds.review_case_rate_max)}."
+                    f"{_float_text(public_documents.thresholds.arms[0].challenge_rate_max)}, "
+                    f"{_float_text(public_documents.thresholds.arms[0].false_decline_rate_max)}, "
+                    "and "
+                    f"{_float_text(public_documents.thresholds.arms[0].review_case_rate_max)}."
                 ),
             ),
         ),
@@ -2044,7 +2269,8 @@ def _privacy_scan(payload: bytes, *, restricted_identifiers: tuple[bytes, ...] =
     lowered = payload.lower()
     representation = repr(payload).lower().encode("ascii", errors="ignore")
     try:
-        decoded = payload.decode("utf-8").lower().encode("utf-8")
+        decoded_text = payload.decode("utf-8")
+        decoded = decoded_text.lower().encode("utf-8")
     except UnicodeDecodeError as error:
         raise ReportingContractError("public payload is not UTF-8") from error
     semantic = b""
@@ -2058,7 +2284,18 @@ def _privacy_scan(payload: bytes, *, restricted_identifiers: tuple[bytes, ...] =
         for token in _FORBIDDEN_PUBLIC_TOKENS
     ):
         raise ReportingContractError("public payload contains restricted evaluator semantics")
-    if any(identifier and identifier in payload for identifier in restricted_identifiers):
+    normalized_public = unicodedata.normalize("NFC", decoded_text).casefold()
+    normalized_identifiers: list[str] = []
+    try:
+        for identifier in restricted_identifiers:
+            if type(identifier) is not bytes or not identifier:
+                continue
+            normalized_identifiers.append(
+                unicodedata.normalize("NFC", identifier.decode("utf-8")).casefold()
+            )
+    except UnicodeDecodeError as error:
+        raise ReportingContractError("restricted identifier evidence is not UTF-8") from error
+    if any(identifier in normalized_public for identifier in normalized_identifiers):
         raise ReportingContractError("public payload contains a restricted row identifier")
 
 

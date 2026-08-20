@@ -73,6 +73,7 @@ def _lineage(descriptor: EvaluationDescriptor) -> EvaluationLineage:
         descriptor=descriptor,
         decision_rows_digest=_row_digest(DECISION_IDS),
         decision_content_digest=_sha("1"),
+        corpus_digest=_sha("0"),
         split_digest=_sha("2"),
         cohort_mapping_digest=_sha("3"),
         training_population_digest=_sha("4"),
