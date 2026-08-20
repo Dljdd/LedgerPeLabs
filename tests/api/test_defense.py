@@ -23,6 +23,7 @@ from apar.evaluation.defender_attestation import DefenderBundleVerifier
 from apar.evaluation.publication_inputs import publish_corpus_attestation, verify_evaluation_inputs
 from apar.evaluation.reporting import PublicArtifactVerifier
 from apar.evaluation.service import (
+    MAX_EXECUTOR_CAPABILITY_BYTES,
     EvaluationExecutor,
     _apply_child_limits,
     _close_inherited_fds,
@@ -437,6 +438,39 @@ def test_executor_capability_is_self_contained_and_service_ignores_class_dispatc
         else:
             type.__setattr__(EvaluationExecutor, "execute", original)
         client.__exit__(None, None, None)
+
+
+def test_executor_factory_enforces_final_canonical_capability_size() -> None:
+    accepted = EvaluationExecutor.from_signed_source(
+        source_path=WORKER_SOURCE,
+        callable_qualname="evaluate",
+        version="1.0.0",
+        config={"padding": "x" * 3_143_849},
+        signer=EVALUATOR_SIGNER,
+        execution_receipt_path=Path("/a/bc"),
+    )
+    assert len(accepted) == MAX_EXECUTOR_CAPABILITY_BYTES
+
+    with pytest.raises(ValueError, match="capability exceeds its cap"):
+        EvaluationExecutor.from_signed_source(
+            source_path=WORKER_SOURCE,
+            callable_qualname="evaluate",
+            version="1.0.0",
+            config={"padding": "x" * 3_143_849},
+            signer=EVALUATOR_SIGNER,
+            execution_receipt_path=Path("/a/bcd"),
+        )
+
+
+def test_executor_factory_rejects_reviewer_four_million_character_config() -> None:
+    with pytest.raises(ValueError, match="capability exceeds its cap"):
+        EvaluationExecutor.from_signed_source(
+            source_path=WORKER_SOURCE,
+            callable_qualname="evaluate",
+            version="1.0.0",
+            config={"padding": "x" * 4_000_000},
+            signer=EVALUATOR_SIGNER,
+        )
 
 
 @pytest.mark.parametrize(

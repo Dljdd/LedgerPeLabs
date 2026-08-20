@@ -54,6 +54,7 @@ from apar.storage.artifacts import ArtifactRef, ArtifactStore
 
 MAX_EVALUATIONS = 10_000
 MAX_EXECUTION_SECONDS = 900.0
+MAX_EXECUTOR_CAPABILITY_BYTES = 4 * 1024 * 1024
 MAX_EXECUTOR_RESULT_BYTES = 128 * 1024 * 1024
 MAX_INDEX_BYTES = 64 * 1024
 INDEX_MEDIA_TYPE = "application/vnd.apar.defense-evaluation-index+json"
@@ -252,6 +253,16 @@ class EvaluationExecutor(bytes, metaclass=_SealedExecutorType):
                 "capability_digest": _digest_document({**fields, "signature_base64": signature}),
             }
         )
+        if not 0 < len(capability) <= MAX_EXECUTOR_CAPABILITY_BYTES:
+            raise ValueError("evaluation worker capability exceeds its cap")
+        verifier = EvaluatorReplayVerifier(
+            signer_key_id=signer.key_id,
+            public_key_base64=signer.public_key_base64,
+        )
+        try:
+            _verify_worker_capability(capability, verifier)
+        except DefenseExecutionConflict as error:
+            raise ValueError("evaluation worker capability failed self-verification") from error
         return bytes.__new__(cls, capability)
 
     @property
@@ -332,7 +343,10 @@ def _audit_worker_source(source: bytes) -> None:
 def _verify_worker_capability(
     capability_payload: bytes, verifier: EvaluatorReplayVerifier
 ) -> _VerifiedExecutorCapability:
-    if type(capability_payload) is not bytes or not 0 < len(capability_payload) <= 4 * 1024 * 1024:
+    if (
+        type(capability_payload) is not bytes
+        or not 0 < len(capability_payload) <= MAX_EXECUTOR_CAPABILITY_BYTES
+    ):
         raise DefenseExecutionConflict("evaluation worker capability is invalid")
     try:
         raw = strict_json_loads(capability_payload)
@@ -1327,11 +1341,16 @@ def _artifact_ref(value: object, *, media_type: str) -> ArtifactRef:
     raw = cast(dict[str, object], value)
     digest = _validate_digest(raw["sha256"])
     size = raw["size_bytes"]
+    maximum_size = (
+        MAX_EXECUTOR_CAPABILITY_BYTES
+        if media_type == EXECUTOR_CAPABILITY_MEDIA_TYPE
+        else MAX_EXECUTOR_RESULT_BYTES
+    )
     if (
         raw["media_type"] != media_type
         or raw["relative_path"] != f"{digest}/payload"
         or type(size) is not int
-        or not 0 < size <= MAX_EXECUTOR_RESULT_BYTES
+        or not 0 < size <= maximum_size
     ):
         raise DefenseArtifactInvalid("defense evaluation index reference is invalid")
     return ArtifactRef(digest, media_type, size, f"{digest}/payload")
@@ -1694,5 +1713,6 @@ __all__ = [
     "INDEX_MEDIA_TYPE",
     "MAX_EVALUATIONS",
     "MAX_EXECUTION_SECONDS",
+    "MAX_EXECUTOR_CAPABILITY_BYTES",
     "PublishedArtifact",
 ]
