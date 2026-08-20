@@ -115,3 +115,10 @@ def test_family_allocation_must_be_equal(tmp_path: Path) -> None:
     )
     with pytest.raises(V2ProtocolError, match="equal family allocation"):
         load_v2_protocol(path)
+
+
+def test_fixture_rejects_non_divisible_family_count() -> None:
+    from apar.evaluation.v2_protocol import PrevalenceStratum
+
+    with pytest.raises(ValueError, match="divisible by four"):
+        PrevalenceStratum.fixture(transaction_count=100, fraud_transaction_count=5)

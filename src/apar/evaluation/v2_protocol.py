@@ -52,6 +52,8 @@ class PrevalenceStratum(ExternalContract):
 
     @classmethod
     def fixture(cls, transaction_count: int = 100, fraud_transaction_count: int = 20) -> "PrevalenceStratum":
+        if fraud_transaction_count % 4:
+            raise ValueError("fixture fraud count must be divisible by four")
         per_family = fraud_transaction_count // 4
         counts = (per_family,) * 4
         counts = (*counts[:-1], fraud_transaction_count - sum(counts[:-1]))
