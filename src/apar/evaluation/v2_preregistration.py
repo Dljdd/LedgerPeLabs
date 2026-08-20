@@ -12,7 +12,6 @@ import binascii
 import hashlib
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal, Self
-from weakref import WeakKeyDictionary
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -35,45 +34,6 @@ SYNTHETIC_NON_CLAIM: SyntheticScope = (
 
 class V2PreregistrationError(ValueError):
     """Raised when a v2 preregistration is incomplete, noncanonical, or untrusted."""
-
-
-class V2VerifiedAuthority:
-    """Opaque, process-local proof that trusted preexecution verified V2 authority."""
-
-    __slots__ = ("__weakref__",)
-
-    def __new__(cls) -> V2VerifiedAuthority:
-        raise TypeError("V2 authority capabilities are minted only by a trusted verifier")
-
-
-_VERIFIED_AUTHORITIES: WeakKeyDictionary[V2VerifiedAuthority, V2Preregistration] = (
-    WeakKeyDictionary()
-)
-
-
-def _issue_verified_v2_authority(preregistration: V2Preregistration) -> V2VerifiedAuthority:
-    """Internal issuance boundary used only after trusted verification succeeds."""
-    if (
-        type(preregistration) is not V2Preregistration
-        or not preregistration.verify_signature()
-        or not preregistration.verify_manifest_bindings()
-    ):
-        raise V2PreregistrationError("verified authority requires an intact preregistration")
-    authority = object.__new__(V2VerifiedAuthority)
-    _VERIFIED_AUTHORITIES[authority] = preregistration
-    return authority
-
-
-def _verified_v2_preregistration(
-    authority: object,
-) -> V2Preregistration | None:
-    """Resolve only a live capability issued by the trusted verifier boundary."""
-    if type(authority) is not V2VerifiedAuthority:
-        return None
-    try:
-        return _VERIFIED_AUTHORITIES.get(authority)
-    except (TypeError, ValueError):
-        return None
 
 
 def _digest(value: object, *, field: str) -> str:
@@ -377,7 +337,6 @@ __all__ = [
     "SyntheticScope",
     "V2Preregistration",
     "V2PreregistrationError",
-    "V2VerifiedAuthority",
     "admit_v2_execution",
     "sign_v2_preregistration",
 ]

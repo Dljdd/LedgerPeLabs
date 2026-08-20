@@ -4,18 +4,22 @@ from __future__ import annotations
 
 import hashlib
 import secrets
-from dataclasses import dataclass
+import shutil
+from dataclasses import dataclass, field
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from apar.evaluation.gates import EvaluatorSigningIdentity
+from apar.evaluation.v2_preexecution import verify_v2_authority
 from apar.evaluation.v2_preregistration import (
     SYNTHETIC_NON_CLAIM,
     V2Preregistration,
-    V2VerifiedAuthority,
-    _issue_verified_v2_authority,
     sign_v2_preregistration,
 )
 from apar.runs import RunSigningIdentity
 from apar.runs.wire import canonical_json_bytes
+
+ROOT = Path(__file__).resolve().parents[2]
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,13 +27,30 @@ class EphemeralV2Authority:
     evaluator: EvaluatorSigningIdentity
     publisher: RunSigningIdentity
     preregistration: V2Preregistration
-    verified_authority: V2VerifiedAuthority
+    verified_authority: object | None = None
+    _verification_directory: TemporaryDirectory[str] | None = field(
+        default=None, repr=False, compare=False
+    )
 
 
-def ephemeral_v2_authority() -> EphemeralV2Authority:
+def ephemeral_v2_authority(*, verified: bool = False) -> EphemeralV2Authority:
     private_seed = secrets.token_bytes(32)
     evaluator = EvaluatorSigningIdentity.from_private_bytes(private_seed)
     publisher = RunSigningIdentity.from_private_bytes(private_seed)
+    if verified:
+        preregistration = _signed_pinned_preregistration(evaluator)
+        directory = TemporaryDirectory(prefix="apar-v2-authority-")
+        verification_root = Path(directory.name).resolve()
+        _copy_preexecution_inputs(verification_root, preregistration)
+        authority = verify_v2_authority(verification_root, preregistration)
+        return EphemeralV2Authority(
+            evaluator,
+            publisher,
+            preregistration,
+            authority,
+            directory,
+        )
+
     synthetic_digest = hashlib.sha256(canonical_json_bytes(SYNTHETIC_NON_CLAIM)).hexdigest()
     payload: dict[str, object] = {
         "schema_version": "1.0.0",
@@ -57,8 +78,42 @@ def ephemeral_v2_authority() -> EphemeralV2Authority:
         "maximum_confirmatory_attempts": 1,
     }
     preregistration = sign_v2_preregistration(payload, signer=evaluator)
-    verified_authority = _issue_verified_v2_authority(preregistration)
-    return EphemeralV2Authority(evaluator, publisher, preregistration, verified_authority)
+    return EphemeralV2Authority(evaluator, publisher, preregistration)
+
+
+def _signed_pinned_preregistration(
+    evaluator: EvaluatorSigningIdentity,
+) -> V2Preregistration:
+    raw = (ROOT / "config/defense/competition-v2-preregistration.json").read_bytes()
+    sealed = V2Preregistration.from_json(raw[:-1] if raw.endswith(b"\n") else raw)
+    payload = sealed.unsigned_document()
+    payload.pop("evaluator_key_id")
+    payload.pop("evaluator_public_key_base64")
+    return sign_v2_preregistration(payload, signer=evaluator)
+
+
+def _copy_preexecution_inputs(
+    verification_root: Path, preregistration: V2Preregistration
+) -> None:
+    shutil.copytree(ROOT / "src", verification_root / "src")
+    for relative in (
+        "config/defense/competition-v2-profile.json",
+        "config/defense/competition-v2-manifests.json",
+        "config/defense/feature-catalog.json",
+        "docs/experiments/defense-v1-preregistration.json",
+        "docs/experiments/defense-v1-result.json",
+        "docs/experiments/defense-v1-run-manifests.json",
+        "fixtures/defense/v1/hash-manifest.json",
+        "fixtures/defense/v1/defender-bundle.json",
+        "fixtures/defense/v1/calibration.json",
+        "fixtures/defense/v1/thresholds.json",
+        "fixtures/defense/v1/split-manifest.json",
+    ):
+        destination = verification_root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / relative, destination)
+    sealed_path = verification_root / "config/defense/competition-v2-preregistration.json"
+    sealed_path.write_bytes(preregistration.canonical_bytes() + b"\n")
 
 
 def _digest(value: str) -> str:

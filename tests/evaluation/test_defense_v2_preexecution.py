@@ -369,6 +369,67 @@ def test_transitive_feature_qualified_builtins_reflection_fails_closed(
     assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
 
 
+@pytest.mark.parametrize(
+    "source",
+    (
+        "import builtins\nlookup, fallback = builtins.getattr, None\n",
+        "import builtins\nif (lookup := builtins.getattr):\n    pass\n",
+        "import builtins\ndef load(lookup=builtins.getattr):\n    return lookup\n",
+        "import builtins\ncapabilities = [builtins.vars]\n",
+        "import builtins\nclass Holder:\n    pass\nholder = Holder()\n"
+        "holder.lookup = builtins.getattr\n",
+        "import importlib\nloader, fallback = importlib, None\n",
+        "import builtins\nif (load := builtins.__import__):\n    pass\n",
+        "import importlib\ndef load(loader=importlib):\n    return loader\n",
+        "import builtins\ncapabilities = [builtins.__import__]\n",
+    ),
+)
+def test_unsupported_reflection_authority_bindings_fail_closed(
+    tmp_path: Path, source: str
+) -> None:
+    """No unsupported Python binding form may retain reflection authority."""
+    _write_defender_source(tmp_path, source)
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
+def test_transitive_feature_destructured_reflection_binding_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """Destructured authority bindings fail closed in reachable feature modules."""
+    _write_defender_source(tmp_path, "from apar.features import destructured_reflection\n")
+    features = tmp_path / "src/apar/features"
+    features.mkdir(parents=True)
+    (features / "destructured_reflection.py").write_text(
+        "import builtins as runtime\n"
+        "lookup, namespace = runtime.getattr, runtime.vars\n",
+        encoding="utf-8",
+    )
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
+def test_transitive_feature_destructured_importlib_binding_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """Destructured importlib authority fails closed in reachable feature modules."""
+    _write_defender_source(tmp_path, "from apar.features import destructured_loader\n")
+    features = tmp_path / "src/apar/features"
+    features.mkdir(parents=True)
+    (features / "destructured_loader.py").write_text(
+        "import importlib\nloader, fallback = importlib, None\n",
+        encoding="utf-8",
+    )
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
 def test_transitive_feature_python_symlink_fails_closed(tmp_path: Path) -> None:
     """Reachable Python inventory cannot hide behind a same-content symlink."""
     _write_defender_source(tmp_path, "from apar.features import linked\n")

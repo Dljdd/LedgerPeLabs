@@ -490,3 +490,95 @@ Complete repository regression suite:
 
 Frozen V1 source, feature, fixture, and experiment-document paths remain unchanged;
 `git diff --check` is clean. No V2 evaluation or durable receipt/result was created.
+
+## Final hardening round 5
+
+### Scope and implementation
+
+- Removed `V2VerifiedAuthority`, `_issue_verified_v2_authority`, and the mutable
+  authority registry from `v2_preregistration`. The opaque capability class and
+  weak registry now exist only inside a private closure owned by
+  `v2_preexecution`; the only issuance function first runs the complete pinned
+  `verify_v2_preexecution` boundary.
+- Changed control admission and threshold selection to resolve capabilities through
+  that verifier-owned closure. A caller cannot construct the capability, and no
+  module-level registry is exposed for mutation.
+- Replaced the tests' direct private issuer call with an isolated ephemeral
+  authority fixture. Trusted test authorities copy the actual frozen source,
+  catalog, manifest, bundle, campaign-ledger, threshold, and V1-root inputs into a
+  temporary repository and obtain their capability through the same public
+  preexecution verifier used by production.
+- Extended the import scanner to fail closed when builtins/importlib reflection
+  authority is retained through destructuring, assignment expressions, function
+  defaults, containers, attribute targets, or other unsupported assignment forms.
+  This covers qualified and aliased `getattr`, `vars`, `__import__`, and importlib
+  roots, including defender-reachable transitive feature modules.
+
+### RED evidence
+
+The initial binding probes demonstrated that destructuring, walrus assignment,
+defaults, containers, and attribute assignment were not rejected:
+
+```text
+.venv/bin/pytest tests/evaluation/test_defense_v2_preexecution.py \
+  -q -k 'unsupported_reflection or destructured_reflection'
+6 failed, 56 deselected in 0.75s
+```
+
+The preregistration module still exposed its private issuer before the move:
+
+```text
+.venv/bin/pytest tests/evaluation/test_defense_v2_preregistration.py \
+  -q -k exposes_no_capability_issuer_or_registry
+1 failed, 8 deselected
+```
+
+Additional exact importlib and `builtins.__import__` probes failed before the
+scanner was widened from only `getattr`/`vars` references to every reflection
+authority root:
+
+```text
+.venv/bin/pytest tests/evaluation/test_defense_v2_preexecution.py \
+  -q -k 'unsupported_reflection or destructured_importlib'
+5 failed, 5 passed, 57 deselected in 2.96s
+```
+
+### GREEN evidence
+
+Focused issuer, preregistration, scanner, controls, and selection contracts:
+
+```text
+.venv/bin/pytest \
+  tests/evaluation/test_defense_v2_preexecution.py \
+  tests/evaluation/test_defense_v2_preregistration.py \
+  tests/evaluation/test_defense_v2_controls.py \
+  tests/evaluation/test_defense_v2_selection.py -q
+105 passed in 7.40s
+```
+
+Static verification:
+
+```text
+.venv/bin/ruff check <round-5 changed Python source and tests>
+All checks passed!
+
+.venv/bin/mypy \
+  src/apar/evaluation/v2_preexecution.py \
+  src/apar/evaluation/v2_preregistration.py \
+  src/apar/evaluation/v2_controls.py \
+  src/apar/evaluation/v2_selection.py \
+  tests/evaluation/v2_authority.py
+Success: no issues found in 5 source files
+```
+
+Complete repository regression suite:
+
+```text
+.venv/bin/pytest -q
+1881 passed, 1 skipped in 478.10s (0:07:58)
+```
+
+The final direct read-only check returned
+`{"status":"not_executed","admissible":true,"codes":[]}`. No frozen V1 source,
+feature, fixture, or experiment-document path changed; `git diff --check` is clean.
+No V2 evaluation or durable receipt/result was created.

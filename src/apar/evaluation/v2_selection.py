@@ -16,7 +16,7 @@ from pydantic import Field, field_validator, model_validator
 
 from apar.contracts._validation import ExternalContract
 from apar.evaluation.v2_controls import ControlValidity, V2ControlContext
-from apar.evaluation.v2_preregistration import V2VerifiedAuthority
+from apar.evaluation.v2_preexecution import V2VerifiedAuthority
 from apar.evaluation.v2_protocol import V2Protocol
 
 if TYPE_CHECKING:
@@ -427,7 +427,7 @@ def evaluate_v2_gates(
     evidence: V2MetricSet | ArmThresholdCandidate,
     protocol: V2Protocol,
     *,
-    verified_authority: V2VerifiedAuthority | None = None,
+    verified_authority: object | None = None,
     control_context: V2ControlContext | None = None,
 ) -> V2GateOutcome:
     """Apply conservative all-scope gates to already-derived metric evidence."""
@@ -514,7 +514,7 @@ def select_v2_thresholds(
     candidates: Sequence[ArmThresholdCandidate],
     protocol: V2Protocol,
     *,
-    verified_authority: V2VerifiedAuthority,
+    verified_authority: object,
     control_contexts: Mapping[str, V2ControlContext],
 ) -> V2SelectionReport:
     """Select only a candidate that passes every matched conservative gate."""

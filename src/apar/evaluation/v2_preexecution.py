@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import ast
 import hashlib
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, Self
+from weakref import WeakKeyDictionary
 
 from pydantic import Field
 
@@ -20,8 +21,6 @@ from apar.evaluation.v2_preregistration import (
     ExecutionReceipt,
     V2Preregistration,
     V2PreregistrationError,
-    V2VerifiedAuthority,
-    _issue_verified_v2_authority,
 )
 from apar.evaluation.v2_protocol import load_v2_protocol, verify_v1_roots
 from apar.runs.wire import WireContractError, canonical_json_bytes, strict_json_loads
@@ -83,6 +82,50 @@ class PreexecutionReport(ExternalContract):
         return cls(admissible=not failed, codes=failed)
 
 
+def _verified_authority_system() -> tuple[
+    type[Any],
+    Callable[[object], V2Preregistration | None],
+    Callable[[Path, V2Preregistration], Any],
+]:
+    registry: WeakKeyDictionary[object, V2Preregistration] = WeakKeyDictionary()
+
+    class V2VerifiedAuthority:
+        """Opaque proof minted only by the pinned preexecution verifier closure."""
+
+        __slots__ = ("__weakref__",)
+
+        def __new__(cls) -> Self:
+            raise TypeError("V2 authority capabilities are minted only by a trusted verifier")
+
+    def resolve(authority: object) -> V2Preregistration | None:
+        if type(authority) is not V2VerifiedAuthority:
+            return None
+        try:
+            return registry.get(authority)
+        except (TypeError, ValueError):
+            return None
+
+    def verify(root: Path, preregistration: V2Preregistration) -> V2VerifiedAuthority:
+        report = verify_v2_preexecution(root, preregistration)
+        if not report.admissible:
+            raise V2PreregistrationError(
+                "V2 authority failed trusted preexecution verification"
+            )
+        authority = object.__new__(V2VerifiedAuthority)
+        registry[authority] = preregistration
+        return authority
+
+    return V2VerifiedAuthority, resolve, verify
+
+
+(
+    V2VerifiedAuthority,
+    _verified_v2_preregistration,
+    verify_v2_authority,
+) = _verified_authority_system()
+del _verified_authority_system
+
+
 def verify_v2_preexecution(root: Path, preregistration: V2Preregistration) -> PreexecutionReport:
     """Validate public admission prerequisites without generating or executing anything."""
     return PreexecutionReport.from_checks(
@@ -100,16 +143,6 @@ def verify_v2_preexecution(root: Path, preregistration: V2Preregistration) -> Pr
             verify_preregistration(root, preregistration),
         )
     )
-
-
-def verify_v2_authority(
-    root: Path, preregistration: V2Preregistration
-) -> V2VerifiedAuthority:
-    """Mint opaque authority only after every pinned preexecution check passes."""
-    report = verify_v2_preexecution(root, preregistration)
-    if not report.admissible:
-        raise V2PreregistrationError("V2 authority failed trusted preexecution verification")
-    return _issue_verified_v2_authority(preregistration)
 
 
 def verify_protocol_digest(preregistration: object) -> PreexecutionCheck:
@@ -416,6 +449,7 @@ def _contains_disallowed_import(
             node,
             importlib_aliases,
             builtins_aliases,
+            import_function_aliases,
             getattr_aliases,
             vars_aliases,
         ):
@@ -454,10 +488,20 @@ def _has_untrusted_authority_reflection(
     node: ast.AST,
     importlib_aliases: set[str],
     builtins_aliases: set[str],
+    import_function_aliases: set[str],
     getattr_aliases: set[str],
     vars_aliases: set[str],
 ) -> bool:
     """Reject reflective authority access unless static syntax proves it absent."""
+    if _has_unsupported_reflection_binding(
+        node,
+        importlib_aliases,
+        builtins_aliases,
+        import_function_aliases,
+        getattr_aliases,
+        vars_aliases,
+    ):
+        return True
     if isinstance(node, ast.Call):
         is_getattr = (
             isinstance(node.func, ast.Name) and node.func.id in getattr_aliases
@@ -485,6 +529,101 @@ def _has_untrusted_authority_reflection(
             root, importlib_aliases, vars_aliases
         )
     return False
+
+
+def _has_unsupported_reflection_binding(
+    node: ast.AST,
+    importlib_aliases: set[str],
+    builtins_aliases: set[str],
+    import_function_aliases: set[str],
+    getattr_aliases: set[str],
+    vars_aliases: set[str],
+) -> bool:
+    def contains(value: ast.expr) -> bool:
+        if _is_reflection_authority_reference(
+            value,
+            importlib_aliases,
+            builtins_aliases,
+            import_function_aliases,
+            getattr_aliases,
+            vars_aliases,
+        ):
+            return True
+        if isinstance(value, ast.Call):
+            children = (*value.args, *(item.value for item in value.keywords))
+        else:
+            children = tuple(
+                child for child in ast.iter_child_nodes(value) if isinstance(child, ast.expr)
+            )
+        return any(contains(child) for child in children)
+
+    if isinstance(node, ast.Assign) and contains(node.value):
+        direct = _is_reflection_authority_reference(
+            node.value,
+            importlib_aliases,
+            builtins_aliases,
+            import_function_aliases,
+            getattr_aliases,
+            vars_aliases,
+        )
+        return not direct or any(not isinstance(target, ast.Name) for target in node.targets)
+    if isinstance(node, ast.AnnAssign) and node.value is not None and contains(node.value):
+        direct = _is_reflection_authority_reference(
+            node.value,
+            importlib_aliases,
+            builtins_aliases,
+            import_function_aliases,
+            getattr_aliases,
+            vars_aliases,
+        )
+        return not direct or not isinstance(node.target, ast.Name)
+    if isinstance(node, ast.NamedExpr):
+        return contains(node.value)
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        defaults = (*node.args.defaults, *(item for item in node.args.kw_defaults if item))
+        return any(contains(item) for item in defaults)
+    return False
+
+
+def _is_reflection_authority_reference(
+    value: ast.expr,
+    importlib_aliases: set[str],
+    builtins_aliases: set[str],
+    import_function_aliases: set[str],
+    getattr_aliases: set[str],
+    vars_aliases: set[str],
+) -> bool:
+    return (
+        _has_importlib_root(value, importlib_aliases, vars_aliases)
+        or _has_named_root(value, builtins_aliases, vars_aliases)
+        or _is_import_function_reference(
+            value,
+            importlib_aliases,
+            builtins_aliases,
+            import_function_aliases,
+            getattr_aliases,
+            vars_aliases,
+        )
+        or _is_reflection_function_reference(
+            value, builtins_aliases, getattr_aliases, vars_aliases
+        )
+    )
+
+
+def _is_reflection_function_reference(
+    value: ast.expr,
+    builtins_aliases: set[str],
+    getattr_aliases: set[str],
+    vars_aliases: set[str],
+) -> bool:
+    return (
+        isinstance(value, ast.Name)
+        and value.id in (getattr_aliases | vars_aliases)
+    ) or _is_qualified_builtins_function(
+        value, builtins_aliases, vars_aliases, "getattr"
+    ) or _is_qualified_builtins_function(
+        value, builtins_aliases, vars_aliases, "vars"
+    )
 
 
 def _is_qualified_builtins_function(

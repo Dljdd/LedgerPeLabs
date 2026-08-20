@@ -22,11 +22,11 @@ from apar.contracts._validation import ExternalContract
 from apar.contracts.decisions import Action
 from apar.evaluation.contracts import EvaluationTruthRow
 from apar.evaluation.gates import EvaluatorSigningIdentity
-from apar.evaluation.v2_preregistration import (
-    V2Preregistration,
+from apar.evaluation.v2_preexecution import (
     V2VerifiedAuthority,
     _verified_v2_preregistration,
 )
+from apar.evaluation.v2_preregistration import V2Preregistration
 from apar.runs.wire import canonical_json_bytes
 
 
@@ -103,7 +103,7 @@ class V2ControlContext(ExternalContract):
         cls,
         preregistration: V2Preregistration,
         *,
-        verified_authority: V2VerifiedAuthority,
+        verified_authority: object,
         arm: Literal["rules_only", "gbdt_only", "layered_hybrid"],
         candidate_id: str,
         input_digest: str,
@@ -217,7 +217,7 @@ class ControlValidity(ExternalContract):
     def valid_for(
         self,
         *,
-        verified_authority: V2VerifiedAuthority,
+        verified_authority: object,
         expected_context: V2ControlContext,
     ) -> bool:
         """Return true only when both attestations match the exact candidate context."""
@@ -267,7 +267,7 @@ ControlEvaluator = Callable[[np.ndarray, tuple[EvaluationTruthRow, ...], tuple[s
 def admit_control_result(
     control: ControlResult,
     *,
-    verified_authority: V2VerifiedAuthority,
+    verified_authority: object,
     expected_context: V2ControlContext,
 ) -> ControlAdmission:
     """Convert a control result into a load-bearing whole-run admission."""

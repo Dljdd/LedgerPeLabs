@@ -6,11 +6,12 @@ import hashlib
 
 import pytest
 
+import apar.evaluation.v2_preregistration as preregistration_module
+from apar.evaluation.v2_preexecution import V2VerifiedAuthority
 from apar.evaluation.v2_preregistration import (
     ExecutionReceipt,
     V2Preregistration,
     V2PreregistrationError,
-    V2VerifiedAuthority,
     admit_v2_execution,
     sign_v2_preregistration,
 )
@@ -31,6 +32,12 @@ def test_verified_authority_capability_has_no_public_constructor() -> None:
     """A caller cannot mint the opaque preexecution trust capability."""
     with pytest.raises(TypeError, match="trusted verifier"):
         V2VerifiedAuthority()
+
+
+def test_preregistration_module_exposes_no_capability_issuer_or_registry() -> None:
+    """Callers cannot import an issuer or mutate a preregistration trust registry."""
+    assert not hasattr(preregistration_module, "_issue_verified_v2_authority")
+    assert not hasattr(preregistration_module, "_VERIFIED_AUTHORITIES")
 
 
 def test_missing_committed_protocol_profile_binding_is_rejected() -> None:

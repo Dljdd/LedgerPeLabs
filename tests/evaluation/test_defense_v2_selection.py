@@ -32,7 +32,7 @@ from apar.evaluation.v2_selection import (
 )
 from tests.evaluation.v2_authority import EphemeralV2Authority, ephemeral_v2_authority
 
-AUTHORITY = ephemeral_v2_authority()
+AUTHORITY = ephemeral_v2_authority(verified=True)
 
 
 def test_self_signed_preregistration_cannot_be_its_own_selection_trust_root() -> None:

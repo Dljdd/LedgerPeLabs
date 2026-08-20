@@ -20,7 +20,7 @@ from apar.evaluation.v2_controls import (
 )
 from tests.evaluation.v2_authority import ephemeral_v2_authority
 
-AUTHORITY = ephemeral_v2_authority()
+AUTHORITY = ephemeral_v2_authority(verified=True)
 CONTROL_BINDING = V2ControlBinding.from_preregistration(
     AUTHORITY.preregistration,
     arm="rules_only",
@@ -228,7 +228,7 @@ def test_control_attestation_cannot_replay_across_execution_bindings() -> None:
         signer=AUTHORITY.evaluator,
         binding=CONTROL_BINDING,
     )
-    other_authority = ephemeral_v2_authority()
+    other_authority = ephemeral_v2_authority(verified=True)
     alternatives = (
         CONTROL_CONTEXT.model_copy(update={"candidate_id": "candidate-b"}),
         CONTROL_CONTEXT.model_copy(update={"arm": "gbdt_only"}),
