@@ -64,6 +64,8 @@ defender was frozen and hidden evaluation was not released: six mandatory review
 cases over 336 threshold rows imply a 1.7857% minimum workload, above the
 preregistered 1% cap. The budget was not relaxed and no champion is claimed.
 
+Defend v2: protocol sealed; evaluation not executed. Any future result remains synthetic-only and is not a real-world prevalence or external-validity claim.
+
 ## Working title
 
 **Adaptive Payment Assurance Range**  

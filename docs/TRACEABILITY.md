@@ -17,6 +17,7 @@ This matrix is the control surface for implementation status. Replace `Specified
 | Defend | Strong GBDT baseline | Validated | Signed 200-campaign training receipt, deterministic native model, and frozen reload/prediction test |
 | Defend | Past-only feature state | Validated | Causal source audit, future-append tests, and frozen 48-feature competition matrix |
 | Defend | Campaign case grouping | Validated | Exact callback reconstruction and signed 6/336 minimum workload failure evidence |
+| Defend | v2 sealed evaluation protocol | Protocol sealed, not executed | Signed preregistration and read-only pre-execution verifier; no evaluation receipt or result artifact exists |
 | Agentic | Identity, mandate, scope, binding, replay | Specified | Integrity attack suite |
 | Evaluate | Chronological and cold-entity splits | Specified | Dataset manifest and assertions |
 | Evaluate | Independent hidden generator | Implemented, not released | Separate pinned authority and isolated worker; release was correctly withheld because no defender could freeze |

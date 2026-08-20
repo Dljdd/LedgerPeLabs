@@ -13,6 +13,13 @@ from apar.runs.wire import canonical_json_bytes
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def test_readme_makes_no_v2_efficacy_claim() -> None:
+    text = (ROOT / "README.md").read_text(encoding="utf-8").lower()
+
+    assert "defend v2: protocol sealed; evaluation not executed" in text
+    assert "defend v2 achieved" not in text
+
+
 def test_signed_preregistration_and_frozen_v1_roots_are_not_executed() -> None:
     """A sealed, unconsumed protocol is reported without starting any work."""
     report = verify_v2_preexecution(ROOT, signed_preregistration())
