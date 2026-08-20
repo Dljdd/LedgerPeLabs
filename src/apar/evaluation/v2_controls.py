@@ -7,17 +7,18 @@ or construct an evaluation population.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import Callable, Literal
+from collections.abc import Callable, Sequence
+from typing import Literal
 
 import numpy as np
 from pydantic import PrivateAttr, model_validator
 
-from apar.contracts.decisions import Action
 from apar.contracts._validation import ExternalContract
+from apar.contracts.decisions import Action
 from apar.evaluation.contracts import EvaluationTruthRow
 
 _CONTROL_CAPABILITY = object()
+_CONTROL_SET_CAPABILITY = object()
 
 
 class ControlResult(ExternalContract):
@@ -32,23 +33,72 @@ class ControlResult(ExternalContract):
     _capability: object = PrivateAttr(default=None)
 
     @classmethod
-    def _issue(cls, **values: object) -> "ControlResult":
-        result = cls(**values)
+    def _issue(cls, **values: object) -> ControlResult:
+        result = cls.model_validate(values)
         object.__setattr__(result, "_capability", _CONTROL_CAPABILITY)
         return result
 
     @classmethod
-    def invalid(cls, kind: Literal["benign_only", "score_permutation"], reason: str) -> "ControlResult":
+    def invalid(
+        cls, kind: Literal["benign_only", "score_permutation"], reason: str
+    ) -> ControlResult:
         return cls._issue(valid=False, kind=kind, reason=reason)
 
     @model_validator(mode="after")
-    def _coherent(self) -> "ControlResult":
+    def _coherent(self) -> ControlResult:
         values = self
         if values.valid != (values.reason is None):
             raise ValueError("control validity and reason disagree")
         if values.true_positive_count < 0 or values.intervention_count < 0:
             raise ValueError("control counts must be nonnegative")
         return values
+
+
+class ControlValidity(ExternalContract):
+    """Both mandatory evaluator-attested controls required by V2 selection."""
+
+    benign_only: object
+    score_permutation: object
+    _capability: object = PrivateAttr(default=None)
+
+    @model_validator(mode="after")
+    def required_control_kinds_are_exact(self) -> ControlValidity:
+        if type(self.benign_only) is not ControlResult or self.benign_only.kind != "benign_only":
+            raise ValueError("benign-only control result is missing")
+        if (
+            type(self.score_permutation) is not ControlResult
+            or self.score_permutation.kind != "score_permutation"
+        ):
+            raise ValueError("score-permutation control result is missing")
+        return self
+
+    @classmethod
+    def attest(
+        cls,
+        *,
+        benign_only: ControlResult,
+        score_permutation: ControlResult,
+    ) -> ControlValidity:
+        """Bind the two exact producer-issued results into one selection gate."""
+        if type(benign_only) is not ControlResult or type(score_permutation) is not ControlResult:
+            raise TypeError("control validity requires exact ControlResult evidence")
+        result = cls(benign_only=benign_only, score_permutation=score_permutation)
+        object.__setattr__(result, "_capability", _CONTROL_SET_CAPABILITY)
+        return result
+
+    @property
+    def valid(self) -> bool:
+        """Return true only while both results retain evaluator-owned attestations."""
+        try:
+            return (
+                self._capability is _CONTROL_SET_CAPABILITY
+                and type(self.benign_only) is ControlResult
+                and type(self.score_permutation) is ControlResult
+                and admit_control_result(self.benign_only).valid
+                and admit_control_result(self.score_permutation).valid
+            )
+        except (AttributeError, TypeError, ValueError):
+            return False
 
 
 class ControlAdmission(ExternalContract):
@@ -59,7 +109,7 @@ class ControlAdmission(ExternalContract):
     reason: str | None = None
 
     @model_validator(mode="after")
-    def _coherent(self) -> "ControlAdmission":
+    def _coherent(self) -> ControlAdmission:
         values = self
         if values.valid != (values.status == "admitted"):
             raise ValueError("admission status and validity disagree")
@@ -76,20 +126,29 @@ ControlEvaluator = Callable[[np.ndarray, tuple[EvaluationTruthRow, ...], tuple[s
 def admit_control_result(control: ControlResult) -> ControlAdmission:
     """Convert a control result into a load-bearing whole-run admission."""
     if type(control) is not ControlResult:
-        return ControlAdmission(valid=False, status="no_promotion", reason="malformed_control_result")
+        return ControlAdmission(
+            valid=False, status="no_promotion", reason="malformed_control_result"
+        )
     if control._capability is not _CONTROL_CAPABILITY:
-        return ControlAdmission(valid=False, status="no_promotion", reason="unattested_control_result")
+        return ControlAdmission(
+            valid=False, status="no_promotion", reason="unattested_control_result"
+        )
     try:
         checked = ControlResult.model_validate(control.model_dump())
     except Exception:
-        return ControlAdmission(valid=False, status="no_promotion", reason="malformed_control_result")
+        return ControlAdmission(
+            valid=False, status="no_promotion", reason="malformed_control_result"
+        )
     if not checked.valid:
-        return ControlAdmission(valid=False, status="no_promotion", reason=control.reason or "control_invalid")
+        return ControlAdmission(
+            valid=False, status="no_promotion", reason=control.reason or "control_invalid"
+        )
     return ControlAdmission(valid=True, status="admitted")
 
 
 def run_benign_only_control(
-    *, actions: Sequence[Action | object],
+    *,
+    actions: Sequence[Action | object],
     truth: Sequence[EvaluationTruthRow],
 ) -> ControlResult:
     """Verify that an all-benign operating control makes no fraud claim.
@@ -105,7 +164,8 @@ def run_benign_only_control(
             return ControlResult.invalid("benign_only", "malformed_benign_control")
         interventions = sum(action is not Action.APPROVE for action in action_values)
         return ControlResult._issue(
-            valid=True, kind="benign_only",
+            valid=True,
+            kind="benign_only",
             intervention_count=interventions,
             true_positive_count=0,
         )
@@ -148,7 +208,7 @@ def run_score_permutation_control(
         if type(qualified) is not bool:
             return ControlResult.invalid("score_permutation", "malformed_evaluator_result")
         if qualified:
-                return ControlResult.invalid("score_permutation", "permuted_scores_qualified")
+            return ControlResult.invalid("score_permutation", "permuted_scores_qualified")
         auc = _auc(permuted, np.asarray([row.is_fraud for row in rows], dtype=bool))
         return ControlResult._issue(valid=True, kind="score_permutation", efficacy_auc=auc)
     except Exception:
@@ -232,6 +292,7 @@ __all__ = [
     "ControlAdmission",
     "ControlEvaluator",
     "ControlResult",
+    "ControlValidity",
     "admit_control_result",
     "run_benign_only_control",
     "run_score_permutation_control",

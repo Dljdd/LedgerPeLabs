@@ -10,9 +10,9 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
-from apar.contracts._validation import ExternalContract
+from apar.contracts._validation import ExternalContract, validate_utc_timestamp
 from apar.contracts.events import EventKind, Rail
 from apar.defense.contracts import ObservedEvent
 from apar.evaluation.contracts import EvaluationTruthRow, Family
@@ -20,7 +20,7 @@ from apar.evaluation.v2_protocol import PrevalenceStratum, SeedCommitment, V2Pro
 from apar.runs.wire import canonical_json_bytes
 
 _BASE_START = datetime(2026, 1, 1, tzinfo=UTC)
-_INJECTION_START = datetime(2026, 2, 1, tzinfo=UTC)
+_INJECTION_START = datetime(2026, 1, 1, 12, tzinfo=UTC)
 _FAMILIES: tuple[Family, ...] = (
     "agentic_intent_abuse",
     "app_scam_mule",
@@ -41,10 +41,26 @@ class PopulationManifest(ExternalContract):
     transaction_count: int = Field(ge=0)
     fraud_transaction_count: int = Field(ge=0)
     day_count: int = Field(gt=0)
+    horizon_start: datetime
+    horizon_end: datetime
     stratum_name: Literal["low", "medium", "high"] | None = None
     seed_commitments: tuple[SeedCommitment, ...]
     observations_sha256: str
     truth_sha256: str
+
+    @field_validator("horizon_start", "horizon_end")
+    @classmethod
+    def horizon_is_utc_midnight(cls, value: datetime) -> datetime:
+        checked = validate_utc_timestamp(value)
+        if checked.time() != datetime.min.time():
+            raise ValueError("population horizon must use UTC midnight boundaries")
+        return checked
+
+    @model_validator(mode="after")
+    def horizon_matches_declared_days(self) -> PopulationManifest:
+        if self.horizon_end - self.horizon_start != timedelta(days=self.day_count):
+            raise ValueError("population horizon does not match declared day count")
+        return self
 
 
 class CampaignInjection(ExternalContract):
@@ -57,7 +73,7 @@ class CampaignInjection(ExternalContract):
     truth: tuple[EvaluationTruthRow, ...]
 
     @model_validator(mode="after")
-    def declared_entities_are_nonempty_and_unique(self) -> "CampaignInjection":
+    def declared_entities_are_nonempty_and_unique(self) -> CampaignInjection:
         if not self.entity_ids or any(not item for item in self.entity_ids):
             raise ValueError("campaign entities must be non-empty")
         if len(self.entity_ids) != len(set(self.entity_ids)):
@@ -73,7 +89,7 @@ class CampaignInjection(ExternalContract):
         decision_count: int = 1,
         entity_ids: tuple[str, ...] | None = None,
         start_at: datetime = _INJECTION_START,
-    ) -> "CampaignInjection":
+    ) -> CampaignInjection:
         """Create an in-memory synthetic campaign for fixture-only tests."""
         if type(decision_count) is not int or decision_count <= 0:
             raise ValueError("fixture decision count must be positive")
@@ -199,6 +215,8 @@ def build_benign_base(protocol: V2Protocol, *, seed: int) -> OperatingPopulation
         day_count=days,
         stratum_name=None,
         seed_commitments=protocol.seed_commitments,
+        horizon_start=_BASE_START,
+        horizon_end=_BASE_START + timedelta(days=days),
     )
 
 
@@ -212,9 +230,7 @@ def inject_frozen_campaigns(
     """Replace exactly ``stratum.fraud_transaction_count`` benign decisions."""
     _require_seed(seed)
     _validate_benign_base(base)
-    _verify_seed_commitment(
-        base.manifest.seed_commitments, name="campaign_injection", seed=seed
-    )
+    _verify_seed_commitment(base.manifest.seed_commitments, name="campaign_injection", seed=seed)
     if type(stratum) is not PrevalenceStratum:
         raise TypeError("stratum must be an exact PrevalenceStratum")
     if len(base.observations) != stratum.transaction_count:
@@ -222,14 +238,18 @@ def inject_frozen_campaigns(
     if not injections:
         raise PopulationIsolationError("frozen campaigns are required")
 
-    flattened_observations = tuple(row for injection in injections for row in injection.observations)
+    flattened_observations = tuple(
+        row for injection in injections for row in injection.observations
+    )
     flattened_truth = tuple(row for injection in injections for row in injection.truth)
     _validate_injection_identity(base, injections, flattened_observations, flattened_truth)
     _validate_injection_context(base, injections, flattened_observations)
     _validate_injection_pairs(injections)
     _validate_frozen_allocation(flattened_truth, stratum)
 
-    replacement_indices = sorted(random.Random(seed).sample(range(len(base.observations)), len(flattened_observations)))
+    replacement_indices = sorted(
+        random.Random(seed).sample(range(len(base.observations)), len(flattened_observations))
+    )
     observations = list(base.observations)
     truth = list(base.truth)
     for index, observation, truth_row in zip(
@@ -244,6 +264,8 @@ def inject_frozen_campaigns(
         day_count=base.manifest.day_count,
         stratum_name=stratum.name,
         seed_commitments=base.manifest.seed_commitments,
+        horizon_start=base.manifest.horizon_start,
+        horizon_end=base.manifest.horizon_end,
     )
 
 
@@ -255,6 +277,8 @@ def _population(
     day_count: int,
     stratum_name: Literal["low", "medium", "high"] | None,
     seed_commitments: tuple[SeedCommitment, ...],
+    horizon_start: datetime,
+    horizon_end: datetime,
 ) -> OperatingPopulation:
     return OperatingPopulation(
         observations=observations,
@@ -264,6 +288,8 @@ def _population(
             transaction_count=len(observations),
             fraud_transaction_count=sum(row.is_fraud for row in truth),
             day_count=day_count,
+            horizon_start=horizon_start,
+            horizon_end=horizon_end,
             stratum_name=stratum_name,
             seed_commitments=seed_commitments,
             observations_sha256=_rows_digest(observations),
@@ -281,6 +307,10 @@ def _validate_benign_base(base: OperatingPopulation) -> None:
         raise PopulationIsolationError("base observations and truth have different lengths")
     if base.manifest.transaction_count != len(base.observations):
         raise PopulationIsolationError("base manifest denominator mismatch")
+    if base.manifest.horizon_end - base.manifest.horizon_start != timedelta(
+        days=base.manifest.day_count
+    ):
+        raise PopulationIsolationError("base manifest day horizon mismatch")
     _validate_row_pairs(base.observations, base.truth, label="base")
     _reject_duplicates(base.observations, base.truth, label="base")
     if any(
@@ -288,6 +318,12 @@ def _validate_benign_base(base: OperatingPopulation) -> None:
         for row in base.observations
     ):
         raise PopulationIsolationError("base decisions must be strict past-only decision rows")
+    if any(
+        row.decision_at is None
+        or not base.manifest.horizon_start <= row.decision_at < base.manifest.horizon_end
+        for row in base.observations
+    ):
+        raise PopulationIsolationError("base decisions exceed declared day horizon")
 
 
 def _validate_injection_identity(
@@ -326,11 +362,10 @@ def _validate_injection_context(
         if prior_campaign_entities & entities:
             raise PopulationIsolationError("entity overlap")
         prior_campaign_entities.update(entities)
-    base_start, base_end = _decision_interval(base.observations)
     for injection in injections:
         start, end = _decision_interval(injection.observations)
-        if start <= base_end and base_start <= end:
-            raise PopulationIsolationError("time overlap")
+        if start < base.manifest.horizon_start or end >= base.manifest.horizon_end:
+            raise PopulationIsolationError("campaign exceeds declared day horizon")
     for index, left in enumerate(injections):
         left_start, left_end = _decision_interval(left.observations)
         for right in injections[index + 1 :]:
@@ -374,8 +409,11 @@ def _validate_row_pairs(
 ) -> None:
     if len(observations) != len(truth):
         raise PopulationIsolationError(f"{label} observations and truth have different lengths")
-    for observation, truth in zip(observations, truth, strict=True):
-        if observation.event_id != truth.event_id or observation.payment_id != truth.payment_id:
+    for observation, truth_row in zip(observations, truth, strict=True):
+        if (
+            observation.event_id != truth_row.event_id
+            or observation.payment_id != truth_row.payment_id
+        ):
             raise PopulationIsolationError(f"{label} observation and truth ids differ")
 
 

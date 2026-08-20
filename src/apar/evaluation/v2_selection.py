@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Literal
 from pydantic import Field, field_validator, model_validator
 
 from apar.contracts._validation import ExternalContract
+from apar.evaluation.v2_controls import ControlValidity
 from apar.evaluation.v2_protocol import V2Protocol
 
 if TYPE_CHECKING:
@@ -22,7 +23,11 @@ if TYPE_CHECKING:
     from apar.evaluation.metrics import MetricReport, MetricValue
 
 V2_BOOTSTRAP_REPLICATES = 2_000
-_STRATA = ("low", "medium", "high")
+_STRATA: tuple[Literal["low"], Literal["medium"], Literal["high"]] = (
+    "low",
+    "medium",
+    "high",
+)
 _METRIC_FIELDS = (
     "precision",
     "recall",
@@ -78,8 +83,10 @@ class BoundedMetric(ExternalContract):
         if any(value is None for value in values):
             if any(value is not None for value in values):
                 raise ValueError("undefined bounded metric cannot claim partial bounds")
-        elif not self.lower <= self.point <= self.upper:
-            raise ValueError("bounded metric bounds must contain the point estimate")
+        else:
+            assert self.point is not None and self.lower is not None and self.upper is not None
+            if not self.lower <= self.point <= self.upper:
+                raise ValueError("bounded metric bounds must contain the point estimate")
         if (self.numerator is None) != (self.denominator is None):
             raise ValueError("metric numerator and denominator must be supplied together")
         if self.bootstrap_replicates == 0:
@@ -179,28 +186,6 @@ class V2MetricSet(ExternalContract):
         )
 
 
-class ControlValidity(ExternalContract):
-    """Typed control gate supplied by a later control producer, never inferred."""
-
-    valid: bool
-    reason: str | None = None
-
-    @field_validator("valid", mode="before")
-    @classmethod
-    def valid_is_exact_bool(cls, value: object) -> object:
-        if type(value) is not bool:
-            raise ValueError("control validity must be an exact bool")
-        return value
-
-    @model_validator(mode="after")
-    def reason_matches_validity(self) -> ControlValidity:
-        if self.valid and self.reason is not None:
-            raise ValueError("valid control cannot carry an invalidity reason")
-        if self.reason is not None and (type(self.reason) is not str or not self.reason):
-            raise ValueError("control reason must be nonempty text when supplied")
-        return self
-
-
 class ArmThresholdCandidate(ExternalContract):
     """One arm's precomputed threshold candidate over matched metric scopes."""
 
@@ -209,7 +194,7 @@ class ArmThresholdCandidate(ExternalContract):
     metrics: V2MetricSet
     strata: dict[Literal["low", "medium", "high"], V2MetricSet]
     families: dict[str, V2MetricSet]
-    control: ControlValidity
+    control: object
 
     @field_validator("candidate_id", mode="before")
     @classmethod
@@ -233,25 +218,32 @@ class ArmThresholdCandidate(ExternalContract):
             raise ValueError("candidate strata must be complete and exact")
         if len(self.families) != 4 or any(not name for name in self.families):
             raise ValueError("candidate families must contain four nonempty names")
+        if type(self.control) is not ControlValidity:
+            raise ValueError("candidate requires exact mandatory control evidence")
         return self
 
     @property
     def minimum_family_captured_value_lower_bound(self) -> float:
         return min(
-            metric.preventable_settled_value_fraction.lower for metric in self.families.values()
-        )  # type: ignore[arg-type]
+            _required_bound(metric.preventable_settled_value_fraction.lower)
+            for metric in self.families.values()
+        )
 
     @property
     def maximum_review_case_rate_upper_bound(self) -> float:
-        return max(metric.review_case_rate.upper for metric in self.strata.values())  # type: ignore[arg-type]
+        return max(
+            _required_bound(metric.review_case_rate.upper) for metric in self.strata.values()
+        )
 
     @property
     def maximum_false_decline_rate_upper_bound(self) -> float:
-        return max(metric.false_decline_rate.upper for metric in self.strata.values())  # type: ignore[arg-type]
+        return max(
+            _required_bound(metric.false_decline_rate.upper) for metric in self.strata.values()
+        )
 
     @property
     def maximum_challenge_rate_upper_bound(self) -> float:
-        return max(metric.challenge_rate.upper for metric in self.strata.values())  # type: ignore[arg-type]
+        return max(_required_bound(metric.challenge_rate.upper) for metric in self.strata.values())
 
     @property
     def p95_decision_latency_upper_bound(self) -> float:
@@ -436,6 +428,8 @@ def evaluate_v2_gates(
     """Apply conservative all-scope gates to already-derived metric evidence."""
     if type(protocol) is not V2Protocol:
         raise TypeError("protocol must be an exact V2Protocol")
+    strata: tuple[V2MetricSet, ...]
+    families: tuple[V2MetricSet, ...]
     if type(evidence) is V2MetricSet:
         aggregate = evidence
         strata = (evidence,)
@@ -445,7 +439,7 @@ def evaluate_v2_gates(
         aggregate = evidence.metrics
         strata = tuple(evidence.strata[name] for name in _STRATA)
         families = tuple(evidence.families.values())
-        control = evidence.control
+        control = evidence.control if type(evidence.control) is ControlValidity else None
     else:
         raise TypeError("gates require exact V2MetricSet or ArmThresholdCandidate evidence")
 
@@ -462,7 +456,7 @@ def evaluate_v2_gates(
         codes.add("BOOTSTRAP_REPLICATES")
     if any(metric.undefined_replicates != 0 for metric in mandatory_metrics):
         codes.add("BOOTSTRAP_UNDEFINED")
-    if control is not None and not control.valid:
+    if type(evidence) is ArmThresholdCandidate and (control is None or not control.valid):
         codes.add("CONTROL_INVALID")
 
     if any(not _at_least(metric.recall, 0.50) for metric in families):
@@ -494,6 +488,12 @@ def evaluate_v2_gates(
         codes.add("TIME_TO_ALERT")
     ordered = tuple(sorted(codes))
     return V2GateOutcome(passed=not ordered, codes=ordered)
+
+
+def _required_bound(value: float | None) -> float:
+    if value is None:
+        raise ValueError("selection tie-break requires defined metric bounds")
+    return value
 
 
 def select_v2_thresholds(

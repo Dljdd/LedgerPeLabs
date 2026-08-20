@@ -33,6 +33,16 @@ from apar.evaluation.service import (
     _install_child_audit_hook,
     _parse_index_payload,
 )
+from apar.evaluation.v2_preregistration import ExecutionReceipt
+from apar.evaluation.v2_reporting import (
+    DefenseV2GateReport,
+    V2ArmScorecard,
+    not_executed_result,
+    render_v2_scorecard,
+)
+from apar.evaluation.v2_selection import V2GateOutcome
+from apar.runs import RunSigningIdentity
+from apar.runs.wire import canonical_json_bytes
 from apar.storage.artifacts import ArtifactStore
 from tests.evaluation.test_replay import (
     _corpus_evidence,
@@ -800,3 +810,56 @@ def test_v2_scorecard_exposes_only_public_not_executed_contract(tmp_path: Path) 
     assert response.status_code == 200
     assert response.json()["status"] == "not_executed"
     assert "hidden_seed" not in response.text
+
+
+def test_v2_scorecard_reads_verified_current_state_after_receipt(tmp_path: Path) -> None:
+    """A durable receipt makes the verified signed result the only current status."""
+    state = tmp_path / ".apar/defense-v2"
+    state.mkdir(parents=True)
+    signer = RunSigningIdentity.from_private_bytes(b"s" * 32)
+    arms = tuple(
+        V2ArmScorecard(
+            arm=arm,
+            status="no_promotion",
+            gate=DefenseV2GateReport(
+                arm=arm,
+                outcome=V2GateOutcome(passed=False, codes=("CONTROL_INVALID",)),
+            ),
+        )
+        for arm in ("rules_only", "gbdt_only", "layered_hybrid")
+    )
+    result = not_executed_result().model_copy(update={"status": "no_promotion", "arms": arms})
+    card, _ = render_v2_scorecard(result, signer=signer)
+    (state / "defense-v2-scorecard.json").write_bytes(card.to_json())
+    receipt = ExecutionReceipt(
+        preregistration_id="apar-defend-v2",
+        execution_nonce="receipt-present",
+    )
+    (state / "execution-receipt.json").write_bytes(
+        canonical_json_bytes(receipt.model_dump(mode="json"))
+    )
+
+    with TestClient(create_app(Settings.from_root(tmp_path))) as client:
+        response = client.get("/defense/v2/scorecard")
+
+    assert response.status_code == 200
+    assert response.json() == json.loads(card.to_json())
+    assert response.json()["status"] == "no_promotion"
+
+
+def test_v2_scorecard_fails_closed_when_receipt_has_no_signed_result(tmp_path: Path) -> None:
+    """A consumed execution cannot be hidden behind the initial compiled-in status."""
+    state = tmp_path / ".apar/defense-v2"
+    state.mkdir(parents=True)
+    receipt = ExecutionReceipt(
+        preregistration_id="apar-defend-v2",
+        execution_nonce="receipt-present",
+    )
+    (state / "execution-receipt.json").write_bytes(
+        canonical_json_bytes(receipt.model_dump(mode="json"))
+    )
+
+    with TestClient(create_app(Settings.from_root(tmp_path))) as client:
+        response = client.get("/defense/v2/scorecard")
+
+    assert response.status_code == 422

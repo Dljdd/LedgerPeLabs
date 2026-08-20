@@ -18,7 +18,11 @@ from apar.evaluation.service import (
     DefenseExecutionConflict,
     DefenseResourceNotFound,
 )
-from apar.evaluation.v2_reporting import DefenseV2Scorecard
+from apar.evaluation.v2_reporting import (
+    DefenseV2Scorecard,
+    V2ReportingContractError,
+    load_current_v2_scorecard,
+)
 
 DEFENSE_EVALUATION_NOT_FOUND: Final = "DEFENSE_EVALUATION_NOT_FOUND"
 DEFENSE_ARTIFACT_NOT_FOUND: Final = "DEFENSE_ARTIFACT_NOT_FOUND"
@@ -31,21 +35,20 @@ Service = Annotated[DefenseEvaluationService, Depends(get_defense_evaluation_ser
 
 _PUBLIC_V2_SCORECARD = DefenseV2Scorecard.from_json(
     base64.b64decode(
-        b"eyJhcm1zIjpbeyJhcm0iOiJydWxlc19vbmx5IiwiZ2F0ZSI6eyJhcm0iOiJydWxlc19vbmx5Iiwib3V0"
-        b"Y29tZSI6eyJjb2RlcyI6WyJOT1RfRVhFQ1VURUQiXSwicGFzc2VkIjpmYWxzZX19LCJzdGF0dXMiOiJu"
-        b"b3RfZXhlY3V0ZWQifSx7ImFybSI6ImdiZHRfb25seSIsImdhdGUiOnsiYXJtIjoiZ2JkdF9vbmx5Iiwi"
-        b"b3V0Y29tZSI6eyJjb2RlcyI6WyJOT1RfRVhFQ1VURUQiXSwicGFzc2VkIjpmYWxzZX19LCJzdGF0dXMi"
-        b"OiJub3RfZXhlY3V0ZWQifSx7ImFybSI6ImxheWVyZWRfaHlicmlkIiwiZ2F0ZSI6eyJhcm0iOiJsYXll"
-        b"cmVkX2h5YnJpZCIsIm91dGNvbWUiOnsiY29kZXMiOlsiTk9UX0VYRUNVVEVEIl0sInBhc3NlZCI6ZmFs"
-        b"c2V9fSwic3RhdHVzIjoibm90X2V4ZWN1dGVkIn1dLCJwcm90b2NvbF9kaWdlc3QiOiI3MzkyZWM0ZmFj"
-        b"MTMzNzU0NzNlNmMzMzU1MjllZjc1NGJjNTlhNGNhYTc0Yzk1ZmYxOWVlZTJkNWZkOWYyNjZkIiwicHVi"
-        b"bGljX2tleV9iYXNlNjQiOiJHU0JNakR1b1c2Qlp6Umlza0JlOUFxR05wZEVNYVB0M21qUytRKzhHZDVF"
-        b"PSIsInNjaGVtYV92ZXJzaW9uIjoiMi4wLjAiLCJzaWduYXR1cmVfYmFzZTY0Ijoielk5bytOMDc3VDUr"
-        b"MzYrbFNENnhjZmpLSERnbDI1eEhZeUdkRkdXc2JyZFdNUXVENkZkdWwyOVk3V1Q0UzlLS2htNFFNZmZv"
-        b"V0RTclhDWXJZUkkxQ1E9PSIsInNpZ25lcl9rZXlfaWQiOiI4MWViYzIzYzVhOWRkNjEzNGIxNWE3ODll"
-        b"Zjg2ZWZhMGE0OWJhMDU1YTQ2MTQ0ODJhNjQxNzQ5ZmFmOTVjZDFiIiwic3RhdHVzIjoibm90X2V4ZWN1"
-        b"dGVkIiwic3ludGhldGljX3Njb3BlIjoiU3ludGhldGljLW9ubHkgZXZhbHVhdGlvbjsgbm90IGEgcmVh"
-        b"bC13b3JsZCBwcmV2YWxlbmNlIG9yIGV4dGVybmFsLXZhbGlkaXR5IGNsYWltLiJ9"
+        b"eyJhcm1zIjpbeyJhcm0iOiJydWxlc19vbmx5IiwiZ2F0ZSI6eyJhcm0iOiJydWxlc19vbmx5Iiwib3V0Y29tZSI6"
+        b"eyJjb2RlcyI6WyJOT1RfRVhFQ1VURUQiXSwicGFzc2VkIjpmYWxzZX19LCJzdGF0dXMiOiJub3RfZXhlY3V0ZWQi"
+        b"fSx7ImFybSI6ImdiZHRfb25seSIsImdhdGUiOnsiYXJtIjoiZ2JkdF9vbmx5Iiwib3V0Y29tZSI6eyJjb2RlcyI6"
+        b"WyJOT1RfRVhFQ1VURUQiXSwicGFzc2VkIjpmYWxzZX19LCJzdGF0dXMiOiJub3RfZXhlY3V0ZWQifSx7ImFybSI6"
+        b"ImxheWVyZWRfaHlicmlkIiwiZ2F0ZSI6eyJhcm0iOiJsYXllcmVkX2h5YnJpZCIsIm91dGNvbWUiOnsiY29kZXMi"
+        b"OlsiTk9UX0VYRUNVVEVEIl0sInBhc3NlZCI6ZmFsc2V9fSwic3RhdHVzIjoibm90X2V4ZWN1dGVkIn1dLCJwcm90"
+        b"b2NvbF9kaWdlc3QiOiJkZTkxYmJiZTNmMmE4MzdkYTUxNDVmZjJhN2ZhNzY3ZmQwMjFmMmFkZTZlZjM2NTVlYzFh"
+        b"ZDRlNTAzYzZlNDZjIiwicHVibGljX2tleV9iYXNlNjQiOiI2UFY3MENqYnFrQ0NpZ3RrOWY4S29SM2szRno2ZUYw"
+        b"S2JFRk1aTzBwb3hvPSIsInNjaGVtYV92ZXJzaW9uIjoiMi4wLjAiLCJzaWduYXR1cmVfYmFzZTY0IjoielArcDVE"
+        b"MU04bVptRW41bnRtN2ZRWHljUXN2S05Na1NxVDVaQjVqYUJvMHgwRGRxdGIweHE2bzZSU3hMTUFnUG9VWGk5ckJR"
+        b"VVhtR09uQmJrU1pOQ3c9PSIsInNpZ25lcl9rZXlfaWQiOiIzOTBmYjgwZTMzYzc5Njk3MTg5ZGU4MzNjOWE3YTQ2"
+        b"MTQ5YWM2NmE4N2QwMDQ0OGM2N2E0ZTVjNTEwODRiY2Q5Iiwic3RhdHVzIjoibm90X2V4ZWN1dGVkIiwic3ludGhl"
+        b"dGljX3Njb3BlIjoiU3ludGhldGljLW9ubHkgZXZhbHVhdGlvbjsgbm90IGEgcmVhbC13b3JsZCBwcmV2YWxlbmNl"
+        b"IG9yIGV4dGVybmFsLXZhbGlkaXR5IGNsYWltLiJ9"
     )
 )
 
@@ -66,9 +69,19 @@ class CreateDefenseEvaluationRequest(ExternalContract):
 
 @router.get("/v2/scorecard", response_model=DefenseV2Scorecard)
 @public_router.get("/v2/scorecard", response_model=DefenseV2Scorecard)
-def get_v2_scorecard() -> DefenseV2Scorecard:
+def get_v2_scorecard(request: Request) -> DefenseV2Scorecard:
     """Read the signed public v2 status; this route cannot start an evaluation."""
-    return _PUBLIC_V2_SCORECARD
+    try:
+        return load_current_v2_scorecard(
+            request.app.state.settings.root,
+            fallback=_PUBLIC_V2_SCORECARD,
+        )
+    except V2ReportingContractError:
+        raise ApiError(
+            422,
+            DEFENSE_ARTIFACT_INVALID,
+            "published defense artifact failed validation",
+        ) from None
 
 
 @router.post(

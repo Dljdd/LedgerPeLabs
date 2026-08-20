@@ -16,14 +16,13 @@ from apar.evaluation.v2_population import (
 from apar.evaluation.v2_protocol import PrevalenceStratum, SeedCommitment, V2Protocol
 from apar.runs.wire import canonical_json_bytes
 
-
 FAMILIES = (
     "agentic_intent_abuse",
     "app_scam_mule",
     "card_testing_cnp",
     "synthetic_merchant_refund",
 )
-CAMPAIGN_START = datetime(2026, 2, 1, tzinfo=UTC)
+CAMPAIGN_START = datetime(2026, 1, 1, 1, tzinfo=UTC)
 
 
 def fixture_seed_commitment(name: str, seed: int) -> SeedCommitment:
@@ -54,7 +53,9 @@ def fixture_protocol(
     )
 
 
-def campaign_injections(*, total_decisions: int, start_at: datetime = CAMPAIGN_START) -> tuple[CampaignInjection, ...]:
+def campaign_injections(
+    *, total_decisions: int, start_at: datetime = CAMPAIGN_START
+) -> tuple[CampaignInjection, ...]:
     assert total_decisions % len(FAMILIES) == 0
     per_family = total_decisions // len(FAMILIES)
     return tuple(
@@ -63,7 +64,7 @@ def campaign_injections(*, total_decisions: int, start_at: datetime = CAMPAIGN_S
             family=family,
             decision_count=per_family,
             entity_ids=(f"actor-{family}", f"counterparty-{family}"),
-            start_at=start_at + timedelta(days=index),
+            start_at=start_at + timedelta(hours=4 * index),
         )
         for index, family in enumerate(FAMILIES)
     )
@@ -90,6 +91,22 @@ def test_injection_keeps_exact_denominator() -> None:
     assert len(result.observations) == 100
     assert len(result.truth) == 100
     assert sum(row.is_fraud for row in result.truth) == 20
+
+
+def test_injection_outside_declared_day_horizon_is_rejected() -> None:
+    """A campaign cannot move the frozen operating population beyond its day range."""
+    base = build_benign_base(fixture_protocol(transaction_count=100, day_count=2), seed=11)
+
+    with pytest.raises(PopulationIsolationError, match="declared day horizon"):
+        inject_frozen_campaigns(
+            base,
+            campaign_injections(
+                total_decisions=20,
+                start_at=datetime(2027, 1, 1, tzinfo=UTC),
+            ),
+            PrevalenceStratum.fixture(100, 20),
+            seed=17,
+        )
 
 
 def test_entity_overlap_is_rejected() -> None:
@@ -170,8 +187,7 @@ def test_benign_base_spans_exactly_28_synthetic_days() -> None:
     base = build_benign_base(fixture_protocol(transaction_count=280, day_count=28), seed=11)
 
     assert {row.decision_at.date() for row in base.observations if row.decision_at} == {
-        (datetime(2026, 1, 1, tzinfo=UTC) + timedelta(days=offset)).date()
-        for offset in range(28)
+        (datetime(2026, 1, 1, tzinfo=UTC) + timedelta(days=offset)).date() for offset in range(28)
     }
     assert all(row.available_at < row.decision_at for row in base.observations if row.decision_at)
 
@@ -203,7 +219,9 @@ def test_injected_campaigns_are_disjoint_from_the_benign_base() -> None:
         for row in base.observations
         for entity in (row.actor_id, row.counterparty_id, *row.optional_refs.values())
     }
-    injected_rows = tuple(row for row, truth in zip(result.observations, result.truth, strict=True) if truth.is_fraud)
+    injected_rows = tuple(
+        row for row, truth in zip(result.observations, result.truth, strict=True) if truth.is_fraud
+    )
     assert base_entities.isdisjoint(
         {
             entity
@@ -211,8 +229,12 @@ def test_injected_campaigns_are_disjoint_from_the_benign_base() -> None:
             for entity in (row.actor_id, row.counterparty_id, *row.optional_refs.values())
         }
     )
-    assert max(row.decision_at for row in base.observations if row.decision_at) < min(
-        row.decision_at for row in injected_rows if row.decision_at
+    assert result.manifest.horizon_start == base.manifest.horizon_start
+    assert result.manifest.horizon_end == base.manifest.horizon_end
+    assert all(
+        result.manifest.horizon_start <= row.decision_at < result.manifest.horizon_end
+        for row in injected_rows
+        if row.decision_at
     )
 
 
@@ -226,7 +248,10 @@ def test_non_benign_base_is_rejected() -> None:
 
     with pytest.raises(PopulationIsolationError, match="non-benign base"):
         inject_frozen_campaigns(
-            non_benign, campaign_injections(total_decisions=20), PrevalenceStratum.fixture(), seed=17
+            non_benign,
+            campaign_injections(total_decisions=20),
+            PrevalenceStratum.fixture(),
+            seed=17,
         )
 
 
@@ -238,7 +263,9 @@ def test_wrong_frozen_family_allocation_is_rejected() -> None:
     malformed = displaced.model_copy(
         update={
             "family": wrong_family,
-            "truth": tuple(row.model_copy(update={"family": wrong_family}) for row in displaced.truth),
+            "truth": tuple(
+                row.model_copy(update={"family": wrong_family}) for row in displaced.truth
+            ),
         }
     )
 
@@ -262,6 +289,8 @@ def test_campaign_and_duplicate_id_overlap_are_rejected() -> None:
     duplicate_event = injection.observations[0].model_copy(
         update={"event_id": base.observations[0].event_id}
     )
-    duplicated = injection.model_copy(update={"observations": (duplicate_event, *injection.observations[1:])})
+    duplicated = injection.model_copy(
+        update={"observations": (duplicate_event, *injection.observations[1:])}
+    )
     with pytest.raises(PopulationIsolationError, match="duplicate event id"):
         inject_frozen_campaigns(base, (duplicated,), PrevalenceStratum.fixture(), seed=17)

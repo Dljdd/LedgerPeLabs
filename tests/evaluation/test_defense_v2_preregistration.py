@@ -26,6 +26,16 @@ def test_missing_seed_commitments_is_rejected() -> None:
         V2Preregistration.model_validate(payload)
 
 
+def test_missing_committed_protocol_profile_binding_is_rejected() -> None:
+    """A digest-only preregistration cannot float free of the frozen V2 profile."""
+    payload = complete_preregistration_payload()
+    del payload["protocol_profile_sha256"]
+    signer = EvaluatorSigningIdentity.from_private_bytes(b"v" * 32)
+
+    with pytest.raises(V2PreregistrationError, match="protocol_profile_sha256"):
+        sign_v2_preregistration(payload, signer=signer)
+
+
 def test_signature_and_manifest_bindings_cover_every_required_contract() -> None:
     """Changing one bound source digest must invalidate the signed contract."""
     preregistration = signed_preregistration()
@@ -97,24 +107,25 @@ def complete_preregistration_payload() -> dict[str, object]:
     return {
         "schema_version": "1.0.0",
         "preregistration_id": "apar-defend-v2",
+        "protocol_profile_sha256": digest("protocol-profile"),
+        "manifest_registry_sha256": digest("manifest-registry"),
         "source_manifest_sha256": digest("source"),
         "feature_manifest_sha256": digest("feature"),
         "candidate_grid_sha256": digest("candidate-grid"),
         "population_manifest_sha256": digest("population"),
         "seed_commitments": (
-            {"name": "operating_population", "commitment_sha256": digest("population-seed")},
-            {"name": "campaign_injection", "commitment_sha256": digest("injection-seed")},
+            {"name": "operating_population", "commitment_sha256": "1" * 64},
+            {"name": "campaign_injection", "commitment_sha256": "2" * 64},
         ),
         "evaluator_capability_sha256": digest("evaluator-capability"),
         "metrics_manifest_sha256": digest("metrics"),
         "bootstrap_manifest_sha256": digest("bootstrap"),
         "controls_manifest_sha256": digest("controls"),
+        "budget_manifest_sha256": digest("budget"),
         "reporting_schema_sha256": digest("reporting"),
         "fidelity_validation_bundle_sha256": digest("fidelity"),
         "synthetic_scope": synthetic_scope,
-        "synthetic_scope_sha256": hashlib.sha256(
-            canonical_json_bytes(synthetic_scope)
-        ).hexdigest(),
+        "synthetic_scope_sha256": hashlib.sha256(canonical_json_bytes(synthetic_scope)).hexdigest(),
         "execution_nonce": digest("one-confirmatory-attempt"),
         "maximum_confirmatory_attempts": 1,
     }

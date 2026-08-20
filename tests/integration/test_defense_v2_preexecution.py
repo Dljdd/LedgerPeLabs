@@ -17,6 +17,9 @@ def test_preexecution_cli_reports_not_executed_without_writing_artifacts(tmp_pat
         "docs/experiments/defense-v1-result.json",
         "docs/experiments/defense-v1-run-manifests.json",
         "fixtures/defense/v1/hash-manifest.json",
+        "config/defense/competition-v2-profile.json",
+        "config/defense/competition-v2-manifests.json",
+        "config/defense/competition-v2-preregistration.json",
     ):
         target = tmp_path / relative
         target.parent.mkdir(parents=True, exist_ok=True)

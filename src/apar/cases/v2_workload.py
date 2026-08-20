@@ -42,6 +42,7 @@ class ReviewCase(ExternalContract):
             raise ValueError("review-case event IDs must be sorted and unique")
         return value
 
+
 class ActionWorkload(ExternalContract):
     """Explicit case and transaction workload denominators for one action vector."""
 
@@ -130,6 +131,8 @@ def aggregate_action_workload(
         for event_id, decision in decision_by_event_id.items()
         if decision.action is Action.CHALLENGE
     }
+    if not challenge_ids <= case_event_ids:
+        raise ValueError("challenged transactions must be represented in review cases")
     decline_ids = {
         event_id
         for event_id, decision in decision_by_event_id.items()
@@ -139,9 +142,7 @@ def aggregate_action_workload(
     reviewed_case_count = sum(
         bool(challenge_ids.intersection(case.event_ids)) for case in review_cases
     )
-    legitimate_ids = {
-        event_id for event_id, row in truth_by_event_id.items() if not row.is_fraud
-    }
+    legitimate_ids = {event_id for event_id, row in truth_by_event_id.items() if not row.is_fraud}
     false_decline_count = len(decline_ids.intersection(legitimate_ids))
     false_intervention_count = len((challenge_ids | decline_ids).intersection(legitimate_ids))
     legitimate_transaction_count = len(legitimate_ids)

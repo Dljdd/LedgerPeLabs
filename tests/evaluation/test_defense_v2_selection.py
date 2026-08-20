@@ -2,8 +2,18 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
+from decimal import Decimal
 
+import numpy as np
+
+from apar.contracts.decisions import Action
+from apar.evaluation.contracts import EvaluationTruthRow
+from apar.evaluation.v2_controls import (
+    ControlResult,
+    run_benign_only_control,
+    run_score_permutation_control,
+)
 from apar.evaluation.v2_protocol import V2Protocol
 from apar.evaluation.v2_selection import (
     ArmThresholdCandidate,
@@ -50,6 +60,17 @@ def test_invalid_typed_control_vetoes_an_otherwise_safe_candidate() -> None:
 
     assert outcome.passed is False
     assert outcome.codes == ("CONTROL_INVALID",)
+
+
+def test_forged_valid_control_cannot_pass_selection() -> None:
+    """A caller-constructed validity boolean is not evidence that controls ran."""
+    forged = ControlValidity.model_construct(valid=True, reason=None)
+    evidence = candidate("forged-control").model_copy(update={"control": forged})
+
+    outcome = evaluate_v2_gates(evidence, protocol())
+
+    assert outcome.passed is False
+    assert "CONTROL_INVALID" in outcome.codes
 
 
 def test_undefined_metric_fails_closed() -> None:
@@ -200,7 +221,46 @@ def candidate(
         metrics=metrics,
         strata=strata,
         families=families,
-        control=ControlValidity(valid=control_valid),
+        control=control_validity(valid=control_valid),
+    )
+
+
+def control_validity(*, valid: bool) -> ControlValidity:
+    benign = run_benign_only_control(
+        actions=(Action.APPROVE,), truth=(_control_truth("benign", fraud=False),)
+    )
+    permutation = run_score_permutation_control(
+        scores=np.array([0.8, 0.2]),
+        truth=(
+            _control_truth("fraud", fraud=True),
+            _control_truth("permuted-benign", fraud=False),
+        ),
+        blocks=("case", "case"),
+        seed=7,
+        evaluator=lambda scores, truth, blocks: False,
+    )
+    if not valid:
+        benign = ControlResult.invalid("benign_only", "control_not_run")
+    return ControlValidity.attest(
+        benign_only=benign,
+        score_permutation=permutation,
+    )
+
+
+def _control_truth(event_id: str, *, fraud: bool) -> EvaluationTruthRow:
+    timestamp = datetime(2026, 8, 20, tzinfo=UTC)
+    return EvaluationTruthRow(
+        event_id=event_id,
+        payment_id=f"payment-{event_id}",
+        campaign_id=f"campaign-{event_id}",
+        family="card_testing_cnp",
+        viewpoint="development",
+        is_fraud=fraud,
+        label_source="population_truth",
+        label_mature_at=timestamp,
+        first_settlement_at=None,
+        net_settled_value=Decimal("0"),
+        lifecycle_event_ids=(event_id,),
     )
 
 

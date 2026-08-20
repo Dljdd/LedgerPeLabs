@@ -134,6 +134,19 @@ def test_rejects_decision_outside_truth_operating_universe() -> None:
         )
 
 
+def test_rejects_challenged_transaction_missing_from_review_cases() -> None:
+    """Incomplete case evidence cannot turn challenged workload into zero review work."""
+    event = _observed("challenged", actor="actor-1", at="2026-01-01T10:00:00Z")
+
+    with pytest.raises(ValueError, match="challenged transactions.*review cases"):
+        aggregate_action_workload(
+            1,
+            (),
+            (_decision(event.event_id, Action.CHALLENGE),),
+            _truth_for((event,)),
+        )
+
+
 def test_zero_legitimate_denominator_keeps_false_decline_rate_undefined() -> None:
     event = _observed("fraud-1", actor="actor-1", at="2026-01-01T10:00:00Z")
 

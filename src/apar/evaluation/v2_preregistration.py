@@ -23,8 +23,11 @@ from apar.evaluation.v2_protocol import SeedCommitment
 from apar.runs.wire import WireContractError, canonical_json_bytes, strict_json_loads
 
 _HEX = frozenset("0123456789abcdef")
+SyntheticScope = Literal[
+    "Synthetic-only evaluation; not a real-world prevalence or external-validity claim."
+]
 _SEED_NAMES = ("operating_population", "campaign_injection")
-SYNTHETIC_NON_CLAIM = (
+SYNTHETIC_NON_CLAIM: SyntheticScope = (
     "Synthetic-only evaluation; not a real-world prevalence or external-validity claim."
 )
 
@@ -62,6 +65,8 @@ class V2Preregistration(ExternalContract):
 
     schema_version: Literal["1.0.0"] = "1.0.0"
     preregistration_id: str
+    protocol_profile_sha256: str
+    manifest_registry_sha256: str
     source_manifest_sha256: str
     feature_manifest_sha256: str
     candidate_grid_sha256: str
@@ -73,9 +78,10 @@ class V2Preregistration(ExternalContract):
     metrics_manifest_sha256: str
     bootstrap_manifest_sha256: str
     controls_manifest_sha256: str
+    budget_manifest_sha256: str
     reporting_schema_sha256: str
     fidelity_validation_bundle_sha256: str | None = None
-    synthetic_scope: Literal[SYNTHETIC_NON_CLAIM]
+    synthetic_scope: SyntheticScope
     synthetic_scope_sha256: str
     execution_nonce: str
     maximum_confirmatory_attempts: Literal[1] = 1
@@ -83,6 +89,8 @@ class V2Preregistration(ExternalContract):
 
     @field_validator(
         "source_manifest_sha256",
+        "protocol_profile_sha256",
+        "manifest_registry_sha256",
         "feature_manifest_sha256",
         "candidate_grid_sha256",
         "population_manifest_sha256",
@@ -91,6 +99,7 @@ class V2Preregistration(ExternalContract):
         "metrics_manifest_sha256",
         "bootstrap_manifest_sha256",
         "controls_manifest_sha256",
+        "budget_manifest_sha256",
         "reporting_schema_sha256",
         "synthetic_scope_sha256",
         "execution_nonce",
@@ -164,6 +173,8 @@ class V2Preregistration(ExternalContract):
         """Recheck all binding semantics after unsafe model copying or deserialization."""
         try:
             for field in (
+                "protocol_profile_sha256",
+                "manifest_registry_sha256",
                 "source_manifest_sha256",
                 "feature_manifest_sha256",
                 "candidate_grid_sha256",
@@ -173,6 +184,7 @@ class V2Preregistration(ExternalContract):
                 "metrics_manifest_sha256",
                 "bootstrap_manifest_sha256",
                 "controls_manifest_sha256",
+                "budget_manifest_sha256",
                 "reporting_schema_sha256",
                 "synthetic_scope_sha256",
                 "execution_nonce",
@@ -230,9 +242,9 @@ class ExecutionAdmission(ExternalContract):
     """The only result of evaluating whether a sealed execution may begin."""
 
     admitted: bool
-    reason: Literal[
-        "maximum_confirmatory_attempts_exhausted", "invalid_preregistration"
-    ] | None = None
+    reason: Literal["maximum_confirmatory_attempts_exhausted", "invalid_preregistration"] | None = (
+        None
+    )
     execution_nonce: str | None = None
 
     @model_validator(mode="after")
@@ -305,6 +317,7 @@ __all__ = [
     "ExecutionAdmission",
     "ExecutionReceipt",
     "SYNTHETIC_NON_CLAIM",
+    "SyntheticScope",
     "V2Preregistration",
     "V2PreregistrationError",
     "admit_v2_execution",

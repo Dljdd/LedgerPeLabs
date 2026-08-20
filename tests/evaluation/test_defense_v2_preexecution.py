@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 from apar.evaluation.gates import EvaluatorSigningIdentity
@@ -11,6 +12,8 @@ from apar.evaluation.v2_preregistration import V2Preregistration, sign_v2_prereg
 from apar.runs.wire import canonical_json_bytes
 
 ROOT = Path(__file__).resolve().parents[2]
+PROFILE = json.loads((ROOT / "config/defense/competition-v2-profile.json").read_bytes())
+MANIFEST_REGISTRY = json.loads((ROOT / "config/defense/competition-v2-manifests.json").read_bytes())
 
 
 def test_readme_makes_no_v2_efficacy_claim() -> None:
@@ -114,6 +117,82 @@ def test_importlib_root_assignment_cannot_import_a_computed_target(tmp_path: Pat
     assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
 
 
+def test_builtins_import_alias_cannot_import_a_computed_target(tmp_path: Path) -> None:
+    """Aliasing the built-in import function cannot evade dynamic-import checks."""
+    _write_defender_source(
+        tmp_path,
+        "from builtins import __import__ as load\n"
+        "module = 'apar.evaluation_hidden'\n"
+        "load(module)\n",
+    )
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
+def test_assigned_builtins_import_capability_is_rejected(tmp_path: Path) -> None:
+    """Assignments of builtins.__import__ remain dynamic-import capabilities."""
+    _write_defender_source(
+        tmp_path,
+        "import builtins as runtime\n"
+        "load = runtime.__import__\n"
+        "module = 'apar.evaluation_hidden'\n"
+        "load(module)\n",
+    )
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
+def test_builtins_import_attribute_cannot_import_a_computed_target(tmp_path: Path) -> None:
+    """A direct builtins.__import__ call remains a dynamic import operation."""
+    _write_defender_source(
+        tmp_path,
+        "import builtins as runtime\n"
+        "module = 'apar.evaluation_hidden'\n"
+        "runtime.__import__(module)\n",
+    )
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
+def test_getattr_builtins_import_alias_is_rejected(tmp_path: Path) -> None:
+    """Reflective aliases of builtins.__import__ cannot bypass the boundary."""
+    _write_defender_source(
+        tmp_path,
+        "import builtins as runtime\n"
+        "load = getattr(runtime, '__import__')\n"
+        "module = 'apar.evaluation_hidden'\n"
+        "load(module)\n",
+    )
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
+def test_transitive_defender_feature_import_is_scanned(tmp_path: Path) -> None:
+    """A hidden import in a defender-reachable feature module must fail closed."""
+    _write_defender_source(tmp_path, "from apar.features import bridge\n")
+    features = tmp_path / "src/apar/features"
+    features.mkdir(parents=True)
+    (features / "__init__.py").write_text("", encoding="utf-8")
+    (features / "bridge.py").write_text(
+        "from apar.features import hidden_bridge\n", encoding="utf-8"
+    )
+    (features / "hidden_bridge.py").write_text(
+        "from apar.evaluation_hidden import worker\n", encoding="utf-8"
+    )
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
 def test_relative_evaluator_import_fails_preexecution(tmp_path: Path) -> None:
     """Relative imports cannot reach an evaluator module outside the v2 namespace."""
     _write_defender_source(tmp_path, "from ..evaluation import hidden_source\n")
@@ -190,13 +269,85 @@ def test_v2_receipt_schema_is_found_without_a_receipt_filename(tmp_path: Path) -
 
 def test_invalid_signature_fails_preexecution() -> None:
     """Unsafe model copies cannot turn an invalid admission into a pass."""
-    preregistration = signed_preregistration().model_copy(
-        update={"signature_base64": ""}
-    )
+    preregistration = signed_preregistration().model_copy(update={"signature_base64": ""})
 
     report = verify_v2_preexecution(ROOT, preregistration)
 
     assert "PREREGISTRATION_INVALID" in report.codes
+
+
+def test_profile_digest_mismatch_fails_preexecution() -> None:
+    """A valid signature cannot substitute a different V2 profile."""
+    payload = _preregistration_payload()
+    payload["protocol_profile_sha256"] = _digest("substituted-profile")
+    preregistration = sign_v2_preregistration(
+        payload,
+        signer=EvaluatorSigningIdentity.from_private_bytes(b"v" * 32),
+    )
+
+    report = verify_v2_preexecution(ROOT, preregistration)
+
+    assert "PROTOCOL_PROFILE_INVALID" in report.codes
+
+
+def test_digest_shaped_bindings_without_real_manifest_fail_preexecution() -> None:
+    """A signature over arbitrary digest strings is not manifest evidence."""
+    payload = _preregistration_payload()
+    payload["manifest_registry_sha256"] = _digest("missing-manifest-registry")
+    preregistration = sign_v2_preregistration(
+        payload,
+        signer=EvaluatorSigningIdentity.from_private_bytes(b"v" * 32),
+    )
+
+    report = verify_v2_preexecution(ROOT, preregistration)
+
+    assert "MANIFEST_BINDINGS_INVALID" in report.codes
+
+
+def test_seed_commitments_must_match_the_committed_profile() -> None:
+    """Re-signing different evaluator seed commitments cannot authorize V2."""
+    payload = _preregistration_payload()
+    payload["seed_commitments"] = (
+        {"name": "operating_population", "commitment_sha256": _digest("other-seed")},
+        {"name": "campaign_injection", "commitment_sha256": "2" * 64},
+    )
+    preregistration = sign_v2_preregistration(
+        payload,
+        signer=EvaluatorSigningIdentity.from_private_bytes(b"v" * 32),
+    )
+
+    report = verify_v2_preexecution(ROOT, preregistration)
+
+    assert "PROTOCOL_PROFILE_INVALID" in report.codes
+
+
+def test_budget_binding_must_match_the_committed_profile() -> None:
+    """A signed substitute budget cannot weaken the frozen profile limits."""
+    payload = _preregistration_payload()
+    payload["budget_manifest_sha256"] = _digest("weaker-budget")
+    preregistration = sign_v2_preregistration(
+        payload,
+        signer=EvaluatorSigningIdentity.from_private_bytes(b"v" * 32),
+    )
+
+    report = verify_v2_preexecution(ROOT, preregistration)
+
+    assert "PROTOCOL_PROFILE_INVALID" in report.codes
+    assert "MANIFEST_BINDINGS_INVALID" in report.codes
+
+
+def test_each_required_component_manifest_is_load_bearing() -> None:
+    """A signed control-manifest substitution must differ from the real registry."""
+    payload = _preregistration_payload()
+    payload["controls_manifest_sha256"] = _digest("substituted-controls")
+    preregistration = sign_v2_preregistration(
+        payload,
+        signer=EvaluatorSigningIdentity.from_private_bytes(b"v" * 32),
+    )
+
+    report = verify_v2_preexecution(ROOT, preregistration)
+
+    assert "MANIFEST_BINDINGS_INVALID" in report.codes
 
 
 def signed_preregistration() -> V2Preregistration:
@@ -211,24 +362,25 @@ def _preregistration_payload() -> dict[str, object]:
     return {
         "schema_version": "1.0.0",
         "preregistration_id": "apar-defend-v2",
-        "source_manifest_sha256": _digest("source"),
-        "feature_manifest_sha256": _digest("feature"),
-        "candidate_grid_sha256": _digest("candidate-grid"),
-        "population_manifest_sha256": _digest("population"),
+        "protocol_profile_sha256": PROFILE["profile_sha256"],
+        "manifest_registry_sha256": _manifest_registry_digest(),
+        "source_manifest_sha256": _manifest_digest("source"),
+        "feature_manifest_sha256": _manifest_digest("feature"),
+        "candidate_grid_sha256": _manifest_digest("candidate_grid"),
+        "population_manifest_sha256": _manifest_digest("population"),
         "seed_commitments": (
-            {"name": "operating_population", "commitment_sha256": _digest("population-seed")},
-            {"name": "campaign_injection", "commitment_sha256": _digest("injection-seed")},
+            {"name": "operating_population", "commitment_sha256": "1" * 64},
+            {"name": "campaign_injection", "commitment_sha256": "2" * 64},
         ),
-        "evaluator_capability_sha256": _digest("evaluator-capability"),
-        "metrics_manifest_sha256": _digest("metrics"),
-        "bootstrap_manifest_sha256": _digest("bootstrap"),
-        "controls_manifest_sha256": _digest("controls"),
-        "reporting_schema_sha256": _digest("reporting"),
-        "fidelity_validation_bundle_sha256": _digest("fidelity"),
+        "evaluator_capability_sha256": _manifest_digest("evaluator_capability"),
+        "metrics_manifest_sha256": _manifest_digest("metrics"),
+        "bootstrap_manifest_sha256": _manifest_digest("bootstrap"),
+        "controls_manifest_sha256": _manifest_digest("controls"),
+        "budget_manifest_sha256": _manifest_digest("budget"),
+        "reporting_schema_sha256": _manifest_digest("reporting_schema"),
+        "fidelity_validation_bundle_sha256": _manifest_digest("fidelity_validation"),
         "synthetic_scope": synthetic_scope,
-        "synthetic_scope_sha256": hashlib.sha256(
-            canonical_json_bytes(synthetic_scope)
-        ).hexdigest(),
+        "synthetic_scope_sha256": hashlib.sha256(canonical_json_bytes(synthetic_scope)).hexdigest(),
         "execution_nonce": _digest("one-confirmatory-attempt"),
         "maximum_confirmatory_attempts": 1,
     }
@@ -236,6 +388,14 @@ def _preregistration_payload() -> dict[str, object]:
 
 def _digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _manifest_registry_digest() -> str:
+    return hashlib.sha256(canonical_json_bytes(MANIFEST_REGISTRY)).hexdigest()
+
+
+def _manifest_digest(name: str) -> str:
+    return hashlib.sha256(canonical_json_bytes(MANIFEST_REGISTRY["manifests"][name])).hexdigest()
 
 
 def _write_defender_source(root: Path, source: str) -> None:

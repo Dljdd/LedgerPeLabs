@@ -11,28 +11,34 @@ import binascii
 import csv
 import hashlib
 import io
-from typing import Literal, Self
+from pathlib import Path
+from typing import Literal, Self, cast
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from pydantic import ValidationError, field_validator, model_validator
 
 from apar.contracts._validation import ExternalContract
-from apar.evaluation.v2_preregistration import SYNTHETIC_NON_CLAIM
+from apar.evaluation.v2_preregistration import (
+    SYNTHETIC_NON_CLAIM,
+    ExecutionReceipt,
+    SyntheticScope,
+)
 from apar.evaluation.v2_selection import V2GateOutcome
 from apar.runs.runner import RunSigningIdentity
 from apar.runs.wire import WireContractError, canonical_json_bytes, strict_json_loads
 
-_ARMS = ("rules_only", "gbdt_only", "layered_hybrid")
+ArmName = Literal["rules_only", "gbdt_only", "layered_hybrid"]
+_ARMS: tuple[ArmName, ArmName, ArmName] = (
+    "rules_only",
+    "gbdt_only",
+    "layered_hybrid",
+)
 _STRATA = ("low", "medium", "high")
 _HEX = frozenset("0123456789abcdef")
-_NOT_EXECUTED = "not_executed"
+_NOT_EXECUTED: Literal["not_executed"] = "not_executed"
 _NOT_EXECUTED_GATE = "NOT_EXECUTED"
-_DEFAULT_PROTOCOL_DIGEST = hashlib.sha256(
-    canonical_json_bytes(
-        {"protocol_id": "apar-defend-v2", "synthetic_scope": SYNTHETIC_NON_CLAIM}
-    )
-).hexdigest()
+_DEFAULT_PROTOCOL_DIGEST = "de91bbbe3f2a837da5145ff2a7fa767fd021f2ade6ef3655ec1ad4e503c6e46c"
 
 
 class V2ReportingContractError(ValueError):
@@ -99,7 +105,7 @@ class _DefenseV2ScorecardFields(ExternalContract):
     schema_version: Literal["2.0.0"] = "2.0.0"
     status: Literal["not_executed", "no_promotion", "promotion_eligible"]
     protocol_digest: str
-    synthetic_scope: Literal[SYNTHETIC_NON_CLAIM]
+    synthetic_scope: SyntheticScope
     arms: tuple[V2ArmScorecard, V2ArmScorecard, V2ArmScorecard]
 
     @field_validator("protocol_digest")
@@ -196,18 +202,72 @@ def not_executed_result(
         status=_NOT_EXECUTED,
         protocol_digest=protocol_digest,
         synthetic_scope=SYNTHETIC_NON_CLAIM,
-        arms=tuple(
-            V2ArmScorecard(
-                arm=arm,
-                status=_NOT_EXECUTED,
-                gate=DefenseV2GateReport(
+        arms=cast(
+            tuple[V2ArmScorecard, V2ArmScorecard, V2ArmScorecard],
+            tuple(
+                V2ArmScorecard(
                     arm=arm,
-                    outcome=V2GateOutcome(passed=False, codes=(_NOT_EXECUTED_GATE,)),
-                ),
-            )
-            for arm in _ARMS
+                    status=_NOT_EXECUTED,
+                    gate=DefenseV2GateReport(
+                        arm=arm,
+                        outcome=V2GateOutcome(passed=False, codes=(_NOT_EXECUTED_GATE,)),
+                    ),
+                )
+                for arm in _ARMS
+            ),
         ),
     )
+
+
+def load_current_v2_scorecard(root: Path, *, fallback: DefenseV2Scorecard) -> DefenseV2Scorecard:
+    """Read the current signed scorecard while reconciling durable execution receipts."""
+    if not isinstance(root, Path) or type(fallback) is not DefenseV2Scorecard:
+        raise V2ReportingContractError("current scorecard lookup requires exact inputs")
+    if fallback.protocol_digest != _DEFAULT_PROTOCOL_DIGEST:
+        raise V2ReportingContractError("fallback scorecard protocol digest is invalid")
+    state_root = root / ".apar"
+    scorecard_path = state_root / "defense-v2" / "defense-v2-scorecard.json"
+    try:
+        receipt_present = False
+        if state_root.exists():
+            if not state_root.is_dir():
+                raise V2ReportingContractError("durable V2 state is not a directory")
+            for path in state_root.rglob("*"):
+                if not path.is_file() or path == scorecard_path:
+                    continue
+                try:
+                    document = strict_json_loads(path.read_bytes())
+                    receipt = ExecutionReceipt.model_validate(document)
+                except (OSError, WireContractError, ValidationError, ValueError, TypeError):
+                    continue
+                if receipt.preregistration_id == "apar-defend-v2":
+                    receipt_present = True
+                    break
+
+        current = (
+            DefenseV2Scorecard.from_json(scorecard_path.read_bytes())
+            if scorecard_path.is_file()
+            else None
+        )
+        if current is not None and current.protocol_digest != _DEFAULT_PROTOCOL_DIGEST:
+            raise V2ReportingContractError("current scorecard protocol digest is invalid")
+        if receipt_present:
+            if current is None or current.status == _NOT_EXECUTED:
+                raise V2ReportingContractError(
+                    "execution receipt requires a verified completed scorecard"
+                )
+            return current
+        if current is not None:
+            if current.status != _NOT_EXECUTED:
+                raise V2ReportingContractError(
+                    "completed scorecard requires a durable execution receipt"
+                )
+            return current
+        return fallback
+    except (OSError, ValidationError, ValueError, TypeError) as error:
+        if isinstance(error, V2ReportingContractError):
+            raise
+        raise V2ReportingContractError("current V2 scorecard state is invalid") from error
 
 
 def render_v2_scorecard(
@@ -343,6 +403,7 @@ __all__ = [
     "DefenseV2GateReport",
     "DefenseV2RenderResult",
     "DefenseV2Scorecard",
+    "load_current_v2_scorecard",
     "V2ArmScorecard",
     "V2ReportingContractError",
     "not_executed_result",
