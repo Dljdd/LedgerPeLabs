@@ -55,6 +55,8 @@ _V2_EVALUATOR_INTERNALS = frozenset(
 )
 _SYS_IMPORT_AUTHORITY_FIELDS = frozenset(
     {
+        "_current_frames",
+        "_getframe",
         "__dict__",
         "__getattr__",
         "__getattribute__",
@@ -64,6 +66,24 @@ _SYS_IMPORT_AUTHORITY_FIELDS = frozenset(
         "path_importer_cache",
     }
 )
+_NAMESPACE_AUTHORITY_PRIMITIVES = frozenset(
+    {
+        "__import__",
+        "compile",
+        "delattr",
+        "eval",
+        "exec",
+        "getattr",
+        "globals",
+        "locals",
+        "setattr",
+        "vars",
+    }
+)
+_FROZEN_SAFE_GETATTR_SOURCES = {
+    "apar/defense/bundle.py": "a31a513f7754580ee25f19351c0ad08d54ba4d9641fcad3369f428335ea9a992",
+    "apar/features/state.py": "ee189dd341fcfd1f9e758ab5889b37278178a9fedba50c474f5dca829970532e",
+}
 _FROZEN_V1_EVALUATION_IMPORTS = frozenset(
     {
         ("bundle.py", "apar.evaluation.splits"),
@@ -480,7 +500,9 @@ def _contains_disallowed_import(
     forbidden: str,
     allowed_prefix: str,
 ) -> bool:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    raw_source = path.read_bytes()
+    tree = ast.parse(raw_source.decode("utf-8"), filename=str(path))
+    allowed_primitives = _frozen_primitive_allowlist(path, project_source, raw_source)
     (
         importlib_aliases,
         builtins_aliases,
@@ -490,6 +512,10 @@ def _contains_disallowed_import(
     ) = _import_bindings(tree)
     sys_aliases = _sys_bindings(tree)
     for node in ast.walk(tree):
+        if _has_namespace_authority(
+            node, builtins_aliases, vars_aliases, allowed_primitives
+        ):
+            return True
         if _has_sys_import_authority_reflection(
             node,
             sys_aliases,
@@ -508,12 +534,14 @@ def _contains_disallowed_import(
         ):
             return True
         if isinstance(node, ast.Import) and any(
-            _is_disallowed_module(name.name, forbidden, allowed_prefix)
+            (name.name == "inspect" or _is_disallowed_module(name.name, forbidden, allowed_prefix))
             and not _is_frozen_v1_import(path, defender_root, name.name)
             for name in node.names
         ):
             return True
         if isinstance(node, ast.ImportFrom):
+            if node.module == "inspect":
+                return True
             for module in _resolved_import_targets(node, path, project_source):
                 if _is_disallowed_module(
                     module, forbidden, allowed_prefix
@@ -532,10 +560,55 @@ def _contains_disallowed_import(
             module_value = node.args[0].value
             if (
                 not isinstance(module_value, str)
-                or module_value == "sys"
+                or module_value in {"inspect", "sys"}
                 or _is_disallowed_module(module_value, forbidden, allowed_prefix)
             ):
                 return True
+    return False
+
+
+def _frozen_primitive_allowlist(
+    path: Path, project_source: Path, raw_source: bytes
+) -> frozenset[str]:
+    try:
+        relative = path.relative_to(project_source).as_posix()
+    except ValueError:
+        return frozenset()
+    expected = _FROZEN_SAFE_GETATTR_SOURCES.get(relative)
+    if expected is not None and hashlib.sha256(raw_source).hexdigest() == expected:
+        return frozenset({"getattr"})
+    return frozenset()
+
+
+def _has_namespace_authority(
+    node: ast.AST,
+    builtins_aliases: set[str],
+    vars_aliases: set[str],
+    allowed_primitives: frozenset[str],
+) -> bool:
+    """Reject namespace mutation and dynamic code primitives at acquisition."""
+    if (
+        isinstance(node, ast.Name)
+        and isinstance(node.ctx, ast.Load)
+        and node.id in _NAMESPACE_AUTHORITY_PRIMITIVES
+        and node.id not in allowed_primitives
+    ):
+        return True
+    if isinstance(node, ast.Attribute):
+        return (
+            node.attr in _NAMESPACE_AUTHORITY_PRIMITIVES
+            and node.attr not in allowed_primitives
+            and _has_named_root(node.value, builtins_aliases, vars_aliases)
+        )
+    if isinstance(node, ast.ImportFrom) and node.module == "builtins":
+        return any(
+            name.name == "*"
+            or (
+                name.name in _NAMESPACE_AUTHORITY_PRIMITIVES
+                and name.name not in allowed_primitives
+            )
+            for name in node.names
+        )
     return False
 
 
@@ -577,7 +650,7 @@ def _has_sys_import_authority_reflection(
 ) -> bool:
     """Reject access to interpreter registries that can recover evaluator modules."""
     if isinstance(node, ast.ImportFrom) and node.module == "sys":
-        return any(name.name in _SYS_IMPORT_AUTHORITY_FIELDS for name in node.names)
+        return True
     if isinstance(node, ast.Attribute):
         return node.attr in _SYS_IMPORT_AUTHORITY_FIELDS and _has_sys_root(
             node.value, sys_aliases

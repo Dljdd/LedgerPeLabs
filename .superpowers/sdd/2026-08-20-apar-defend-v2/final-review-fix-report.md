@@ -761,3 +761,79 @@ The final read-only preexecution script returned
 `{"admissible":true,"codes":[],"status":"not_executed"}`. Frozen V1 source,
 feature, fixture, and experiment-document paths have no diff; `git diff --check`
 is clean. No V2 evaluation or durable receipt/result was created.
+
+## Final hardening round 8
+
+### Scope and implementation
+
+- Rejected every `from sys import ...` form, including wildcard imports, because
+  frozen V1 uses only ordinary `import sys` and needs no from-import exception.
+- Added a fail-closed namespace/code-execution primitive boundary covering
+  `eval`, `exec`, `compile`, `globals`, `locals`, `vars`, `__import__`, `getattr`,
+  `setattr`, and `delattr`, including builtins imports, qualified builtins access,
+  aliases, stored references, and reflective acquisition.
+- Rejected frame recovery through `sys._getframe` and `sys._current_frames`, and
+  rejected `inspect` imports/dynamic acquisition in defender-reachable code.
+- Preserved the four necessary frozen-V1 `getattr` call sites only when the entire
+  containing source file matches its committed SHA-256. Any edit, alternate file,
+  or reachable feature loses the exemption and fails closed.
+
+### RED evidence
+
+The exact wildcard import bypass initially remained admissible:
+
+```text
+.venv/bin/pytest tests/evaluation/test_defense_v2_preexecution.py \
+  -q -k sys_import_authority
+1 failed, 11 passed, 72 deselected in 0.45s
+```
+
+The consolidated namespace/code-execution probes all bypassed before the
+primitive-acquisition rule was added:
+
+```text
+.venv/bin/pytest tests/evaluation/test_defense_v2_preexecution.py \
+  -q -k namespace_and_code_execution
+10 failed, 84 deselected in 0.49s
+```
+
+These probes cover `globals()['__builtins__']['__import__']`, string `eval`, an
+imported eval alias, compile/exec, locals, zero-argument vars, `sys._getframe`,
+getattr, setattr, and delattr.
+
+### GREEN evidence
+
+Combined sys and namespace authority probes:
+
+```text
+.venv/bin/pytest tests/evaluation/test_defense_v2_preexecution.py \
+  -q -k 'namespace_and_code_execution or sys_import_authority'
+22 passed, 72 deselected in 0.35s
+```
+
+Complete preexecution scanner and static verification:
+
+```text
+.venv/bin/pytest tests/evaluation/test_defense_v2_preexecution.py -q
+94 passed in 9.06s
+
+.venv/bin/ruff check \
+  src/apar/evaluation/v2_preexecution.py \
+  tests/evaluation/test_defense_v2_preexecution.py
+All checks passed!
+
+.venv/bin/mypy src/apar/evaluation/v2_preexecution.py
+Success: no issues found in 1 source file
+```
+
+Complete repository regression suite:
+
+```text
+.venv/bin/pytest -q
+1910 passed, 1 skipped in 565.29s (0:09:25)
+```
+
+The final read-only preexecution script returned
+`{"admissible":true,"codes":[],"status":"not_executed"}`. Frozen V1 source,
+feature, fixture, and experiment-document paths have no diff; `git diff --check`
+is clean. No V2 evaluation or durable receipt/result was created.

@@ -474,6 +474,8 @@ def test_mutated_container_and_for_bound_reflection_fail_closed(
         "import sys\nsys.meta_path.append(object())\n",
         "from sys import modules as loaded\n"
         "evaluator = loaded['apar.evaluation.v2_preexecution']\n",
+        "from sys import *\n"
+        "evaluator = modules['apar.evaluation.v2_preexecution']\n",
         "import importlib\nruntime = importlib.import_module('sys')\n"
         "evaluator = runtime.modules['apar.evaluation.v2_preexecution']\n",
         "import sys\nmodules = sys.__getattribute__('modules')\n"
@@ -505,6 +507,34 @@ def test_transitive_feature_sys_modules_access_fails_closed(tmp_path: Path) -> N
         "evaluator = runtime.modules['apar.evaluation.v2_preexecution']\n",
         encoding="utf-8",
     )
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        "evaluator = globals()['__builtins__']['__import__']('sys').modules[\n"
+        "    'apar.evaluation.v2_preexecution'\n]\n",
+        "evaluator = eval(\"__import__('sys').modules\")\n",
+        "from builtins import eval as run\nrun('1 + 1')\n",
+        "code = compile('value = 1', '<defender>', 'exec')\nexec(code)\n",
+        "namespace = locals()\nnamespace['evaluator'] = object()\n",
+        "namespace = vars()\nnamespace['evaluator'] = object()\n",
+        "import sys\nframe = sys._getframe()\n"
+        "evaluator = frame.f_globals['__builtins__']\n",
+        "value = getattr(object(), '__class__')\n",
+        "target = object()\nsetattr(target, 'authority', object())\n",
+        "target = object()\ndelattr(target, 'authority')\n",
+    ),
+)
+def test_namespace_and_code_execution_primitives_fail_closed(
+    tmp_path: Path, source: str
+) -> None:
+    """Defender code cannot recover evaluator authority through Python namespaces."""
+    _write_defender_source(tmp_path, source)
 
     report = verify_v2_preexecution(tmp_path, signed_preregistration())
 
