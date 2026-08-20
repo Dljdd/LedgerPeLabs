@@ -12,6 +12,7 @@ from apar.contracts._validation import ExternalContract, validate_utc_timestamp
 from apar.contracts.decisions import Action
 from apar.defense.contracts import ObservedEvent
 from apar.defense.policy import DefenseDecision
+from apar.defense.rules import DefenseReason
 from apar.evaluation.contracts import EvaluationTruthRow
 
 _REVIEW_WINDOW = timedelta(hours=24)
@@ -23,7 +24,6 @@ class ReviewCase(ExternalContract):
     entity_key: str = Field(min_length=1)
     window_start: datetime
     event_ids: tuple[str, ...] = Field(min_length=1)
-    integrity_failure_event_ids: tuple[str, ...] = ()
 
     @field_validator("window_start")
     @classmethod
@@ -33,7 +33,7 @@ class ReviewCase(ExternalContract):
             raise ValueError("review-case window_start must be UTC midnight")
         return value
 
-    @field_validator("event_ids", "integrity_failure_event_ids")
+    @field_validator("event_ids")
     @classmethod
     def event_ids_are_canonical(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         if any(type(event_id) is not str or not event_id for event_id in value):
@@ -41,13 +41,6 @@ class ReviewCase(ExternalContract):
         if value != tuple(sorted(set(value))):
             raise ValueError("review-case event IDs must be sorted and unique")
         return value
-
-    @model_validator(mode="after")
-    def integrity_failures_are_case_events(self) -> ReviewCase:
-        if not set(self.integrity_failure_event_ids).issubset(self.event_ids):
-            raise ValueError("integrity failure event IDs must belong to the review case")
-        return self
-
 
 class ActionWorkload(ExternalContract):
     """Explicit case and transaction workload denominators for one action vector."""
@@ -105,9 +98,6 @@ def group_review_cases(
             entity_key=entity_key,
             window_start=window_start,
             event_ids=tuple(sorted(event.event_id for event in rows)),
-            integrity_failure_event_ids=tuple(
-                sorted(event.event_id for event in rows if event.integrity_status == "fail")
-            ),
         )
         for (entity_key, window_start), rows in sorted(grouped.items())
     )
@@ -123,18 +113,27 @@ def aggregate_action_workload(
     if type(total_transaction_count) is not int or total_transaction_count <= 0:
         raise ValueError("total transaction count must be a positive integer")
 
-    case_event_ids, integrity_failure_event_ids = _case_event_sets(review_cases)
-    action_by_event_id = _actions_by_event_id(decisions)
+    case_event_ids = _case_event_ids(review_cases)
+    decision_by_event_id = _decisions_by_event_id(decisions)
     truth_by_event_id = _truth_by_event_id(truth)
-    unknown_action_ids = set(action_by_event_id).difference(truth_by_event_id)
+    if total_transaction_count != len(truth_by_event_id):
+        raise ValueError("total transaction count must equal the truth operating universe")
+    unknown_case_event_ids = case_event_ids.difference(truth_by_event_id)
+    if unknown_case_event_ids:
+        raise ValueError("review cases must reference operating truth rows")
+    unknown_action_ids = set(decision_by_event_id).difference(truth_by_event_id)
     if unknown_action_ids:
         raise ValueError("action decisions must reference operating truth rows")
 
     challenge_ids = {
-        event_id for event_id, action in action_by_event_id.items() if action is Action.CHALLENGE
+        event_id
+        for event_id, decision in decision_by_event_id.items()
+        if decision.action is Action.CHALLENGE
     }
     decline_ids = {
-        event_id for event_id, action in action_by_event_id.items() if action is Action.DECLINE
+        event_id
+        for event_id, decision in decision_by_event_id.items()
+        if decision.action is Action.DECLINE
     }
     reviewed_ids = challenge_ids.intersection(case_event_ids)
     reviewed_case_count = sum(
@@ -153,7 +152,11 @@ def aggregate_action_workload(
         review_case_count=reviewed_case_count,
         reviewed_transaction_count=len(reviewed_ids),
         challenge_count=len(challenge_ids),
-        automatic_integrity_decline_count=len(decline_ids.intersection(integrity_failure_event_ids)),
+        automatic_integrity_decline_count=sum(
+            decision.action is Action.DECLINE
+            and DefenseReason.INTEGRITY_FAILURE in decision.reason_codes
+            for decision in decision_by_event_id.values()
+        ),
         false_decline_count=false_decline_count,
         false_intervention_count=false_intervention_count,
         review_case_rate=reviewed_case_count / total_transaction_count,
@@ -176,9 +179,8 @@ def _validate_observation(event: ObservedEvent) -> None:
     validate_utc_timestamp(event.decision_at)
 
 
-def _case_event_sets(review_cases: Sequence[ReviewCase]) -> tuple[set[str], set[str]]:
+def _case_event_ids(review_cases: Sequence[ReviewCase]) -> set[str]:
     event_ids: set[str] = set()
-    integrity_failure_event_ids: set[str] = set()
     for case in review_cases:
         if type(case) is not ReviewCase:
             raise TypeError("review cases must be exact ReviewCase instances")
@@ -187,20 +189,19 @@ def _case_event_sets(review_cases: Sequence[ReviewCase]) -> tuple[set[str], set[
         if duplicate_ids:
             raise ValueError("review cases must not share event IDs")
         event_ids.update(case.event_ids)
-        integrity_failure_event_ids.update(case.integrity_failure_event_ids)
-    return event_ids, integrity_failure_event_ids
+    return event_ids
 
 
-def _actions_by_event_id(decisions: Sequence[DefenseDecision]) -> dict[str, Action]:
-    actions: dict[str, Action] = {}
+def _decisions_by_event_id(decisions: Sequence[DefenseDecision]) -> dict[str, DefenseDecision]:
+    rows: dict[str, DefenseDecision] = {}
     for decision in decisions:
         if type(decision) is not DefenseDecision:
             raise TypeError("workload decisions must be exact DefenseDecision instances")
         DefenseDecision.model_validate(decision.model_dump())
-        if decision.event_id in actions:
+        if decision.event_id in rows:
             raise ValueError("workload decisions must have unique event IDs")
-        actions[decision.event_id] = decision.action
-    return actions
+        rows[decision.event_id] = decision
+    return rows
 
 
 def _truth_by_event_id(truth: Sequence[EvaluationTruthRow]) -> dict[str, EvaluationTruthRow]:

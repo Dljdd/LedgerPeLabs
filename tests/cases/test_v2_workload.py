@@ -5,9 +5,12 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal
 
+import pytest
+
 from apar.cases.v2_workload import aggregate_action_workload, group_review_cases
 from apar.contracts.decisions import Action
 from apar.defense.policy import DefenseDecision
+from apar.defense.rules import DefenseReason
 from apar.evaluation.contracts import EvaluationTruthRow
 from tests.cases.conftest import decision, observation
 
@@ -22,7 +25,7 @@ def test_two_transactions_in_one_utc_window_are_one_review_case() -> None:
         100,
         group_review_cases(events),
         (decision("a"), decision("b")),
-        _truth_for(events),
+        _truth_for(events, background_count=98),
     )
 
     assert (
@@ -67,20 +70,41 @@ def test_false_decline_rate_uses_legitimate_denominator() -> None:
     assert workload.false_interventions_per_10k == 100.0
 
 
-def test_decline_precedence_excludes_case_review_and_counts_integrity_decline() -> None:
-    event = _observed(
-        "integrity-failure",
+def test_integrity_declines_require_integrity_failure_decision_provenance() -> None:
+    non_integrity_event = _observed(
+        "integrity-failure-non-integrity-decline",
         actor="actor-1",
+        at="2026-01-01T10:00:00Z",
+        integrity_status="fail",
+        integrity_reason="receipt_failed",
+    )
+    integrity_event = _observed(
+        "integrity-failure-automatic-decline",
+        actor="actor-2",
         at="2026-01-01T10:00:00Z",
         integrity_status="fail",
         integrity_reason="receipt_failed",
     )
 
     workload = aggregate_action_workload(
-        1,
-        group_review_cases((event,)),
-        (_decision(event.event_id, Action.DECLINE),),
-        _truth_for((event,), fraudulent_ids=(event.event_id,)),
+        2,
+        group_review_cases((non_integrity_event, integrity_event)),
+        (
+            _decision(
+                non_integrity_event.event_id,
+                Action.DECLINE,
+                reasons=(DefenseReason.ACTOR_VELOCITY,),
+            ),
+            _decision(
+                integrity_event.event_id,
+                Action.DECLINE,
+                reasons=(DefenseReason.INTEGRITY_FAILURE,),
+            ),
+        ),
+        _truth_for(
+            (non_integrity_event, integrity_event),
+            fraudulent_ids=(non_integrity_event.event_id, integrity_event.event_id),
+        ),
     )
 
     assert (
@@ -89,6 +113,25 @@ def test_decline_precedence_excludes_case_review_and_counts_integrity_decline() 
         workload.challenge_count,
         workload.automatic_integrity_decline_count,
     ) == (0, 0, 0, 1)
+
+
+def test_rejects_declared_total_that_differs_from_truth_operating_universe() -> None:
+    event = _observed("one", actor="actor-1", at="2026-01-01T10:00:00Z")
+
+    with pytest.raises(ValueError, match="total transaction count"):
+        aggregate_action_workload(2, (), (), _truth_for((event,)))
+
+
+def test_rejects_decision_outside_truth_operating_universe() -> None:
+    event = _observed("known", actor="actor-1", at="2026-01-01T10:00:00Z")
+
+    with pytest.raises(ValueError, match="action decisions"):
+        aggregate_action_workload(
+            1,
+            (),
+            (_decision("orphan", Action.CHALLENGE),),
+            _truth_for((event,)),
+        )
 
 
 def test_zero_legitimate_denominator_keeps_false_decline_rate_undefined() -> None:
@@ -116,15 +159,22 @@ def _observed(event_id: str, *, actor: str, at: str, **updates: object):
     )
 
 
-def _decision(event_id: str, action: Action) -> DefenseDecision:
-    return decision(event_id, action=action)
+def _decision(
+    event_id: str, action: Action, *, reasons: tuple[DefenseReason, ...] = ()
+) -> DefenseDecision:
+    return decision(event_id, action=action).model_copy(update={"reason_codes": reasons})
 
 
 def _truth_for(
-    events: tuple[object, ...], *, fraudulent_ids: tuple[str, ...] = ()
+    events: tuple[object, ...],
+    *,
+    fraudulent_ids: tuple[str, ...] = (),
+    background_count: int = 0,
 ) -> tuple[EvaluationTruthRow, ...]:
     return _truth_rows(
-        *(event.event_id for event in events), fraudulent_ids=fraudulent_ids
+        *(event.event_id for event in events),
+        *(f"background-{index}" for index in range(background_count)),
+        fraudulent_ids=fraudulent_ids,
     )
 
 
