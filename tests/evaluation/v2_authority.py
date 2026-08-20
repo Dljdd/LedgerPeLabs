@@ -10,7 +10,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from apar.evaluation.gates import EvaluatorSigningIdentity
-from apar.evaluation.v2_preexecution import verify_v2_authority
+from apar.evaluation.v2_preexecution import V2VerifiedAuthority, verify_v2_preexecution
 from apar.evaluation.v2_preregistration import (
     SYNTHETIC_NON_CLAIM,
     V2Preregistration,
@@ -28,6 +28,7 @@ class EphemeralV2Authority:
     publisher: RunSigningIdentity
     preregistration: V2Preregistration
     verified_authority: object | None = None
+    verification_root: Path | None = None
     _verification_directory: TemporaryDirectory[str] | None = field(
         default=None, repr=False, compare=False
     )
@@ -42,12 +43,16 @@ def ephemeral_v2_authority(*, verified: bool = False) -> EphemeralV2Authority:
         directory = TemporaryDirectory(prefix="apar-v2-authority-")
         verification_root = Path(directory.name).resolve()
         _copy_preexecution_inputs(verification_root, preregistration)
-        authority = verify_v2_authority(verification_root, preregistration)
+        report = verify_v2_preexecution(verification_root, preregistration)
+        if not report.admissible:
+            raise RuntimeError(f"test authority preexecution failed: {report.codes}")
+        authority = V2VerifiedAuthority.from_preregistration(preregistration)
         return EphemeralV2Authority(
             evaluator,
             publisher,
             preregistration,
             authority,
+            verification_root,
             directory,
         )
 

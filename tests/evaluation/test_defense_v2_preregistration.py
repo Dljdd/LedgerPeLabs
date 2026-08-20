@@ -6,8 +6,12 @@ import hashlib
 
 import pytest
 
+import apar.evaluation.v2_preexecution as preexecution_module
 import apar.evaluation.v2_preregistration as preregistration_module
-from apar.evaluation.v2_preexecution import V2VerifiedAuthority
+from apar.evaluation.v2_preexecution import (
+    V2VerifiedAuthority,
+    _verified_v2_preregistration,
+)
 from apar.evaluation.v2_preregistration import (
     ExecutionReceipt,
     V2Preregistration,
@@ -28,10 +32,25 @@ def test_missing_seed_commitments_is_rejected() -> None:
         V2Preregistration.model_validate(payload)
 
 
-def test_verified_authority_capability_has_no_public_constructor() -> None:
-    """A caller cannot mint the opaque preexecution trust capability."""
-    with pytest.raises(TypeError, match="trusted verifier"):
-        V2VerifiedAuthority()
+def test_self_signed_authority_attestation_has_no_trust_by_construction() -> None:
+    """Constructible evidence is trusted only after fixed-root cryptographic verification."""
+    outsider = ephemeral_v2_authority()
+    authority = V2VerifiedAuthority.from_preregistration(outsider.preregistration)
+
+    assert _verified_v2_preregistration(authority) is None
+
+
+def test_retargeted_root_cannot_replace_pinned_evaluator_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even privileged root retargeting cannot make an outsider signature authoritative."""
+    outsider = ephemeral_v2_authority(verified=True)
+    assert outsider.verification_root is not None
+    monkeypatch.setattr(
+        preexecution_module, "_TRUSTED_V2_ROOT", outsider.verification_root
+    )
+
+    assert _verified_v2_preregistration(outsider.verified_authority) is None
 
 
 def test_preregistration_module_exposes_no_capability_issuer_or_registry() -> None:

@@ -6,6 +6,7 @@ from decimal import Decimal
 import numpy as np
 import pytest
 
+import apar.evaluation.v2_preexecution as preexecution_module
 from apar.contracts.decisions import Action
 from apar.evaluation.contracts import EvaluationTruthRow
 from apar.evaluation.gates import EvaluatorSigningIdentity
@@ -27,13 +28,29 @@ CONTROL_BINDING = V2ControlBinding.from_preregistration(
     candidate_id="candidate-a",
     input_digest="a" * 64,
 )
-CONTROL_CONTEXT = V2ControlContext.from_preregistration(
-    AUTHORITY.preregistration,
-    verified_authority=AUTHORITY.verified_authority,
+CONTROL_CONTEXT = V2ControlContext(
+    preregistration=AUTHORITY.preregistration,
     arm="rules_only",
     candidate_id="candidate-a",
     input_digest="a" * 64,
 )
+
+
+@pytest.fixture(autouse=True)
+def trusted_test_authority_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Inject one isolated trust root without exposing it through production APIs."""
+    assert AUTHORITY.verification_root is not None
+    monkeypatch.setattr(
+        preexecution_module, "_TRUSTED_V2_ROOT", AUTHORITY.verification_root
+    )
+    monkeypatch.setattr(
+        preexecution_module,
+        "_trusted_evaluator_identity",
+        lambda: (
+            AUTHORITY.preregistration.evaluator_key_id,
+            AUTHORITY.preregistration.evaluator_public_key_base64,
+        ),
+    )
 
 
 def truth_row(event_id: str, *, fraud: bool) -> EvaluationTruthRow:
@@ -216,6 +233,20 @@ def test_external_signer_cannot_mint_control_attestation() -> None:
         )
 
 
+def test_copied_root_self_signed_authority_is_not_trusted() -> None:
+    """A caller-controlled copied seal is not an independent production trust anchor."""
+    outsider = ephemeral_v2_authority(verified=True)
+
+    with pytest.raises(V2ControlError, match="verified authority"):
+        V2ControlContext.from_preregistration(
+            outsider.preregistration,
+            verified_authority=outsider.verified_authority,
+            arm="rules_only",
+            candidate_id="copied-root",
+            input_digest="a" * 64,
+        )
+
+
 def evaluator_signer() -> EvaluatorSigningIdentity:
     return AUTHORITY.evaluator
 
@@ -233,9 +264,8 @@ def test_control_attestation_cannot_replay_across_execution_bindings() -> None:
         CONTROL_CONTEXT.model_copy(update={"candidate_id": "candidate-b"}),
         CONTROL_CONTEXT.model_copy(update={"arm": "gbdt_only"}),
         CONTROL_CONTEXT.model_copy(update={"input_digest": "b" * 64}),
-        V2ControlContext.from_preregistration(
-            other_authority.preregistration,
-            verified_authority=other_authority.verified_authority,
+        V2ControlContext(
+            preregistration=other_authority.preregistration,
             arm="rules_only",
             candidate_id="candidate-a",
             input_digest="a" * 64,

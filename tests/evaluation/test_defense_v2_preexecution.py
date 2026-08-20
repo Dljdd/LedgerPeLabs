@@ -37,11 +37,20 @@ def test_signed_preregistration_and_frozen_v1_roots_are_not_executed() -> None:
     assert (report.status, report.codes) == ("not_executed", ())
 
 
-def test_trusted_preexecution_verifier_mints_opaque_authority() -> None:
-    """Only the complete pinned preexecution verification can issue production trust."""
-    authority = verify_v2_authority(ROOT, signed_preregistration())
+def test_trusted_preexecution_verifier_returns_verifiable_authority_evidence() -> None:
+    """Production authority evidence is derived only from the fixed pinned verifier."""
+    authority = verify_v2_authority(signed_preregistration())
 
     assert type(authority).__name__ == "V2VerifiedAuthority"
+
+
+def test_caller_selected_repository_cannot_issue_authority() -> None:
+    """A copied repository and re-signed seal cannot choose the production trust root."""
+    attacker = ephemeral_v2_authority(verified=True)
+    assert attacker.verification_root is not None
+
+    with pytest.raises(TypeError):
+        verify_v2_authority(attacker.verification_root, attacker.preregistration)
 
 
 def test_hidden_import_in_defender_fails_preexecution(tmp_path: Path) -> None:
@@ -430,6 +439,26 @@ def test_transitive_feature_destructured_importlib_binding_fails_closed(
     assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
 
 
+@pytest.mark.parametrize(
+    "source",
+    (
+        "import builtins\nitems = []\nitems.append(builtins.getattr)\n"
+        "lookup = items[0]\nlookup(builtins, '__import__')\n",
+        "import builtins\nfor lookup, fallback in ((builtins.getattr, None),):\n"
+        "    lookup(builtins, '__import__')\n",
+    ),
+)
+def test_mutated_container_and_for_bound_reflection_fail_closed(
+    tmp_path: Path, source: str
+) -> None:
+    """Container mutation and loop destructuring cannot launder reflection authority."""
+    _write_defender_source(tmp_path, source)
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
 def test_transitive_feature_python_symlink_fails_closed(tmp_path: Path) -> None:
     """Reachable Python inventory cannot hide behind a same-content symlink."""
     _write_defender_source(tmp_path, "from apar.features import linked\n")
@@ -471,20 +500,29 @@ def test_apar_package_evaluator_import_fails_preexecution(tmp_path: Path) -> Non
     assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
 
 
-def test_relative_versioned_evaluator_import_remains_admissible(tmp_path: Path) -> None:
-    """Relative syntax may still name an explicitly versioned public contract."""
-    _write_defender_source(tmp_path, "from ..evaluation import v2_preexecution\n")
+def test_relative_public_v2_protocol_import_remains_admissible(tmp_path: Path) -> None:
+    """Relative syntax may still name the versioned data-only protocol contract."""
+    _write_defender_source(tmp_path, "from ..evaluation import v2_protocol\n")
 
     report = verify_v2_preexecution(tmp_path, signed_preregistration())
 
     assert "HIDDEN_IMPORT_BOUNDARY" not in report.codes
 
 
-def test_versioned_public_evaluator_import_remains_admissible(tmp_path: Path) -> None:
-    """The sealed pre-execution public contract remains an approved dependency."""
+def test_sensitive_versioned_evaluator_import_fails_closed(tmp_path: Path) -> None:
+    """Defender code cannot import and mutate evaluator trust-boundary internals."""
     _write_defender_source(
         tmp_path, "from apar.evaluation.v2_preexecution import PreexecutionReport\n"
     )
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
+def test_public_v2_protocol_import_remains_admissible(tmp_path: Path) -> None:
+    """A versioned data-only protocol contract remains defender-visible."""
+    _write_defender_source(tmp_path, "from apar.evaluation.v2_protocol import V2Protocol\n")
 
     report = verify_v2_preexecution(tmp_path, signed_preregistration())
 

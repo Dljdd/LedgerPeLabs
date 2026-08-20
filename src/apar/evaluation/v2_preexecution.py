@@ -8,12 +8,11 @@ from __future__ import annotations
 
 import ast
 import hashlib
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Literal, Self
-from weakref import WeakKeyDictionary
+from typing import Literal, Self
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from apar.contracts._validation import ExternalContract
 from apar.evaluation.v2_preregistration import (
@@ -44,6 +43,16 @@ _MANIFEST_FIELDS = {
 _PROTOCOL_DIGEST = hashlib.sha256(
     canonical_json_bytes({"protocol_id": _PROTOCOL_ID, "synthetic_scope": SYNTHETIC_NON_CLAIM})
 ).hexdigest()
+_TRUSTED_V2_ROOT = Path(__file__).resolve().parents[3]
+_V2_EVALUATOR_INTERNALS = frozenset(
+    {
+        "apar.evaluation.v2_controls",
+        "apar.evaluation.v2_preexecution",
+        "apar.evaluation.v2_preregistration",
+        "apar.evaluation.v2_reporting",
+        "apar.evaluation.v2_selection",
+    }
+)
 _FROZEN_V1_EVALUATION_IMPORTS = frozenset(
     {
         ("bundle.py", "apar.evaluation.splits"),
@@ -82,48 +91,72 @@ class PreexecutionReport(ExternalContract):
         return cls(admissible=not failed, codes=failed)
 
 
-def _verified_authority_system() -> tuple[
-    type[Any],
-    Callable[[object], V2Preregistration | None],
-    Callable[[Path, V2Preregistration], Any],
-]:
-    registry: WeakKeyDictionary[object, V2Preregistration] = WeakKeyDictionary()
+class V2VerifiedAuthority(ExternalContract):
+    """Portable evidence whose signed preregistration is verified at every use."""
 
-    class V2VerifiedAuthority:
-        """Opaque proof minted only by the pinned preexecution verifier closure."""
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    preregistration: V2Preregistration
+    preregistration_sha256: str
 
-        __slots__ = ("__weakref__",)
+    @model_validator(mode="after")
+    def digest_binds_signed_preregistration(self) -> Self:
+        expected = hashlib.sha256(self.preregistration.canonical_bytes()).hexdigest()
+        if self.preregistration_sha256 != expected:
+            raise ValueError("authority attestation does not bind its preregistration")
+        return self
 
-        def __new__(cls) -> Self:
-            raise TypeError("V2 authority capabilities are minted only by a trusted verifier")
+    @classmethod
+    def from_preregistration(cls, preregistration: V2Preregistration) -> V2VerifiedAuthority:
+        return cls(
+            preregistration=preregistration,
+            preregistration_sha256=hashlib.sha256(
+                preregistration.canonical_bytes()
+            ).hexdigest(),
+        )
 
-    def resolve(authority: object) -> V2Preregistration | None:
-        if type(authority) is not V2VerifiedAuthority:
+
+def _verified_v2_preregistration(authority: object) -> V2Preregistration | None:
+    """Revalidate an attestation against the fixed deployment trust root."""
+    if type(authority) is not V2VerifiedAuthority:
+        return None
+    try:
+        checked = V2VerifiedAuthority.model_validate(authority.model_dump())
+        preregistration = checked.preregistration
+        key_id, public_key = _trusted_evaluator_identity()
+        if (
+            preregistration.evaluator_key_id != key_id
+            or preregistration.evaluator_public_key_base64 != public_key
+        ):
             return None
-        try:
-            return registry.get(authority)
-        except (TypeError, ValueError):
-            return None
-
-    def verify(root: Path, preregistration: V2Preregistration) -> V2VerifiedAuthority:
-        report = verify_v2_preexecution(root, preregistration)
+        report = verify_v2_preexecution(_TRUSTED_V2_ROOT, preregistration)
         if not report.admissible:
-            raise V2PreregistrationError(
-                "V2 authority failed trusted preexecution verification"
-            )
-        authority = object.__new__(V2VerifiedAuthority)
-        registry[authority] = preregistration
-        return authority
-
-    return V2VerifiedAuthority, resolve, verify
+            return None
+        return preregistration
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
 
 
-(
-    V2VerifiedAuthority,
-    _verified_v2_preregistration,
-    verify_v2_authority,
-) = _verified_authority_system()
-del _verified_authority_system
+def verify_v2_authority(preregistration: V2Preregistration) -> V2VerifiedAuthority:
+    """Verify against the fixed deployment root and return portable signed evidence."""
+    key_id, public_key = _trusted_evaluator_identity()
+    if (
+        type(preregistration) is not V2Preregistration
+        or preregistration.evaluator_key_id != key_id
+        or preregistration.evaluator_public_key_base64 != public_key
+    ):
+        raise V2PreregistrationError("V2 authority differs from pinned evaluator identity")
+    report = verify_v2_preexecution(_TRUSTED_V2_ROOT, preregistration)
+    if not report.admissible:
+        raise V2PreregistrationError("V2 authority failed trusted preexecution verification")
+    return V2VerifiedAuthority.from_preregistration(preregistration)
+
+
+def _trusted_evaluator_identity(
+    key_id: str = "cd9b875d4eb8ce4745a0495bced1da975a0fec817540242ff93b04cbbf805ca0",
+    public_key_base64: str = "7pIyh9RVX0G8GYuW5eSbgXsmfDEl7okUry8jrQ9rpOs=",
+) -> tuple[str, str]:
+    """Return the deployment-pinned public evaluator identity; no secret is stored."""
+    return key_id, public_key_base64
 
 
 def verify_v2_preexecution(root: Path, preregistration: V2Preregistration) -> PreexecutionReport:
@@ -579,9 +612,39 @@ def _has_unsupported_reflection_binding(
         return not direct or not isinstance(node.target, ast.Name)
     if isinstance(node, ast.NamedExpr):
         return contains(node.value)
+    if isinstance(node, ast.AugAssign):
+        return contains(node.value)
+    if isinstance(node, (ast.For, ast.AsyncFor)):
+        return contains(node.iter)
+    if isinstance(node, ast.comprehension):
+        return contains(node.iter)
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
         defaults = (*node.args.defaults, *(item for item in node.args.kw_defaults if item))
         return any(contains(item) for item in defaults)
+    if isinstance(node, ast.Call):
+        arguments = (*node.args, *(item.value for item in node.keywords))
+        if any(contains(item) for item in arguments):
+            return True
+        direct_callable = (
+            isinstance(node.func, ast.Name)
+            and node.func.id in (getattr_aliases | vars_aliases)
+        ) or _is_import_function_reference(
+            node.func,
+            importlib_aliases,
+            builtins_aliases,
+            import_function_aliases,
+            getattr_aliases,
+            vars_aliases,
+        ) or (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr != "import_module"
+            and _has_importlib_root(node.func.value, importlib_aliases, vars_aliases)
+        ) or (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr not in {"__import__", "getattr", "vars"}
+            and _has_named_root(node.func.value, builtins_aliases, vars_aliases)
+        )
+        return contains(node.func) and not direct_callable
     return False
 
 
@@ -815,6 +878,10 @@ def _is_disallowed_module(module: str | None, forbidden: str, allowed_prefix: st
     return (
         module == forbidden
         or module.startswith(f"{forbidden}.")
+        or any(
+            module == internal or module.startswith(f"{internal}.")
+            for internal in _V2_EVALUATOR_INTERNALS
+        )
         or (
             (module == "apar.evaluation" or module.startswith("apar.evaluation."))
             and not module.startswith(allowed_prefix)

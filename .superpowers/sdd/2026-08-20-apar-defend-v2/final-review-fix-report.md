@@ -582,3 +582,100 @@ The final direct read-only check returned
 `{"status":"not_executed","admissible":true,"codes":[]}`. No frozen V1 source,
 feature, fixture, or experiment-document path changed; `git diff --check` is clean.
 No V2 evaluation or durable receipt/result was created.
+
+## Final hardening round 6
+
+### Scope and implementation
+
+- Replaced the closure-local class plus `WeakKeyDictionary` registry with a plain
+  `V2VerifiedAuthority` evidence contract. The object carries the exact signed
+  preregistration and its canonical digest; construction itself grants no trust.
+  Every control-context and selection admission reparses the evidence, verifies the
+  source-pinned production evaluator key ID/public key, verifies the Ed25519-signed
+  preregistration, and reruns the complete fixed-root preexecution boundary.
+- Removed the caller-selected root parameter from `verify_v2_authority`. Production
+  issuance now uses only the deployment root derived from the installed verifier
+  source and the pinned public evaluator identity. A copied repository with a
+  caller-re-signed seal cannot issue or validate production authority.
+- Kept test authority injection explicitly outside production APIs: isolated tests
+  copy all frozen inputs, pass complete preexecution, and use pytest-scoped
+  monkeypatching for their temporary root and ephemeral public identity. This is a
+  privileged test harness, not a Python-opacity or capability security claim.
+- Removed sensitive evaluator modules (`v2_preexecution`, `v2_preregistration`,
+  `v2_controls`, `v2_selection`, and `v2_reporting`) from the defender import
+  surface, preventing defender-reachable code from retargeting trust state. The
+  versioned data-only `v2_protocol` contract remains importable in absolute and
+  relative forms.
+- Extended reflection scanning across call arguments, container mutation,
+  subscripted callables, `for`/async-`for` destructuring, comprehensions, augmented
+  assignments, and assignment expressions. Qualified builtins reflection fails
+  closed, while static non-import importlib metadata calls remain admissible.
+
+### RED evidence
+
+The exact copied-root, registry/capability, append/index, and loop-destructuring
+probes all demonstrated the prior bypasses:
+
+```text
+.venv/bin/pytest \
+  tests/evaluation/test_defense_v2_preexecution.py \
+  tests/evaluation/test_defense_v2_controls.py \
+  -q -k 'caller_selected_repository or copied_root_self_signed or mutated_container'
+4 failed, 79 deselected in 3.10s
+```
+
+Specifically, the caller-selected copied repository issued an authority without
+raising, the copied-root self-signed context was accepted, and neither
+`items.append(builtins.getattr); items[0]` nor `for lookup, ... in
+((builtins.getattr, ...),)` produced `HIDDEN_IMPORT_BOUNDARY`.
+
+### GREEN evidence
+
+Exact adversarial trust, reflection, and sensitive-import probes:
+
+```text
+.venv/bin/pytest \
+  tests/evaluation/test_defense_v2_preexecution.py \
+  tests/evaluation/test_defense_v2_controls.py \
+  -q -k 'caller_selected_repository or copied_root_self_signed or \
+  mutated_container or sensitive_versioned or public_v2_protocol'
+6 passed, 78 deselected in 2.59s
+```
+
+Focused V2 preregistration, preexecution, controls, and selection contracts:
+
+```text
+.venv/bin/pytest \
+  tests/evaluation/test_defense_v2_preexecution.py \
+  tests/evaluation/test_defense_v2_preregistration.py \
+  tests/evaluation/test_defense_v2_controls.py \
+  tests/evaluation/test_defense_v2_selection.py -q
+111 passed in 63.00s (0:01:02)
+```
+
+Static verification:
+
+```text
+.venv/bin/ruff check <round-6 changed Python source and tests>
+All checks passed!
+
+.venv/bin/mypy \
+  src/apar/evaluation/v2_preexecution.py \
+  src/apar/evaluation/v2_preregistration.py \
+  src/apar/evaluation/v2_controls.py \
+  src/apar/evaluation/v2_selection.py \
+  tests/evaluation/v2_authority.py
+Success: no issues found in 5 source files
+```
+
+Complete repository regression suite:
+
+```text
+.venv/bin/pytest -q
+1887 passed, 1 skipped in 540.62s (0:09:00)
+```
+
+The final read-only preexecution script returned
+`{"admissible":true,"codes":[],"status":"not_executed"}`. Frozen V1 source,
+feature, fixture, and experiment-document paths have no diff; `git diff --check`
+is clean. No V2 evaluation or durable receipt/result was created.

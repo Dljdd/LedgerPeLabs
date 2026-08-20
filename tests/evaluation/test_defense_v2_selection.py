@@ -8,6 +8,7 @@ from decimal import Decimal
 import numpy as np
 import pytest
 
+import apar.evaluation.v2_preexecution as preexecution_module
 from apar.contracts.decisions import Action
 from apar.evaluation.contracts import EvaluationTruthRow
 from apar.evaluation.v2_controls import (
@@ -33,6 +34,23 @@ from apar.evaluation.v2_selection import (
 from tests.evaluation.v2_authority import EphemeralV2Authority, ephemeral_v2_authority
 
 AUTHORITY = ephemeral_v2_authority(verified=True)
+
+
+@pytest.fixture(autouse=True)
+def trusted_test_authority_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Inject one isolated trust root without exposing it through production APIs."""
+    assert AUTHORITY.verification_root is not None
+    monkeypatch.setattr(
+        preexecution_module, "_TRUSTED_V2_ROOT", AUTHORITY.verification_root
+    )
+    monkeypatch.setattr(
+        preexecution_module,
+        "_trusted_evaluator_identity",
+        lambda: (
+            AUTHORITY.preregistration.evaluator_key_id,
+            AUTHORITY.preregistration.evaluator_public_key_base64,
+        ),
+    )
 
 
 def test_self_signed_preregistration_cannot_be_its_own_selection_trust_root() -> None:
