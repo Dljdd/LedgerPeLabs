@@ -1,0 +1,4 @@
+arm,status,reason
+rules_only,not_evaluated,operating_budget_infeasible
+gbdt_only,not_evaluated,operating_budget_infeasible
+layered_hybrid,no_promotion,operating_budget_infeasible

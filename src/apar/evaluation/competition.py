@@ -11,10 +11,10 @@ from typing import Literal, cast
 from uuid import NAMESPACE_URL, uuid5
 
 import numpy as np
-from pydantic import field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from apar.cases import group_cases, simulate_case_queue
-from apar.contracts._validation import ExternalContract
+from apar.contracts._validation import ExternalContract, validate_utc_timestamp
 from apar.defense.bundle import DefenderBundlePublisher, LoadedDefenderBundle
 from apar.defense.contracts import ObservedEvent
 from apar.defense.rules import RuleEngine
@@ -39,6 +39,7 @@ from apar.evaluation.gates import (
     VerifiedReplayBatch,
     evaluate_promotion_gates,
 )
+from apar.evaluation.hidden_source import HiddenSourceWorkerBinding
 from apar.evaluation.metrics import (
     BootstrapDerivationEvidence,
     LatencySample,
@@ -91,6 +92,7 @@ from apar.evaluation.reporting import (
 from apar.evaluation.splits import (
     EntityCohort,
     EvaluationSplit,
+    SplitConfig,
     make_evaluation_split,
     make_leave_one_family_out,
 )
@@ -192,6 +194,9 @@ class RestrictedHiddenContextEnvelope(ExternalContract):
     observations_sha256: str
     restricted_context_ref: dict[str, object]
     context_sha256: str
+    source_mode: Literal["fixture_isolation", "authenticated_independent_runs"]
+    source_lineage_digest: str
+    source_run_count: int = Field(ge=0, le=4)
     as_of: datetime
     assurance_mode: Literal["production_measured"] = "production_measured"
     signer_key_id: str
@@ -203,6 +208,7 @@ class RestrictedHiddenContextEnvelope(ExternalContract):
         "development_corpus_digest",
         "context_sha256",
         "observations_sha256",
+        "source_lineage_digest",
         "signer_key_id",
     )
     @classmethod
@@ -223,6 +229,8 @@ class RestrictedHiddenContextEnvelope(ExternalContract):
             or observations.sha256 == restricted.sha256
             or self.as_of.tzinfo is None
             or self.as_of.utcoffset() != timedelta(0)
+            or (self.source_mode == "authenticated_independent_runs")
+            != (self.source_run_count == 4)
         ):
             raise ValueError("hidden context digest differs from its reference")
         return self
@@ -305,6 +313,8 @@ def seal_hidden_context(
     context: ReplayEvaluationContext,
     profile_sha256: str,
     development_corpus_digest: str,
+    source_lineage_digest: str | None = None,
+    source_run_count: int = 0,
 ) -> ArtifactRef:
     """Seal an authority-owned hidden context behind a signed restricted pointer."""
     if (
@@ -318,6 +328,18 @@ def seal_hidden_context(
     _digest(profile_sha256, label="profile digest")
     _digest(development_corpus_digest, label="development corpus digest")
     context_ref = store.put_bytes(context.to_json(), HIDDEN_CONTEXT_MEDIA_TYPE)
+    if source_lineage_digest is None:
+        if source_run_count != 0:
+            raise ValueError("hidden source lineage inputs differ")
+        checked_source_digest = hashlib.sha256(context.to_json()).hexdigest()
+        source_mode = "fixture_isolation"
+    else:
+        checked_source_digest = _digest(
+            source_lineage_digest, label="hidden source lineage digest"
+        )
+        if source_run_count != 4:
+            raise ValueError("hidden source lineage inputs differ")
+        source_mode = "authenticated_independent_runs"
     observations_payload = canonical_json_bytes(
         [row.model_dump(mode="json") for row in context.observations]
     )
@@ -335,6 +357,9 @@ def seal_hidden_context(
         "profile_sha256": profile_sha256,
         "public_key_base64": signer.public_key_base64,
         "restricted_context_ref": _ref_document(context_ref),
+        "source_lineage_digest": checked_source_digest,
+        "source_mode": source_mode,
+        "source_run_count": source_run_count,
         "schema_version": "1.0.0",
         "signer_key_id": signer.key_id,
     }
@@ -737,6 +762,8 @@ class PublishedG3Evaluation:
     descriptor_scope: tuple[str, ...]
     restricted_publication_receipt_ref: ArtifactRef
     development_evidence_ref: ArtifactRef | None = None
+    hidden_released_at: datetime | None = None
+    hidden_public_proof: HiddenPublicProof | None = None
 
 
 def publish_reduced_g3_evaluation(
@@ -950,6 +977,7 @@ def publish_reduced_g3_evaluation(
         promotion_envelope_digest=envelope.envelope_digest,
         descriptor_scope=descriptor_scope,
         restricted_publication_receipt_ref=restricted_receipt_ref,
+        hidden_public_proof=(hidden_proofs[0] if hidden_proofs else None),
     )
 
 
@@ -1215,6 +1243,63 @@ def _evaluation_matrix(
         catalog=complete.catalog,
         catalog_digest=complete.catalog_digest,
         rows=tuple(row_by_id[item] for item in event_ids),
+    )
+
+
+def _build_competition_hidden_context(
+    *,
+    corpus: FrozenCorpus,
+    defender: LoadedDefenderBundle,
+) -> ReplayEvaluationContext:
+    """Build one authority-owned context after orchestration authenticated its runs."""
+    if (
+        type(corpus) is not FrozenCorpus
+        or type(defender) is not LoadedDefenderBundle
+        or corpus.manifest.profile_id != "defense-hidden-authority-v1"
+        or len(corpus.manifest.run_ids) != len(_FAMILIES)
+        or len(set(corpus.manifest.run_ids)) != len(_FAMILIES)
+        or {row.family for row in corpus.truth} != set(_FAMILIES)
+    ):
+        raise ValueError("hidden corpus lineage is not independently authenticated")
+    hidden_truth = tuple(
+        row.model_copy(update={"viewpoint": "hidden", "label_source": "hidden_truth"})
+        for row in corpus.truth
+    )
+    hidden = FrozenCorpus(
+        observations=corpus.observations,
+        truth=hidden_truth,
+        manifest=corpus.manifest,
+    )
+    decisions = tuple(row for row in hidden.observations if row.is_decision_point)
+    if not decisions or any(row.decision_at is None for row in decisions):
+        raise ValueError("hidden corpus has no exact decision rows")
+    earliest = min(cast(datetime, row.decision_at) for row in decisions)
+    latest_maturity = max(row.label_mature_at for row in hidden.truth)
+    split = make_evaluation_split(
+        hidden,
+        SplitConfig(
+            train_end=earliest - timedelta(seconds=3),
+            calibrator_fit_end=earliest - timedelta(seconds=2),
+            threshold_end=earliest - timedelta(seconds=1),
+            development_end=latest_maturity,
+        ),
+    )
+    event_ids = split.row_ids["development"]
+    if set(event_ids) != {row.event_id for row in hidden.truth}:
+        raise ValueError("hidden split does not cover its independent decisions")
+    matrix = _evaluation_matrix(
+        corpus=hidden,
+        split=split,
+        event_ids=event_ids,
+        catalog=defender.catalog,
+    )
+    return _descriptor_context(
+        descriptor=EvaluationDescriptor(kind=EvaluationKind.HIDDEN, value="hidden"),
+        corpus=hidden,
+        split=split,
+        event_ids=event_ids,
+        matrix=matrix,
+        defender=defender,
     )
 
 
@@ -1605,6 +1690,7 @@ def publish_competition_evaluation(
     hidden_context_ref: ArtifactRef | None = None,
     hidden_context_signer: RunSigningIdentity | None = None,
     development_evidence_ref: ArtifactRef | None = None,
+    hidden_source_binding: HiddenSourceWorkerBinding | None = None,
 ) -> PublishedG3Evaluation:
     """Run the full pooled/LOFO robustness matrix and publish Task13 evidence."""
     if corpus.manifest.profile_id == _FIXTURE_PROFILE_ID:
@@ -1627,11 +1713,17 @@ def publish_competition_evaluation(
     if hidden_requested:
         if not EvaluatorSigningIdentity.is_exact(hidden_signer):
             raise ValueError("hidden evaluation requires its private authority")
+        if type(hidden_source_binding) is not HiddenSourceWorkerBinding:
+            raise ValueError("hidden evaluation requires authenticated source evidence")
         hidden_verifier = EvaluatorReplayVerifier.from_signer(
             cast(EvaluatorSigningIdentity, hidden_signer)
         )
     else:
-        if hidden_signer is not None or hidden_context_signer is not None:
+        if (
+            hidden_signer is not None
+            or hidden_context_signer is not None
+            or hidden_source_binding is not None
+        ):
             raise ValueError("development evaluation cannot receive hidden authorities")
         hidden_verifier = evaluator_verifier
     defender_verifier = DefenderBundleVerifier(
@@ -1700,6 +1792,7 @@ def publish_competition_evaluation(
         metric_evidence = prior_request.metric_evidence
 
     hidden_proofs: tuple[HiddenPublicProof, ...] = ()
+    hidden_released_at: datetime | None = None
     if hidden_context_ref is not None:
         if type(hidden_context_signer) is not RunSigningIdentity:
             raise ValueError("hidden context requires its pinned authority signer")
@@ -1711,6 +1804,11 @@ def publish_competition_evaluation(
             development_corpus_digest=frozen_corpus_digest(corpus),
             development_event_ids=tuple(row.event_id for row in corpus.observations),
         )
+        if (
+            hidden_envelope.source_mode != "authenticated_independent_runs"
+            or hidden_envelope.source_run_count != len(_FAMILIES)
+        ):
+            raise ValueError("competition hidden context lacks authenticated source runs")
         hidden_matrix = build_feature_matrix(
             hidden_observations, pooled.defender.catalog
         )
@@ -1719,10 +1817,20 @@ def publish_competition_evaluation(
             hidden_observations, hidden_ids, as_of=hidden_envelope.as_of
         )
         authority = HiddenEvaluationAuthority(
-            defender_verifier, store, cast(EvaluatorSigningIdentity, hidden_signer)
+            defender_verifier,
+            store,
+            cast(EvaluatorSigningIdentity, hidden_signer),
+            hidden_source_binding,
         )
+        ensemble_frozen_at = max(
+            pooled.defender.manifest.frozen_at,
+            *(candidate.defender.manifest.frozen_at for candidate in lofo.values()),
+        )
+        authority_release_time = hidden_envelope.as_of
+        if authority_release_time <= ensemble_frozen_at:
+            raise ValueError("hidden authority seal does not follow defender freeze")
         capability = authority.freeze_and_issue(  # type: ignore[attr-defined]
-            pooled.attestation, issued_at=pooled.defender.manifest.frozen_at
+            pooled.attestation, issued_at=ensemble_frozen_at
         )
         hidden_result = replay_defense_arms(
             matrix=hidden_matrix,
@@ -1736,11 +1844,21 @@ def publish_competition_evaluation(
             hidden_authority=authority,
             hidden_capability=capability,
             hidden_ref=restricted_hidden_ref,
-            hidden_released_at=pooled.defender.manifest.frozen_at,
+            hidden_released_at=authority_release_time,
             hidden_sealed_at=hidden_envelope.as_of,
         )
         if type(hidden_result) is not HiddenReplayOutcome:
             raise TypeError("hidden descriptor returned a development batch")
+        hidden_released_at = validate_utc_timestamp(
+            datetime.fromisoformat(
+                hidden_result.public_proof.issued_at.replace("Z", "+00:00")
+            )
+        )
+        if (
+            hidden_released_at != authority_release_time
+            or hidden_released_at <= ensemble_frozen_at
+        ):
+            raise ValueError("hidden public proof timing differs")
         components.append(hidden_result.batch)
         hidden_proofs = (hidden_result.public_proof,)
     components.sort(
@@ -1841,6 +1959,8 @@ def publish_competition_evaluation(
         descriptor_scope=scope,
         restricted_publication_receipt_ref=restricted_receipt_ref,
         development_evidence_ref=frozen_development_ref,
+        hidden_released_at=hidden_released_at,
+        hidden_public_proof=(hidden_proofs[0] if hidden_proofs else None),
     )
 
 
@@ -1978,6 +2098,8 @@ def _published_result(
     descriptor_scope: tuple[str, ...],
     restricted_publication_receipt_ref: ArtifactRef,
     development_evidence_ref: ArtifactRef | None = None,
+    hidden_released_at: datetime | None = None,
+    hidden_public_proof: HiddenPublicProof | None = None,
 ) -> PublishedG3Evaluation:
     public = {
         name: reference.as_artifact_ref()
@@ -1993,6 +2115,8 @@ def _published_result(
         descriptor_scope=descriptor_scope,
         restricted_publication_receipt_ref=restricted_publication_receipt_ref,
         development_evidence_ref=development_evidence_ref,
+        hidden_released_at=hidden_released_at,
+        hidden_public_proof=hidden_public_proof,
     )
 
 

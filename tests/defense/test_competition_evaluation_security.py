@@ -36,6 +36,7 @@ from apar.evaluation.gates import (
     EvaluatorReplayVerifier,
     EvaluatorSigningIdentity,
 )
+from apar.evaluation.hidden_source import HiddenSourceWorkerBinding
 from apar.evaluation.metrics import LatencySample, SliceAssignment, SliceManifest
 from apar.evaluation.regimes import RegimeKind
 from apar.evaluation.replay import (
@@ -804,11 +805,14 @@ def test_competition_publisher_executes_exact_matrix_then_extends_frozen_develop
         update={"event_id": "isolated-hidden", "payment_id": "isolated-hidden-payment"}
     )
     hidden_batch = batch(EvaluationDescriptor(kind=EvaluationKind.HIDDEN, value="hidden"))
+    authority_release = datetime(2027, 2, 1, tzinfo=UTC)
 
     class FakeHiddenOutcome:
         def __init__(self) -> None:
             self.batch = hidden_batch
-            self.public_proof = object()
+            self.public_proof = SimpleNamespace(
+                issued_at=authority_release.isoformat().replace("+00:00", "Z")
+            )
 
     monkeypatch.setattr(competition, "HiddenReplayOutcome", FakeHiddenOutcome)
     monkeypatch.setattr(
@@ -820,7 +824,12 @@ def test_competition_publisher_executes_exact_matrix_then_extends_frozen_develop
         competition,
         "verify_hidden_context",
         lambda **kwargs: (
-            SimpleNamespace(as_of=datetime(2027, 2, 1, tzinfo=UTC)),
+            SimpleNamespace(
+                as_of=authority_release,
+                source_mode="authenticated_independent_runs",
+                source_run_count=4,
+                source_lineage_digest="6" * 64,
+            ),
             (hidden_observation,),
             _ref("8", "application/vnd.apar.hidden-evaluation-context+json"),
         ),
@@ -841,11 +850,29 @@ def test_competition_publisher_executes_exact_matrix_then_extends_frozen_develop
             return object()
 
     monkeypatch.setattr(competition, "HiddenEvaluationAuthority", FakeAuthority)
-    monkeypatch.setattr(
-        competition, "replay_defense_arms", lambda **_kwargs: FakeHiddenOutcome()
-    )
+    hidden_replay_inputs: list[dict[str, object]] = []
+
+    def replay_hidden(**kwargs: object) -> FakeHiddenOutcome:
+        hidden_replay_inputs.append(kwargs)
+        return FakeHiddenOutcome()
+
+    monkeypatch.setattr(competition, "replay_defense_arms", replay_hidden)
     hidden_context_ref = _ref(
         "7", "application/vnd.apar.restricted-hidden-context-envelope+json"
+    )
+    source_identity = RunSigningIdentity.from_private_bytes(b"s" * 32)
+    source_binding = HiddenSourceWorkerBinding(
+        receipt_ref=_ref(
+            "6", "application/vnd.apar.restricted-hidden-source-receipt+json"
+        ),
+        source_signer_key_id=source_identity.key_id,
+        source_public_key_base64=source_identity.public_key_base64,
+        development_run_ids=tuple(
+            f"run-{index:032x}" for index in range(200)
+        ),
+        development_event_ids=("hidden-event",),
+        development_payment_ids=("hidden-payment",),
+        development_campaign_ids=("hidden-campaign",),
     )
     publish_competition_evaluation(
         store=store,
@@ -861,7 +888,42 @@ def test_competition_publisher_executes_exact_matrix_then_extends_frozen_develop
         hidden_context_ref=hidden_context_ref,
         hidden_context_signer=hidden_context_signer,
         development_evidence_ref=development.development_evidence_ref,
+        hidden_source_binding=source_binding,
     )
     assert development_builds == 1
     assert len(envelopes[-1]) == 17
     assert len(published_scopes[-1]) == 17
+    assert hidden_replay_inputs[-1]["hidden_released_at"] == authority_release
+    assert hidden_replay_inputs[-1]["hidden_sealed_at"] == authority_release
+
+    monkeypatch.setattr(
+        competition,
+        "verify_hidden_context",
+        lambda **_kwargs: (
+            SimpleNamespace(
+                as_of=authority_release,
+                source_mode="fixture_isolation",
+                source_run_count=0,
+                source_lineage_digest="6" * 64,
+            ),
+            (hidden_observation,),
+            _ref("8", "application/vnd.apar.hidden-evaluation-context+json"),
+        ),
+    )
+    with pytest.raises(ValueError, match="authenticated source runs"):
+        publish_competition_evaluation(
+            store=store,
+            publication_signer=publication_signer,
+            evaluator_signer=evaluator_signer,
+            hidden_signer=hidden_signer,
+            pooled_ref=pooled_ref,
+            held_family_refs=held_refs,  # type: ignore[arg-type]
+            corpus=corpus,
+            split=split,  # type: ignore[arg-type]
+            profile_sha256="a" * 64,
+            authenticated_run_ids=corpus.manifest.run_ids,
+            hidden_context_ref=hidden_context_ref,
+            hidden_context_signer=hidden_context_signer,
+            development_evidence_ref=development.development_evidence_ref,
+            hidden_source_binding=source_binding,
+        )

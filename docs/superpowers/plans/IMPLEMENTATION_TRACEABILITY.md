@@ -20,13 +20,13 @@ This matrix records where each approved specification area is implemented and ho
 | Hidden validity | Simulator Task 7 | Restricted reasons and visible boolean-only result |
 | Separately implemented hidden generator | Simulator Task 7; Defense Task 6 | Static import scan prevents main-generator and defender imports; frozen hidden-run artifacts |
 | Layered defense order | Simulator Task 4; Defense Tasks 1 through 3 | Integrity precedence, timeout fallback, stable reasons, calibrated budget tests |
-| Rules and strong GBDT baselines | Defense Tasks 2 and 3 | Rules, transaction/entity, temporal, and graph-feature CatBoost evaluation |
+| Rules and strong GBDT baselines | Defense Tasks 2 and 3; frozen Task 15 evidence | Deterministic CatBoost reloads against the frozen 48-feature matrix; exhaustive matched-threshold selection records a truthful workload-infeasible `no_promotion` result |
 | Online and asynchronous processing | Defense Tasks 1, 4, and 7 | Feature checkpoint/replay and separate synchronous versus graph/case latency reports |
 | Agentic trust plane | Simulator Task 4 | Identity, signature, mandate, amount, currency, payee, cart, expiry, nonce, and receipt-chain rejection tests |
 | Event and feature data contracts | Foundation Task 2; Defense Task 1 | Versioned event envelope, distinct timestamps, feature catalog, source-event IDs, and forbidden-source tests |
 | Scoring and model output contract | Foundation Task 2; Defense Tasks 2 and 3 | Calibrated score, action, owner, reason, evidence, fallback, and latency contract tests |
 | Temporal and entity-isolated evaluation | Defense Task 5 | Whole-campaign partitions and returning/cold-entity cohort tests |
-| Operational metrics and promotion gates | Defense Tasks 5 through 7 | Value, friction, workload, reconstruction, calibration, latency, per-family, rollback, and approval gates |
+| Operational metrics and promotion gates | Defense Tasks 5 through 7; Task 15 | Workload reconstruction is load-bearing: six mandatory cases over 336 rows exceed the preregistered 1% cap, vetoing freeze/hidden release without retuning |
 | Safety, privacy, and governance | Foundation Task 4; Defense Task 7; Prototype Task 8 | Immutable artifacts, restricted exports, privacy scan, SBOM, license and secret checks |
 | Six-view product experience | Prototype Tasks 1 through 5 | Component, accessibility, and interaction tests for all six routes |
 | Five-minute judging narrative | Prototype Task 6 | Offline Playwright golden path and deterministic fallback recording |
@@ -47,4 +47,3 @@ This matrix records where each approved specification area is implemented and ho
 - `EvaluationBundle` contains both development and hidden-run results but never exposes hidden parameters to defender code.
 - `AssuranceReport` references artifacts by digest and cannot be mutated by promotion.
 - The web client consumes versioned API models and never reads `.apar/` directly.
-

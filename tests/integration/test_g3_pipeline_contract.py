@@ -353,6 +353,7 @@ def test_competition_ensemble_requires_pooled_and_four_distinct_lofo_candidates(
     """Catch a production manifest that silently relabels pooled-only as LOFO."""
     profile = load_competition_profile(PROFILE, competition=True)
     signer = RunSigningIdentity.from_private_bytes(b"g" * 32)
+    hidden_source = RunSigningIdentity.from_private_bytes(b"h" * 32)
 
     def ref(character: str) -> ArtifactRef:
         digest = character * 64
@@ -372,6 +373,8 @@ def test_competition_ensemble_requires_pooled_and_four_distinct_lofo_candidates(
         pooled_ref=ref("1"),
         held_family_refs=held,
         signer=signer,
+        hidden_source_signer_key_id=hidden_source.key_id,
+        hidden_source_public_key_base64=hidden_source.public_key_base64,
     )
 
     assert ensemble.mode == "competition_full"
@@ -397,4 +400,6 @@ def test_competition_ensemble_requires_pooled_and_four_distinct_lofo_candidates(
             pooled_ref=ref("1"),
             held_family_refs=missing_family,
             signer=signer,
+            hidden_source_signer_key_id=hidden_source.key_id,
+            hidden_source_public_key_base64=hidden_source.public_key_base64,
         )

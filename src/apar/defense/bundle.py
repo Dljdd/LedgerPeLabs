@@ -20,8 +20,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path, PurePosixPath
-from typing import Literal, NamedTuple, cast
+from typing import Literal, NamedTuple, Never, cast
 from uuid import UUID
+from weakref import WeakKeyDictionary
 
 import catboost  # type: ignore[import-untyped]
 import cryptography
@@ -53,6 +54,8 @@ from apar.features.state import FeatureVector, feature_catalog_digest
 from apar.runs.runner import RunSigningIdentity
 from apar.runs.wire import canonical_json_bytes, strict_json_loads
 from apar.storage.artifacts import ArtifactRef, ArtifactStore
+
+_TRUSTED_MODEL_DUMP = pydantic.BaseModel.model_dump
 
 GENESIS_ROLLBACK_REF = "genesis"
 _SCHEMA_VERSION = "1.0.0"
@@ -744,6 +747,25 @@ class DefenderBundleManifest(ExternalContract):
         return matching[0]
 
 
+def _trusted_manifest_document(
+    manifest: DefenderBundleManifest,
+    *,
+    include_signature: bool,
+    mode: Literal["json", "python"] = "json",
+) -> dict[str, object]:
+    """Snapshot a manifest without dispatching to mutable manifest methods."""
+    if type(manifest) is not DefenderBundleManifest:
+        raise BundleContractError("bundle manifest identity differs")
+    document = _TRUSTED_MODEL_DUMP(
+        manifest,
+        mode=mode,
+        exclude=set() if include_signature else {"signature_base64"},
+    )
+    if type(document) is not dict:
+        raise BundleContractError("bundle manifest document is invalid")
+    return cast(dict[str, object], document)
+
+
 def _validated_base64(value: object, size: int, *, label: str) -> bytes:
     if type(value) is not str:
         raise ValueError(f"{label} must be canonical base64")
@@ -796,7 +818,9 @@ class LoadedDefenderBundle:
         else:
             raise BundleContractError("loaded defender bundle is already initialized")
         snapshot = _LoadedSnapshot(
-            manifest_bytes=canonical_json_bytes(manifest.model_dump(mode="json")),
+            manifest_bytes=canonical_json_bytes(
+                _trusted_manifest_document(manifest, include_signature=True)
+            ),
             model_bytes=bytes(component_bytes["model"]),
             receipt_bytes=bytes(component_bytes["receipt"]),
             catalog_bytes=bytes(component_bytes["catalog"]),
@@ -908,6 +932,189 @@ class LoadedDefenderBundle:
             strict_json_loads(self._snapshot.reload_fixture_bytes)
         )
         _verify_reload_parity(self.scorer, self.calibrator, self.reload_matrix, fixture)
+
+
+class _BundleVerifierState(NamedTuple):
+    key_id: str
+    public_key_base64: str
+    public_key: bytes
+
+
+class _BundlePublicVerifier(tuple[_BundleVerifierState]):
+    """Minimal immutable public authority used for portable bundle reloads."""
+
+    __slots__ = ()
+
+    def __new__(
+        cls, *, key_id: str, public_key_base64: str
+    ) -> _BundlePublicVerifier:
+        checked_key_id = _validate_digest(key_id, label="bundle signer key ID")
+        public = _validated_base64(public_key_base64, 32, label="bundle public key")
+        if _digest(public) != checked_key_id:
+            raise BundleContractError("bundle public verifier identity is inconsistent")
+        return tuple.__new__(
+            cls, (_BundleVerifierState(checked_key_id, public_key_base64, public),)
+        )
+
+    def __init__(self, *, key_id: str, public_key_base64: str) -> None:
+        del key_id, public_key_base64
+
+    @property
+    def _state(self) -> _BundleVerifierState:
+        if type(self) is not _BundlePublicVerifier or tuple.__len__(self) != 1:
+            raise BundleContractError("bundle public verifier state is invalid")
+        state = tuple.__getitem__(self, 0)
+        if type(state) is not _BundleVerifierState:
+            raise BundleContractError("bundle public verifier state is invalid")
+        return state
+
+    @property
+    def key_id(self) -> str:
+        return self._state.key_id
+
+    @property
+    def public_key_base64(self) -> str:
+        return self._state.public_key_base64
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise TypeError("bundle public verifier is immutable")
+
+    def __delattr__(self, name: str) -> None:
+        del name
+        raise TypeError("bundle public verifier is immutable")
+
+    def __reduce__(self) -> Never:
+        raise TypeError("bundle public verifier cannot be serialized")
+
+    def verify(self, document: object, signature_base64: str) -> bool:
+        try:
+            signature = _validated_base64(signature_base64, 64, label="signature")
+            Ed25519PublicKey.from_public_bytes(self._state.public_key).verify(
+                signature, canonical_json_bytes(document)
+            )
+        except (InvalidSignature, TypeError, ValueError):
+            return False
+        return True
+
+
+def _new_bundle_public_verifier(
+    *, key_id: str, public_key_base64: str
+) -> _BundlePublicVerifier:
+    checked_key_id = _validate_digest(key_id, label="bundle signer key ID")
+    public = _validated_base64(public_key_base64, 32, label="bundle public key")
+    if _digest(public) != checked_key_id:
+        raise BundleContractError("bundle public verifier identity is inconsistent")
+    return tuple.__new__(
+        _BundlePublicVerifier,
+        (_BundleVerifierState(checked_key_id, public_key_base64, public),),
+    )
+
+
+class _BundleReaderState(NamedTuple):
+    store: ArtifactStore
+    verifier: _BundlePublicVerifier
+    source_root: Path
+    source_root_identity: tuple[int, int, int]
+
+
+def _bundle_reader_state_store() -> tuple[Callable[..., None], Callable[..., object]]:
+    states: WeakKeyDictionary[object, _BundleReaderState] = WeakKeyDictionary()
+
+    def register(instance: object, state: _BundleReaderState) -> None:
+        if instance in states:
+            raise TypeError("public bundle reader cannot be reinitialized")
+        states[instance] = state
+
+    def get(instance: object) -> _BundleReaderState:
+        try:
+            return states[instance]
+        except KeyError as error:
+            raise TypeError("public bundle reader identity is invalid") from error
+
+    return register, get
+
+
+_register_bundle_reader, _get_bundle_reader_state = _bundle_reader_state_store()
+
+
+def _trusted_register_bundle_reader(
+    instance: object,
+    state: _BundleReaderState,
+    _register: Callable[..., None] = _register_bundle_reader,
+) -> None:
+    _register(instance, state)
+
+
+def _trusted_bundle_reader_state(
+    instance: object,
+    _get: Callable[..., object] = _get_bundle_reader_state,
+) -> _BundleReaderState:
+    state = _get(instance)
+    if type(state) is not _BundleReaderState or tuple.__len__(state) != 4:
+        raise BundleContractError("public bundle reader state differs")
+    return state
+
+
+class _SealedBundleReaderType(type):
+    def __setattr__(cls, name: str, value: object) -> None:
+        del cls, name, value
+        raise TypeError("public bundle reader type is sealed")
+
+    def __delattr__(cls, name: str) -> None:
+        del cls, name
+        raise TypeError("public bundle reader type is sealed")
+
+
+class DefenderBundleReader(metaclass=_SealedBundleReaderType):
+    """Public-key-only capability whose trusted state lives outside the instance."""
+
+    __slots__ = ("__weakref__",)
+
+    def __init__(
+        self,
+        store: ArtifactStore,
+        *,
+        signer_key_id: str,
+        public_key_base64: str,
+        source_root: Path,
+    ) -> None:
+        if type(self) is not DefenderBundleReader or type(store) is not ArtifactStore:
+            raise BundleContractError("bundle reader inputs differ")
+        try:
+            _trusted_bundle_reader_state(self)
+        except TypeError:
+            pass
+        else:
+            raise TypeError("public bundle reader cannot be reinitialized")
+        verifier = _new_bundle_public_verifier(
+            key_id=signer_key_id,
+            public_key_base64=public_key_base64,
+        )
+        descriptor, identity = _open_source_root(source_root)
+        os.close(descriptor)
+        _trusted_register_bundle_reader(
+            self,
+            _BundleReaderState(store, verifier, source_root, identity),
+        )
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise TypeError("public bundle reader is immutable")
+
+    def __delattr__(self, name: str) -> None:
+        del name
+        raise TypeError("public bundle reader is immutable")
+
+    def __copy__(self) -> Never:
+        raise TypeError("public bundle reader cannot be copied")
+
+    def __deepcopy__(self, memo: object) -> Never:
+        del memo
+        raise TypeError("public bundle reader cannot be copied")
+
+    def __reduce__(self) -> Never:
+        raise TypeError("public bundle reader cannot be serialized")
 
 
 class DefenderBundlePublisher:
@@ -1067,12 +1274,18 @@ class DefenderBundlePublisher:
             }
             unsigned = DefenderBundleManifest.model_validate(document)
             manifest = unsigned.model_copy(
-                update={"signature_base64": self._signer.sign(unsigned.unsigned_document())}
+                update={
+                    "signature_base64": self._signer.sign(
+                        _trusted_manifest_document(unsigned, include_signature=False)
+                    )
+                }
             )
             manifest = DefenderBundleManifest.model_validate(manifest)
             if not self._verify_signature(manifest):
                 raise BundleContractError("new bundle signature did not verify")
-            payload = canonical_json_bytes(manifest.model_dump(mode="json"))
+            payload = canonical_json_bytes(
+                _trusted_manifest_document(manifest, include_signature=True)
+            )
             ref = self._store.put_bytes(payload, _BUNDLE_MEDIA)
             return manifest, ref
         except BundleContractError:
@@ -1086,7 +1299,13 @@ class DefenderBundlePublisher:
             self._require_open()
             if type(manifest) is not DefenderBundleManifest:
                 return False
-            validated = DefenderBundleManifest.model_validate(manifest.model_dump(mode="python"))
+            validated = DefenderBundleManifest.model_validate(
+                _trusted_manifest_document(
+                    manifest,
+                    include_signature=True,
+                    mode="python",
+                )
+            )
             self._load_validated(validated, ancestry_bytes=0)
             return True
         except Exception:
@@ -1103,7 +1322,9 @@ class DefenderBundlePublisher:
             payload = self._store.read(ref)
             document = strict_json_loads(payload)
             manifest = _manifest_from_document(document)
-            if canonical_json_bytes(manifest.model_dump(mode="json")) != payload:
+            if canonical_json_bytes(
+                _trusted_manifest_document(manifest, include_signature=True)
+            ) != payload:
                 raise BundleContractError("bundle manifest is not canonical")
             return self._load_validated(manifest, ancestry_bytes=ref.size_bytes)
         except BundleContractError:
@@ -1631,20 +1852,54 @@ class DefenderBundlePublisher:
         )
 
     def _verify_signature(self, manifest: DefenderBundleManifest) -> bool:
+        signer: object = self._signer
+        public_verifier_state: _BundleVerifierState | None = None
+        if type(signer) is _BundlePublicVerifier:
+            if tuple.__len__(signer) != 1:
+                return False
+            state = tuple.__getitem__(signer, 0)
+            if type(state) is not _BundleVerifierState or tuple.__len__(state) != 3:
+                return False
+            public_verifier_state = state
+            key_id = cast(str, tuple.__getitem__(state, 0))
+            public_key_base64 = cast(str, tuple.__getitem__(state, 1))
+        elif type(signer) is RunSigningIdentity:
+            key_id = signer.key_id
+            public_key_base64 = signer.public_key_base64
+        else:
+            return False
         if (
-            manifest.signer_key_id != self._signer.key_id
-            or manifest.public_key_base64 != self._signer.public_key_base64
+            manifest.signer_key_id != key_id
+            or manifest.public_key_base64 != public_key_base64
         ):
             return False
+        unsigned_document = _trusted_manifest_document(
+            manifest,
+            include_signature=False,
+        )
         try:
             public_key = _validated_base64(manifest.public_key_base64, 32, label="public key")
             signature = _validated_base64(manifest.signature_base64, 64, label="signature")
             Ed25519PublicKey.from_public_bytes(public_key).verify(
-                signature, canonical_json_bytes(manifest.unsigned_document())
+                signature, canonical_json_bytes(unsigned_document)
             )
         except (InvalidSignature, TypeError, ValueError):
             return False
-        return self._signer.verify(manifest.unsigned_document(), manifest.signature_base64)
+        if public_verifier_state is not None:
+            try:
+                public = cast(bytes, tuple.__getitem__(public_verifier_state, 2))
+                signature = _validated_base64(
+                    manifest.signature_base64, 64, label="signature"
+                )
+                Ed25519PublicKey.from_public_bytes(public).verify(
+                    signature, canonical_json_bytes(unsigned_document)
+                )
+            except (InvalidSignature, TypeError, ValueError):
+                return False
+            return True
+        if type(signer) is not RunSigningIdentity:
+            return False
+        return signer.verify(unsigned_document, manifest.signature_base64)
 
     def _read_named_component(self, manifest: DefenderBundleManifest, name: str) -> bytes:
         descriptor = manifest.component(name)
@@ -1661,6 +1916,7 @@ class DefenderBundlePublisher:
         if len(payload) != ref.size_bytes or _digest(payload) != descriptor.sha256:
             raise BundleContractError("component size or payload digest mismatch")
         return payload
+
 
     def _component_ref_for_digest(
         self, digest: str, media_type: str, size_limit: int
@@ -1684,9 +1940,255 @@ class DefenderBundlePublisher:
         payload = self._store.read(ref)
         document = strict_json_loads(payload)
         manifest = _manifest_from_document(document)
-        if canonical_json_bytes(manifest.model_dump(mode="json")) != payload:
+        if canonical_json_bytes(
+            _trusted_manifest_document(manifest, include_signature=True)
+        ) != payload:
             raise BundleContractError("rollback manifest is not canonical")
         return manifest, len(payload)
+
+
+_TRUSTED_PUBLISHER_LOAD = DefenderBundlePublisher.load
+_TRUSTED_PUBLISHER_CLOSE = DefenderBundlePublisher.close
+_TRUSTED_PUBLISHER_REQUIRE_OPEN = DefenderBundlePublisher._require_open
+_TRUSTED_PUBLISHER_LOAD_VALIDATED = DefenderBundlePublisher._load_validated
+_TRUSTED_PUBLISHER_VERIFY_ANCESTRY = DefenderBundlePublisher._verify_ancestry
+_TRUSTED_PUBLISHER_VERIFY_SIGNATURE = DefenderBundlePublisher._verify_signature
+_TRUSTED_PUBLISHER_READ_COMPONENT = DefenderBundlePublisher._read_named_component
+_TRUSTED_PUBLISHER_LOAD_MANIFEST = DefenderBundlePublisher._load_manifest_ref_with_size
+
+
+def _load_public_validated(
+    publisher: DefenderBundlePublisher,
+    manifest: DefenderBundleManifest,
+    *,
+    ancestry_bytes: int,
+) -> LoadedDefenderBundle:
+    """Verify every truth-free component while retaining the signed split binding."""
+    _TRUSTED_PUBLISHER_VERIFY_ANCESTRY(
+        publisher,
+        manifest,
+        visited=set(),
+        depth=0,
+        cumulative_bytes=ancestry_bytes,
+    )
+    component_bytes = {
+        name: _TRUSTED_PUBLISHER_READ_COMPONENT(publisher, manifest, name)
+        for name in sorted(_COMPONENT_FIELD_MEDIA)
+        if name != "split"
+    }
+    catalog = FeatureCatalog.model_validate(strict_json_loads(component_bytes["catalog"]))
+    feature_semantic = _validate_catalog(catalog)
+    if feature_semantic != manifest.feature_semantic_digest:
+        raise BundleContractError("feature catalog semantic digest mismatch")
+    receipt = TrainingReceipt.model_validate(strict_json_loads(component_bytes["receipt"]))
+    scorer = CatBoostScorer.from_bytes(component_bytes["model"], receipt)
+    if receipt.catalog_digest != feature_semantic:
+        raise BundleContractError("training receipt catalog mismatch")
+    rules = RuleManifest.model_validate(strict_json_loads(component_bytes["rules"]))
+    if rule_manifest_digest(rules) != manifest.rule_semantic_digest:
+        raise BundleContractError("rule manifest semantic digest mismatch")
+    calibrator = ProbabilityCalibrator.from_json(component_bytes["calibration"])
+    threshold = ThresholdReport.from_json(component_bytes["threshold"])
+    if not threshold.feasible or threshold.thresholds is None:
+        raise BundleContractError("frozen threshold report is infeasible")
+    environment = EnvironmentLock.model_validate(
+        strict_json_loads(component_bytes["environment"])
+    )
+    source_inventory = SourceInventory.model_validate(
+        strict_json_loads(component_bytes["source_inventory"])
+    )
+    _validate_environment(environment, scorer, calibrator)
+    _validate_source_inventory(
+        publisher._source_root_fd,
+        publisher._source_root_identity,
+        source_inventory,
+    )
+    training = _matrix_from_parquet(component_bytes["training_matrix"], catalog)
+    calibration_fit = _matrix_from_parquet(component_bytes["calibration_fit_matrix"], catalog)
+    calibration_selection = _matrix_from_parquet(
+        component_bytes["calibration_selection_matrix"], catalog
+    )
+    threshold_matrix = _matrix_from_parquet(component_bytes["threshold_matrix"], catalog)
+    reload_matrix = _matrix_from_parquet(component_bytes["reload_matrix"], catalog)
+    matrices = {
+        "training": (training, manifest.training_matrix_semantic_digest),
+        "calibration fit": (
+            calibration_fit,
+            manifest.calibration_fit_matrix_semantic_digest,
+        ),
+        "calibration selection": (
+            calibration_selection,
+            manifest.calibration_selection_matrix_semantic_digest,
+        ),
+        "threshold": (threshold_matrix, manifest.threshold_matrix_semantic_digest),
+        "reload": (reload_matrix, manifest.reload_matrix_semantic_digest),
+    }
+    for label, (matrix, semantic_digest) in matrices.items():
+        if _matrix_semantic_digest(matrix) != semantic_digest:
+            raise BundleContractError(f"{label} matrix semantic digest mismatch")
+
+    training_binding = TrainingBindingReceipt.model_validate(
+        strict_json_loads(component_bytes["training_binding"])
+    )
+    calibration_binding = CalibrationBindingReceipt.model_validate(
+        strict_json_loads(component_bytes["calibration_binding"])
+    )
+    threshold_binding = ThresholdBindingReceipt.model_validate(
+        strict_json_loads(component_bytes["threshold_binding"])
+    )
+    split_semantic = training_binding.split_semantic_digest
+    if any(
+        binding.split_artifact_digest != manifest.split_artifact_digest
+        or binding.split_semantic_digest != split_semantic
+        for binding in (training_binding, calibration_binding, threshold_binding)
+    ):
+        raise BundleContractError("public split binding receipt is inconsistent")
+    _verify_training_binding(
+        training_binding,
+        manifest,
+        split_semantic,
+        receipt,
+        training,
+        component_bytes,
+    )
+    fit_probabilities = scorer.predict(calibration_fit)
+    selection_probabilities = scorer.predict(calibration_selection)
+    calibration_expected = {
+        "split_artifact_digest": manifest.split_artifact_digest,
+        "split_semantic_digest": split_semantic,
+        "model_digest": manifest.model_digest,
+        "fit_matrix_digest": manifest.calibration_fit_matrix_digest,
+        "fit_matrix_semantic_digest": manifest.calibration_fit_matrix_semantic_digest,
+        "fit_row_ids_digest": _row_ids_digest(
+            tuple(row.event_id for row in calibration_fit.rows)
+        ),
+        "fit_probability_scores_digest": _numeric_array_digest(fit_probabilities),
+        "selection_matrix_digest": manifest.calibration_selection_matrix_digest,
+        "selection_matrix_semantic_digest": (
+            manifest.calibration_selection_matrix_semantic_digest
+        ),
+        "selection_row_ids_digest": _row_ids_digest(
+            tuple(row.event_id for row in calibration_selection.rows)
+        ),
+        "selection_probability_scores_digest": _numeric_array_digest(
+            selection_probabilities
+        ),
+        "calibration_artifact_digest": _digest(component_bytes["calibration"]),
+        "calibration_state_digest": calibrator.artifact.artifact_digest,
+    }
+    calibration_document = calibration_binding.model_dump(mode="python")
+    if any(calibration_document[name] != value for name, value in calibration_expected.items()):
+        raise BundleContractError("public calibration binding receipt is inconsistent")
+
+    threshold_probabilities = scorer.predict(threshold_matrix)
+    threshold_calibrated = calibrator.predict(threshold_probabilities)
+    rule_engine = RuleEngine(rules)
+    rule_scores = np.asarray(
+        [
+            rule_engine.evaluate(event, row).score
+            for event, row in zip(
+                threshold_matrix.events,
+                threshold_matrix.rows,
+                strict=True,
+            )
+        ],
+        dtype=np.float64,
+    )
+    layered = np.maximum(rule_scores, threshold_calibrated)
+    threshold_expected = {
+        "split_artifact_digest": manifest.split_artifact_digest,
+        "split_semantic_digest": split_semantic,
+        "model_digest": manifest.model_digest,
+        "matrix_digest": manifest.threshold_matrix_digest,
+        "matrix_semantic_digest": manifest.threshold_matrix_semantic_digest,
+        "row_ids_digest": _row_ids_digest(
+            tuple(row.event_id for row in threshold_matrix.rows)
+        ),
+        "model_probability_scores_digest": _numeric_array_digest(
+            threshold_probabilities
+        ),
+        "calibrated_scores_digest": _numeric_array_digest(layered),
+        "mandatory_actions_digest": _actions_digest(
+            np.asarray(threshold_binding.mandatory_actions, dtype=object)
+        ),
+        "threshold_artifact_digest": _digest(component_bytes["threshold"]),
+        "threshold_report_digest": threshold.report_digest,
+        "callback_contract_version": _CALLBACK_CONTRACT_VERSION,
+    }
+    threshold_document = threshold_binding.model_dump(mode="python")
+    if any(threshold_document[name] != value for name, value in threshold_expected.items()):
+        raise BundleContractError("public threshold binding receipt is inconsistent")
+    if (
+        threshold.input_scores_digest != threshold_binding.calibrated_scores_digest
+        or threshold.input_labels_digest != threshold_binding.labels_digest
+        or threshold.input_mandatory_actions_digest
+        != threshold_binding.mandatory_actions_digest
+        or threshold.input_values_digest != threshold_binding.values_digest
+    ):
+        raise BundleContractError("public threshold report input binding is inconsistent")
+    fixture = _ReloadFixture.model_validate(
+        strict_json_loads(component_bytes["reload_fixture"])
+    )
+    if fixture.matrix_semantic_digest != manifest.reload_matrix_semantic_digest:
+        raise BundleContractError("reload fixture matrix binding mismatch")
+    _verify_reload_parity(scorer, calibrator, reload_matrix, fixture)
+    return LoadedDefenderBundle(manifest=manifest, component_bytes=component_bytes)
+
+
+def load_verified_defender_bundle(
+    reader: DefenderBundleReader,
+    ref: ArtifactRef,
+) -> LoadedDefenderBundle:
+    """Load through closure-pinned public state, never through mutable reader fields."""
+    if type(reader) is not DefenderBundleReader:
+        raise BundleContractError("public bundle reader identity differs")
+    state = _trusted_bundle_reader_state(reader)
+    store = cast(ArtifactStore, tuple.__getitem__(state, 0))
+    verifier = cast(_BundlePublicVerifier, tuple.__getitem__(state, 1))
+    source_root = cast(Path, tuple.__getitem__(state, 2))
+    source_identity = cast(tuple[int, int, int], tuple.__getitem__(state, 3))
+    descriptor, identity = _open_source_root(source_root)
+    if identity != source_identity:
+        os.close(descriptor)
+        raise BundleContractError("public bundle reader source root changed")
+    class _EphemeralPublicLoader(DefenderBundlePublisher):
+        __slots__ = ()
+
+        load = _TRUSTED_PUBLISHER_LOAD
+        close = _TRUSTED_PUBLISHER_CLOSE
+        _require_open = _TRUSTED_PUBLISHER_REQUIRE_OPEN
+        _load_validated = _TRUSTED_PUBLISHER_LOAD_VALIDATED
+        _verify_ancestry = _TRUSTED_PUBLISHER_VERIFY_ANCESTRY
+        _verify_signature = _TRUSTED_PUBLISHER_VERIFY_SIGNATURE
+        _read_named_component = _TRUSTED_PUBLISHER_READ_COMPONENT
+        _load_manifest_ref_with_size = _TRUSTED_PUBLISHER_LOAD_MANIFEST
+
+    publisher = object.__new__(_EphemeralPublicLoader)
+    object.__setattr__(publisher, "_store", store)
+    object.__setattr__(publisher, "_signer", cast(RunSigningIdentity, verifier))
+    object.__setattr__(publisher, "_source_root_fd", descriptor)
+    object.__setattr__(publisher, "_source_root_identity", identity)
+    object.__setattr__(publisher, "_closed", False)
+    try:
+        if type(ref) is not ArtifactRef or ref.media_type != _BUNDLE_MEDIA:
+            raise BundleContractError("bundle reference has an invalid type or media type")
+        if ref.size_bytes > _MAX_BUNDLE_BYTES:
+            raise BundleContractError("bundle reference exceeds its size limit")
+        payload = store.read(ref)
+        manifest = _manifest_from_document(strict_json_loads(payload))
+        if canonical_json_bytes(
+            _trusted_manifest_document(manifest, include_signature=True)
+        ) != payload:
+            raise BundleContractError("bundle manifest is not canonical")
+        loaded = _load_public_validated(
+            publisher,
+            manifest,
+            ancestry_bytes=ref.size_bytes,
+        )
+        loaded.verify_reload()
+        return loaded
+    finally:
+        _TRUSTED_PUBLISHER_CLOSE(publisher)
 
 
 @dataclass(frozen=True, slots=True)

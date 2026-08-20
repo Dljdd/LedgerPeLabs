@@ -5,15 +5,18 @@ from __future__ import annotations
 import hashlib
 import inspect
 import os
+import pickle
 import platform
 import sys
 import sysconfig
 from contextlib import suppress
+from copy import copy, deepcopy
 from dataclasses import FrozenInstanceError, dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import cast
+from uuid import uuid4
 
 import catboost  # type: ignore[import-untyped]
 import numpy as np
@@ -34,6 +37,7 @@ from apar.defense.bundle import (
     CalibrationBindingReceipt,
     DefenderBundleManifest,
     DefenderBundlePublisher,
+    DefenderBundleReader,
     EnvironmentLock,
     InstalledDistribution,
     SourceInventory,
@@ -42,6 +46,7 @@ from apar.defense.bundle import (
     TrainingBindingReceipt,
     build_source_inventory,
     current_environment_lock,
+    load_verified_defender_bundle,
 )
 from apar.defense.calibration import ProbabilityCalibrator, select_calibrator
 from apar.defense.contracts import ObservedEvent
@@ -447,6 +452,140 @@ def test_valid_publish_load_is_deterministic_and_reproduces_all_scores(
         atol=0.0,
     )
     assert strict_json_loads(bundle_fixture.store.read(ref)) == manifest.model_dump(mode="json")
+
+
+def test_public_key_only_reader_reloads_but_cannot_freeze(
+    bundle_fixture: BundleFixture,
+    tmp_path: Path,
+) -> None:
+    manifest, ref = bundle_fixture.publisher.freeze(**bundle_fixture.kwargs)
+    reader = DefenderBundleReader(
+        bundle_fixture.store,
+        signer_key_id=bundle_fixture.signer.key_id,
+        public_key_base64=bundle_fixture.signer.public_key_base64,
+        source_root=bundle_fixture.source_root,
+    )
+    loaded = load_verified_defender_bundle(reader, ref)
+    np.testing.assert_allclose(
+        loaded.scorer.predict(loaded.reload_matrix),
+        bundle_fixture.scorer.predict(bundle_fixture.reload_matrix),
+        rtol=0.0,
+        atol=0.0,
+    )
+    public_store = ArtifactStore(tmp_path / "public-artifacts")
+    public_ref = public_store.put_bytes(bundle_fixture.store.read(ref), ref.media_type)
+    for component in manifest.components:
+        if component.name == "split":
+            continue
+        component_ref = bundle_fixture.store.resolve(component.sha256)
+        copied = public_store.put_bytes(
+            bundle_fixture.store.read(component_ref),
+            component_ref.media_type,
+        )
+        assert copied == component_ref
+    with pytest.raises(ValueError, match="does not exist"):
+        public_store.resolve(manifest.split_artifact_digest)
+    public_reader = DefenderBundleReader(
+        public_store,
+        signer_key_id=bundle_fixture.signer.key_id,
+        public_key_base64=bundle_fixture.signer.public_key_base64,
+        source_root=bundle_fixture.source_root,
+    )
+    public_loaded = load_verified_defender_bundle(public_reader, public_ref)
+    public_loaded.verify_reload()
+    np.testing.assert_array_equal(
+        public_loaded.scorer.predict(public_loaded.reload_matrix),
+        loaded.scorer.predict(loaded.reload_matrix),
+    )
+    with pytest.raises((AttributeError, TypeError)):
+        object.__setattr__(reader, "_signer", RunSigningIdentity.from_private_bytes(b"x" * 32))
+    with pytest.raises((AttributeError, TypeError)):
+        object.__delattr__(reader, "_signer")
+    with pytest.raises(TypeError, match="reinitialized"):
+        reader.__init__(
+            bundle_fixture.store,
+            signer_key_id=RunSigningIdentity.from_private_bytes(b"x" * 32).key_id,
+            public_key_base64=RunSigningIdentity.from_private_bytes(
+                b"x" * 32
+            ).public_key_base64,
+            source_root=bundle_fixture.source_root,
+        )
+    for operation in (copy, deepcopy):
+        with pytest.raises(TypeError, match="cannot be copied"):
+            operation(reader)
+    for protocol in range(pickle.HIGHEST_PROTOCOL + 1):
+        with pytest.raises(TypeError, match="cannot be serialized"):
+            pickle.dumps(reader, protocol=protocol)
+    attacker = RunSigningIdentity.from_private_bytes(b"x" * 32)
+    attacker_manifest = _resign(
+        manifest,
+        attacker,
+        signer_key_id=attacker.key_id,
+        public_key_base64=attacker.public_key_base64,
+    )
+    attacker_ref = bundle_fixture.store.put_bytes(
+        canonical_json_bytes(attacker_manifest.model_dump(mode="json")),
+        bundle_module._BUNDLE_MEDIA,
+    )
+    original_verify = bundle_module._BundlePublicVerifier.verify
+    original_key_id = bundle_module._BundlePublicVerifier.key_id
+    original_public_key = bundle_module._BundlePublicVerifier.public_key_base64
+    original_publisher_load = DefenderBundlePublisher.load
+    original_publisher_verify = DefenderBundlePublisher._verify_signature
+    original_unsigned_document = DefenderBundleManifest.unsigned_document
+    forged_manifest = manifest.model_copy(update={"bundle_id": str(uuid4())})
+    forged_ref = bundle_fixture.store.put_bytes(
+        canonical_json_bytes(forged_manifest.model_dump(mode="json")),
+        bundle_module._BUNDLE_MEDIA,
+    )
+    type.__setattr__(bundle_module._BundlePublicVerifier, "verify", lambda *_args: True)
+    type.__setattr__(
+        bundle_module._BundlePublicVerifier,
+        "key_id",
+        property(lambda _self: attacker.key_id),
+    )
+    type.__setattr__(
+        bundle_module._BundlePublicVerifier,
+        "public_key_base64",
+        property(lambda _self: attacker.public_key_base64),
+    )
+    type.__setattr__(DefenderBundlePublisher, "load", lambda *_args: object())
+    type.__setattr__(DefenderBundlePublisher, "_verify_signature", lambda *_args: True)
+    type.__setattr__(
+        DefenderBundleManifest,
+        "unsigned_document",
+        lambda _self: original_unsigned_document(manifest),
+    )
+    try:
+        assert load_verified_defender_bundle(reader, ref).manifest == manifest
+        with pytest.raises(BundleContractError, match="signature"):
+            load_verified_defender_bundle(reader, attacker_ref)
+        with pytest.raises(BundleContractError, match="signature"):
+            load_verified_defender_bundle(reader, forged_ref)
+    finally:
+        type.__setattr__(bundle_module._BundlePublicVerifier, "verify", original_verify)
+        type.__setattr__(bundle_module._BundlePublicVerifier, "key_id", original_key_id)
+        type.__setattr__(
+            bundle_module._BundlePublicVerifier,
+            "public_key_base64",
+            original_public_key,
+        )
+        type.__setattr__(DefenderBundlePublisher, "load", original_publisher_load)
+        type.__setattr__(
+            DefenderBundlePublisher, "_verify_signature", original_publisher_verify
+        )
+        type.__setattr__(
+            DefenderBundleManifest,
+            "unsigned_document",
+            original_unsigned_document,
+        )
+    with pytest.raises(BundleContractError, match="identity"):
+        DefenderBundleReader(
+            bundle_fixture.store,
+            signer_key_id="0" * 64,
+            public_key_base64=manifest.public_key_base64,
+            source_root=bundle_fixture.source_root,
+        )
 
 
 def test_loaded_mutable_contracts_are_copy_on_access_and_cannot_change_signed_state(

@@ -211,16 +211,26 @@ def _hidden_imports(tree: ast.AST) -> tuple[tuple[int, str], ...]:
             else:
                 found.append((node.lineno, "<unresolved-dynamic-import>"))
         elif isinstance(node, ast.Attribute):
-            if (
+            exact_immutable_primitive = (
+                _call_name(node.value) in {"object", "tuple"}
+                and node.attr
+                in {"__getitem__", "__len__", "__new__", "__setattr__"}
+            )
+            if not exact_immutable_primitive and (
+                (
                 node.attr.startswith("__")
                 and node.attr.endswith("__")
                 and node.attr
                 not in {"__version__", "__name__", "__getattribute__", "__setattr__"}
-            ) or (
-                node.attr in {"__dict__", "__globals__", "__builtins__", "__import__"}
-            ) or (
-                node.attr == "import_module"
-                and _call_name(node.value) in importlib_names
+                )
+                or (
+                    node.attr
+                    in {"__dict__", "__globals__", "__builtins__", "__import__"}
+                )
+                or (
+                    node.attr == "import_module"
+                    and _call_name(node.value) in importlib_names
+                )
             ):
                 found.append((node.lineno, "<import-dunder-reflection>"))
         elif isinstance(node, ast.Subscript) and (

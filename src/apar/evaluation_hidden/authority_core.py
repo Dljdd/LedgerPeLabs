@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import secrets
 import threading
@@ -26,6 +27,7 @@ from apar.evaluation.gates import (
     ReplayResult,
     VerifiedReplayBatch,
 )
+from apar.evaluation.hidden_source import HiddenSourceWorkerBinding
 from apar.evaluation_hidden.worker_client import (
     EvaluatorWorkerClient,
     EvaluatorWorkerManifest,
@@ -345,10 +347,13 @@ class HiddenEvaluationAuthority(metaclass=_SealedType):
         verifier: DefenderBundleVerifier,
         restricted_store: ArtifactStore,
         evaluator_signer: EvaluatorSigningIdentity,
+        hidden_source_binding: HiddenSourceWorkerBinding | None = None,
     ) -> HiddenEvaluationAuthority:
         if cls is not HiddenEvaluationAuthority:
             raise HiddenBoundaryError("hidden authority cannot be constructed externally")
-        return _new_authority(verifier, restricted_store, evaluator_signer)
+        return _new_authority(
+            verifier, restricted_store, evaluator_signer, hidden_source_binding
+        )
 
     def __setattr__(self, name: str, value: object) -> None:
         del name, value
@@ -375,10 +380,46 @@ class _HiddenProductView(Protocol):
     evaluation_lineage_digest: str
 
 
+_HiddenSourceSnapshot = tuple[
+    tuple[str, str, int, str],
+    str,
+    str,
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+]
+
+
+def _snapshot_hidden_source_binding(
+    binding: HiddenSourceWorkerBinding | None,
+) -> _HiddenSourceSnapshot | None:
+    if binding is None:
+        return None
+    if type(binding) is not HiddenSourceWorkerBinding:
+        raise HiddenBoundaryError("hidden authority source binding is invalid")
+    source_ref = binding.receipt_ref
+    return (
+        (
+            source_ref.sha256,
+            source_ref.media_type,
+            source_ref.size_bytes,
+            source_ref.relative_path,
+        ),
+        binding.source_signer_key_id,
+        binding.source_public_key_base64,
+        tuple(binding.development_run_ids),
+        tuple(binding.development_event_ids),
+        tuple(binding.development_payment_ids),
+        tuple(binding.development_campaign_ids),
+    )
+
+
 def _new_authority(
     verifier: DefenderBundleVerifier,
     restricted_store: ArtifactStore,
     evaluator_signer: EvaluatorSigningIdentity,
+    hidden_source_binding: HiddenSourceWorkerBinding | None,
 ) -> HiddenEvaluationAuthority:
     if type(verifier) is not DefenderBundleVerifier:
         raise HiddenBoundaryError("hidden authority requires the exact neutral verifier")
@@ -386,10 +427,17 @@ def _new_authority(
         raise HiddenBoundaryError("hidden authority requires an exact restricted store")
     if not EvaluatorSigningIdentity.is_exact(evaluator_signer):
         raise HiddenBoundaryError("hidden authority requires an exact evaluator signer")
+    if (
+        hidden_source_binding is not None
+        and type(hidden_source_binding) is not HiddenSourceWorkerBinding
+    ):
+        raise HiddenBoundaryError("hidden authority source binding is invalid")
 
     trusted_verifier = verifier
     trusted_store = restricted_store
     trusted_signer = evaluator_signer
+    trusted_hidden_source = hidden_source_binding
+    hidden_source_snapshot = _snapshot_hidden_source_binding(hidden_source_binding)
     evaluator_verifier = EvaluatorReplayVerifier.from_signer(trusted_signer)
     worker_manifest = EvaluatorWorkerManifest.create(trusted_signer)
     worker_client = EvaluatorWorkerClient(worker_manifest, evaluator_verifier)
@@ -450,8 +498,9 @@ def _new_authority(
             verifier: DefenderBundleVerifier,
             restricted_store: ArtifactStore,
             evaluator_signer: EvaluatorSigningIdentity,
+            hidden_source_binding: HiddenSourceWorkerBinding | None = None,
         ) -> _BoundAuthority:
-            del cls, verifier, restricted_store, evaluator_signer
+            del cls, verifier, restricted_store, evaluator_signer, hidden_source_binding
             raise HiddenBoundaryError("hidden authority cannot be constructed externally")
 
         def __init__(
@@ -459,6 +508,7 @@ def _new_authority(
             verifier: DefenderBundleVerifier,
             restricted_store: ArtifactStore,
             evaluator_signer: EvaluatorSigningIdentity,
+            hidden_source_binding: HiddenSourceWorkerBinding | None = None,
         ) -> None:
             nonlocal initialized
             if (
@@ -467,6 +517,7 @@ def _new_authority(
                 or verifier is not trusted_verifier
                 or restricted_store is not trusted_store
                 or evaluator_signer is not trusted_signer
+                or hidden_source_binding is not trusted_hidden_source
             ):
                 raise HiddenBoundaryError("hidden authority is already initialized")
             initialized = True
@@ -620,6 +671,9 @@ def _new_authority(
                     "release_sequence": sequence,
                     "released_at": _time_wire(release_time),
                     "sealed_at": _time_wire(seal_time),
+                    "hidden_source": _hidden_source_request_document(
+                        hidden_source_snapshot
+                    ),
                 }
                 response = worker_client.invoke(request)
                 outcome = _public_outcome_from_worker(
@@ -653,6 +707,166 @@ class _WorkerAttestationView(NamedTuple):
     bundle_manifest_digest: str
 
 
+def _hidden_source_request_document(
+    snapshot: _HiddenSourceSnapshot | None,
+) -> dict[str, object] | None:
+    """Materialize a worker document only from construction-time primitives."""
+    if snapshot is None:
+        return None
+    reference, key_id, public_key, run_ids, event_ids, payment_ids, campaign_ids = (
+        snapshot
+    )
+    sha256, media_type, size_bytes, relative_path = reference
+    return {
+        "development_campaign_ids": list(campaign_ids),
+        "development_event_ids": list(event_ids),
+        "development_payment_ids": list(payment_ids),
+        "development_run_ids": list(run_ids),
+        "receipt_ref": {
+            "media_type": media_type,
+            "relative_path": relative_path,
+            "sha256": sha256,
+            "size_bytes": size_bytes,
+        },
+        "source_public_key_base64": public_key,
+        "source_signer_key_id": key_id,
+    }
+
+
+def _verify_hidden_source_worker(
+    *,
+    store: ArtifactStore,
+    restricted_ref: ArtifactRef,
+    restricted_payload: bytes,
+    source_document: object,
+    sealed_at_wire: str,
+) -> None:
+    """Reassemble independent runs only inside the isolated restricted worker."""
+    if hashlib.sha256(restricted_payload).hexdigest() != restricted_ref.sha256:
+        raise HiddenBoundaryError("hidden restricted context digest differs")
+    expected = {
+        "development_campaign_ids",
+        "development_event_ids",
+        "development_payment_ids",
+        "development_run_ids",
+        "receipt_ref",
+        "source_public_key_base64",
+        "source_signer_key_id",
+    }
+    if type(source_document) is not dict or set(source_document) != expected:
+        raise HiddenBoundaryError("hidden source worker binding fields differ")
+    source = cast(dict[str, object], source_document)
+    collections: dict[str, tuple[str, ...]] = {}
+    for name in (
+        "development_campaign_ids",
+        "development_event_ids",
+        "development_payment_ids",
+        "development_run_ids",
+    ):
+        value = source[name]
+        if type(value) is not list or any(type(item) is not str for item in value):
+            raise HiddenBoundaryError("hidden source identity binding differs")
+        collections[name] = tuple(cast(list[str], value))
+    if (
+        len(collections["development_run_ids"]) != 200
+        or len(set(collections["development_run_ids"])) != 200
+    ):
+        raise HiddenBoundaryError("hidden source development runs differ")
+    from apar.evaluation.hidden_source import (
+        HIDDEN_SOURCE_RECEIPT_MEDIA_TYPE,
+        HiddenSourceReceipt,
+        ordered_ids_digest,
+    )
+    receipt_ref = _ref_from_document(source["receipt_ref"])
+    if receipt_ref.media_type != HIDDEN_SOURCE_RECEIPT_MEDIA_TYPE:
+        raise HiddenBoundaryError("hidden source receipt reference differs")
+    try:
+        source_key_id = _exact_digest_field(source["source_signer_key_id"])
+        public_key_base64 = cast(str, source["source_public_key_base64"])
+        public_key = base64.b64decode(public_key_base64, validate=True)
+        if len(public_key) != 32 or hashlib.sha256(public_key).hexdigest() != source_key_id:
+            raise HiddenBoundaryError("hidden source authority identity differs")
+    except (TypeError, ValueError, binascii.Error) as error:
+        raise HiddenBoundaryError("hidden source authority identity differs") from error
+    receipt_payload = store.read(receipt_ref)
+    try:
+        receipt = HiddenSourceReceipt.model_validate_json(receipt_payload)
+        receipt_signature = base64.b64decode(
+            receipt.signature_base64, validate=True
+        )
+        Ed25519PublicKey.from_public_bytes(public_key).verify(
+            receipt_signature,
+            canonical_json_bytes(receipt.unsigned_document()),
+        )
+    except (InvalidSignature, TypeError, ValueError, binascii.Error) as error:
+        raise HiddenBoundaryError("hidden source receipt is invalid") from error
+    if (
+        canonical_json_bytes(receipt.model_dump(mode="json")) != receipt_payload
+        or receipt.signer_key_id != source_key_id
+        or receipt.public_key_base64 != public_key_base64
+        or receipt.hidden_context_digest != restricted_ref.sha256
+        or _time_wire(receipt.authority_as_of) != sealed_at_wire
+        or receipt.development_run_ids_digest
+        != ordered_ids_digest(collections["development_run_ids"])
+        or receipt.development_event_ids_digest
+        != ordered_ids_digest(collections["development_event_ids"])
+        or receipt.development_payment_ids_digest
+        != ordered_ids_digest(collections["development_payment_ids"])
+        or receipt.development_campaign_ids_digest
+        != ordered_ids_digest(collections["development_campaign_ids"])
+        or set(receipt.run_ids).intersection(collections["development_run_ids"])
+    ):
+        raise HiddenBoundaryError("hidden source receipt worker lineage differs")
+    from apar.evaluation.contracts import CorpusManifest, FrozenCorpus
+    from apar.evaluation.regimes import frozen_corpus_digest
+    from apar.evaluation.replay import ReplayEvaluationContext
+
+    context = ReplayEvaluationContext.from_json(restricted_payload)
+    corpus = FrozenCorpus(
+        observations=context.observations,
+        truth=context.truth,
+        manifest=CorpusManifest(
+            profile_id="defense-hidden-authority-v1",
+            run_ids=receipt.run_ids,
+            run_lineage_digests=receipt.run_lineage_digests,
+            observation_count=len(context.observations),
+            truth_count=len(context.truth),
+        ),
+    )
+    campaigns_by_family = {
+        family: {row.campaign_id for row in context.truth if row.family == family}
+        for family in receipt.families
+    }
+    if (
+        frozen_corpus_digest(corpus) != receipt.hidden_corpus_digest
+        or {row.event_id for row in corpus.observations}.intersection(
+            collections["development_event_ids"]
+        )
+        or {row.payment_id for row in corpus.truth}.intersection(
+            collections["development_payment_ids"]
+        )
+        or {row.campaign_id for row in corpus.truth}.intersection(
+            collections["development_campaign_ids"]
+        )
+        or {row.family for row in corpus.truth} != set(receipt.families)
+        or any(len(campaigns_by_family[family]) != 1 for family in receipt.families)
+        or len({row.campaign_id for row in context.truth}) != 4
+        or any(
+            row.viewpoint != "hidden" or row.label_source != "hidden_truth"
+            for row in context.truth
+        )
+        or {row.event_id for row in context.truth}
+        != {row.event_id for row in context.observations if row.is_decision_point}
+    ):
+        raise HiddenBoundaryError("hidden source corpus worker lineage differs")
+    if (
+        _time_wire(context.as_of) != sealed_at_wire
+        or context.evaluation.kind.value != "hidden"
+        or context.evaluation.value != "hidden"
+    ):
+        raise HiddenBoundaryError("hidden restricted context differs from source corpus")
+
+
 def _isolated_worker_main(document: object) -> dict[str, object]:
     """Resolve and evaluate restricted truth only inside the pinned worker process."""
     if type(document) is not dict:
@@ -675,6 +889,7 @@ def _isolated_worker_main(document: object) -> dict[str, object]:
         "release_sequence",
         "released_at",
         "sealed_at",
+        "hidden_source",
     }
     if set(request) != expected or request["schema_version"] != "1.0.0":
         raise HiddenBoundaryError("isolated worker request field set is invalid")
@@ -751,6 +966,14 @@ def _isolated_worker_main(document: object) -> dict[str, object]:
         raise HiddenBoundaryError("restricted hidden payload is not canonical JSON") from error
     if canonical_json_bytes(parsed) != payload:
         raise HiddenBoundaryError("restricted hidden payload is not canonical JSON")
+    if request["hidden_source"] is not None:
+        _verify_hidden_source_worker(
+            store=store,
+            restricted_ref=restricted_ref,
+            restricted_payload=payload,
+            source_document=request["hidden_source"],
+            sealed_at_wire=sealed_at_wire,
+        )
     product = replay_module._evaluate_hidden_worker_document(request["frozen"], payload)
     if _time_wire(product.evaluator_as_of) != sealed_at_wire:
         raise HiddenBoundaryError("hidden evaluator time differs from sealed release time")

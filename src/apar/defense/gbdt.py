@@ -394,7 +394,10 @@ def train_gbdt(
                 model.predict_proba(_pool(validation_data))[:, 1], dtype=np.float64
             )
             _validate_probabilities(probabilities, len(fold.validation_ids))
-            average_precision = float(average_precision_score(validation_labels, probabilities))
+            average_precision = _normalize_unit_metric(
+                float(average_precision_score(validation_labels, probabilities)),
+                label="average precision",
+            )
             legitimate_fpr = _legitimate_fpr(
                 validation_labels, probabilities, config.fpr_probability_threshold
             )
@@ -704,6 +707,14 @@ def _validate_folds(
 def _require_both_classes(labels: Mapping[str, int], ids: Sequence[str], *, label: str) -> None:
     if {labels[row_id] for row_id in ids} != {0, 1}:
         raise ModelContractError(f"{label} must contain both classes")
+
+
+def _normalize_unit_metric(value: float, *, label: str) -> float:
+    """Normalize only machine-precision drift from a mathematically unit metric."""
+    tolerance = 8.0 * math.ulp(1.0)
+    if not math.isfinite(value) or value < -tolerance or value > 1.0 + tolerance:
+        raise ModelContractError(f"{label} must be finite and inside [0, 1]")
+    return min(1.0, max(0.0, value))
 
 
 def _balanced_class_weights(labels: Mapping[str, int], ids: Sequence[str]) -> tuple[float, float]:

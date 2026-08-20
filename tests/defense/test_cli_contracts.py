@@ -392,6 +392,31 @@ def test_training_derives_mandatory_rule_ids_for_model_exclusion() -> None:
     assert mandatory_ids == ("mandatory",)
 
 
+def test_threshold_case_observations_neutralize_nondecision_timestamps() -> None:
+    """Keep Task10's observation contract exact for lifecycle context rows."""
+    select = _contract("_case_observations")
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    decision = _event("selected", now)
+    unrelated = _event("unrelated", now + timedelta(seconds=1))
+    settlement = _event("settlement", now + timedelta(seconds=2)).model_copy(
+        update={
+            "event_type": EventKind.SETTLEMENT,
+            "is_decision_point": False,
+        }
+    )
+
+    observations = select(
+        (decision, unrelated, settlement),
+        (decision.event_id,),
+    )
+
+    assert tuple(row.event_id for row in observations) == (
+        decision.event_id,
+        settlement.event_id,
+    )
+    assert observations[1].decision_at is None
+
+
 def test_rolling_folds_keep_equal_time_campaign_cohorts_whole_and_causal() -> None:
     """Catch index-based folds that split simultaneous campaigns or one class."""
     build_folds = _contract("_rolling_campaign_folds")
@@ -432,6 +457,54 @@ def test_rolling_folds_keep_equal_time_campaign_cohorts_whole_and_causal() -> No
         assert fit_times.isdisjoint(validation_times)
         assert {labels[row_id] for row_id in fold.fit_ids} == {False, True}
         assert {labels[row_id] for row_id in fold.validation_ids} == {False, True}
+
+
+def test_rolling_folds_skip_boundaries_inside_overlapping_campaign_intervals() -> None:
+    """Catch first-decision grouping that crosses a still-active campaign."""
+    build_folds = _contract("_rolling_campaign_folds")
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    campaigns = tuple(
+        f"campaign-{group}-{member}" for group in range(5) for member in range(4)
+    )
+    row_ids = tuple(f"row-{campaign}" for campaign in campaigns)
+    row_campaigns = dict(zip(row_ids, campaigns, strict=True))
+    campaign_starts = {
+        campaign: start
+        + timedelta(days=8 * int(campaign.split("-")[1]))
+        + timedelta(seconds=10 * int(campaign.split("-")[2]))
+        for campaign in campaigns
+    }
+    campaign_ends = {
+        campaign: campaign_starts[campaign]
+        + timedelta(minutes=90 - 10 * int(campaign.split("-")[2]))
+        for campaign in campaigns
+    }
+    labels = {
+        row_id: int(campaign.split("-")[2]) % 2 == 1
+        for row_id, campaign in zip(row_ids, campaigns, strict=True)
+    }
+    split = SimpleNamespace(
+        campaigns={"train": campaigns},
+        row_campaigns=row_campaigns,
+        row_is_fraud=labels,
+        training_row_ids=row_ids,
+    )
+
+    folds = build_folds(
+        split,
+        campaign_start_times=campaign_starts,
+        campaign_end_times=campaign_ends,
+    )
+
+    assert len(folds) >= 2
+    for fold in folds:
+        fit_campaigns = {row_campaigns[row_id] for row_id in fold.fit_ids}
+        validation_campaigns = {
+            row_campaigns[row_id] for row_id in fold.validation_ids
+        }
+        assert max(campaign_ends[item] for item in fit_campaigns) < min(
+            campaign_starts[item] for item in validation_campaigns
+        )
 
 
 def test_production_ensemble_requires_pooled_and_four_distinct_lofo_roles() -> None:

@@ -537,6 +537,23 @@ def test_fold_result_rejects_undefined_or_nonfinite_metrics() -> None:
         )
 
 
+def test_training_normalizes_machine_precision_average_precision_roundoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep an exact perfect PR-AUC representable inside its closed unit interval."""
+    import apar.defense.gbdt as gbdt_module
+
+    monkeypatch.setattr(
+        gbdt_module,
+        "average_precision_score",
+        lambda *_args, **_kwargs: 1.0000000000000002,
+    )
+
+    scorer = _train()
+
+    assert {row.average_precision for row in scorer.receipt.fold_results} == {1.0}
+
+
 @pytest.mark.parametrize("mutation", ("missing", "extra", "reordered", "duplicate", "nonfinite"))
 def test_training_rejects_any_feature_matrix_contract_mutation(mutation: str) -> None:
     matrix = _matrix()
