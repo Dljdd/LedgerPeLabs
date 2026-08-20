@@ -672,13 +672,13 @@ def test_apar_package_evaluator_import_fails_preexecution(tmp_path: Path) -> Non
     assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
 
 
-def test_relative_public_v2_protocol_import_remains_admissible(tmp_path: Path) -> None:
-    """Relative syntax may still name the versioned data-only protocol contract."""
+def test_legacy_evaluator_v2_protocol_import_fails_closed(tmp_path: Path) -> None:
+    """The legacy evaluator package is never defender-visible, even for v2 data."""
     _write_defender_source(tmp_path, "from ..evaluation import v2_protocol\n")
 
     report = verify_v2_preexecution(tmp_path, signed_preregistration())
 
-    assert "HIDDEN_IMPORT_BOUNDARY" not in report.codes
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
 
 
 def test_sensitive_versioned_evaluator_import_fails_closed(tmp_path: Path) -> None:
@@ -694,43 +694,19 @@ def test_sensitive_versioned_evaluator_import_fails_closed(tmp_path: Path) -> No
 
 def test_public_v2_protocol_import_remains_admissible(tmp_path: Path) -> None:
     """A versioned data-only protocol contract remains defender-visible."""
-    _write_defender_source(tmp_path, "from apar.evaluation.v2_protocol import V2Protocol\n")
+    _write_defender_source(tmp_path, "from apar.v2_protocol import V2Protocol\n")
 
     report = verify_v2_preexecution(tmp_path, signed_preregistration())
 
     assert "HIDDEN_IMPORT_BOUNDARY" not in report.codes
 
 
-@pytest.mark.parametrize("malicious_relative", ("__init__.py", "v2_protocol.py"))
-def test_public_v2_protocol_module_and_package_are_scanned(
-    tmp_path: Path, malicious_relative: str
-) -> None:
-    """The one public evaluator contract cannot hide code in its import chain."""
-    _write_defender_source(
-        tmp_path, "from apar.evaluation.v2_protocol import V2Protocol\n"
-    )
-    evaluation = tmp_path / "src/apar/evaluation"
-    evaluation.mkdir(parents=True)
-    (evaluation / "__init__.py").write_text("", encoding="utf-8")
-    (evaluation / "v2_protocol.py").write_text("V2Protocol = object\n", encoding="utf-8")
-    (evaluation / malicious_relative).write_text(
-        "namespace = (lambda: None).__globals__\n",
-        encoding="utf-8",
-    )
-
-    report = verify_v2_preexecution(tmp_path, signed_preregistration())
-
-    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
-
-
 def test_present_public_v2_protocol_must_match_pinned_bytes(tmp_path: Path) -> None:
     """Even capability-safe replacement bytes cannot impersonate the public contract."""
-    _write_defender_source(
-        tmp_path, "from apar.evaluation.v2_protocol import V2Protocol\n"
-    )
-    evaluation = tmp_path / "src/apar/evaluation"
-    evaluation.mkdir(parents=True)
-    (evaluation / "v2_protocol.py").write_text(
+    _write_defender_source(tmp_path, "from apar.v2_protocol import V2Protocol\n")
+    package = tmp_path / "src/apar"
+    package.mkdir(parents=True, exist_ok=True)
+    (package / "v2_protocol.py").write_text(
         "V2Protocol = object\n", encoding="utf-8"
     )
 

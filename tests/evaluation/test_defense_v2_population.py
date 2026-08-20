@@ -13,8 +13,8 @@ from apar.evaluation.v2_population import (
     build_benign_base,
     inject_frozen_campaigns,
 )
-from apar.evaluation.v2_protocol import PrevalenceStratum, SeedCommitment, V2Protocol
 from apar.runs.wire import canonical_json_bytes
+from apar.v2_protocol import PrevalenceStratum, SeedCommitment, V2Protocol
 
 FAMILIES = (
     "agentic_intent_abuse",

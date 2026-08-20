@@ -17,7 +17,7 @@ from pydantic import Field, field_validator, model_validator
 from apar.contracts._validation import ExternalContract
 from apar.evaluation.v2_controls import ControlValidity, V2ControlContext
 from apar.evaluation.v2_preexecution import V2VerifiedAuthority
-from apar.evaluation.v2_protocol import V2Protocol
+from apar.v2_protocol import V2Protocol
 
 if TYPE_CHECKING:
     from apar.cases.v2_workload import ActionWorkload

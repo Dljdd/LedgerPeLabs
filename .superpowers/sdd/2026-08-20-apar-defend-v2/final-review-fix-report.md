@@ -1057,3 +1057,88 @@ Complete repository regression suite:
 Frozen V1 source, feature, fixture, and experiment-document paths have no diff;
 `git diff --check` is clean. No V2 evaluation or durable receipt/result was
 created.
+
+## Final hardening round 12
+
+### Scope and implementation
+
+- Relocated the defender-visible protocol implementation to
+  `apar.v2_protocol`, outside the evaluator package and behind the inert
+  `apar` package initializer.
+- Removed the public protocol's dependency on `apar.runs.wire` by giving the
+  isolated contract a minimal strict canonical JSON codec. A fresh process can
+  now import the protocol without loading any `apar.evaluation`, `apar.runs`, or
+  `apar.redteam` module.
+- Updated every v2 production consumer and test to the isolated path. The old
+  `apar.evaluation.v2_protocol` module is an evaluator-only compatibility
+  re-export and is explicitly forbidden to defender source.
+- Recursively scans the new public module, inert package initializer, and local
+  dependency leaves. The public module and initializer remain verifier-owned
+  path/SHA pins, so replacement bytes fail regardless of otherwise-safe syntax.
+- Updated the v2 design's process-isolation contract; no V1 source, fixture, or
+  experiment artifact changed.
+
+### RED evidence
+
+The required module did not exist before relocation, so a fresh-process import
+failed immediately:
+
+```text
+.venv/bin/pytest -q tests/evaluation/test_defense_v2_protocol.py \
+  -k public_protocol_import_does_not_load
+1 failed, 9 deselected in 0.83s
+```
+
+At the same time the legacy evaluator path remained admitted while the new
+isolated path was rejected by the scanner:
+
+```text
+.venv/bin/pytest -q tests/evaluation/test_defense_v2_preexecution.py \
+  -k 'legacy_evaluator_v2_protocol or public_v2_protocol_import_remains_admissible'
+2 failed, 100 deselected in 0.50s
+```
+
+### GREEN evidence
+
+Protocol isolation and complete preexecution regression:
+
+```text
+.venv/bin/pytest -q \
+  tests/evaluation/test_defense_v2_protocol.py \
+  tests/evaluation/test_defense_v2_preexecution.py
+112 passed in 9.44s
+
+PYTHONPATH=src .venv/bin/python -c \
+  'import sys; import apar.v2_protocol; ...'
+loaded forbidden modules: []
+```
+
+Static and read-only verification:
+
+```text
+.venv/bin/ruff check <all changed Python source and tests>
+All checks passed!
+
+.venv/bin/mypy \
+  src/apar/v2_protocol.py \
+  src/apar/evaluation/v2_protocol.py \
+  src/apar/evaluation/v2_preregistration.py \
+  src/apar/evaluation/v2_population.py \
+  src/apar/evaluation/v2_selection.py \
+  src/apar/evaluation/v2_preexecution.py
+Success: no issues found in 6 source files
+
+.venv/bin/python scripts/verify_defense_v2_preexecution.py
+{"admissible":true,"codes":[],"status":"not_executed"}
+```
+
+Complete repository regression suite:
+
+```text
+.venv/bin/pytest -q
+1919 passed, 1 skipped in 567.35s (0:09:27)
+```
+
+Frozen V1 source, feature, fixture, and experiment-document paths have no diff;
+`git diff --check` is clean. No V2 evaluation or durable receipt/result was
+created.

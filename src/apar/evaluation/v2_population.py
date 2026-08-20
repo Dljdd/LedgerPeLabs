@@ -16,8 +16,8 @@ from apar.contracts._validation import ExternalContract, validate_utc_timestamp
 from apar.contracts.events import EventKind, Rail
 from apar.defense.contracts import ObservedEvent
 from apar.evaluation.contracts import EvaluationTruthRow, Family
-from apar.evaluation.v2_protocol import PrevalenceStratum, SeedCommitment, V2Protocol
 from apar.runs.wire import canonical_json_bytes
+from apar.v2_protocol import PrevalenceStratum, SeedCommitment, V2Protocol
 
 _BASE_START = datetime(2026, 1, 1, tzinfo=UTC)
 _INJECTION_START = datetime(2026, 1, 1, 12, tzinfo=UTC)

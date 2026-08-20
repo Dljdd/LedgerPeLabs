@@ -277,16 +277,20 @@ only the exact public data-contract modules, feature namespace, and v2 protocol
 contract named by the verifier; every allowed local import is scanned
 recursively. Every other defender-reachable Python file must use only the
 verifier's explicit AST-node, attribute, and static-import allowlists. Dynamic
-imports, lambdas,
-dunder access, runtime-introspection modules, reflection, dynamic code, and any
+imports, lambdas, dunder access, runtime-introspection modules, reflection,
+dynamic code, and any
 syntax or capability absent from those allowlists fail admission. The same rule
 applies transitively to reachable feature and local package modules.
 
-The sole public evaluator import, `apar.evaluation.v2_protocol`, is not exempt
-from graph closure. Its module and executable `apar.evaluation` package
-initializer must both match verifier-pinned SHA-256 values and are scanned as
-reachable source. All other evaluator modules remain forbidden terminal nodes;
-the scanner neither admits nor recursively inventories them.
+The defender-visible protocol lives at `apar.v2_protocol`, outside the evaluator
+package. Its `apar` package initializer is inert, and the protocol owns a small
+strict JSON codec rather than importing the `apar.runs` transport layer. A fresh
+process importing this contract must load no `apar.evaluation`, `apar.runs`, or
+`apar.redteam` module. The module, its package initializer, and every local
+dependency leaf are recursively scanned; the public module and initializer must
+also match verifier-pinned SHA-256 values. The legacy
+`apar.evaluation.v2_protocol` compatibility path and every other evaluator
+module remain forbidden terminal nodes for defender code.
 
 An eventual v2 evaluator must also enforce an operating-system process boundary:
 defender code runs in a fresh process whose address space has never loaded

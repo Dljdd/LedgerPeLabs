@@ -19,7 +19,6 @@ from apar.evaluation.v2_controls import (
     run_score_permutation_control,
 )
 from apar.evaluation.v2_preregistration import V2Preregistration, sign_v2_preregistration
-from apar.evaluation.v2_protocol import V2Protocol
 from apar.evaluation.v2_selection import (
     ArmThresholdCandidate,
     BootstrapMetricContribution,
@@ -31,6 +30,7 @@ from apar.evaluation.v2_selection import (
     evaluate_v2_gates,
     select_v2_thresholds,
 )
+from apar.v2_protocol import V2Protocol
 from tests.evaluation.v2_authority import EphemeralV2Authority, ephemeral_v2_authority
 
 AUTHORITY = ephemeral_v2_authority(verified=True)

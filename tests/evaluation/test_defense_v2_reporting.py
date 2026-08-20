@@ -7,7 +7,6 @@ from pathlib import Path
 import pytest
 
 from apar.evaluation.v2_preregistration import ExecutionReceipt, V2Preregistration
-from apar.evaluation.v2_protocol import load_v2_protocol
 from apar.evaluation.v2_reporting import (
     DefenseV2GateReport,
     DefenseV2Scorecard,
@@ -19,6 +18,7 @@ from apar.evaluation.v2_reporting import (
 )
 from apar.evaluation.v2_selection import V2GateOutcome
 from apar.runs.wire import canonical_json_bytes
+from apar.v2_protocol import load_v2_protocol
 from tests.evaluation.v2_authority import ephemeral_v2_authority
 
 ROOT = Path(__file__).resolve().parents[2]

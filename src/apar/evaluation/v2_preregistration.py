@@ -19,8 +19,8 @@ from pydantic import ValidationError, field_validator, model_validator
 
 from apar.contracts._validation import ExternalContract
 from apar.evaluation.gates import EvaluatorSigningIdentity
-from apar.evaluation.v2_protocol import SeedCommitment
 from apar.runs.wire import WireContractError, canonical_json_bytes, strict_json_loads
+from apar.v2_protocol import SeedCommitment
 
 _HEX = frozenset("0123456789abcdef")
 SyntheticScope = Literal[
