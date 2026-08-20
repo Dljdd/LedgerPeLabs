@@ -459,6 +459,58 @@ def test_mutated_container_and_for_bound_reflection_fail_closed(
     assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
 
 
+@pytest.mark.parametrize(
+    "source",
+    (
+        "import sys\nevaluator = sys.modules['apar.evaluation.v2_preexecution']\n",
+        "import sys as runtime\nevaluator = runtime.modules.get(\n"
+        "    'apar.evaluation.v2_preexecution'\n)\n",
+        "import sys\nevaluator = getattr(sys, 'modules')[\n"
+        "    'apar.evaluation.v2_preexecution'\n]\n",
+        "import sys\nevaluator = vars(sys)['modules'][\n"
+        "    'apar.evaluation.v2_preexecution'\n]\n",
+        "import sys\nevaluator = sys.__dict__['modules'][\n"
+        "    'apar.evaluation.v2_preexecution'\n]\n",
+        "import sys\nsys.meta_path.append(object())\n",
+        "from sys import modules as loaded\n"
+        "evaluator = loaded['apar.evaluation.v2_preexecution']\n",
+        "import importlib\nruntime = importlib.import_module('sys')\n"
+        "evaluator = runtime.modules['apar.evaluation.v2_preexecution']\n",
+        "import sys\nmodules = sys.__getattribute__('modules')\n"
+        "evaluator = modules['apar.evaluation.v2_preexecution']\n",
+        "import sys\nmodules = object.__getattribute__(sys, 'modules')\n"
+        "evaluator = modules['apar.evaluation.v2_preexecution']\n",
+        "import sys\nmodules = sys.__getattr__('modules')\n"
+        "evaluator = modules['apar.evaluation.v2_preexecution']\n",
+    ),
+)
+def test_sys_import_authority_reflection_fails_closed(
+    tmp_path: Path, source: str
+) -> None:
+    """The loaded-module registry and interpreter import hooks are evaluator authority."""
+    _write_defender_source(tmp_path, source)
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
+def test_transitive_feature_sys_modules_access_fails_closed(tmp_path: Path) -> None:
+    """A reachable feature cannot recover evaluator internals through sys.modules."""
+    _write_defender_source(tmp_path, "from apar.features import loaded_evaluator\n")
+    features = tmp_path / "src/apar/features"
+    features.mkdir(parents=True)
+    (features / "loaded_evaluator.py").write_text(
+        "import sys as runtime\n"
+        "evaluator = runtime.modules['apar.evaluation.v2_preexecution']\n",
+        encoding="utf-8",
+    )
+
+    report = verify_v2_preexecution(tmp_path, signed_preregistration())
+
+    assert "HIDDEN_IMPORT_BOUNDARY" in report.codes
+
+
 def test_transitive_feature_python_symlink_fails_closed(tmp_path: Path) -> None:
     """Reachable Python inventory cannot hide behind a same-content symlink."""
     _write_defender_source(tmp_path, "from apar.features import linked\n")

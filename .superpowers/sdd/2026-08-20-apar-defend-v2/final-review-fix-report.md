@@ -679,3 +679,85 @@ The final read-only preexecution script returned
 `{"admissible":true,"codes":[],"status":"not_executed"}`. Frozen V1 source,
 feature, fixture, and experiment-document paths have no diff; `git diff --check`
 is clean. No V2 evaluation or durable receipt/result was created.
+
+## Final hardening round 7
+
+### Scope and implementation
+
+- Added explicit static tracking for direct and aliased `sys` module roots in every
+  defender and defender-reachable feature module.
+- Made interpreter import authority fail closed: `sys.modules`, `sys.meta_path`,
+  `sys.path_hooks`, `sys.path_importer_cache`, `sys.__dict__`, `vars(sys)`,
+  constant or computed `getattr(sys, ...)`, `from sys import modules`, and dynamic
+  loading of `sys` are rejected.
+- Closed dunder reflection paths through `sys.__getattribute__`, `sys.__getattr__`,
+  and generic calls such as `object.__getattribute__(sys, ...)`.
+- Propagated simple `sys` aliases while rejecting laundering through destructuring,
+  assignment expressions, defaults, containers, loops, comprehensions, augmented
+  assignments, and arbitrary call arguments. Legitimate frozen-V1 access to
+  `sys.implementation`, `sys.byteorder`, stdout, and stderr remains admissible.
+
+### RED evidence
+
+The initial exact loaded-module/import-hook probes all bypassed the boundary:
+
+```text
+.venv/bin/pytest tests/evaluation/test_defense_v2_preexecution.py \
+  -q -k 'sys_import_authority or transitive_feature_sys_modules'
+7 failed, 71 deselected in 0.56s
+```
+
+After direct/aliased registry handling, two additional acquisition paths remained
+and were captured before implementation:
+
+```text
+.venv/bin/pytest tests/evaluation/test_defense_v2_preexecution.py \
+  -q -k sys_import_authority
+2 failed, 6 passed, 72 deselected in 2.64s
+```
+
+The exact `sys.__getattribute__` and `sys.__getattr__` probes then demonstrated the
+dunder-reflection gap before it was closed:
+
+```text
+.venv/bin/pytest tests/evaluation/test_defense_v2_preexecution.py \
+  -q -k sys_import_authority
+2 failed, 9 passed, 72 deselected in 0.37s
+```
+
+### GREEN evidence
+
+Exact direct, aliased, dynamic, dunder, and transitive feature probes:
+
+```text
+.venv/bin/pytest tests/evaluation/test_defense_v2_preexecution.py \
+  -q -k 'sys_import_authority or transitive_feature_sys_modules'
+12 passed, 71 deselected in 0.30s
+```
+
+Complete preexecution scanner suite and static checks:
+
+```text
+.venv/bin/pytest tests/evaluation/test_defense_v2_preexecution.py -q
+83 passed in 9.10s
+
+.venv/bin/ruff check \
+  src/apar/evaluation/v2_preexecution.py \
+  tests/evaluation/test_defense_v2_preexecution.py
+All checks passed!
+
+.venv/bin/mypy src/apar/evaluation/v2_preexecution.py
+Success: no issues found in 1 source file
+```
+
+Complete repository regression suite:
+
+```text
+.venv/bin/pytest -q
+1899 passed, 1 skipped in 558.51s (0:09:18)
+```
+
+The final read-only preexecution script returned
+`{"admissible":true,"codes":[],"status":"not_executed"}`. Frozen V1 source,
+feature, fixture, and experiment-document paths have no diff; `git diff --check`
+is clean. No V2 evaluation or durable receipt/result was created.

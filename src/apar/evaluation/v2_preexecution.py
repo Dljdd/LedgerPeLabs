@@ -53,6 +53,17 @@ _V2_EVALUATOR_INTERNALS = frozenset(
         "apar.evaluation.v2_selection",
     }
 )
+_SYS_IMPORT_AUTHORITY_FIELDS = frozenset(
+    {
+        "__dict__",
+        "__getattr__",
+        "__getattribute__",
+        "meta_path",
+        "modules",
+        "path_hooks",
+        "path_importer_cache",
+    }
+)
 _FROZEN_V1_EVALUATION_IMPORTS = frozenset(
     {
         ("bundle.py", "apar.evaluation.splits"),
@@ -477,7 +488,16 @@ def _contains_disallowed_import(
         getattr_aliases,
         vars_aliases,
     ) = _import_bindings(tree)
+    sys_aliases = _sys_bindings(tree)
     for node in ast.walk(tree):
+        if _has_sys_import_authority_reflection(
+            node,
+            sys_aliases,
+            builtins_aliases,
+            getattr_aliases,
+            vars_aliases,
+        ):
+            return True
         if _has_untrusted_authority_reflection(
             node,
             importlib_aliases,
@@ -510,11 +530,119 @@ def _contains_disallowed_import(
             if not node.args or not isinstance(node.args[0], ast.Constant):
                 return True
             module_value = node.args[0].value
-            if not isinstance(module_value, str) or _is_disallowed_module(
-                module_value, forbidden, allowed_prefix
+            if (
+                not isinstance(module_value, str)
+                or module_value == "sys"
+                or _is_disallowed_module(module_value, forbidden, allowed_prefix)
             ):
                 return True
     return False
+
+
+def _sys_bindings(tree: ast.AST) -> set[str]:
+    aliases = {
+        name.asname or "sys"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for name in node.names
+        if name.name == "sys"
+    }
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            value: ast.expr | None = None
+            targets: tuple[ast.expr, ...] = ()
+            if isinstance(node, ast.Assign):
+                value = node.value
+                targets = tuple(node.targets)
+            elif isinstance(node, ast.AnnAssign):
+                value = node.value
+                targets = (node.target,)
+            if value is None or not _has_sys_root(value, aliases):
+                continue
+            for target in targets:
+                if isinstance(target, ast.Name) and target.id not in aliases:
+                    aliases.add(target.id)
+                    changed = True
+    return aliases
+
+
+def _has_sys_import_authority_reflection(
+    node: ast.AST,
+    sys_aliases: set[str],
+    builtins_aliases: set[str],
+    getattr_aliases: set[str],
+    vars_aliases: set[str],
+) -> bool:
+    """Reject access to interpreter registries that can recover evaluator modules."""
+    if isinstance(node, ast.ImportFrom) and node.module == "sys":
+        return any(name.name in _SYS_IMPORT_AUTHORITY_FIELDS for name in node.names)
+    if isinstance(node, ast.Attribute):
+        return node.attr in _SYS_IMPORT_AUTHORITY_FIELDS and _has_sys_root(
+            node.value, sys_aliases
+        )
+    if isinstance(node, ast.Call):
+        is_getattr = (
+            isinstance(node.func, ast.Name) and node.func.id in getattr_aliases
+        ) or _is_qualified_builtins_function(
+            node.func, builtins_aliases, vars_aliases, "getattr"
+        )
+        is_vars = (
+            isinstance(node.func, ast.Name) and node.func.id in vars_aliases
+        ) or _is_qualified_builtins_function(
+            node.func, builtins_aliases, vars_aliases, "vars"
+        )
+        if is_vars and len(node.args) == 1 and _has_sys_root(node.args[0], sys_aliases):
+            return True
+        if is_getattr and node.args and _has_sys_root(node.args[0], sys_aliases):
+            if len(node.args) < 2 or not isinstance(node.args[1], ast.Constant):
+                return True
+            return node.args[1].value in _SYS_IMPORT_AUTHORITY_FIELDS
+    if isinstance(node, ast.Subscript):
+        root = _reflection_mapping_root(node.value, vars_aliases)
+        if _has_sys_root(root, sys_aliases):
+            return not isinstance(node.slice, ast.Constant) or (
+                node.slice.value in _SYS_IMPORT_AUTHORITY_FIELDS
+            )
+    return _has_unsupported_sys_binding(node, sys_aliases)
+
+
+def _has_unsupported_sys_binding(node: ast.AST, sys_aliases: set[str]) -> bool:
+    def contains(value: ast.expr) -> bool:
+        if _has_sys_root(value, sys_aliases):
+            return True
+        if isinstance(value, ast.Attribute) and _has_sys_root(value.value, sys_aliases):
+            return value.attr in _SYS_IMPORT_AUTHORITY_FIELDS
+        return any(
+            contains(child)
+            for child in ast.iter_child_nodes(value)
+            if isinstance(child, ast.expr)
+        )
+
+    if isinstance(node, ast.Assign) and contains(node.value):
+        direct = _has_sys_root(node.value, sys_aliases)
+        return not direct or any(not isinstance(target, ast.Name) for target in node.targets)
+    if isinstance(node, ast.AnnAssign) and node.value is not None and contains(node.value):
+        return not _has_sys_root(node.value, sys_aliases) or not isinstance(
+            node.target, ast.Name
+        )
+    if isinstance(node, (ast.NamedExpr, ast.AugAssign)):
+        return contains(node.value)
+    if isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+        return contains(node.iter)
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        defaults = (*node.args.defaults, *(item for item in node.args.kw_defaults if item))
+        return any(contains(item) for item in defaults)
+    if isinstance(node, ast.Call):
+        return any(
+            contains(item) for item in (*node.args, *(kw.value for kw in node.keywords))
+        )
+    return False
+
+
+def _has_sys_root(value: ast.expr, sys_aliases: set[str]) -> bool:
+    return isinstance(value, ast.Name) and value.id in sys_aliases
 
 
 def _has_untrusted_authority_reflection(
