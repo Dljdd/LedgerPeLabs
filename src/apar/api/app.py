@@ -12,6 +12,12 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from apar import __version__
 from apar.config import Settings
+from apar.evaluation.gates import EvaluatorReplayVerifier
+from apar.evaluation.service import (
+    DefenseEvaluationService,
+    EvaluationExecutor,
+    UnavailableEvaluationExecutor,
+)
 from apar.registry.repository import ThreatRepository
 from apar.runs import RunRunner, RunSigningIdentity
 from apar.storage.artifacts import ArtifactStore
@@ -84,16 +90,45 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         signer=signer,
         run_index_root=run_state_root / "runs",
     )
+    evaluator_verifier = app.state.evaluator_verifier
+    hidden_proof_verifier = app.state.hidden_proof_verifier
+    if evaluator_verifier is None:
+        evaluator_verifier = EvaluatorReplayVerifier(
+            signer_key_id=signer.key_id,
+            public_key_base64=signer.public_key_base64,
+        )
+        hidden_proof_verifier = evaluator_verifier
+    app.state.defense_service = DefenseEvaluationService(
+        artifact_store=app.state.artifact_store,
+        signer=signer,
+        evaluator_verifier=evaluator_verifier,
+        hidden_proof_verifier=hidden_proof_verifier,
+        executor=app.state.defense_executor,
+    )
     yield
 
 
-def create_app(settings: Settings) -> FastAPI:
+def create_app(
+    settings: Settings,
+    *,
+    defense_executor: EvaluationExecutor | None = None,
+    evaluator_verifier: EvaluatorReplayVerifier | None = None,
+    hidden_proof_verifier: EvaluatorReplayVerifier | None = None,
+) -> FastAPI:
     """Build an unbound local API application for the supplied settings."""
+    from apar.api.routes.defense import router as defense_router
     from apar.api.routes.health import router as health_router
     from apar.api.routes.registry import router as registry_router
     from apar.api.routes.runs import router as runs_router
     from apar.api.routes.scenarios import router as scenarios_router
 
+    if (evaluator_verifier is None) != (hidden_proof_verifier is None):
+        raise TypeError("both defense evaluator authorities must be supplied together")
+    if evaluator_verifier is not None and (
+        type(evaluator_verifier) is not EvaluatorReplayVerifier
+        or type(hidden_proof_verifier) is not EvaluatorReplayVerifier
+    ):
+        raise TypeError("defense evaluator authorities must be exact pinned verifiers")
     app = FastAPI(
         title="APAR API",
         version=__version__,
@@ -102,10 +137,18 @@ def create_app(settings: Settings) -> FastAPI:
         lifespan=_lifespan,
     )
     app.state.settings = settings
+    app.state.defense_executor = (
+        defense_executor
+        if defense_executor is not None
+        else UnavailableEvaluationExecutor()
+    )
+    app.state.evaluator_verifier = evaluator_verifier
+    app.state.hidden_proof_verifier = hidden_proof_verifier
     app.add_exception_handler(ApiError, _api_error_handler)
     app.add_exception_handler(RequestValidationError, _validation_error_handler)
     app.add_exception_handler(StarletteHTTPException, _http_error_handler)
     app.include_router(health_router)
+    app.include_router(defense_router)
     app.include_router(registry_router)
     app.include_router(scenarios_router)
     app.include_router(runs_router)
