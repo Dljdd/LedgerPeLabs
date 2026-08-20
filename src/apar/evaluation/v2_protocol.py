@@ -44,6 +44,8 @@ class PrevalenceStratum(ExternalContract):
             raise ValueError("invalid frozen family allocation")
         if sum(self.family_transaction_counts) != self.fraud_transaction_count:
             raise ValueError("invalid frozen family allocation")
+        if len(set(self.family_transaction_counts)) != 1:
+            raise ValueError("invalid equal family allocation")
         if self.fraud_transaction_count > self.transaction_count:
             raise ValueError("fraud transactions exceed denominator")
         return self
@@ -103,6 +105,12 @@ class V2Protocol(ExternalContract):
                 raise ValueError("invalid frozen production strata")
             if self.operating.transaction_count != 100_000:
                 raise ValueError("invalid frozen production denominator")
+            if self.operating.day_count != 28:
+                raise ValueError("production profile requires 28 synthetic days")
+            if any(item.transaction_count != 100_000 for item in self.strata):
+                raise ValueError("invalid production stratum denominator")
+            if self.v1_roots != _V1_ROOTS:
+                raise ValueError("invalid frozen v1 root mapping")
         for path, digest in self.v1_roots.items():
             _digest(digest, field=f"v1_roots[{path}]")
         return self

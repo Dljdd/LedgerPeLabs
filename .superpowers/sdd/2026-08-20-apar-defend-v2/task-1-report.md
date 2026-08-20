@@ -22,3 +22,10 @@
 ## Concerns
 
 - The requested frozen-v1 test command cannot complete in this environment because `pyarrow` is not installed. The new protocol tests pass independently.
+
+## Review round 1/5 fixes
+
+- RED: three regression tests initially failed for mutable production day/stratum denominators, substituted/omitted v1 root mappings, and unequal family allocations.
+- GREEN: `python -m pytest tests/evaluation/test_defense_v2_protocol.py -q` passed: 8 tests.
+- Production validation now requires 28 synthetic days, 100,000 transactions in every stratum, exact equality with the hard-coded v1 root mapping, and equal four-family allocations.
+- The frozen-v1 environment concern remains unchanged: `pyarrow` is unavailable for collection of the frozen suite.

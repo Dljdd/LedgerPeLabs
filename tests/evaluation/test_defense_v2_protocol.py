@@ -70,3 +70,48 @@ def test_unknown_and_duplicate_strata_are_rejected(tmp_path: Path) -> None:
     path.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")))
     with pytest.raises(V2ProtocolError, match="strata"):
         load_v2_protocol(path)
+
+
+def _rewrite_profile(tmp_path: Path, mutate: object) -> Path:
+    document = json.loads(PROFILE.read_bytes())
+    mutate(document)
+    unsigned = dict(document)
+    unsigned.pop("profile_sha256", None)
+    document["profile_sha256"] = hashlib.sha256(
+        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    path = tmp_path / "profile.json"
+    path.write_bytes(json.dumps(document, sort_keys=True, separators=(",", ":")).encode())
+    return path
+
+
+def test_production_day_and_stratum_denominators_are_sealed(tmp_path: Path) -> None:
+    path = _rewrite_profile(tmp_path, lambda d: d["operating"].update(day_count=1))
+    with pytest.raises(V2ProtocolError, match="28 synthetic days"):
+        load_v2_protocol(path)
+
+    path = _rewrite_profile(tmp_path, lambda d: d["strata"][0].update(transaction_count=99_999))
+    with pytest.raises(V2ProtocolError, match="stratum denominator"):
+        load_v2_protocol(path)
+
+
+def test_declared_v1_roots_must_match_frozen_mapping(tmp_path: Path) -> None:
+    path = _rewrite_profile(
+        tmp_path,
+        lambda d: d["v1_roots"].update({"docs/experiments/defense-v1-result.json": "0" * 64}),
+    )
+    with pytest.raises(V2ProtocolError, match="frozen v1 root mapping"):
+        load_v2_protocol(path)
+
+    path = _rewrite_profile(tmp_path, lambda d: d["v1_roots"].pop("docs/experiments/defense-v1-result.json"))
+    with pytest.raises(V2ProtocolError, match="frozen v1 root mapping"):
+        load_v2_protocol(path)
+
+
+def test_family_allocation_must_be_equal(tmp_path: Path) -> None:
+    path = _rewrite_profile(
+        tmp_path,
+        lambda d: d["strata"][0].update(family_transaction_counts=[24, 25, 25, 26]),
+    )
+    with pytest.raises(V2ProtocolError, match="equal family allocation"):
+        load_v2_protocol(path)
