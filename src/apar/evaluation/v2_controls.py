@@ -11,11 +11,13 @@ from collections.abc import Sequence
 from typing import Callable, Literal
 
 import numpy as np
-from pydantic import model_validator
+from pydantic import PrivateAttr, model_validator
 
 from apar.contracts.decisions import Action
 from apar.contracts._validation import ExternalContract
 from apar.evaluation.contracts import EvaluationTruthRow
+
+_CONTROL_CAPABILITY = object()
 
 
 class ControlResult(ExternalContract):
@@ -27,10 +29,17 @@ class ControlResult(ExternalContract):
     intervention_count: int = 0
     true_positive_count: int = 0
     efficacy_auc: float | None = None
+    _capability: object = PrivateAttr(default=None)
+
+    @classmethod
+    def _issue(cls, **values: object) -> "ControlResult":
+        result = cls(**values)
+        object.__setattr__(result, "_capability", _CONTROL_CAPABILITY)
+        return result
 
     @classmethod
     def invalid(cls, kind: Literal["benign_only", "score_permutation"], reason: str) -> "ControlResult":
-        return cls(valid=False, kind=kind, reason=reason)
+        return cls._issue(valid=False, kind=kind, reason=reason)
 
     @model_validator(mode="after")
     def _coherent(self) -> "ControlResult":
@@ -68,12 +77,14 @@ def admit_control_result(control: ControlResult) -> ControlAdmission:
     """Convert a control result into a load-bearing whole-run admission."""
     if type(control) is not ControlResult:
         return ControlAdmission(valid=False, status="no_promotion", reason="malformed_control_result")
+    if control._capability is not _CONTROL_CAPABILITY:
+        return ControlAdmission(valid=False, status="no_promotion", reason="unattested_control_result")
     try:
-        checked = ControlResult.model_validate(control)
+        checked = ControlResult.model_validate(control.model_dump())
     except Exception:
         return ControlAdmission(valid=False, status="no_promotion", reason="malformed_control_result")
     if not checked.valid:
-        return ControlAdmission(valid=False, status="no_promotion", reason=checked.reason or "control_invalid")
+        return ControlAdmission(valid=False, status="no_promotion", reason=control.reason or "control_invalid")
     return ControlAdmission(valid=True, status="admitted")
 
 
@@ -93,12 +104,12 @@ def run_benign_only_control(
         if any(row.is_fraud for row in rows):
             return ControlResult.invalid("benign_only", "malformed_benign_control")
         interventions = sum(action is not Action.APPROVE for action in action_values)
-        return ControlResult(
+        return ControlResult._issue(
             valid=True, kind="benign_only",
             intervention_count=interventions,
             true_positive_count=0,
         )
-    except (TypeError, ValueError):
+    except Exception:
         return ControlResult.invalid("benign_only", "malformed_benign_control")
 
 
@@ -139,8 +150,8 @@ def run_score_permutation_control(
         if qualified:
                 return ControlResult.invalid("score_permutation", "permuted_scores_qualified")
         auc = _auc(permuted, np.asarray([row.is_fraud for row in rows], dtype=bool))
-        return ControlResult(valid=True, kind="score_permutation", efficacy_auc=auc)
-    except (TypeError, ValueError):
+        return ControlResult._issue(valid=True, kind="score_permutation", efficacy_auc=auc)
+    except Exception:
         return ControlResult.invalid("score_permutation", "malformed_permutation_control")
 
 

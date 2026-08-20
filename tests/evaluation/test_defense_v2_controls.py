@@ -103,6 +103,18 @@ def test_evaluator_exception_is_fail_closed() -> None:
 
 
 def test_forged_valid_control_cannot_be_admitted() -> None:
-    forged = ControlResult.model_construct(valid=True, kind="benign_only", reason="forged")
+    forged = ControlResult.model_construct(valid=True, kind="benign_only", reason=None)
     admission = admit_control_result(forged)
     assert (admission.valid, admission.status) == (False, "no_promotion")
+
+
+def test_benign_action_property_exception_is_fail_closed() -> None:
+    class BrokenAction:
+        @property
+        def action(self):
+            raise RuntimeError("action unavailable")
+
+    result = run_benign_only_control(
+        actions=(BrokenAction(),), truth=(truth_row("row-1", fraud=False),)
+    )
+    assert (result.valid, result.reason) == (False, "malformed_benign_control")
