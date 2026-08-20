@@ -18,6 +18,8 @@ _V1_ROOTS = {
     "docs/experiments/defense-v1-run-manifests.json": "eb11ca98912b124a845bdd173a515effb97b83a232b1b6b3937b810933c6e07e",
     "fixtures/defense/v1/hash-manifest.json": "158d5562eb7723a45b7ef5c2c1eededa1378aebe11645e00e2cd6ffcb58bd941",
 }
+FIXTURE_OPERATING_POPULATION_SEED = 11
+FIXTURE_CAMPAIGN_INJECTION_SEED = 17
 
 
 class V2ProtocolError(ValueError):
@@ -81,6 +83,22 @@ class SeedCommitment(ExternalContract):
     )
 
 
+def _fixture_seed_commitments() -> tuple[SeedCommitment, ...]:
+    """Return public, deterministic commitments for in-memory fixture construction."""
+    return tuple(
+        SeedCommitment(
+            name=name,
+            commitment_sha256=hashlib.sha256(
+                canonical_json_bytes({"name": name, "seed": seed})
+            ).hexdigest(),
+        )
+        for name, seed in (
+            ("operating_population", FIXTURE_OPERATING_POPULATION_SEED),
+            ("campaign_injection", FIXTURE_CAMPAIGN_INJECTION_SEED),
+        )
+    )
+
+
 class V2Protocol(ExternalContract):
     schema_version: str = "1.0.0"
     protocol_id: str = "apar-defend-v2"
@@ -119,6 +137,7 @@ class V2Protocol(ExternalContract):
 
     @classmethod
     def fixture(cls, *, transaction_count: int = 100) -> "V2Protocol":
+        """Return a fixture-only profile with public commitments for seeds 11 and 17."""
         return cls(
             fixture_only=True,
             operating=OperatingPopulationProfile(
@@ -131,7 +150,7 @@ class V2Protocol(ExternalContract):
                 PrevalenceStratum(name="high", transaction_count=transaction_count, fraud_transaction_count=12, family_transaction_counts=(3, 3, 3, 3)),
             ),
             budgets=V2Budget(challenge_rate_max=.02, false_decline_rate_max=.001, review_case_rate_max=.01),
-            seed_commitments=(),
+            seed_commitments=_fixture_seed_commitments(),
         )
 
     def canonical_bytes(self) -> bytes:
@@ -182,6 +201,7 @@ def verify_v1_roots(root: Path) -> None:
 
 
 __all__ = [
+    "FIXTURE_CAMPAIGN_INJECTION_SEED", "FIXTURE_OPERATING_POPULATION_SEED",
     "OperatingPopulationProfile", "PrevalenceStratum", "SeedCommitment",
     "V2Budget", "V2Protocol", "V2ProtocolError", "load_v2_protocol",
     "verify_v1_roots",

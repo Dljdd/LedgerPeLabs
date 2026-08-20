@@ -69,6 +69,14 @@ def campaign_injections(*, total_decisions: int, start_at: datetime = CAMPAIGN_S
     )
 
 
+def test_direct_protocol_fixture_accepts_its_documented_operating_seed() -> None:
+    protocol = V2Protocol.fixture(transaction_count=100)
+
+    base = build_benign_base(protocol, seed=11)
+
+    assert base.manifest.seed_commitments == protocol.seed_commitments
+
+
 def test_injection_keeps_exact_denominator() -> None:
     base = build_benign_base(fixture_protocol(transaction_count=100), seed=11)
 
