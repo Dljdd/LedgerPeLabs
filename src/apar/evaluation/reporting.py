@@ -2273,18 +2273,31 @@ def _privacy_scan(payload: bytes, *, restricted_identifiers: tuple[bytes, ...] =
         decoded = decoded_text.lower().encode("utf-8")
     except UnicodeDecodeError as error:
         raise ReportingContractError("public payload is not UTF-8") from error
-    semantic = b""
+    semantic_strings: list[str] = []
     if payload.startswith((b"{", b"[")):
         try:
-            semantic = repr(strict_json_loads(payload)).lower().encode("utf-8", errors="ignore")
-        except WireContractError:
-            semantic = decoded
+            parsed = strict_json_loads(payload)
+        except WireContractError as error:
+            raise ReportingContractError("public JSON is not strict canonical JSON") from error
+        if canonical_json_bytes(parsed) != payload:
+            raise ReportingContractError("public JSON is not strict canonical JSON")
+        semantic_strings.extend(_json_semantic_strings(parsed))
+    else:
+        try:
+            rows = csv.reader(io.StringIO(decoded_text, newline=""), strict=True)
+            semantic_strings.extend(cell for row in rows for cell in row)
+        except csv.Error as error:
+            raise ReportingContractError("public text cells are invalid") from error
+    semantic = "\n".join(semantic_strings).casefold().encode("utf-8")
     if any(
         token in lowered or token in representation or token in decoded or token in semantic
         for token in _FORBIDDEN_PUBLIC_TOKENS
     ):
         raise ReportingContractError("public payload contains restricted evaluator semantics")
     normalized_public = unicodedata.normalize("NFC", decoded_text).casefold()
+    normalized_semantic = tuple(
+        unicodedata.normalize("NFC", value).casefold() for value in semantic_strings
+    )
     normalized_identifiers: list[str] = []
     try:
         for identifier in restricted_identifiers:
@@ -2295,8 +2308,33 @@ def _privacy_scan(payload: bytes, *, restricted_identifiers: tuple[bytes, ...] =
             )
     except UnicodeDecodeError as error:
         raise ReportingContractError("restricted identifier evidence is not UTF-8") from error
-    if any(identifier in normalized_public for identifier in normalized_identifiers):
+    if any(
+        identifier in normalized_public or any(identifier in value for value in normalized_semantic)
+        for identifier in normalized_identifiers
+    ):
         raise ReportingContractError("public payload contains a restricted row identifier")
+
+
+def _json_semantic_strings(value: object) -> tuple[str, ...]:
+    output: list[str] = []
+
+    def visit(item: object) -> None:
+        if type(item) is str:
+            output.append(item)
+        elif type(item) is dict:
+            for key, nested in cast(dict[str, object], item).items():
+                output.append(key)
+                visit(nested)
+        elif type(item) is list:
+            for nested in cast(list[object], item):
+                visit(nested)
+        elif item is None or type(item) in {bool, int, float}:
+            output.append(str(item))
+        else:
+            raise ReportingContractError("public JSON contains an unsupported scalar")
+
+    visit(value)
+    return tuple(output)
 
 
 def _csv_bytes(header: tuple[str, ...], rows: tuple[tuple[str, ...], ...]) -> bytes:

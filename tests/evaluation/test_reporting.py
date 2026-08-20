@@ -436,6 +436,16 @@ def test_privacy_scan_rejects_casefold_and_unicode_equivalent_restricted_ids() -
         _privacy_scan(b"STRASSE", restricted_identifiers=("Straße".encode(),))
     with pytest.raises(ReportingContractError, match="restricted row identifier"):
         _privacy_scan("Cafe\u0301".encode(), restricted_identifiers=("Café".encode(),))
+    with pytest.raises(ReportingContractError, match="restricted row identifier"):
+        _privacy_scan(
+            b'{"safe":"Caf\\u00e9"}',
+            restricted_identifiers=("Café".encode(),),
+        )
+    with pytest.raises(ReportingContractError, match="restricted row identifier"):
+        _privacy_scan(
+            b'{"CAF\\u00c9":"safe"}',
+            restricted_identifiers=("café".encode(),),
+        )
 
 
 def test_restricted_handles_have_constant_nonrevealing_representations(publication) -> None:

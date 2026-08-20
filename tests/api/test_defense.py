@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import base64
 import copy
+import inspect
 import json
+import multiprocessing
 import os
+import resource
+import socket
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,9 +24,12 @@ from apar.evaluation.publication_inputs import publish_corpus_attestation, verif
 from apar.evaluation.reporting import PublicArtifactVerifier
 from apar.evaluation.service import (
     EvaluationExecutor,
+    _apply_child_limits,
+    _close_inherited_fds,
     _index_payload,
     _IndexRecord,
     _input_key,
+    _install_child_audit_hook,
     _parse_index_payload,
 )
 from apar.storage.artifacts import ArtifactStore
@@ -45,10 +52,47 @@ pytest_plugins = ("tests.defense.test_bundle",)
 WORKER_SOURCE = Path(__file__).parents[1] / "fixtures" / "defense_evaluator_worker.py"
 
 
+def _probe_closed_inherited_fd(connection) -> None:
+    descriptor = os.open(os.devnull, os.O_RDONLY)
+    try:
+        os.dup2(descriptor, 100)
+    finally:
+        os.close(descriptor)
+    _close_inherited_fds(connection.fileno())
+    try:
+        os.fstat(100)
+    except OSError:
+        connection.send_bytes(b"closed")
+    else:
+        connection.send_bytes(b"open")
+    finally:
+        connection.close()
+
+
+def _probe_python_audit_denials(connection) -> None:
+    _install_child_audit_hook()
+    denied: list[bool] = []
+    for operation in (
+        lambda: socket.socket(),
+        lambda: os.system("true"),
+        lambda: os.open(os.devnull, os.O_RDONLY),
+    ):
+        try:
+            operation()
+        except PermissionError:
+            denied.append(True)
+        else:
+            denied.append(False)
+    connection.send_bytes(json.dumps(denied).encode("ascii"))
+    connection.close()
+
+
 @dataclass(frozen=True, slots=True)
 class _ExecutionTracker:
     marker: Path
     timeout_seconds: float
+    capability: object
+    initial_calls: int = 0
 
     @property
     def process_ids(self) -> tuple[int, ...]:
@@ -58,7 +102,7 @@ class _ExecutionTracker:
 
     @property
     def calls(self) -> int:
-        return len(self.process_ids)
+        return max(0, len(self.process_ids) - self.initial_calls)
 
 
 def _client(
@@ -104,17 +148,18 @@ def _client(
         threshold_set=threshold_set,
     )
     marker = tmp_path / marker_name
+    initial_calls = len(marker.read_text(encoding="ascii").splitlines()) if marker.exists() else 0
     executor = EvaluationExecutor.from_signed_source(
         source_path=WORKER_SOURCE,
         callable_qualname="evaluate",
         version="1.0.0",
         config={
-            "delay_seconds": delay_seconds,
-            "marker_path": str(marker),
+            "delay_iterations": 100_000_000 if delay_seconds else 0,
             "request_base64": base64.b64encode(request.to_worker_json()).decode("ascii"),
         },
         signer=EVALUATOR_SIGNER,
         timeout_seconds=timeout_seconds,
+        execution_receipt_path=marker,
     )
     settings = Settings(
         root=tmp_path.resolve(),
@@ -136,7 +181,7 @@ def _client(
     client.__enter__()
     return (
         client,
-        _ExecutionTracker(marker, executor.timeout_seconds),
+        _ExecutionTracker(marker, executor.timeout_seconds, executor, initial_calls),
         request,
         corpus_ref,
         defender_ref,
@@ -311,11 +356,11 @@ def test_executor_and_trust_capabilities_are_exact_sealed_and_independent(
         callable_qualname="evaluate",
         version="1.0.0",
         config={
-            "delay_seconds": 0.0,
-            "marker_path": str(tmp_path / "sealed.calls"),
+            "delay_iterations": 0,
             "request_base64": base64.b64encode(request.to_worker_json()).decode("ascii"),
         },
         signer=EVALUATOR_SIGNER,
+        execution_receipt_path=tmp_path / "sealed.calls",
     )
     assert not hasattr(EvaluationExecutor, "from_worker")
     assert repr(executor) == "<sealed evaluator worker capability>"
@@ -355,6 +400,104 @@ def test_executor_and_trust_capabilities_are_exact_sealed_and_independent(
         )
 
 
+def test_executor_capability_is_self_contained_and_service_ignores_class_dispatch(
+    tmp_path: Path, bundle_fixture
+) -> None:
+    client, _tracker, request, corpus_ref, defender_ref, _settings = _client(
+        tmp_path, bundle_fixture
+    )
+    factory = EvaluationExecutor.from_signed_source.__func__
+    closure_values = inspect.getclosurevars(factory).nonlocals.values()
+    assert isinstance(_tracker.capability, bytes)
+    assert not any(type(value).__name__ == "WeakKeyDictionary" for value in closure_values)
+
+    called = False
+
+    def replaced_execute(*args: object, **kwargs: object):
+        nonlocal called
+        del args, kwargs
+        called = True
+        return request
+
+    original = EvaluationExecutor.__dict__.get("execute")
+    type.__setattr__(EvaluationExecutor, "execute", replaced_execute)
+    try:
+        response = client.post(
+            "/api/v1/defense/evaluations",
+            json={
+                "corpus_artifact_digest": corpus_ref.sha256,
+                "defender_artifact_digest": defender_ref.sha256,
+            },
+        )
+        assert response.status_code == 201
+        assert called is False
+    finally:
+        if original is None:
+            type.__delattr__(EvaluationExecutor, "execute")
+        else:
+            type.__setattr__(EvaluationExecutor, "execute", original)
+        client.__exit__(None, None, None)
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        "import _socket\ndef evaluate(inputs, config):\n    return _socket.socket()\n",
+        "import os\ndef evaluate(inputs, config):\n    return os.system('true')\n",
+        "def evaluate(inputs, config):\n    return open('/tmp/escape', 'wb')\n",
+        "import ctypes\ndef evaluate(inputs, config):\n    return config['request_base64']\n",
+    ),
+)
+def test_worker_source_rejects_prebound_network_process_and_file_capabilities(
+    tmp_path: Path, source: str
+) -> None:
+    path = tmp_path / "unsafe_worker.py"
+    path.write_text(source, encoding="utf-8")
+    with pytest.raises(ValueError, match="forbidden|prebound|file"):
+        EvaluationExecutor.from_signed_source(
+            source_path=path,
+            callable_qualname="evaluate",
+            version="1.0.0",
+            config={"request_base64": "AA=="},
+            signer=EVALUATOR_SIGNER,
+        )
+
+
+def test_required_child_rlimit_failure_is_not_suppressed(monkeypatch) -> None:
+    def fail(_kind: int, _limits: tuple[int, int]) -> None:
+        raise OSError("setrlimit denied")
+
+    monkeypatch.setattr(resource, "setrlimit", fail)
+    with pytest.raises(OSError, match="setrlimit denied"):
+        _apply_child_limits()
+
+
+def test_child_closes_inherited_fd_100_before_worker_execution() -> None:
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe(duplex=False)
+    process = context.Process(target=_probe_closed_inherited_fd, args=(child,))
+    process.start()
+    child.close()
+    assert parent.poll(5)
+    assert parent.recv_bytes() == b"closed"
+    process.join(timeout=5)
+    assert process.exitcode == 0
+    parent.close()
+
+
+def test_python_audit_hook_denies_prebound_network_process_and_open() -> None:
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe(duplex=False)
+    process = context.Process(target=_probe_python_audit_denials, args=(child,))
+    process.start()
+    child.close()
+    assert parent.poll(5)
+    assert json.loads(parent.recv_bytes()) == [True, True, True]
+    process.join(timeout=5)
+    assert process.exitcode == 0
+    parent.close()
+
+
 def test_defense_post_body_is_capped_before_parser_or_executor(
     tmp_path: Path, bundle_fixture
 ) -> None:
@@ -388,7 +531,7 @@ def test_signed_evaluation_index_survives_service_restart(tmp_path: Path, bundle
         client.__exit__(None, None, None)
 
     restarted, restarted_tracker, _, _, _, _ = _client(
-        tmp_path, bundle_fixture, marker_name="second.calls"
+        tmp_path, bundle_fixture, marker_name="first.calls"
     )
     try:
         fetched = restarted.get(f"/api/v1/defense/evaluations/{evaluation_id}")
@@ -422,7 +565,7 @@ def test_restart_revalidates_signed_index_without_breaking_health(
     pointer = next(path for path in index_root.iterdir() if path.name != "index.lock")
     pointer.write_bytes(b"{}")
 
-    restarted, _, _, _, _, _ = _client(tmp_path, bundle_fixture, marker_name="invalid-index.calls")
+    restarted, _, _, _, _, _ = _client(tmp_path, bundle_fixture)
     try:
         fetched = restarted.get(f"/api/v1/defense/evaluations/{evaluation_id}")
         health = restarted.get("/api/v1/health")
@@ -471,9 +614,7 @@ def test_interrupted_index_temporary_is_never_a_visible_evaluation(
     temporary.write_bytes(b"partial")
     temporary.chmod(0o600)
 
-    restarted, tracker, _, _, _, _ = _client(
-        tmp_path, bundle_fixture, marker_name="crash-restart.calls"
-    )
+    restarted, tracker, _, _, _, _ = _client(tmp_path, bundle_fixture)
     try:
         unknown = restarted.get("/api/v1/defense/evaluations/" + "0" * 64)
         assert unknown.status_code == 404
@@ -548,9 +689,7 @@ def test_index_rejects_duplicate_evaluation_id_for_a_different_input_pair(
     duplicate_path.write_bytes(_index_payload(duplicate, bundle_fixture.signer))
     duplicate_path.chmod(0o600)
 
-    restarted, _, _, _, _, _ = _client(
-        tmp_path, bundle_fixture, marker_name="duplicate-index.calls"
-    )
+    restarted, _, _, _, _, _ = _client(tmp_path, bundle_fixture)
     try:
         fetched = restarted.get(
             f"/api/v1/defense/evaluations/{created.json()['evaluation_id']}"
@@ -575,10 +714,45 @@ def test_every_get_reauthenticates_original_corpus_and_defender_inputs(
         )
         assert created.status_code == 201
         (settings.artifact_root / corpus_ref.relative_path).write_bytes(b"tampered")
-        fetched = client.get(
-            f"/api/v1/defense/evaluations/{created.json()['evaluation_id']}"
-        )
+        fetched = client.get(f"/api/v1/defense/evaluations/{created.json()['evaluation_id']}")
         assert fetched.status_code == 422
         assert fetched.json()["detail"]["code"] == "DEFENSE_ARTIFACT_INVALID"
+    finally:
+        client.__exit__(None, None, None)
+
+
+def test_get_validates_only_the_exact_selected_record(tmp_path: Path, bundle_fixture) -> None:
+    """GET scans signed metadata globally but fully loads only its unique target."""
+    client, _, _, corpus_ref, defender_ref, settings = _client(tmp_path, bundle_fixture)
+    try:
+        created = client.post(
+            "/api/v1/defense/evaluations",
+            json={
+                "corpus_artifact_digest": corpus_ref.sha256,
+                "defender_artifact_digest": defender_ref.sha256,
+            },
+        )
+        assert created.status_code == 201
+        index_root = settings.artifact_root / ".defense-evaluation-index-v1"
+        pointer = next(path for path in index_root.iterdir() if path.name != "index.lock")
+        verifier = PublicArtifactVerifier.from_signer(bundle_fixture.signer)
+        original = _parse_index_payload(pointer.read_bytes(), verifier)
+        other_corpus = "a" * 64
+        other_defender = "b" * 64
+        unselected = _IndexRecord(
+            _input_key(other_corpus, other_defender),
+            other_corpus,
+            other_defender,
+            "c" * 64,
+            original.bundle_ref,
+            original.receipt_ref,
+        )
+        other_path = index_root / f"{unselected.input_key}.json"
+        other_path.write_bytes(_index_payload(unselected, bundle_fixture.signer))
+        other_path.chmod(0o600)
+
+        fetched = client.get(f"/api/v1/defense/evaluations/{created.json()['evaluation_id']}")
+        assert fetched.status_code == 200
+        assert fetched.content == created.content
     finally:
         client.__exit__(None, None, None)
