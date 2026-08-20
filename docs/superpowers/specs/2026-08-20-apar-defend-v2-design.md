@@ -282,6 +282,12 @@ dunder access, runtime-introspection modules, reflection, dynamic code, and any
 syntax or capability absent from those allowlists fail admission. The same rule
 applies transitively to reachable feature and local package modules.
 
+The sole public evaluator import, `apar.evaluation.v2_protocol`, is not exempt
+from graph closure. Its module and executable `apar.evaluation` package
+initializer must both match verifier-pinned SHA-256 values and are scanned as
+reachable source. All other evaluator modules remain forbidden terminal nodes;
+the scanner neither admits nor recursively inventories them.
+
 An eventual v2 evaluator must also enforce an operating-system process boundary:
 defender code runs in a fresh process whose address space has never loaded
 evaluator modules and which has no evaluator signing key, seed material, receipt

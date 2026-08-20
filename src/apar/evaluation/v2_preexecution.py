@@ -117,6 +117,12 @@ _FROZEN_DEFENDER_SOURCE_SHA256 = {
     "apar/defense/thresholds.py": (
         "761455996886d89acec1392a16c826bc74231b7d8bee1d128e6bddd8fdb2734c"
     ),
+    "apar/evaluation/__init__.py": (
+        "a077efc2574c01413de421fb2a5165312b86ac4d575676b7e15a158c2f213a52"
+    ),
+    "apar/evaluation/v2_protocol.py": (
+        "6545b49f143e31028063f5d236e991b2073fbc27fd5f27a3dafefaca6987c664"
+    ),
     "apar/features/__init__.py": "e6e294bf20a5fabba6e8a8068e2ed9d81d62d96427714dbebdf53acf02aa2657",
     "apar/features/builders.py": "9d8b29bceb4bd752c402073db07724a5d8a8795fe0b6746448802cf84319a031",
     "apar/features/catalog.py": "b58382fa4530a12fad7c614fc9107f30be0495f1f18a42e8ca01f476b0bd2a6d",
@@ -141,6 +147,10 @@ _STRICT_DEFENDER_IMPORTS = frozenset(
     }
 )
 _STRICT_DEFENDER_IMPORT_PREFIXES = ("apar.features",)
+_PUBLIC_V2_PROTOCOL_MODULE = "apar.evaluation.v2_protocol"
+_PUBLIC_V2_PROTOCOL_SOURCES = frozenset(
+    {"apar/evaluation/__init__.py", "apar/evaluation/v2_protocol.py"}
+)
 _STRICT_DEFENDER_ATTRIBUTES = frozenset(
     {
         "amount",
@@ -562,6 +572,13 @@ def verify_import_boundary(root: Path, *, forbidden: str, allowed_prefix: str) -
                 if not (module == "apar" or module.startswith("apar.")):
                     continue
                 if module == "apar.evaluation" or module.startswith("apar.evaluation."):
+                    if module == _PUBLIC_V2_PROTOCOL_MODULE or module.startswith(
+                        f"{_PUBLIC_V2_PROTOCOL_MODULE}."
+                    ):
+                        pending.extend(
+                            (target, False)
+                            for target in _local_module_paths(project_source, module)
+                        )
                     continue
                 is_feature = module == "apar.features" or module.startswith("apar.features.")
                 if traverse_dependencies or is_feature or _is_strict_defender_import(module):
@@ -621,7 +638,12 @@ def _contains_disallowed_import(
     allowed_prefix: str,
 ) -> bool:
     raw_source = path.read_bytes()
+    if _has_mismatched_pinned_public_v2_source(path, project_source, raw_source):
+        return True
     tree = ast.parse(raw_source.decode("utf-8"), filename=str(path))
+    frozen_public_v2_source = _is_frozen_public_v2_source(
+        path, project_source, raw_source
+    )
     if not _is_frozen_defender_source(path, project_source, raw_source) and (
         _violates_strict_defender_capabilities(tree, path, project_source)
     ):
@@ -660,6 +682,7 @@ def _contains_disallowed_import(
         if isinstance(node, ast.Import) and any(
             (name.name == "inspect" or _is_disallowed_module(name.name, forbidden, allowed_prefix))
             and not _is_frozen_v1_import(path, defender_root, name.name)
+            and not frozen_public_v2_source
             for name in node.names
         ):
             return True
@@ -669,7 +692,9 @@ def _contains_disallowed_import(
             for module in _resolved_import_targets(node, path, project_source):
                 if _is_disallowed_module(
                     module, forbidden, allowed_prefix
-                ) and not _is_frozen_v1_import(path, defender_root, module):
+                ) and not _is_frozen_v1_import(
+                    path, defender_root, module
+                ) and not frozen_public_v2_source:
                     return True
         if isinstance(node, ast.Call) and _is_dynamic_import_call(
             node,
@@ -701,6 +726,31 @@ def _is_frozen_defender_source(
         return False
     expected = _FROZEN_DEFENDER_SOURCE_SHA256.get(relative)
     return expected is not None and hashlib.sha256(raw_source).hexdigest() == expected
+
+
+def _is_frozen_public_v2_source(
+    path: Path, project_source: Path, raw_source: bytes
+) -> bool:
+    try:
+        relative = path.relative_to(project_source).as_posix()
+    except ValueError:
+        return False
+    return relative in _PUBLIC_V2_PROTOCOL_SOURCES and _is_frozen_defender_source(
+        path, project_source, raw_source
+    )
+
+
+def _has_mismatched_pinned_public_v2_source(
+    path: Path, project_source: Path, raw_source: bytes
+) -> bool:
+    try:
+        relative = path.relative_to(project_source).as_posix()
+    except ValueError:
+        return False
+    if relative not in _PUBLIC_V2_PROTOCOL_SOURCES:
+        return False
+    expected = _FROZEN_DEFENDER_SOURCE_SHA256[relative]
+    return hashlib.sha256(raw_source).hexdigest() != expected
 
 
 def _violates_strict_defender_capabilities(
