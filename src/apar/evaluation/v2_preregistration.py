@@ -290,7 +290,9 @@ def admit_v2_execution(
     """Admit only the first confirmatory execution of a valid sealed contract."""
     if type(preregistration) is not V2Preregistration:
         return ExecutionAdmission.denied("invalid_preregistration")
-    if type(existing_receipts) not in (tuple, list):
+    if not isinstance(existing_receipts, Sequence) or isinstance(
+        existing_receipts, (str, bytes, bytearray, memoryview)
+    ):
         return ExecutionAdmission.denied("invalid_preregistration")
     if len(existing_receipts) >= preregistration.maximum_confirmatory_attempts:
         return ExecutionAdmission.denied("maximum_confirmatory_attempts_exhausted")

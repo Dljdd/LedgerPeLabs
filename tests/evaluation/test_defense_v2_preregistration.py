@@ -53,6 +53,29 @@ def test_second_admission_is_denied() -> None:
     )
 
 
+def test_empty_general_sequence_is_admitted() -> None:
+    """An empty non-list Sequence must leave the confirmatory admission available."""
+    preregistration = signed_preregistration()
+
+    admission = admit_v2_execution(preregistration, existing_receipts=range(0))
+
+    assert (admission.admitted, admission.reason, admission.execution_nonce) == (
+        True,
+        None,
+        preregistration.execution_nonce,
+    )
+
+
+def test_nonempty_general_sequence_exhausts_admission() -> None:
+    """A prior receipt represented by a non-list Sequence must consume the attempt."""
+    admission = admit_v2_execution(signed_preregistration(), existing_receipts=range(1))
+
+    assert (admission.admitted, admission.reason) == (
+        False,
+        "maximum_confirmatory_attempts_exhausted",
+    )
+
+
 def test_caller_approval_flag_is_not_an_admission_path() -> None:
     """An unbound approval boolean must be rejected instead of authorizing execution."""
     payload = complete_preregistration_payload()
