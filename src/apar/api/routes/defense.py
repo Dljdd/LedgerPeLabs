@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from typing import Annotated, Final, Never
 
 from fastapi import APIRouter, Depends, Request, Response
@@ -17,6 +18,7 @@ from apar.evaluation.service import (
     DefenseExecutionConflict,
     DefenseResourceNotFound,
 )
+from apar.evaluation.v2_reporting import DefenseV2Scorecard
 
 DEFENSE_EVALUATION_NOT_FOUND: Final = "DEFENSE_EVALUATION_NOT_FOUND"
 DEFENSE_ARTIFACT_NOT_FOUND: Final = "DEFENSE_ARTIFACT_NOT_FOUND"
@@ -24,7 +26,28 @@ DEFENSE_ARTIFACT_INVALID: Final = "DEFENSE_ARTIFACT_INVALID"
 DEFENSE_EVALUATION_CONFLICT: Final = "DEFENSE_EVALUATION_CONFLICT"
 
 router = APIRouter(prefix="/api/v1/defense")
+public_router = APIRouter(prefix="/defense")
 Service = Annotated[DefenseEvaluationService, Depends(get_defense_evaluation_service)]
+
+_PUBLIC_V2_SCORECARD = DefenseV2Scorecard.from_json(
+    base64.b64decode(
+        b"eyJhcm1zIjpbeyJhcm0iOiJydWxlc19vbmx5IiwiZ2F0ZSI6eyJhcm0iOiJydWxlc19vbmx5Iiwib3V0"
+        b"Y29tZSI6eyJjb2RlcyI6WyJOT1RfRVhFQ1VURUQiXSwicGFzc2VkIjpmYWxzZX19LCJzdGF0dXMiOiJu"
+        b"b3RfZXhlY3V0ZWQifSx7ImFybSI6ImdiZHRfb25seSIsImdhdGUiOnsiYXJtIjoiZ2JkdF9vbmx5Iiwi"
+        b"b3V0Y29tZSI6eyJjb2RlcyI6WyJOT1RfRVhFQ1VURUQiXSwicGFzc2VkIjpmYWxzZX19LCJzdGF0dXMi"
+        b"OiJub3RfZXhlY3V0ZWQifSx7ImFybSI6ImxheWVyZWRfaHlicmlkIiwiZ2F0ZSI6eyJhcm0iOiJsYXll"
+        b"cmVkX2h5YnJpZCIsIm91dGNvbWUiOnsiY29kZXMiOlsiTk9UX0VYRUNVVEVEIl0sInBhc3NlZCI6ZmFs"
+        b"c2V9fSwic3RhdHVzIjoibm90X2V4ZWN1dGVkIn1dLCJwcm90b2NvbF9kaWdlc3QiOiI3MzkyZWM0ZmFj"
+        b"MTMzNzU0NzNlNmMzMzU1MjllZjc1NGJjNTlhNGNhYTc0Yzk1ZmYxOWVlZTJkNWZkOWYyNjZkIiwicHVi"
+        b"bGljX2tleV9iYXNlNjQiOiJHU0JNakR1b1c2Qlp6Umlza0JlOUFxR05wZEVNYVB0M21qUytRKzhHZDVF"
+        b"PSIsInNjaGVtYV92ZXJzaW9uIjoiMi4wLjAiLCJzaWduYXR1cmVfYmFzZTY0Ijoielk5bytOMDc3VDUr"
+        b"MzYrbFNENnhjZmpLSERnbDI1eEhZeUdkRkdXc2JyZFdNUXVENkZkdWwyOVk3V1Q0UzlLS2htNFFNZmZv"
+        b"V0RTclhDWXJZUkkxQ1E9PSIsInNpZ25lcl9rZXlfaWQiOiI4MWViYzIzYzVhOWRkNjEzNGIxNWE3ODll"
+        b"Zjg2ZWZhMGE0OWJhMDU1YTQ2MTQ0ODJhNjQxNzQ5ZmFmOTVjZDFiIiwic3RhdHVzIjoibm90X2V4ZWN1"
+        b"dGVkIiwic3ludGhldGljX3Njb3BlIjoiU3ludGhldGljLW9ubHkgZXZhbHVhdGlvbjsgbm90IGEgcmVh"
+        b"bC13b3JsZCBwcmV2YWxlbmNlIG9yIGV4dGVybmFsLXZhbGlkaXR5IGNsYWltLiJ9"
+    )
+)
 
 
 class CreateDefenseEvaluationRequest(ExternalContract):
@@ -39,6 +62,13 @@ class CreateDefenseEvaluationRequest(ExternalContract):
         if type(value) is not str:
             raise ValueError("artifact digests must be exact strings")
         return value
+
+
+@router.get("/v2/scorecard", response_model=DefenseV2Scorecard)
+@public_router.get("/v2/scorecard", response_model=DefenseV2Scorecard)
+def get_v2_scorecard() -> DefenseV2Scorecard:
+    """Read the signed public v2 status; this route cannot start an evaluation."""
+    return _PUBLIC_V2_SCORECARD
 
 
 @router.post(
@@ -167,4 +197,4 @@ def _artifact_not_found() -> Never:
     raise ApiError(404, DEFENSE_ARTIFACT_NOT_FOUND, "public artifact not found")
 
 
-__all__ = ["CreateDefenseEvaluationRequest", "router"]
+__all__ = ["CreateDefenseEvaluationRequest", "public_router", "router"]

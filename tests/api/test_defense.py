@@ -790,3 +790,13 @@ def test_get_validates_only_the_exact_selected_record(tmp_path: Path, bundle_fix
         assert fetched.content == created.content
     finally:
         client.__exit__(None, None, None)
+
+
+def test_v2_scorecard_exposes_only_public_not_executed_contract(tmp_path: Path) -> None:
+    """The public v2 read does not need a configured evaluation executor."""
+    with TestClient(create_app(Settings.from_root(tmp_path))) as client:
+        response = client.get("/defense/v2/scorecard")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "not_executed"
+    assert "hidden_seed" not in response.text

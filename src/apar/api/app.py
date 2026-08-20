@@ -218,6 +218,7 @@ def create_app(
     defender_public_key_base64: str | None = None,
 ) -> FastAPI:
     """Build an unbound local API application for the supplied settings."""
+    from apar.api.routes.defense import public_router
     from apar.api.routes.defense import router as defense_router
     from apar.api.routes.health import router as health_router
     from apar.api.routes.registry import router as registry_router
@@ -285,6 +286,7 @@ def create_app(
     app.add_exception_handler(DefenseServiceUnavailable, _defense_unavailable_handler)
     app.add_exception_handler(DefenseArtifactInvalid, _defense_invalid_handler)
     app.include_router(health_router)
+    app.include_router(public_router)
     app.include_router(defense_router)
     app.include_router(registry_router)
     app.include_router(scenarios_router)
