@@ -1,0 +1,34 @@
+{
+  "schema_version": "1.0.0",
+  "protocol_id": "apar-defend-v3",
+  "status": "no_promotion",
+  "reason": "incomplete_execution_path",
+  "synthetic_scope": "Synthetic-only evaluation; not a real-world prevalence or external-validity claim.",
+  "execution_nonce": "ddd7271bd2fbca437687959bf858e5889ac3ba5e3d9443296dd4874702baa109",
+  "started_at": "2026-08-21T10:50:15.618302Z",
+  "completed_at": "2026-08-21T10:50:16.215414Z",
+  "source_tree_sha256": "ca0fbce80e3dabebab3e09dda244b163b901534a890507d4e5a5907ddd75bad3",
+  "config_manifest_sha256": "84da523c41bac361b000dde5f74b5f6195cc5b0cc9175378ed12c73cb7cc92a7",
+  "defender_bundle_sha256": "78de5c32770c777e1a76e23fc264d833acc42ae6e212af78e62ec26284612ca0",
+  "population_manifest_sha256": "33a6234c38656def1bfad4cf9c5193a0fb9778f93b4494e6b930dbba0b817754",
+  "arms": [
+    {"arm": "rules_only", "status": "no_promotion", "reason": "incomplete_execution_path"},
+    {"arm": "gbdt_only", "status": "no_promotion", "reason": "incomplete_execution_path"},
+    {"arm": "layered_hybrid", "status": "no_promotion", "reason": "incomplete_execution_path"}
+  ],
+  "limitations": [
+    "The v3 confirmatory execution consumed the one permitted attempt on an incomplete scaffold.",
+    "No defender scoring, metric computation, gate evaluation, or scorecard generation was performed.",
+    "The no_promotion result reflects an incomplete execution path, not model performance.",
+    "No competition evidence, champion, or promotion claim is supported by this result.",
+    "V1 evidence remains byte-for-byte unchanged. V2 remains sealed and unexecuted.",
+    "Synthetic-only evaluation; not a real-world prevalence or external-validity claim."
+  ],
+  "non_claims": [
+    "No model performance comparison was performed.",
+    "No precision, recall, F1, PR-AUC, ROC-AUC, calibration, or Brier score was computed.",
+    "No workload, value, or time-to-alert metric was evaluated.",
+    "No gate was passed or failed on model evidence.",
+    "No champion was frozen and no hidden evaluation was opened."
+  ]
+}

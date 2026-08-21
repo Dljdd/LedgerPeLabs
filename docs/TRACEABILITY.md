@@ -32,6 +32,7 @@ This matrix is the control surface for implementation status. Replace `Specified
 | Submission | Repository, walkthrough, web prototype | Specified | Final archive inventory |
 | Validation spike | H1-H5 falsification spike | Validated with limitations | `validation_spike` reports and outputs |
 | Defend v3 | Execution path drafted; evaluation not executed | Drafted | Separately versioned protocol; no v3 population or result exists |
+| Defend v3 result | Confirmatory attempt consumed on incomplete scaffold | Truthful no_promotion | No scoring, metrics, or gates were evaluated; v4 protocol revision required |
 
 ## Status update rules
 
