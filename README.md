@@ -66,6 +66,8 @@ preregistered 1% cap. The budget was not relaxed and no champion is claimed.
 
 Defend v2: protocol sealed; evaluation not executed. Any future result remains synthetic-only and is not a real-world prevalence or external-validity claim.
 
+Defend v3: execution path drafted; evaluation not executed.
+
 ## Working title
 
 **Adaptive Payment Assurance Range**  
