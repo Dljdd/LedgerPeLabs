@@ -70,6 +70,8 @@ Defend v3: execution path drafted; evaluation not executed.
 
 Defend v3 confirmatory attempt consumed on an incomplete scaffold; truthful `no_promotion` recorded. No competition evidence was produced. A v4 protocol revision is required.
 
+Defend v4: execution path implemented; evaluation not executed.
+
 ## Working title
 
 **Adaptive Payment Assurance Range**  
