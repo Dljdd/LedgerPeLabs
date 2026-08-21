@@ -50,11 +50,21 @@ scenario compiler, API, and immutable artifact store from clean temporary state.
 | Threat registry and scenario compiler | G0 foundation implemented |
 | Rail-specific simulator | Specified, not implemented |
 | Adaptive red-team optimizer | Harness validated; adaptive optimizer not implemented |
-| Defender service | Specified; validation baseline only |
+| Defender service | Implemented; 200-campaign v1 evidence is signed and hash-pinned, with truthful `no_promotion` after the frozen 1% workload budget proved infeasible |
 | Agentic trust plane | Specified, not implemented |
 | Web prototype and walkthrough | Specified, not implemented |
 
 The `validation_spike` is retained as supporting evidence. It must not be represented as the complete competition solution.
+
+The Defend G3 implementation gate is available with `.venv/bin/python scripts/verify_g3.py`.
+The full synthetic competition result is pinned in
+`docs/experiments/defense-v1-result.json` and `fixtures/defense/v1/`. It contains
+exactly 200 authenticated campaigns. The trained candidate reloads, but no
+defender was frozen and hidden evaluation was not released: six mandatory review
+cases over 336 threshold rows imply a 1.7857% minimum workload, above the
+preregistered 1% cap. The budget was not relaxed and no champion is claimed.
+
+Defend v2: protocol sealed; evaluation not executed. Any future result remains synthetic-only and is not a real-world prevalence or external-validity claim.
 
 ## Working title
 

@@ -129,6 +129,24 @@ class ArtifactStore:
             raise ValueError(f"artifact does not exist: {digest}") from error
         return ref
 
+    def validated_worker_root(self) -> Path:
+        """Return the exact open root path for a separately isolated trusted worker."""
+        root_fd = self._open_root_directory()
+        try:
+            descriptor = os.fstat(root_fd)
+            resolved = self._root.resolve(strict=True)
+            lexical = resolved.lstat()
+            if (
+                resolved.is_symlink()
+                or not resolved.is_dir()
+                or (descriptor.st_dev, descriptor.st_ino)
+                != (lexical.st_dev, lexical.st_ino)
+            ):
+                raise ValueError("artifact worker root no longer matches pinned store")
+            return resolved
+        finally:
+            os.close(root_fd)
+
     def _load_if_present(self, digest: str) -> tuple[ArtifactRef, bytes] | None:
         try:
             return self._load_verified(digest)

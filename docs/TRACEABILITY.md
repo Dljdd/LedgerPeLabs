@@ -13,16 +13,17 @@ This matrix is the control surface for implementation status. Replace `Specified
 | Adapt | Candidate uses prior feedback | Specified | Candidate trace and counterfactual test |
 | Adapt | Matched random, adaptive, and agent ablation | Specified | Red-team evaluation report |
 | Adapt | Hidden economic and causal validity | Specified | Hidden-valid result summary |
-| Defend | Tuned rules baseline | Specified | Versioned rules and metrics |
-| Defend | Strong GBDT baseline | Specified | Model bundle and comparison |
-| Defend | Past-only feature state | Partially validated | Validation spike plus production tests |
-| Defend | Campaign case grouping | Specified | Case output and reconstruction metrics |
+| Defend | Tuned rules baseline | Implemented | Versioned rules and matched-threshold tests; competition evaluation correctly stopped before comparison |
+| Defend | Strong GBDT baseline | Validated | Signed 200-campaign training receipt, deterministic native model, and frozen reload/prediction test |
+| Defend | Past-only feature state | Validated | Causal source audit, future-append tests, and frozen 48-feature competition matrix |
+| Defend | Campaign case grouping | Validated | Exact callback reconstruction and signed 6/336 minimum workload failure evidence |
+| Defend | v2 sealed evaluation protocol | Protocol sealed, not executed | Signed preregistration and read-only pre-execution verifier; no evaluation receipt or result artifact exists |
 | Agentic | Identity, mandate, scope, binding, replay | Specified | Integrity attack suite |
 | Evaluate | Chronological and cold-entity splits | Specified | Dataset manifest and assertions |
-| Evaluate | Independent hidden generator | Specified | Separate package hash and freeze record |
-| Evaluate | Fixed operational budgets | Specified | Action-frontier report |
+| Evaluate | Independent hidden generator | Implemented, not released | Separate pinned authority and isolated worker; release was correctly withheld because no defender could freeze |
+| Evaluate | Fixed operational budgets | Validated negative | Signed exhaustive frontier proves 1.7857% minimum review workload exceeds the frozen 1% cap; no relaxation |
 | Evaluate | No future batch ranking | Specified | Online queue test |
-| Governance | Immutable content-addressed runs | Specified | Artifact-store tests |
+| Governance | Immutable content-addressed runs | Validated | 200 signed run manifests plus signed corpus/result/hash aliases |
 | Governance | Human promotion gate | Specified | Signed report and audit event |
 | Safety | Synthetic-only, no live targeting | Specified | Network and input safety tests |
 | Engineering | Portable one-command start | Specified | Clean-machine test log |
@@ -39,4 +40,3 @@ This matrix is the control surface for implementation status. Replace `Specified
 - A same-code hidden regime does not satisfy the independent hidden-generator requirement.
 - A fixed or random candidate schedule does not satisfy adaptive search.
 - An architecture diagram does not satisfy an implementation requirement.
-
