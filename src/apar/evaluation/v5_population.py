@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -93,6 +94,158 @@ _PARTITION_SEED_KEYS = (
 )
 _LEGITIMATE_ACTORS_PER_PARTITION = 40
 _CAMPAIGNS_PER_FAMILY_SMOKE = 2
+
+
+def _enrich_features(
+    rows: list[V5DecisionRow],
+) -> list[V5DecisionRow]:
+    """Compute history-only velocity, temporal, graph, and DQ features."""
+    actor_events: dict[str, list[V5DecisionRow]] = defaultdict(list)
+    counterparty_events: dict[str, list[V5DecisionRow]] = defaultdict(list)
+    pair_events: dict[tuple[str, str], list[V5DecisionRow]] = defaultdict(list)
+
+    for row in rows:
+        actor_events[row.actor_id].append(row)
+        counterparty_events[row.counterparty_id].append(row)
+        pair_events[(row.actor_id, row.counterparty_id)].append(row)
+
+    enriched: list[V5DecisionRow] = []
+    for row in rows:
+        features = dict(row.predictive_features)
+        now = row.decision_at
+
+        # Actor history (strictly prior events only)
+        prior_actor = [
+            r for r in actor_events[row.actor_id]
+            if r.decision_at < now and r.event_id != row.event_id
+        ]
+        velocity_windows = [
+            (60, "1m"), (300, "5m"), (3600, "1h"),
+            (86400, "24h"), (604800, "7d"),
+        ]
+        for window_seconds, name in velocity_windows:
+            count = sum(
+                1 for r in prior_actor
+                if (now - r.decision_at).total_seconds() <= window_seconds
+            )
+            features[f"actor_count_{name}"] = float(count)
+        features["actor_amount_1h"] = sum(
+            float(r.amount) for r in prior_actor if (now - r.decision_at).total_seconds() <= 3600
+        )
+        features["actor_amount_24h"] = sum(
+            float(r.amount) for r in prior_actor if (now - r.decision_at).total_seconds() <= 86400
+        )
+
+        first_seen = min((r.decision_at for r in actor_events[row.actor_id]), default=now)
+        last_prior = max((r.decision_at for r in prior_actor), default=None)
+        features["actor_seconds_since_first"] = (now - first_seen).total_seconds()
+        features["actor_seconds_since_last"] = (
+            (now - last_prior).total_seconds() if last_prior else -1.0
+        )
+        features["actor_distinct_counterparties_24h"] = float(
+            len({
+                r.counterparty_id for r in prior_actor
+                if (now - r.decision_at).total_seconds() <= 86400
+            })
+        )
+
+        # Counterparty history
+        prior_cp = [
+            r for r in counterparty_events[row.counterparty_id]
+            if r.decision_at < now and r.event_id != row.event_id
+        ]
+        features["counterparty_count_1h"] = float(
+            sum(1 for r in prior_cp if (now - r.decision_at).total_seconds() <= 3600)
+        )
+        features["counterparty_count_24h"] = float(len(prior_cp))
+        features["counterparty_amount_24h"] = sum(float(r.amount) for r in prior_cp)
+        features["counterparty_distinct_actors_24h"] = float(
+            len({r.actor_id for r in prior_cp})
+        )
+
+        # Pair history
+        pair_key = (row.actor_id, row.counterparty_id)
+        prior_pair = [
+            r for r in pair_events[pair_key]
+            if r.decision_at < now and r.event_id != row.event_id
+        ]
+        features["pair_prior_count"] = float(len(prior_pair))
+        features["pair_seconds_since_last"] = (
+            (now - max(r.decision_at for r in prior_pair)).total_seconds()
+            if prior_pair else -1.0
+        )
+        features["graph_repeated_edge"] = float(min(len(prior_pair), 5.0))
+
+        # Amount z-score vs actor's 24h history
+        amounts_24h = [
+            float(r.amount) for r in prior_actor
+            if (now - r.decision_at).total_seconds() <= 86400
+        ]
+        current_amount = float(row.amount)
+        if len(amounts_24h) >= 3:
+            mean_amt = sum(amounts_24h) / len(amounts_24h)
+            variance = sum((a - mean_amt) ** 2 for a in amounts_24h) / len(amounts_24h)
+            std = math.sqrt(max(variance, 0.01))
+            features["actor_amount_zscore_24h"] = (current_amount - mean_amt) / std
+        else:
+            features["actor_amount_zscore_24h"] = 0.0
+
+        # Graph fan-out/fan-in
+        features["graph_actor_fanout"] = float(
+            features.get("actor_distinct_counterparties_24h", 0)
+        )
+        features["graph_counterparty_fanin"] = float(
+            features.get("counterparty_distinct_actors_24h", 0)
+        )
+
+        # Shared neighbors (simplified: shared counterparties among actors)
+        actor_cps = {
+            r.counterparty_id for r in actor_events[row.actor_id]
+            if r.decision_at < now
+        }
+        cp_actors = {
+            r.actor_id for r in counterparty_events[row.counterparty_id]
+            if r.decision_at < now
+        }
+        shared = sum(
+            1
+            for other_actor in cp_actors
+            if other_actor != row.actor_id
+            and ({r.counterparty_id for r in actor_events.get(other_actor, [])} & actor_cps)
+        )
+        features["graph_shared_neighbor_count"] = float(shared)
+        features["graph_two_hop_reach"] = float(min(shared * 2, 20.0))
+
+        # Burst motif: rapid successive events from same actor
+        recent = [
+            r for r in prior_actor
+            if (now - r.decision_at).total_seconds() <= 60
+        ]
+        features["graph_burst_motif"] = float(min(len(recent), 10.0))
+        actor_history = len(actor_events[row.actor_id])
+        cp_history = len(counterparty_events[row.counterparty_id])
+        component_size = actor_history + cp_history
+        features["graph_component_size"] = float(min(component_size, 100.0))
+        total_edges = sum(len(v) for v in pair_events.values())
+        graph_nodes = max(len(actor_events) * len(counterparty_events), 1)
+        features["graph_edge_density"] = total_edges / graph_nodes
+        features["graph_prior_suspicious_count"] = float(
+            sum(1 for r in prior_cp if r.is_fraud)
+        ) if any(r.is_fraud for r in prior_cp) else 0.0
+
+        # Data quality
+        features["dq_missing_optional_count"] = 0.0
+        features["dq_current_availability_lag_ms"] = 0.0
+        last_seen = features.get("actor_seconds_since_last", -1)
+        dq_lag_ms = abs(last_seen) * 1000 if last_seen >= 0 else 5000.0
+        features["dq_mean_history_lag_ms"] = dq_lag_ms
+        features["dq_late_event_count"] = 0.0
+        features["dq_history_count"] = float(len(prior_actor))
+        features["dq_history_age_seconds"] = features.get("actor_seconds_since_first", 0)
+        features["dq_degraded_state"] = 0.0
+
+        enriched.append(row.model_copy(update={"predictive_features": features}))
+    return enriched
 
 
 class _PopulationIsolationError(ValueError):
@@ -260,7 +413,9 @@ def build_v5_corpus(
         fraud_rows = _build_fraud_campaigns_for_partition(
             partition_name, campaigns_for_profile, seed
         )
-        partitions[partition_name] = benign_rows + fraud_rows
+        all_rows = benign_rows + fraud_rows
+        enriched_rows = _enrich_features(all_rows)
+        partitions[partition_name] = enriched_rows
         all_actors[partition_name] = {r.actor_id for r in partitions[partition_name]}
         all_campaigns[partition_name] = {r.campaign_id for r in partitions[partition_name]}
 
