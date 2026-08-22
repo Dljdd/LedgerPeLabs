@@ -72,6 +72,8 @@ Defend v3 confirmatory attempt consumed on an incomplete scaffold; truthful `no_
 
 Defend v4: execution path implemented; evaluation not executed.
 
+Defend v4 confirmatory attempt consumed; truthful `no_promotion` recorded. Real frozen CatBoost/calibrator/rules were scored, but CALIBRATION and TIME_TO_ALERT gates always fail because those metrics are not yet computed (fail-closed None). No champion is claimed.
+
 ## Working title
 
 **Adaptive Payment Assurance Range**  

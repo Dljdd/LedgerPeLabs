@@ -1,0 +1,77 @@
+{
+  "schema_version": "1.0.0",
+  "protocol_id": "apar-defend-v4",
+  "status": "no_promotion",
+  "reason": "gates_not_satisfied_by_any_arm",
+  "synthetic_scope": "Synthetic-only evaluation; not a real-world prevalence or external-validity claim.",
+  "execution_nonce": "9aa7527bf488483536cae5b95fd8d8d248a60657c2de5fedc30e92b2c6ed0b8c",
+  "started_at": "2026-08-22T05:24:46.131360Z",
+  "completed_at": "2026-08-22T05:24:46.260354Z",
+  "source_tree_sha256": "285a388777f4370f82f4d1de59004d67837dd07c7db9b434c13e1a8ccb497dbd",
+  "config_manifest_sha256": "84da523c41bac361b000dde5f74b5f6195cc5b0cc9175378ed12c73cb7cc92a7",
+  "defender_bundle_sha256": "78de5c32770c777e1a76e23fc264d833acc42ae6e212af78e62ec26284612ca0",
+  "population_manifest_sha256": "974273d8038115f04e04245b588abd239179325480898dca54a25e9aae55b7c6",
+  "arms": [
+    {
+      "arm": "rules_only",
+      "status": "no_promotion",
+      "recall_min": 0.0,
+      "captured_value_fraction": 0.0,
+      "challenge_rate_max": 0.0,
+      "review_case_rate_max": 0.0,
+      "p95_decision_latency_ms": 0.1,
+      "failed_gates": [
+        "CALIBRATION",
+        "CAPTURED_VALUE",
+        "FALSE_DECLINE_BUDGET",
+        "FAMILY_COVERAGE",
+        "TIME_TO_ALERT",
+        "VALUE_PROTECTION"
+      ]
+    },
+    {
+      "arm": "gbdt_only",
+      "status": "no_promotion",
+      "recall_min": 1.0,
+      "captured_value_fraction": 1.0,
+      "challenge_rate_max": 0.0,
+      "review_case_rate_max": 0.0,
+      "p95_decision_latency_ms": 0.5,
+      "failed_gates": [
+        "CALIBRATION",
+        "FALSE_DECLINE_BUDGET",
+        "TIME_TO_ALERT"
+      ]
+    },
+    {
+      "arm": "layered_hybrid",
+      "status": "no_promotion",
+      "recall_min": 1.0,
+      "captured_value_fraction": 1.0,
+      "challenge_rate_max": 0.0,
+      "review_case_rate_max": 0.0,
+      "p95_decision_latency_ms": 0.6,
+      "failed_gates": [
+        "CALIBRATION",
+        "FALSE_DECLINE_BUDGET",
+        "TIME_TO_ALERT"
+      ]
+    }
+  ],
+  "limitations": [
+    "The v4 confirmatory execution used the actual frozen CatBoost model, isotonic calibrator, and rule engine on a small synthetic efficacy population.",
+    "CALIBRATION and TIME_TO_ALERT gates always fail because ECE and time-to-alert metrics are not yet computed; they fail closed as None.",
+    "This means no arm can pass under the current implementation regardless of model performance.",
+    "rules_only additionally fails family coverage (recall 0) and value protection (captured value 0).",
+    "gbdt_only and layered_hybrid show perfect recall on this small population but cannot pass due to uncomputed gates.",
+    "No champion is frozen and no hidden evaluation was opened.",
+    "V1 evidence remains byte-for-byte unchanged. V2 remains sealed and unexecuted. V3 attempt consumed on incomplete scaffold.",
+    "Synthetic-only evaluation; not a real-world prevalence or external-validity claim."
+  ],
+  "non_claims": [
+    "No real-world fraud prevalence or production performance claim is made or implied.",
+    "The small efficacy population does not support generalizable precision, F1, PR-AUC, or ROC-AUC conclusions.",
+    "Perfect recall for GBDT and hybrid arms reflects the small population size, not validated detection quality.",
+    "No champion is promoted and no defender bundle is frozen as competition-ready."
+  ]
+}

@@ -34,6 +34,7 @@ This matrix is the control surface for implementation status. Replace `Specified
 | Defend v3 | Execution path drafted; evaluation not executed | Drafted | Separately versioned protocol; no v3 population or result exists |
 | Defend v3 result | Confirmatory attempt consumed on incomplete scaffold | Truthful no_promotion | No scoring, metrics, or gates were evaluated; v4 protocol revision required |
 | Defend v4 | Execution path implemented; evaluation not executed | Implemented | Actual scoring, gate evaluation, and signed publication wired into the v3 boundary |
+| Defend v4 result | Confirmatory attempt consumed with real scoring | Truthful no_promotion | Frozen CatBoost/calibrator/rules scored; ECE/time-to-alert not computed so all arms fail conservatively |
 
 ## Status update rules
 
