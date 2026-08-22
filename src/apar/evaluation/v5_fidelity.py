@@ -67,6 +67,11 @@ def audit_v5_fidelity(corpus: V5Corpus) -> FidelityAudit:
                 _check(f"fraud_median_amount_{name}", FidelityDimension.STATISTICAL,
                        median_fraud, 0.0, 50000.0)
             )
+        max_amount = max((float(r.amount) for r in rows), default=0.0)
+        checks.append(
+            _check(f"max_transaction_amount_{name}", FidelityDimension.STATISTICAL,
+                   max_amount, 0.0, 100000.0)
+        )
 
         # Temporal
         if fraud:
@@ -74,8 +79,25 @@ def audit_v5_fidelity(corpus: V5Corpus) -> FidelityAudit:
             mean_hour = sum(times) / len(times)
             checks.append(
                 _check(f"fraud_mean_hour_{name}", FidelityDimension.TEMPORAL,
-                       mean_hour, 0.0, 24.0)
+                   mean_hour, 0.0, 24.0)
             )
+
+        # Temporal lifecycle ordering: within a campaign, timestamps must be non-decreasing.
+        from collections import defaultdict
+        campaign_times: dict[str, list] = defaultdict(list)
+        for row in rows:
+            campaign_times[row.campaign_id].append(row.decision_at)
+        monotonic_violations = sum(
+            1
+            for times in campaign_times.values()
+            if any(times[i] > times[i + 1] for i in range(len(times) - 1))
+        )
+        total_campaigns = max(len(campaign_times), 1)
+        violation_rate = monotonic_violations / total_campaigns
+        checks.append(
+            _check(f"campaign_monotonic_timestamps_{name}", FidelityDimension.TEMPORAL,
+                   violation_rate, 0.0, 0.0)
+        )
 
         # Relational
         actors = {r.actor_id for r in rows}
