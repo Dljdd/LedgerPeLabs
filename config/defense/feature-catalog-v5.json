@@ -1,0 +1,19 @@
+{
+  "schema_version": "5.0.0",
+  "catalog_name": "sentinel-v5",
+  "features": [
+    {"name": "amount", "type": "float", "group": "transaction"},
+    {"name": "txn_hour_sin", "type": "float", "group": "temporal"},
+    {"name": "txn_hour_cos", "type": "float", "group": "temporal"},
+    {"name": "rail_card", "type": "float", "group": "transaction"},
+    {"name": "rail_a2a", "type": "float", "group": "transaction"},
+    {"name": "rail_agentic", "type": "float", "group": "transaction"},
+    {"name": "integrity_pass", "type": "float", "group": "integrity"},
+    {"name": "actor_count_1m", "type": "float", "group": "velocity"},
+    {"name": "actor_count_10m", "type": "float", "group": "velocity"},
+    {"name": "actor_count_1h", "type": "float", "group": "velocity"},
+    {"name": "actor_amount_zscore_24h", "type": "float", "group": "behavioral"},
+    {"name": "graph_actor_fanout", "type": "float", "group": "graph"},
+    {"name": "graph_counterparty_fanin", "type": "float", "group": "graph"}
+  ]
+}
