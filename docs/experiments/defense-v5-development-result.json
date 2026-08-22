@@ -2,9 +2,32 @@
   "status": "development_not_ready",
   "profile": "production",
   "protocol_sha256": "575ce4888850176fe3d5e9b74ff80c6549dcb7bf457984196145668f9b497fb8",
-  "corpus_sha256": "ee5107b14214ae6ba7eef44ea23d9a55b5bb67d9188d2a310e147bb0508fcabc",
+  "corpus_sha256": "36f3b42962bb37cdeb727cad17be4ea1502dc8514e19d90c7d59f312ebb8a888",
   "fidelity_status": "pass",
-  "failed_gates": [],
-  "arms": {},
+  "failed_gates": [
+    "captured_value_fraction_min",
+    "family_recall_min"
+  ],
+  "arms": {
+    "full_sentinel": {
+      "arm": "full_sentinel",
+      "recall": 0.0,
+      "precision": null,
+      "f1": null,
+      "pr_auc": 0.36942996468807804,
+      "roc_auc": 0.5,
+      "brier": 0.36942996468807804,
+      "false_decline_rate": 0.0,
+      "challenge_rate": 0.0,
+      "review_rate": 0.0,
+      "captured_value_fraction": 0.0,
+      "escaped_value_fraction": 1.0,
+      "p50_latency_ms": null,
+      "p95_latency_ms": null,
+      "support_total": 5947,
+      "support_fraud": 2197,
+      "support_legitimate": 3750
+    }
+  },
   "hardening": null
 }

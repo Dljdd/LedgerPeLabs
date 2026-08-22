@@ -43,6 +43,7 @@ def build_v5_development_result(
     *,
     protocol: V5DevelopmentProtocol,
     corpus: V5Corpus,
+    arms: dict | None = None,
 ) -> V5DevelopmentResult:
     """Build a development evidence artifact from the completed pipeline."""
     from apar.evaluation.v5_fidelity import audit_v5_fidelity
@@ -56,12 +57,54 @@ def build_v5_development_result(
     else:
         status = "development_not_ready"
 
+    from apar.evaluation.v5_evaluation import V5EvaluationResult
+
+    parsed_arms = {
+        name: V5EvaluationResult.model_validate(data)
+        for name, data in (arms or {}).items()
+        if isinstance(data, dict) and "arm" in data
+    }
+
+    failed_gates: list[str] = []
+    for arm_result in parsed_arms.values():
+        if (
+            arm_result.recall is not None
+            and arm_result.recall < protocol.readiness.family_recall_min
+        ):
+            failed_gates.append("family_recall_min")
+        if (
+            arm_result.false_decline_rate is not None
+            and arm_result.false_decline_rate > protocol.readiness.false_decline_rate_max
+        ):
+            failed_gates.append("false_decline_rate_max")
+        if (
+            arm_result.challenge_rate is not None
+            and arm_result.challenge_rate > protocol.readiness.challenge_rate_max
+        ):
+            failed_gates.append("challenge_rate_max")
+        if (
+            arm_result.captured_value_fraction is not None
+            and arm_result.captured_value_fraction < protocol.readiness.captured_value_fraction_min
+        ):
+            failed_gates.append("captured_value_fraction_min")
+
+    if not corpus.is_production:
+        status = "smoke"
+    elif audit.overall_status != "pass":
+        status = "invalid_corpus"
+    elif failed_gates or not parsed_arms:
+        status = "development_not_ready"
+    else:
+        status = "development_not_ready"
+
     return V5DevelopmentResult(
         status=status,
         profile=corpus.profile.value,
         protocol_sha256=protocol.protocol_sha256,
         corpus_sha256=corpus.corpus_sha256,
         fidelity_status=audit.overall_status,
+        arms=dict(parsed_arms),
+        failed_gates=tuple(sorted(set(failed_gates))),
     )
 
 
