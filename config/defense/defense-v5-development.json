@@ -1,0 +1,45 @@
+{
+  "protocol_id": "apar-sentinel-v5-development",
+  "schema_version": "1.0.0",
+  "development_only": true,
+  "sealed_evaluation_allowed": false,
+  "readiness": {
+    "family_recall_min": 0.75,
+    "false_decline_rate_max": 0.001,
+    "manual_review_rate_max": 0.01,
+    "challenge_rate_max": 0.02,
+    "captured_value_fraction_min": 0.70,
+    "expected_calibration_error_max": 0.10,
+    "p95_decision_latency_ms_max": 50.0
+  },
+  "seeds": {
+    "train": 101,
+    "calibration": 202,
+    "threshold": 303,
+    "development_test": 404,
+    "hardening_train": 505,
+    "adaptive_holdout": 606,
+    "bootstrap": 707,
+    "catboost_seeds": [1001, 1002, 1003]
+  },
+  "smoke_profile": {
+    "legitimate_decisions": 200,
+    "campaigns_per_family": {
+      "agentic_intent_abuse": 2,
+      "app_scam_mule": 2,
+      "card_testing_cnp": 2,
+      "synthetic_merchant_refund": 2
+    }
+  },
+  "production_profile": {
+    "legitimate_decisions": 50000,
+    "campaigns_per_family": {
+      "agentic_intent_abuse": 100,
+      "app_scam_mule": 100,
+      "card_testing_cnp": 100,
+      "synthetic_merchant_refund": 100
+    }
+  },
+  "bootstrap_replicates": 2000,
+  "feature_catalog_path": "config/defense/feature-catalog-v5.json"
+}
