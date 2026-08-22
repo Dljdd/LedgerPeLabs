@@ -76,6 +76,16 @@ def train_sentinel_defender(
     bootstrap_seed: int,
 ) -> SentinelDefender:
     """Train a three-seed calibrated CatBoost ensemble with novelty router."""
+    calibration_labels = set(y_calibration.tolist())
+    if calibration_labels != {0, 1}:
+        raise ValueError(
+            f"one-class calibration partition: labels present = {sorted(calibration_labels)}"
+        )
+    threshold_labels = set(y_threshold.tolist())
+    if threshold_labels != {0, 1}:
+        raise ValueError(
+            f"one-class threshold partition: labels present = {sorted(threshold_labels)}"
+        )
     members: list[CatBoostClassifier] = []
     calibrators: list[IsotonicRegression] = []
     for seed in catboost_seeds:
