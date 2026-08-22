@@ -9,7 +9,9 @@ import sys
 from pathlib import Path
 
 _VALID_STATUSES = {"development_ready", "development_not_ready", "invalid_corpus"}
-_FORBIDDEN_CLAIMS = {"winner", "production_ready", "competition_validated", "confirmatory_supported"}
+_FORBIDDEN_CLAIMS = {
+    "winner", "production_ready", "competition_validated", "confirmatory_supported",
+}
 
 
 def _fail(message: str) -> int:
