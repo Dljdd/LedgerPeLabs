@@ -2,31 +2,32 @@
   "status": "development_not_ready",
   "profile": "production",
   "protocol_sha256": "575ce4888850176fe3d5e9b74ff80c6549dcb7bf457984196145668f9b497fb8",
-  "corpus_sha256": "36f3b42962bb37cdeb727cad17be4ea1502dc8514e19d90c7d59f312ebb8a888",
+  "corpus_sha256": "0189354f31c402d071e20ee9c644b55feb5e130d08f2933b3df4457ff62589c2",
   "fidelity_status": "pass",
   "failed_gates": [
     "captured_value_fraction_min",
+    "challenge_rate_max",
     "family_recall_min"
   ],
   "arms": {
     "full_sentinel": {
       "arm": "full_sentinel",
-      "recall": 0.0,
-      "precision": null,
-      "f1": null,
-      "pr_auc": 0.36942996468807804,
-      "roc_auc": 0.5,
-      "brier": 0.36942996468807804,
+      "recall": 0.4841053587647593,
+      "precision": 0.6122917863296956,
+      "f1": 0.5407050469185899,
+      "pr_auc": 0.6217503282736957,
+      "roc_auc": 0.814694732061762,
+      "brier": 0.07898932989998456,
       "false_decline_rate": 0.0,
-      "challenge_rate": 0.0,
-      "review_rate": 0.0,
-      "captured_value_fraction": 0.0,
-      "escaped_value_fraction": 1.0,
+      "challenge_rate": 0.056726975921643316,
+      "review_rate": 0.008706298462794177,
+      "captured_value_fraction": 0.6688010341595101,
+      "escaped_value_fraction": 0.3311989658404899,
       "p50_latency_ms": null,
       "p95_latency_ms": null,
-      "support_total": 5947,
-      "support_fraud": 2197,
-      "support_legitimate": 3750
+      "support_total": 14702,
+      "support_fraud": 2202,
+      "support_legitimate": 12500
     }
   },
   "hardening": null
