@@ -1,0 +1,16 @@
+{
+  "schema_version": "1.0.0",
+  "record_type": "rejected_experiment",
+  "protocol_id": "apar-sentinel-v5-development",
+  "rejected_commit": "3c5af3ce23a2d011964a46f884563e3f7ae75b98",
+  "original_result_sha256": "d7d162f2364c43a95a69434eacc3120a10e06a6273230911555a4a9810a58174",
+  "status": "invalid_experiment",
+  "rejection_reasons": [
+    "partition_contamination: development_test was re-split internally and every fraud row appeared in both training and testing",
+    "one_class_calibration: calibration partition contained only legitimate labels, collapsing isotonic output to zero",
+    "nondeterministic_corpus_generation: builtin hash() caused different corpus digests across processes",
+    "missing_readiness_gates: only four gates were checked; ECE, Brier, latency, time-to-alert, per-family recall, and finiteness were absent"
+  ],
+  "evidence_policy": "Metrics from this experiment (recall, ROC-AUC, PR-AUC) must not be used for model selection, threshold tuning, or competition claims.",
+  "superseded_by": "Fix Round 1 commits on codex/apar-sentinel-v5 after 3c5af3c"
+}
