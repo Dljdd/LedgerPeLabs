@@ -413,9 +413,7 @@ def build_v5_corpus(
         fraud_rows = _build_fraud_campaigns_for_partition(
             partition_name, campaigns_for_profile, seed
         )
-        all_rows = benign_rows + fraud_rows
-        enriched_rows = _enrich_features(all_rows)
-        partitions[partition_name] = enriched_rows
+        partitions[partition_name] = benign_rows + fraud_rows
         all_actors[partition_name] = {r.actor_id for r in partitions[partition_name]}
         all_campaigns[partition_name] = {r.campaign_id for r in partitions[partition_name]}
 
