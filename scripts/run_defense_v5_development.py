@@ -20,24 +20,36 @@ _FORBIDDEN_FEATURE_NAMES = {
 
 
 def _score_and_evaluate(
-    corpus_partition_decisions,
+    *,
+    train_decisions,
+    calibration_decisions,
+    threshold_decisions,
+    dev_test_decisions,
     protocol_seeds: tuple[int, ...],
     bootstrap_seed: int,
 ) -> dict:
     """Score the partition with a trained Sentinel defender and evaluate arms."""
     from apar.evaluation.v5_evaluation import V5Arm, evaluate_v5_arm
 
-    rows = corpus_partition_decisions
-    fraud_rows = [r for r in rows if r.is_fraud]
-    benign_rows = [r for r in rows if not r.is_fraud]
+    train_fraud = [r for r in train_decisions if r.is_fraud]
+    train_benign = [r for r in train_decisions if not r.is_fraud]
 
-    if not fraud_rows or not benign_rows:
+    cal_fraud = [r for r in calibration_decisions if r.is_fraud]
+    cal_benign = [r for r in calibration_decisions if not r.is_fraud]
+    thr_fraud = [r for r in threshold_decisions if r.is_fraud]
+    thr_benign = [r for r in threshold_decisions if not r.is_fraud]
+
+    if not train_fraud or not train_benign:
         return {"error": "insufficient mixed data for training"}
+    if not cal_fraud or not cal_benign:
+        return {"error": "one-class calibration partition"}
+    if not thr_fraud or not thr_benign:
+        return {"error": "one-class threshold partition"}
 
     feature_names = sorted(
-        {key for row in rows for key in row.predictive_features}
+        {key for row in train_decisions for key in row.predictive_features}
         - _FORBIDDEN_FEATURE_NAMES
-)
+    )
 
     def _matrix(selected_rows):
         return np.array([
@@ -45,24 +57,17 @@ def _score_and_evaluate(
             for row in selected_rows
         ], dtype=np.float64)
 
-    x_benign = _matrix(benign_rows)
-    x_fraud = _matrix(fraud_rows)
-    y_benign = np.zeros(len(benign_rows), dtype=int)
-    y_fraud = np.ones(len(fraud_rows), dtype=int)
-
-    n_benign = len(benign_rows)
-    train_end = int(n_benign * 0.4)
-    cal_end = int(n_benign * 0.55)
-    threshold_end = int(n_benign * 0.7)
-
-    x_train = np.vstack([x_benign[:train_end], x_fraud])
-    y_train = np.concatenate([y_benign[:train_end], y_fraud])
-    x_cal = x_benign[train_end:cal_end]
-    y_cal = y_benign[train_end:cal_end]
-    x_threshold = x_benign[cal_end:threshold_end]
-    y_threshold = y_benign[cal_end:threshold_end]
-    x_test = np.vstack([x_benign[threshold_end:], x_fraud])
-    y_test = np.concatenate([y_benign[threshold_end:], y_fraud])
+    x_train = np.vstack([_matrix(train_benign), _matrix(train_fraud)])
+    y_train = np.concatenate([
+        np.zeros(len(train_benign), dtype=int),
+        np.ones(len(train_fraud), dtype=int),
+    ])
+    x_cal = _matrix(calibration_decisions)
+    y_cal = np.array([0 if not r.is_fraud else 1 for r in calibration_decisions])
+    x_threshold = _matrix(threshold_decisions)
+    y_threshold = np.array([0 if not r.is_fraud else 1 for r in threshold_decisions])
+    x_test = _matrix(dev_test_decisions)
+    y_test = np.array([0 if not r.is_fraud else 1 for r in dev_test_decisions])
 
     defender = train_sentinel_defender(
         x_train=x_train,
@@ -81,11 +86,8 @@ def _score_and_evaluate(
 
     actions = [SentinelAction(d.action) for d in decisions]
     probs = np.array([d.ensemble_probability for d in decisions])
-    test_rows = x_test_rows_for_campaigns(
-        rows, benign_rows, fraud_rows, threshold_end
-    )
-    campaign_ids = np.array([r.campaign_id for r in test_rows])
-    amounts = np.array([float(r.amount) for r in test_rows])
+    campaign_ids = np.array([r.campaign_id for r in dev_test_decisions])
+    amounts = np.array([float(r.amount) for r in dev_test_decisions])
 
     arm_result = evaluate_v5_arm(
         arm=V5Arm.FULL_SENTINEL,
@@ -102,9 +104,6 @@ def _score_and_evaluate(
     }
 
 
-def x_test_rows_for_campaigns(all_rows, benign_rows, fraud_rows, threshold_end):
-    test_benign = benign_rows[threshold_end:]
-    return test_benign + fraud_rows
 
 
 def main() -> int:
@@ -117,16 +116,28 @@ def main() -> int:
     protocol = load_v5_development_protocol(root / "config/defense/defense-v5-development.json")
     profile = V5Profile(args.profile)
     corpus = build_v5_corpus(protocol, profile=profile)
-    dev_test = corpus.partitions.get("development_test")
 
-    arm_metrics = {}
-    if dev_test is not None:
+    train_partition = corpus.partitions.get("train")
+    calibration_partition = corpus.partitions.get("calibration")
+    threshold_partition = corpus.partitions.get("threshold")
+    dev_test_partition = corpus.partitions.get("development_test")
+
+    arm_metrics: dict[str, dict] = {}
+    partitions_ready = all(
+        p is not None
+        for p in (train_partition, calibration_partition, threshold_partition, dev_test_partition)
+    )
+    if partitions_ready:
         scoring_output = _score_and_evaluate(
-            dev_test.decisions,
-            protocol.seeds.catboost_seeds,
-            protocol.seeds.bootstrap,
+            train_decisions=train_partition.decisions,
+            calibration_decisions=calibration_partition.decisions,
+            threshold_decisions=threshold_partition.decisions,
+            dev_test_decisions=dev_test_partition.decisions,
+            protocol_seeds=protocol.seeds.catboost_seeds,
+            bootstrap_seed=protocol.seeds.bootstrap,
         )
-        arm_metrics["full_sentinel"] = scoring_output.get("arm_result", {})
+        if "arm_result" in scoring_output:
+            arm_metrics["full_sentinel"] = scoring_output["arm_result"]
 
     result = build_v5_development_result(
         protocol=protocol, corpus=corpus, arms=arm_metrics,
