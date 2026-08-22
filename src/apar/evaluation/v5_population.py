@@ -143,7 +143,9 @@ def _build_fraud_campaigns_for_partition(
 ) -> list[V5DecisionRow]:
     import random
 
-    rng = random.Random(seed_value + hash(partition_name) % 10000)
+    domain_input = f"fraud_campaign:{partition_name}".encode()
+    partition_offset = int.from_bytes(hashlib.sha256(domain_input).digest()[:4], "big") % 10000
+    rng = random.Random(seed_value + partition_offset)
     offset_days = _PARTITION_OFFSETS_DAYS.get(partition_name, 0)
     rows: list[V5DecisionRow] = []
     campaign_counter = 0
