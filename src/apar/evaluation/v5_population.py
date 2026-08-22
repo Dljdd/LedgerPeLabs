@@ -28,6 +28,9 @@ class V5DecisionRow(BaseModel):
     is_fraud: bool
     rail: str = "card"
     integrity_status: str = "not_applicable"
+    lifecycle_state: str = ""
+    source_command_id: str = ""
+    source_event_id: str = ""
     predictive_features: dict[str, float] = Field(default_factory=dict)
 
     @field_validator("decision_at", mode="before")
@@ -68,6 +71,12 @@ _FAMILY_PREFIXES = {
     V5Family.APP_SCAM_MULE.value: "appscam",
     V5Family.CARD_TESTING_CNP.value: "cardtest",
     V5Family.SYNTHETIC_MERCHANT_REFUND.value: "synthrefund",
+}
+_FAMILY_LIFECYCLE = {
+    "agentic_intent_abuse": ["trust_check", "authorization_attempt", "terminal_decline"],
+    "app_scam_mule": ["victim_funding", "fan_in", "layering", "cash_out"],
+    "card_testing_cnp": ["probe", "probe", "escalation", "authorization"],
+    "synthetic_merchant_refund": ["purchase", "settlement", "refund_abuse", "chargeback"],
 }
 _BASE_START = datetime(2026, 1, 1, tzinfo=UTC)
 _PARTITION_OFFSETS_DAYS = {
@@ -160,6 +169,8 @@ def _build_fraud_campaigns_for_partition(
             start_minute = rng.randint(0, 59)
             base_amount = rng.randint(200, 80_000)
             for d in range(decisions_in_campaign):
+                lifecycle = _FAMILY_LIFECYCLE.get(family_value, ["event"])
+                lifecycle_state = lifecycle[d % len(lifecycle)]
                 decision_at = _BASE_START + timedelta(
                     days=offset_days,
                     hours=start_hour,
@@ -191,6 +202,9 @@ def _build_fraud_campaigns_for_partition(
                     is_fraud=True,
                     rail=rail,
                     integrity_status=integrity if rail == "agentic" else "not_applicable",
+                    lifecycle_state=lifecycle_state,
+                    source_command_id=f"cmd-{campaign_id}-{d:03d}",
+                    source_event_id=event_id,
                     predictive_features={
                         "amount": max(amount_cents, 50) / 100.0,
                         f"rail_{rail}": 1.0,
