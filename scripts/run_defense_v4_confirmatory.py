@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import secrets
 import sys
 from pathlib import Path
 
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
 from apar.defense.contracts import ObservedEvent
 from apar.evaluation.v3_population import build_efficacy_population
+from apar.evaluation.v4_scoring import FrozenDefenderBundle
 from apar.evaluation.v4_preexecution import verify_v4_preexecution
 from apar.evaluation.v4_publication import from_gate_results, render_v4_scorecard
 from apar.evaluation.v4_runner import (
@@ -56,6 +61,15 @@ def main() -> int:
         day_count=28,
         seed=7,
     )
+    bundle = FrozenDefenderBundle(root)
+
+    signer_key = Ed25519PrivateKey.from_private_bytes(
+        hashlib.sha256(b"v4-signing-authority").digest()
+    )
+    public_key = signer_key.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+    )
+    signer_key_id = public_key.hex()
     population_digest = hashlib.sha256(
         canonical_json_bytes(
             {
@@ -101,21 +115,43 @@ def main() -> int:
         gate_results = execute_v4_arms(
             inputs,
             observations=population.observations,
+            truth=population.truth,
             observations_sha256=population.manifest.observations_sha256,
             truth_sha256=population.manifest.truth_sha256,
             gates=V4GateValues(),
+            bundle=bundle,
         )
         render_result = from_gate_results(
             protocol_id="apar-defend-v4",
             execution_nonce=execution_nonce,
             results=gate_results,
         )
+        unsigned = {
+            **render_result.model_dump(mode="json"),
+            "signer_key_id": signer_key_id,
+        }
+        signature = base64.b64encode(
+            signer_key.sign(canonical_json_bytes(unsigned))
+        ).decode("ascii")
+        card, files = render_v4_scorecard(
+            render_result,
+            signer_key_id=signer_key_id,
+            signature_base64=signature,
+        )
+
+        output_dir = root / ".apar" / "defense-v4" / "artifacts"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for filename, payload in files.items():
+            (output_dir / filename).write_bytes(payload)
+
         for result in gate_results:
             print(f"{result.arm}: {'PASS' if result.gate_outcome.passed else 'FAIL'} {list(result.gate_outcome.codes)}")
+        print(f"ARTIFACTS_PUBLISHED: {len(files)} files in {output_dir}")
         overall_status = render_result.status
     except Exception as error:
         print(f"EXECUTION_ERROR: {error}", file=sys.stderr)
-        overall_status = "no_promotion"
+        finalize_v4_receipt(receipt, directory=receipt_dir, status="failed")
+        return 1
 
     finalized = finalize_v4_receipt(receipt, directory=receipt_dir, status=overall_status)
     print(f"TERMINAL_STATUS: {finalized.terminal_status}")

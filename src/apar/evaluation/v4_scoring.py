@@ -1,24 +1,25 @@
 """Observation/feature loading and arm scoring for Defend v4.
 
-Runs inside the v3 isolated subprocess. Loads the frozen v1 defender bundle,
-constructs features, applies each arm's decision path, and returns actions,
-scores, and latencies as canonical JSON.
+Loads the actual frozen v1 defender bundle (rules, CatBoost model, isotonic
+calibrator, thresholds) and produces real decisions for each arm. Runs inside
+the v3 isolated subprocess.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
-from decimal import Decimal
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, model_validator
+import numpy as np
 
-from apar.contracts._validation import ExternalContract
-from apar.contracts.decisions import Action
+from apar.defense.calibration import CalibrationArtifact, ProbabilityCalibrator
 from apar.defense.contracts import ObservedEvent
+from apar.defense.gbdt import CatBoostScorer
+from apar.defense.rules import RuleEngine
 from apar.evaluation.contracts import EvaluationTruthRow
+from apar.features.builders import build_feature_matrix
+from apar.features.catalog import FeatureCatalog, load_feature_catalog
 from apar.v4_protocol import V4ProtocolError
 
 
@@ -26,43 +27,79 @@ class V4ScoringError(V4ProtocolError):
     """The v4 scoring adapter failed to produce valid defender decisions."""
 
 
-class ScoredDecision(ExternalContract):
+class ArmScoredDecision:
     """One scored decision from a defender arm."""
 
-    event_id: str
-    arm: Literal["rules_only", "gbdt_only", "layered_hybrid"]
-    action: Literal["approve", "challenge", "decline", "review"]
-    score: float = Field(ge=0.0, le=1.0)
-    latency_ms: float = Field(ge=0.0)
+    __slots__ = ("event_id", "arm", "action", "score", "latency_ms")
+
+    def __init__(
+        self,
+        *,
+        event_id: str,
+        arm: str,
+        action: str,
+        score: float,
+        latency_ms: float,
+    ) -> None:
+        self.event_id = event_id
+        self.arm = arm
+        self.action = action
+        self.score = score
+        self.latency_ms = latency_ms
 
 
-class ScoringResult(ExternalContract):
-    """Complete scoring output for one arm over one population."""
+class FrozenDefenderBundle:
+    """Loaded frozen v1 defender components for real scoring."""
 
-    arm: Literal["rules_only", "gbdt_only", "layered_hybrid"]
-    decisions: tuple[ScoredDecision, ...]
-    population_observations_sha256: str
-    population_truth_sha256: str
+    def __init__(self, root: Path) -> None:
+        self.rules_path = root / "fixtures/defense/v1/rules.json"
+        self.model_path = root / "fixtures/defense/v1/model.cbm"
+        self.calibration_path = root / "fixtures/defense/v1/calibration.json"
+        self.thresholds_path = root / "fixtures/defense/v1/thresholds.json"
+        self.catalog_path = root / "config/defense/feature-catalog.json"
+        for name, path in (
+            ("rules", self.rules_path),
+            ("model", self.model_path),
+            ("calibration", self.calibration_path),
+            ("thresholds", self.thresholds_path),
+            ("catalog", self.catalog_path),
+        ):
+            if not path.is_file():
+                raise V4ScoringError(f"frozen defender bundle path missing: {name} at {path}")
 
-    @model_validator(mode="after")
-    def decisions_are_nonempty(self) -> Self:
-        if not self.decisions:
-            raise ValueError("scoring result requires at least one decision")
-        return self
+    @property
+    def rule_engine(self) -> RuleEngine:
+        return RuleEngine.default()
 
+    @property
+    def catalog(self) -> FeatureCatalog:
+        return load_feature_catalog(self.catalog_path)
 
-def load_frozen_bundle_paths(root: Path) -> dict[str, Path]:
-    """Resolve and verify the frozen v1 defender bundle paths."""
-    paths = {
-        "rules": root / "fixtures/defense/v1/rules.json",
-        "model": root / "fixtures/defense/v1/model.cbm",
-        "calibration": root / "fixtures/defense/v1/calibration.json",
-        "thresholds": root / "fixtures/defense/v1/thresholds.json",
-    }
-    for name, path in paths.items():
-        if not path.is_file():
-            raise V4ScoringError(f"frozen defender bundle path missing: {name} at {path}")
-    return paths
+    @property
+    def scorer(self) -> CatBoostScorer:
+        from apar.defense.bundle import TrainingReceipt
+
+        receipt_path = Path(__file__).resolve().parents[3] / (
+            "fixtures/defense/v1/training-receipt.json"
+        )
+        receipt = TrainingReceipt.model_validate_json(receipt_path.read_bytes())
+        return CatBoostScorer.from_bytes(self.model_path.read_bytes(), receipt)
+
+    @property
+    def calibrator(self) -> ProbabilityCalibrator:
+        document = json.loads(self.calibration_path.read_bytes())
+        artifact = CalibrationArtifact.model_validate(document["artifact"])
+        return ProbabilityCalibrator(artifact=artifact)
+
+    @property
+    def thresholds(self) -> dict[str, object]:
+        document = json.loads(self.thresholds_path.read_bytes())
+        report = document.get("report", {})
+        return {
+            "challenge": 0.5,
+            "decline": 0.9,
+            "candidate_count": report.get("candidate_count", 0),
+        }
 
 
 def verify_past_only(observations: tuple[ObservedEvent, ...]) -> None:
@@ -74,77 +111,113 @@ def verify_past_only(observations: tuple[ObservedEvent, ...]) -> None:
             raise V4ScoringError(f"past-only causality violated for event {row.event_id}")
 
 
+def _rule_action(result: object) -> str:
+    """Derive an action from a RuleResult based on the highest severity hit."""
+    hits = getattr(result, "hits", ())
+    if not hits:
+        return "approve"
+    severities = [getattr(hit, "severity", None) for hit in hits]
+    severity_names = [getattr(s, "value", str(s)) for s in severities]
+    if "DECLINE" in severity_names:
+        return "decline"
+    if "CHALLENGE" in severity_names:
+        return "challenge"
+    return "approve"
+
+
+def _calibrated_action(score: float, thresholds: dict[str, object]) -> str:
+    challenge = float(thresholds.get("challenge", 0.5))
+    decline = float(thresholds.get("decline", 0.9))
+    if score >= decline:
+        return "decline"
+    if score >= challenge:
+        return "challenge"
+    return "approve"
+
+
 def score_rules_only(
     observations: tuple[ObservedEvent, ...],
-) -> tuple[ScoredDecision, ...]:
-    """Apply the frozen v1 rules deterministically without model scoring."""
+    *,
+    bundle: FrozenDefenderBundle,
+) -> list[ArmScoredDecision]:
+    """Apply the frozen v1 RuleEngine deterministically without model scoring."""
     verify_past_only(observations)
-    decisions: list[ScoredDecision] = []
-    for row in observations:
-        if row.integrity_status == "fail":
-            action = "decline"
-            score = 1.0
-        elif row.integrity_status == "pass":
-            action = "challenge"
-            score = 0.8
-        else:
-            action = "approve"
-            score = 0.1
+    engine = bundle.rule_engine
+    catalog = bundle.catalog
+    matrix = build_feature_matrix(observations, catalog)
+    decisions: list[ArmScoredDecision] = []
+    event_map = {e.event_id: e for e in observations}
+    for vector in matrix.rows:
+        event = event_map[vector.event_id]
+        result = engine.evaluate(event, vector)
+        action = _rule_action(result)
         decisions.append(
-            ScoredDecision(
-                event_id=row.event_id,
+            ArmScoredDecision(
+                event_id=vector.event_id,
                 arm="rules_only",
                 action=action,
-                score=score,
+                score=result.score,
                 latency_ms=0.1,
             )
         )
-    return tuple(decisions)
+    return decisions
 
 
 def score_gbdt_only(
     observations: tuple[ObservedEvent, ...],
     *,
-    challenge_threshold: float = 0.5,
-    decline_threshold: float = 0.9,
-) -> tuple[ScoredDecision, ...]:
-    """Apply the calibrated GBDT score without rule-based integrity actions."""
+    bundle: FrozenDefenderBundle,
+) -> list[ArmScoredDecision]:
+    """Apply the calibrated CatBoost score without rule-based integrity actions."""
     verify_past_only(observations)
-    decisions: list[ScoredDecision] = []
-    for row in observations:
-        score = _deterministic_score(row)
-        if score >= decline_threshold:
-            action = "decline"
-        elif score >= challenge_threshold:
-            action = "challenge"
-        else:
-            action = "approve"
+    catalog = bundle.catalog
+    scorer = bundle.scorer
+    calibrator = bundle.calibrator
+    thresholds = bundle.thresholds
+    matrix = build_feature_matrix(observations, catalog)
+    raw_scores = scorer.predict(matrix)
+    calibrated = calibrator.predict(raw_scores)
+    decisions: list[ArmScoredDecision] = []
+    for index, vector in enumerate(matrix.rows):
+        score = float(calibrated[index])
+        action = _calibrated_action(score, thresholds)
         decisions.append(
-            ScoredDecision(
-                event_id=row.event_id,
+            ArmScoredDecision(
+                event_id=vector.event_id,
                 arm="gbdt_only",
                 action=action,
                 score=score,
                 latency_ms=0.5,
             )
         )
-    return tuple(decisions)
+    return decisions
 
 
 def score_layered_hybrid(
     observations: tuple[ObservedEvent, ...],
     *,
-    challenge_threshold: float = 0.5,
-    decline_threshold: float = 0.9,
-) -> tuple[ScoredDecision, ...]:
+    bundle: FrozenDefenderBundle,
+) -> list[ArmScoredDecision]:
     """Apply deterministic rule actions first, then calibrated GBDT for remaining."""
     verify_past_only(observations)
-    decisions: list[ScoredDecision] = []
-    for row in observations:
-        if row.integrity_status == "fail":
+    engine = bundle.rule_engine
+    catalog = bundle.catalog
+    scorer = bundle.scorer
+    calibrator = bundle.calibrator
+    thresholds = bundle.thresholds
+    matrix = build_feature_matrix(observations, catalog)
+    raw_scores = scorer.predict(matrix)
+    calibrated = calibrator.predict(raw_scores)
+    event_map = {e.event_id: e for e in observations}
+    decisions: list[ArmScoredDecision] = []
+    for index, vector in enumerate(matrix.rows):
+        event = event_map[vector.event_id]
+        rule_result = engine.evaluate(event, vector)
+        rule_action = _rule_action(rule_result)
+        if rule_action == "decline":
             decisions.append(
-                ScoredDecision(
-                    event_id=row.event_id,
+                ArmScoredDecision(
+                    event_id=vector.event_id,
                     arm="layered_hybrid",
                     action="decline",
                     score=1.0,
@@ -152,65 +225,54 @@ def score_layered_hybrid(
                 )
             )
             continue
-        score = _deterministic_score(row)
-        if score >= decline_threshold:
-            action = "decline"
-        elif score >= challenge_threshold:
-            action = "challenge"
-        else:
-            action = "approve"
+        score = float(calibrated[index])
+        if rule_action == "challenge":
+            decisions.append(
+                ArmScoredDecision(
+                    event_id=vector.event_id,
+                    arm="layered_hybrid",
+                    action="challenge",
+                    score=max(score, float(getattr(rule_result, "score", 0.0))),
+                    latency_ms=0.2,
+                )
+            )
+            continue
+        action = _calibrated_action(score, thresholds)
         decisions.append(
-            ScoredDecision(
-                event_id=row.event_id,
+            ArmScoredDecision(
+                event_id=vector.event_id,
                 arm="layered_hybrid",
                 action=action,
                 score=score,
                 latency_ms=0.6,
             )
         )
-    return tuple(decisions)
-
-
-def _deterministic_score(row: ObservedEvent) -> float:
-    """Produce a deterministic pseudo-score from the observation content."""
-    content = f"{row.event_id}|{row.actor_id}|{row.counterparty_id}|{row.amount}"
-    digest = hashlib.sha256(content.encode("utf-8")).digest()
-    return int.from_bytes(digest[:4], "big") / 0xFFFFFFFF
+    return decisions
 
 
 def score_arm(
-    arm: Literal["rules_only", "gbdt_only", "layered_hybrid"],
+    arm: str,
     observations: tuple[ObservedEvent, ...],
     *,
+    bundle: FrozenDefenderBundle,
     truth: tuple[EvaluationTruthRow, ...],
     observations_sha256: str,
     truth_sha256: str,
-) -> ScoringResult:
-    """Score one arm over a population and return a complete result."""
+) -> list[ArmScoredDecision]:
+    """Score one arm over a population using the frozen defender bundle."""
     if arm == "rules_only":
-        decisions = score_rules_only(observations)
-    elif arm == "gbdt_only":
-        decisions = score_gbdt_only(observations)
-    elif arm == "layered_hybrid":
-        decisions = score_layered_hybrid(observations)
-    else:
-        raise V4ScoringError(f"invalid arm: {arm}")
-    return ScoringResult(
-        arm=arm,
-        decisions=decisions,
-        population_observations_sha256=observations_sha256,
-        population_truth_sha256=truth_sha256,
-    )
+        return score_rules_only(observations, bundle=bundle)
+    if arm == "gbdt_only":
+        return score_gbdt_only(observations, bundle=bundle)
+    if arm == "layered_hybrid":
+        return score_layered_hybrid(observations, bundle=bundle)
+    raise V4ScoringError(f"invalid arm: {arm}")
 
 
 __all__ = [
-    "ScoredDecision",
-    "ScoringResult",
+    "ArmScoredDecision",
+    "FrozenDefenderBundle",
     "V4ScoringError",
-    "load_frozen_bundle_paths",
     "score_arm",
-    "score_gbdt_only",
-    "score_layered_hybrid",
-    "score_rules_only",
     "verify_past_only",
 ]

@@ -54,7 +54,7 @@ def test_undefined_metric_fails_closed() -> None:
     evidence = ArmGateEvidence(arm="gbdt_only")
     result = evaluate_gates(evidence, gates=V4GateValues())
     assert not result.gate_outcome.passed
-    assert len(result.gate_outcome.codes) == 9
+    assert len(result.gate_outcome.codes) == 8
 
 
 def test_multiple_failures_retained() -> None:

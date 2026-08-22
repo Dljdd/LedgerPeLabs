@@ -14,7 +14,7 @@ from pydantic import model_validator
 
 from apar.contracts._validation import ExternalContract
 from apar.evaluation.v2_selection import V2GateOutcome
-from apar.evaluation.v4_gate_evaluation import ArmPromotionResult
+from apar.evaluation.v4_gate_evaluation import ArmGateEvidence, ArmPromotionResult
 from apar.runs.wire import canonical_json_bytes
 from apar.v4_protocol import SYNTHETIC_NON_CLAIM, V4ProtocolError
 
@@ -29,6 +29,7 @@ class V4ArmScorecard(ExternalContract):
     arm: Literal["rules_only", "gbdt_only", "layered_hybrid"]
     status: Literal["not_executed", "no_promotion", "promotion_eligible"]
     gate_codes: tuple[str, ...] = ()
+    evidence: ArmGateEvidence | None = None
 
     @model_validator(mode="after")
     def status_is_coherent(self) -> Self:
@@ -110,6 +111,7 @@ def from_gate_results(
             arm=result.arm,
             status="promotion_eligible" if result.gate_outcome.passed else "no_promotion",
             gate_codes=result.gate_outcome.codes,
+            evidence=result.evidence,
         )
         for result in results
     )
@@ -164,14 +166,37 @@ def _arm_metrics_csv(card: DefenseV4Scorecard) -> bytes:
         )
     )
     for arm in card.arms:
-        writer.writerow(
-            (
+        evidence = arm.evidence
+        if evidence is None:
+            row = (arm.arm, arm.status) + ("",) * 16
+        else:
+            row = (
                 arm.arm, arm.status,
-                "", "", "", "", "", "", "", "",
-                "", "", "", "", "", "", "", "",
+                "",  # precision placeholder
+                _fmt(evidence.family_recall_min),
+                "",  # f1 placeholder
+                "",  # pr_auc placeholder
+                "",  # roc_auc placeholder
+                _fmt(evidence.calibration_ece_max),
+                "",  # brier placeholder
+                "",  # fpr placeholder
+                _fmt(evidence.challenge_rate_max),
+                _fmt(evidence.false_decline_rate_max),
+                _fmt(evidence.review_case_rate_max),
+                "",  # false_interventions_per_10k placeholder
+                _fmt(evidence.captured_value_min),
+                _fmt(evidence.escaped_value_max),
+                _fmt(evidence.p95_time_to_alert_seconds_max),
+                _fmt(evidence.p95_decision_latency_ms_max),
             )
+        writer.writerow(
+            row
         )
     return buffer.getvalue().encode("utf-8")
+
+
+def _fmt(value: float | None) -> str:
+    return f"{value:.6f}" if value is not None else ""
 
 
 def _workload_csv(card: DefenseV4Scorecard) -> bytes:

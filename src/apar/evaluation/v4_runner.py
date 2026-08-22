@@ -16,9 +16,15 @@ from pathlib import Path
 from apar.defense.contracts import ObservedEvent
 from apar.evaluation.v3_isolation import IsolationCapabilityManifest
 from apar.evaluation.v3_receipt import ExecutionReceipt, has_receipt, write_receipt_atomically
-from apar.evaluation.v4_gate_evaluation import ArmGateEvidence, ArmPromotionResult, evaluate_gates
-from apar.evaluation.v4_scoring import ScoringResult, score_arm
-from apar.evaluation.v4_publication import DefenseV4RenderResult, from_gate_results
+from apar.evaluation.contracts import EvaluationTruthRow
+from apar.evaluation.v4_gate_evaluation import (
+    ArmPromotionResult,
+    evaluate_gates,
+    project_gate_evidence,
+)
+from apar.evaluation.v4_scoring import FrozenDefenderBundle
+from apar.evaluation.v4_scoring import ArmScoredDecision
+from apar.evaluation.v4_scoring import score_arm
 from apar.v4_protocol import V4GateValues, V4ProtocolError
 
 
@@ -82,17 +88,20 @@ def execute_v4_arms(
     inputs: V4ExecutionInputs,
     *,
     observations: tuple[ObservedEvent, ...],
+    truth: tuple[EvaluationTruthRow, ...],
     observations_sha256: str,
     truth_sha256: str,
     gates: V4GateValues,
+    bundle: FrozenDefenderBundle,
 ) -> tuple[ArmPromotionResult, ...]:
     """Score all three arms, evaluate gates, and return promotion results."""
     results: list[ArmPromotionResult] = []
     for arm in ("rules_only", "gbdt_only", "layered_hybrid"):
         try:
-            scoring = score_arm(
+            decisions = score_arm(
                 arm,
                 observations,
+                bundle=bundle,
                 truth=(),
                 observations_sha256=observations_sha256,
                 truth_sha256=truth_sha256,
@@ -100,38 +109,10 @@ def execute_v4_arms(
         except Exception as error:
             raise V4RunnerError(f"scoring failed for arm {arm}: {error}") from error
 
-        evidence = _project_gate_evidence(scoring)
+        evidence = project_gate_evidence(decisions, truth, arm=arm)
         result = evaluate_gates(evidence, gates=gates)
         results.append(result)
     return tuple(results)
-
-
-def _project_gate_evidence(scoring: ScoringResult) -> ArmGateEvidence:
-    """Project scored decisions into gate evidence bounds."""
-    actions = [d.action for d in scoring.decisions]
-    total = len(actions)
-    if total == 0:
-        return ArmGateEvidence(arm=scoring.arm)
-
-    challenges = sum(1 for a in actions if a == "challenge")
-    declines = sum(1 for a in actions if a == "decline")
-    reviews = sum(1 for a in actions if a in ("challenge", "review"))
-    latencies = [d.latency_ms for d in scoring.decisions]
-    latencies.sort()
-    p95_latency = latencies[int(len(latencies) * 0.95)] if latencies else 0.0
-
-    return ArmGateEvidence(
-        arm=scoring.arm,
-        family_recall_min=0.0,
-        calibration_ece_max=0.0,
-        challenge_rate_max=challenges / total,
-        false_decline_rate_max=declines / total,
-        review_case_rate_max=reviews / total,
-        p95_decision_latency_ms_max=p95_latency,
-        captured_value_min=0.0,
-        escaped_value_max=1.0,
-        p95_time_to_alert_seconds_max=0.0,
-    )
 
 
 def finalize_v4_receipt(

@@ -15,9 +15,14 @@ from apar.evaluation.v4_runner import (
     finalize_v4_receipt,
     verify_v4_approval,
 )
+from apar.evaluation.v4_scoring import FrozenDefenderBundle
+from apar.evaluation.contracts import EvaluationTruthRow
+from decimal import Decimal
 from apar.v4_protocol import V4GateValues
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[2]
+BUNDLE = FrozenDefenderBundle(ROOT)
 
 def _inputs(approval: str | None = None) -> V4ExecutionInputs:
     return V4ExecutionInputs(
@@ -53,6 +58,7 @@ def test_execute_arms_produces_gate_results(tmp_path: Path) -> None:
     from decimal import Decimal
     from apar.contracts.events import EventKind, Rail
     from apar.defense.contracts import ObservedEvent
+    from apar.evaluation.contracts import Family
 
     observations = tuple(
         ObservedEvent(
@@ -72,12 +78,30 @@ def test_execute_arms_produces_gate_results(tmp_path: Path) -> None:
         )
         for index in range(10)
     )
+    truth = tuple(
+        EvaluationTruthRow(
+            event_id=f"row-{index}",
+            payment_id=f"payment-{index}",
+            campaign_id=f"campaign-{index}",
+            family="card_testing_cnp",
+            viewpoint="development",
+            is_fraud=index % 2 == 0,
+            label_source="population_truth",
+            label_mature_at=datetime(2026, 8, 22, tzinfo=UTC),
+            first_settlement_at=datetime(2026, 8, 22, tzinfo=UTC),
+            net_settled_value=Decimal("100.00"),
+            lifecycle_event_ids=(f"row-{index}",),
+        )
+        for index in range(10)
+    )
     results = execute_v4_arms(
         _inputs(),
         observations=observations,
+        truth=truth,
         observations_sha256="a" * 64,
         truth_sha256="b" * 64,
         gates=V4GateValues(),
+        bundle=BUNDLE,
     )
     assert len(results) == 3
     assert all(not result.gate_outcome.passed for result in results)
