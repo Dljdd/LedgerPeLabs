@@ -1,0 +1,10 @@
+{
+  "status": "development_not_ready",
+  "profile": "production",
+  "protocol_sha256": "575ce4888850176fe3d5e9b74ff80c6549dcb7bf457984196145668f9b497fb8",
+  "corpus_sha256": "ee5107b14214ae6ba7eef44ea23d9a55b5bb67d9188d2a310e147bb0508fcabc",
+  "fidelity_status": "pass",
+  "failed_gates": [],
+  "arms": {},
+  "hardening": null
+}
