@@ -8,14 +8,22 @@ import math
 from base64 import b64decode
 from binascii import Error as Base64Error
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal, Self, cast
 
 import numpy as np
 from catboost import CatBoostClassifier  # type: ignore[import-untyped]
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 from sklearn.metrics import (  # type: ignore[import-untyped]
     average_precision_score,
     brier_score_loss,
@@ -23,7 +31,12 @@ from sklearn.metrics import (  # type: ignore[import-untyped]
 )
 
 from apar.defense.rules import RuleManifest
-from apar.defense.sentinel import SentinelAction
+from apar.defense.sentinel import (
+    FULL_SENTINEL_DISAGREEMENT_REVIEW_THRESHOLD,
+    FULL_SENTINEL_NOVELTY_CHALLENGE_THRESHOLD,
+    FULL_SENTINEL_NOVELTY_REVIEW_THRESHOLD,
+    SentinelAction,
+)
 from apar.evaluation.v5_population import V5DecisionRow, V5ExecutionManifest
 
 _INTERVENTION_ACTIONS = {
@@ -31,6 +44,14 @@ _INTERVENTION_ACTIONS = {
     SentinelAction.REVIEW_HOLD,
     SentinelAction.DECLINE_HOLD,
 }
+_MAX_EXECUTION_ARTIFACTS = 4_096
+_MAX_EXECUTION_ARTIFACT_BYTES = 268_435_456
+_MAX_FEATURE_BATCH_BYTES = 134_217_728
+_MAX_FEATURE_MATRIX_CELLS = 10_000_000
+_MAX_SCORE_ROWS = 100_000
+_MAX_CATBOOST_ARTIFACT_BYTES = 67_108_864
+_MAX_ISOLATION_TREES = 512
+_MAX_ISOLATION_NODES = 262_144
 
 
 class V5Arm(StrEnum):
@@ -64,10 +85,12 @@ _EXPECTED_SWITCHES = {
     V5Arm.FULL_SENTINEL: (True, True, True, True, True, True),
 }
 _EXPECTED_IMPLEMENTATION_PATHS = (
+    "src/apar/contracts/_validation.py",
     "src/apar/contracts/decisions.py",
     "src/apar/contracts/events.py",
     "src/apar/contracts/scenarios.py",
     "src/apar/defense/rules.py",
+    "src/apar/defense/contracts.py",
     "src/apar/defense/sentinel.py",
     "src/apar/evaluation/v5_arms.py",
     "src/apar/evaluation/v5_evaluation.py",
@@ -78,6 +101,8 @@ _EXPECTED_IMPLEMENTATION_PATHS = (
     "src/apar/evaluation/v5_protocol.py",
     "src/apar/evaluation/v5_reporting.py",
     "src/apar/features/sentinel.py",
+    "src/apar/features/catalog.py",
+    "src/apar/features/state.py",
     "src/apar/generators/campaigns.py",
     "src/apar/generators/population.py",
     "src/apar/simulator/clock.py",
@@ -188,6 +213,8 @@ def build_v5_execution_artifacts(
     manifests: Sequence[V5ExecutionManifest],
 ) -> tuple[V5ExecutionArtifact, ...]:
     """Serialize validated execution manifests into canonical bounded artifacts."""
+    if len(manifests) > _MAX_EXECUTION_ARTIFACTS:
+        raise ValueError("execution artifact count exceeds production profile limit")
     artifacts: list[V5ExecutionArtifact] = []
     for manifest in sorted(manifests, key=lambda item: item.evidence_sha256):
         validated = V5ExecutionManifest.model_validate(manifest)
@@ -208,7 +235,18 @@ def build_v5_execution_artifacts(
         )
     if len({artifact.evidence_sha256 for artifact in artifacts}) != len(artifacts):
         raise ValueError("execution artifacts must have unique evidence digests")
+    _validate_execution_artifact_bounds(artifacts)
     return tuple(artifacts)
+
+
+def _validate_execution_artifact_bounds(
+    artifacts: Sequence[V5ExecutionArtifact],
+) -> None:
+    if len(artifacts) > _MAX_EXECUTION_ARTIFACTS:
+        raise ValueError("execution artifact count exceeds production profile limit")
+    total_bytes = sum(len(artifact.payload_json.encode()) for artifact in artifacts)
+    if total_bytes > _MAX_EXECUTION_ARTIFACT_BYTES:
+        raise ValueError("execution artifact bytes exceed production profile limit")
 
 
 def build_v5_arm_support_rows(
@@ -314,21 +352,28 @@ class V5TrainingPartitionEvidence(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     partition: Literal["train", "calibration", "threshold"]
-    ordered_event_ids: tuple[str, ...]
-    labels: tuple[Literal[0, 1], ...]
-    feature_names: tuple[str, ...]
-    feature_matrix: tuple[tuple[float, ...], ...]
-    support_records: tuple[V5ArmSupportRow, ...]
-    execution_artifacts: tuple[V5ExecutionArtifact, ...]
+    ordered_event_ids: tuple[str, ...] = Field(max_length=_MAX_SCORE_ROWS)
+    labels: tuple[Literal[0, 1], ...] = Field(max_length=_MAX_SCORE_ROWS)
+    feature_names: tuple[str, ...] = Field(max_length=256)
+    feature_matrix: tuple[tuple[float, ...], ...] = Field(max_length=_MAX_SCORE_ROWS)
+    support_records: tuple[V5ArmSupportRow, ...] = Field(max_length=_MAX_SCORE_ROWS)
+    execution_artifacts: tuple[V5ExecutionArtifact, ...] = Field(
+        max_length=_MAX_EXECUTION_ARTIFACTS
+    )
     catalog_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     feature_batch_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    feature_batch_payload_json: str = Field(max_length=20_000_000)
+    feature_batch_payload_json: str = Field(max_length=_MAX_FEATURE_BATCH_BYTES)
     feature_matrix_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     ordered_rows_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     ordered_support_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
     def ordered_provenance_is_complete(self) -> Self:
+        if len(self.feature_batch_payload_json.encode()) > _MAX_FEATURE_BATCH_BYTES:
+            raise ValueError("feature batch bytes exceed production profile limit")
+        if sum(len(row) for row in self.feature_matrix) > _MAX_FEATURE_MATRIX_CELLS:
+            raise ValueError("feature matrix cell count exceeds production profile limit")
+        _validate_execution_artifact_bounds(self.execution_artifacts)
         if not self.ordered_event_ids or len(self.ordered_event_ids) != len(self.labels):
             raise ValueError("training partition event IDs and labels must align")
         if len(set(self.ordered_event_ids)) != len(self.ordered_event_ids):
@@ -542,7 +587,9 @@ class V5IsolationForestManifest(BaseModel):
     feature_count: int = Field(gt=0)
     max_samples: int = Field(gt=0)
     offset: float
-    trees: tuple[V5IsolationTreeManifest, ...] = Field(min_length=1, max_length=512)
+    trees: tuple[V5IsolationTreeManifest, ...] = Field(
+        min_length=1, max_length=_MAX_ISOLATION_TREES
+    )
     artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     def computed_digest(self) -> str:
@@ -579,6 +626,10 @@ class V5IsolationForestManifest(BaseModel):
 
     @model_validator(mode="after")
     def forest_is_content_addressed(self) -> Self:
+        if len(self.trees) > _MAX_ISOLATION_TREES:
+            raise ValueError("isolation forest tree count exceeds production profile limit")
+        if sum(len(tree.children_left) for tree in self.trees) > _MAX_ISOLATION_NODES:
+            raise ValueError("isolation forest node count exceeds production profile limit")
         if not math.isfinite(self.offset):
             raise ValueError("isolation forest offset must be finite")
         if any(
@@ -637,6 +688,14 @@ class V5ArmSpecification(BaseModel):
 
     @model_validator(mode="after")
     def specification_is_bound(self) -> Self:
+        model_artifact_bytes = sum(
+            len(artifact.payload_base64) * 3 // 4
+            - artifact.payload_base64.endswith("=")
+            - artifact.payload_base64.endswith("==")
+            for artifact in self.model_artifacts
+        )
+        if model_artifact_bytes > _MAX_CATBOOST_ARTIFACT_BYTES:
+            raise ValueError("CatBoost artifact bytes exceed production profile limit")
         if self.spec_sha256 != self.computed_digest():
             raise ValueError("arm specification digest mismatch")
         if Counter(self.graph_feature_names + self.non_graph_feature_names) != Counter(
@@ -796,6 +855,15 @@ class V5ArmSpecification(BaseModel):
                 or threshold_map["rules_decline"] != _RULE_DECLINE_THRESHOLD
             ):
                 raise ValueError("rule threshold values do not match frozen semantics")
+            if self.arm is V5Arm.FULL_SENTINEL and (
+                threshold_map["disagreement_review"]
+                != FULL_SENTINEL_DISAGREEMENT_REVIEW_THRESHOLD
+                or threshold_map["novelty_challenge"]
+                != FULL_SENTINEL_NOVELTY_CHALLENGE_THRESHOLD
+                or threshold_map["novelty_review"]
+                != FULL_SENTINEL_NOVELTY_REVIEW_THRESHOLD
+            ):
+                raise ValueError("fixed full sentinel threshold values do not match")
             expected_threshold_digest = _canonical_digest(
                 {
                     "source_partition": self.threshold_source_partition,
@@ -822,6 +890,13 @@ class V5ArmSpecification(BaseModel):
                 for item in self.training_partitions
             ):
                 raise ValueError("training provenance catalog digest mismatch")
+            if any(
+                item.feature_names != self.catalog_feature_names
+                for item in self.training_partitions
+            ):
+                raise ValueError(
+                    "training provenance must retain exact full catalog feature names"
+                )
             event_sets = [set(item.ordered_event_ids) for item in self.training_partitions]
             if any(
                 left & right
@@ -962,7 +1037,7 @@ class V5ArmRowEvidence(BaseModel):
     subset_feature_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     model_raw_scores: tuple[float, ...] = ()
     model_calibrated_scores: tuple[float, ...] = ()
-    threshold_trace: dict[str, float]
+    threshold_trace: Mapping[str, float]
     rule_components: tuple[tuple[str, float], ...] = ()
     action: SentinelAction
     probability: float = Field(ge=0.0, le=1.0)
@@ -1001,6 +1076,19 @@ class V5ArmRowEvidence(BaseModel):
             raise ValueError("arm evidence numbers must be finite")
         return value
 
+    @field_validator("threshold_trace", mode="after")
+    @classmethod
+    def threshold_trace_is_canonical_and_immutable(
+        cls, value: Mapping[str, float]
+    ) -> Mapping[str, float]:
+        return MappingProxyType(dict(sorted(value.items())))
+
+    @field_serializer("threshold_trace")
+    def serialize_threshold_trace(
+        self, value: Mapping[str, float]
+    ) -> dict[str, float]:
+        return dict(value)
+
     @model_validator(mode="after")
     def output_digest_is_bound(self) -> Self:
         numeric_values = (
@@ -1036,8 +1124,10 @@ class V5ArmScore(BaseModel):
 
     spec: V5ArmSpecification
     support_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    execution_artifacts: tuple[V5ExecutionArtifact, ...]
-    rows: tuple[V5ArmRowEvidence, ...]
+    execution_artifacts: tuple[V5ExecutionArtifact, ...] = Field(
+        max_length=_MAX_EXECUTION_ARTIFACTS
+    )
+    rows: tuple[V5ArmRowEvidence, ...] = Field(max_length=_MAX_SCORE_ROWS)
     score_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     def computed_digest(self) -> str:
@@ -1049,6 +1139,15 @@ class V5ArmScore(BaseModel):
             raise ValueError("arm score requires an execution-bound specification")
         if not self.rows:
             raise ValueError("arm score must contain rows")
+        if len(self.rows) > _MAX_SCORE_ROWS:
+            raise ValueError("arm score row count exceeds production profile limit")
+        _validate_execution_artifact_bounds(self.execution_artifacts)
+        evaluation_ids = {row.support.event_id for row in self.rows}
+        if any(
+            evaluation_ids & set(partition.ordered_event_ids)
+            for partition in self.spec.training_partitions
+        ):
+            raise ValueError("arm evaluation support overlaps a training partition")
         if any(row.arm_spec_sha256 != self.spec.spec_sha256 for row in self.rows):
             raise ValueError("arm row evidence specification digest mismatch")
         expected = _canonical_digest(
@@ -1338,7 +1437,7 @@ def _recompute_rule_components(
 
 
 def _probability_action(
-    probability: float, threshold_trace: dict[str, float]
+    probability: float, threshold_trace: Mapping[str, float]
 ) -> SentinelAction:
     if probability >= threshold_trace["model_decline"]:
         return SentinelAction.DECLINE_HOLD
@@ -1349,7 +1448,7 @@ def _probability_action(
     return SentinelAction.APPROVE
 
 
-def _rules_action(score: float, threshold_trace: dict[str, float]) -> SentinelAction:
+def _rules_action(score: float, threshold_trace: Mapping[str, float]) -> SentinelAction:
     if score >= threshold_trace["rules_decline"]:
         return SentinelAction.DECLINE_HOLD
     if score >= threshold_trace["rules_challenge"]:
@@ -1388,13 +1487,33 @@ class V5ArmScoreSet(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    by_arm: dict[V5Arm, V5ArmScore]
+    by_arm: Mapping[V5Arm, V5ArmScore]
+
+    @field_validator("by_arm", mode="after")
+    @classmethod
+    def arm_mapping_is_immutable(
+        cls, value: Mapping[V5Arm, V5ArmScore]
+    ) -> Mapping[V5Arm, V5ArmScore]:
+        return MappingProxyType(dict(value))
+
+    @field_serializer("by_arm")
+    def serialize_arm_mapping(
+        self, value: Mapping[V5Arm, V5ArmScore]
+    ) -> dict[V5Arm, V5ArmScore]:
+        return dict(value)
 
     @model_validator(mode="after")
     def arms_share_exact_support(self) -> Self:
         if tuple(self.by_arm) != _CURRENT_ARMS:
             raise ValueError("score set must contain the exact ordered current arms")
         results = tuple(self.by_arm.values())
+        for result in results:
+            evaluation_ids = {row.support.event_id for row in result.rows}
+            if any(
+                evaluation_ids & set(partition.ordered_event_ids)
+                for partition in result.spec.training_partitions
+            ):
+                raise ValueError("score-set evaluation support overlaps training partition")
         support_digests = {result.support_sha256 for result in results}
         if len(support_digests) != 1:
             raise ValueError("arms do not share identical evaluation support")
@@ -1608,8 +1727,12 @@ class V5EvaluationResult(BaseModel):
     support_sha256: str = ""
     feature_count: int = 0
     arm_spec: V5ArmSpecification | None = None
-    execution_artifacts: tuple[V5ExecutionArtifact, ...] = ()
-    row_evidence: tuple[V5ArmRowEvidence, ...] = ()
+    execution_artifacts: tuple[V5ExecutionArtifact, ...] = Field(
+        default=(), max_length=_MAX_EXECUTION_ARTIFACTS
+    )
+    row_evidence: tuple[V5ArmRowEvidence, ...] = Field(
+        default=(), max_length=_MAX_SCORE_ROWS
+    )
     score_sha256: str = ""
     result_sha256: str = ""
 
@@ -1623,10 +1746,19 @@ class V5EvaluationResult(BaseModel):
             return self
         if self.arm_spec is None or not self.execution_artifacts or not self.row_evidence:
             raise ValueError("arm result evidence is incomplete")
+        if len(self.row_evidence) > _MAX_SCORE_ROWS:
+            raise ValueError("arm result score row count exceeds production profile limit")
+        _validate_execution_artifact_bounds(self.execution_artifacts)
         if self.arm_spec_sha256 != self.arm_spec.spec_sha256:
             raise ValueError("arm result specification digest mismatch")
         if self.feature_count != len(self.arm_spec.feature_names):
             raise ValueError("arm result feature count disagrees with specification")
+        evaluation_ids = {row.support.event_id for row in self.row_evidence}
+        if any(
+            evaluation_ids & set(partition.ordered_event_ids)
+            for partition in self.arm_spec.training_partitions
+        ):
+            raise ValueError("arm result evaluation support overlaps training partition")
         if self.arm != self.arm_spec.arm.value:
             raise ValueError("arm result name disagrees with specification")
         if any(row.arm_spec_sha256 != self.arm_spec_sha256 for row in self.row_evidence):

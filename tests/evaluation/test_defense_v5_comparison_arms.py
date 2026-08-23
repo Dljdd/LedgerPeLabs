@@ -251,11 +251,45 @@ def test_four_arms_train_and_score_independent_component_paths() -> None:
         calibration_evidence=calibration_provenance,
         threshold_evidence=threshold_provenance,
     )
+    feature_semantics_forge = deepcopy(
+        trained.by_arm[V5Arm.FULL_SENTINEL].spec.model_dump(mode="json")
+    )
+    forged_training = feature_semantics_forge["training_partitions"][0]
+    forged_training["feature_names"][0] = "is_fraud"
+    feature_payload = json.loads(forged_training["feature_batch_payload_json"])
+    feature_payload["names"][0] = "is_fraud"
+    forged_training["feature_batch_payload_json"] = json.dumps(
+        feature_payload, sort_keys=True
+    )
+    forged_training["feature_batch_sha256"] = hashlib.sha256(
+        forged_training["feature_batch_payload_json"].encode()
+    ).hexdigest()
+    feature_semantics_forge["spec_sha256"] = independent_digest(
+        {
+            key: value
+            for key, value in feature_semantics_forge.items()
+            if key != "spec_sha256"
+        }
+    )
+    with pytest.raises(ValueError, match="full catalog feature names|feature semantics"):
+        V5ArmSpecification.model_validate(feature_semantics_forge)
+
     support = build_v5_arm_support_rows(test_rows)
     execution_artifacts = build_v5_execution_artifacts(
         corpus.partitions["development_test"].executions
     )
     trust_failures = [row.integrity_status == "fail" for row in test_rows]
+    with pytest.raises(ValueError, match="evaluation.*overlap|training partition"):
+        score(
+            trained=trained,
+            catalog=catalog,
+            features_matrix=x_train,
+            support=build_v5_arm_support_rows(train_rows),
+            execution_artifacts=build_v5_execution_artifacts(
+                corpus.partitions["train"].executions
+            ),
+            trust_failures=[row.integrity_status == "fail" for row in train_rows],
+        )
     scored = score(
         trained=trained,
         catalog=catalog,
@@ -480,6 +514,118 @@ def test_four_arms_train_and_score_independent_component_paths() -> None:
         document["score_sha256"] = independent_digest(
             {key: value for key, value in document.items() if key != "score_sha256"}
         )
+
+    for threshold_name, forged_value in (
+        ("disagreement_review", 0.150000001),
+        ("novelty_challenge", 0.700000001),
+        ("novelty_review", 0.900000001),
+    ):
+        full_threshold_forge = deepcopy(
+            scored.by_arm[V5Arm.FULL_SENTINEL].model_dump(mode="json")
+        )
+        forged_thresholds = dict(full_threshold_forge["spec"]["threshold_values"])
+        forged_thresholds[threshold_name] = forged_value
+        full_threshold_forge["spec"]["threshold_values"] = sorted(
+            forged_thresholds.items()
+        )
+        threshold_partition = full_threshold_forge["spec"]["training_partitions"][2]
+        full_threshold_forge["spec"]["threshold_digest"] = independent_digest(
+            {
+                "source_partition": "threshold",
+                "method": "sentinel_percentile_v1",
+                "threshold_ordered_rows_sha256": threshold_partition[
+                    "ordered_rows_sha256"
+                ],
+                "threshold_support_sha256": threshold_partition[
+                    "ordered_support_sha256"
+                ],
+                "threshold_feature_batch_sha256": threshold_partition[
+                    "feature_batch_sha256"
+                ],
+                "threshold_feature_matrix_sha256": threshold_partition[
+                    "feature_matrix_sha256"
+                ],
+                "threshold_values": full_threshold_forge["spec"]["threshold_values"],
+            }
+        )
+        full_threshold_forge["spec"]["spec_sha256"] = independent_digest(
+            {
+                key: value
+                for key, value in full_threshold_forge["spec"].items()
+                if key != "spec_sha256"
+            }
+        )
+        for row in full_threshold_forge["rows"]:
+            row["arm_spec_sha256"] = full_threshold_forge["spec"]["spec_sha256"]
+            row["threshold_trace"].update(forged_thresholds)
+        rebind_score(full_threshold_forge)
+        with pytest.raises(ValueError, match="fixed full sentinel threshold"):
+            V5ArmScore.model_validate(full_threshold_forge)
+
+    immutable_row = scored.by_arm[V5Arm.FULL_SENTINEL].rows[0]
+    with pytest.raises(TypeError):
+        immutable_row.threshold_trace["novelty_review"] = 0.1
+    with pytest.raises(TypeError):
+        scored.by_arm[V5Arm.RULES_ONLY] = scored.by_arm[V5Arm.RULES_ONLY]
+    assert scored.model_dump_json() == scored.model_dump_json()
+
+    full_score = scored.by_arm[V5Arm.FULL_SENTINEL]
+    oversized_rows = full_score.model_copy(
+        update={"rows": (full_score.rows[0],) * 100_001}
+    )
+    with pytest.raises(ValueError, match="score row.*limit"):
+        oversized_rows.rows_match_specification()
+    largest_execution = max(
+        execution_artifacts, key=lambda artifact: len(artifact.payload_json.encode())
+    )
+    oversized_execution_count = full_score.model_copy(
+        update={"execution_artifacts": (largest_execution,) * 4_097}
+    )
+    with pytest.raises(ValueError, match="execution artifact count.*limit"):
+        oversized_execution_count.rows_match_specification()
+    artifact_repetitions = (
+        268_435_456 // len(largest_execution.payload_json.encode()) + 1
+    )
+    assert artifact_repetitions < 4_096
+    oversized_execution_bytes = full_score.model_copy(
+        update={
+            "execution_artifacts": (largest_execution,) * artifact_repetitions
+        }
+    )
+    with pytest.raises(ValueError, match="execution artifact bytes.*limit"):
+        oversized_execution_bytes.rows_match_specification()
+    first_feature_row = train_provenance.feature_matrix[0]
+    matrix_repetitions = 10_000_000 // len(first_feature_row) + 1
+    oversized_matrix = train_provenance.model_copy(
+        update={"feature_matrix": (first_feature_row,) * matrix_repetitions}
+    )
+    with pytest.raises(ValueError, match="feature matrix cell.*limit"):
+        oversized_matrix.ordered_provenance_is_complete()
+    novelty_manifest = full_score.spec.novelty_manifest
+    assert novelty_manifest is not None
+    source_tree = novelty_manifest.trees[0]
+    large_tree = source_tree.model_copy(
+        update={
+            "children_left": (-1,) * 1_025,
+            "children_right": (-1,) * 1_025,
+            "feature": (-2,) * 1_025,
+            "threshold": (0.0,) * 1_025,
+            "decision_path_lengths": (1.0,) * 1_025,
+            "average_path_lengths": (0.0,) * 1_025,
+        }
+    )
+    oversized_forest = novelty_manifest.model_copy(
+        update={"trees": (large_tree,) * 256}
+    )
+    with pytest.raises(ValueError, match="isolation forest node.*limit"):
+        oversized_forest.forest_is_content_addressed()
+    model_artifact = full_score.spec.model_artifacts[0]
+    model_repetitions = 67_108_864 // len(model_artifact.payload()) + 1
+    oversized_models = full_score.spec.model_copy(
+        update={"model_artifacts": (model_artifact,) * model_repetitions}
+    )
+    with pytest.raises(ValueError, match="CatBoost artifact bytes.*limit"):
+        oversized_models.specification_is_bound()
 
     for result in scored.by_arm.values():
         assert result.score_sha256 == independent_digest(

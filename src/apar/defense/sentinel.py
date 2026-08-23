@@ -6,9 +6,13 @@ from enum import StrEnum
 
 import numpy as np
 from catboost import CatBoostClassifier  # type: ignore[import-untyped]
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 from sklearn.ensemble import IsolationForest  # type: ignore[import-untyped]
 from sklearn.isotonic import IsotonicRegression  # type: ignore[import-untyped]
+
+FULL_SENTINEL_DISAGREEMENT_REVIEW_THRESHOLD = 0.15
+FULL_SENTINEL_NOVELTY_CHALLENGE_THRESHOLD = 0.7
+FULL_SENTINEL_NOVELTY_REVIEW_THRESHOLD = 0.9
 
 
 class SentinelAction(StrEnum):
@@ -43,9 +47,22 @@ class SentinelThresholds(BaseModel):
     challenge_threshold: float = 0.5
     review_threshold: float = 0.7
     decline_threshold: float = 0.9
-    disagreement_review_threshold: float = 0.15
-    novelty_challenge_threshold: float = 0.7
-    novelty_review_threshold: float = 0.9
+    disagreement_review_threshold: float = FULL_SENTINEL_DISAGREEMENT_REVIEW_THRESHOLD
+    novelty_challenge_threshold: float = FULL_SENTINEL_NOVELTY_CHALLENGE_THRESHOLD
+    novelty_review_threshold: float = FULL_SENTINEL_NOVELTY_REVIEW_THRESHOLD
+
+    @model_validator(mode="after")
+    def routing_thresholds_are_frozen(self) -> SentinelThresholds:
+        if (
+            self.disagreement_review_threshold
+            != FULL_SENTINEL_DISAGREEMENT_REVIEW_THRESHOLD
+            or self.novelty_challenge_threshold
+            != FULL_SENTINEL_NOVELTY_CHALLENGE_THRESHOLD
+            or self.novelty_review_threshold
+            != FULL_SENTINEL_NOVELTY_REVIEW_THRESHOLD
+        ):
+            raise ValueError("full sentinel routing thresholds are fixed")
+        return self
 
 
 class SentinelModelManifest(BaseModel):

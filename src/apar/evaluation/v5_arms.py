@@ -301,6 +301,11 @@ def train_v5_arm_set(
     if any(template.bootstrap_seed != bootstrap_seed for template in configuration.arms):
         raise ValueError("bootstrap seed disagrees with the frozen arm specification")
     training_partitions = (train_evidence, calibration_evidence, threshold_evidence)
+    if any(
+        evidence.feature_names != catalog.feature_names
+        for evidence in training_partitions
+    ):
+        raise ValueError("training evidence feature semantics differ from full catalog")
     matrices = (x_train, x_calibration, x_threshold)
     labels_by_partition = (y_train, y_calibration, y_threshold)
     expected_names = ("train", "calibration", "threshold")
@@ -673,6 +678,13 @@ def score_v5_arm_set(
         raise ValueError("evaluation features, support, and trust must align")
     if len({row.event_id for row in support}) != len(support):
         raise ValueError("evaluation support event IDs must be unique")
+    evaluation_ids = {row.event_id for row in support}
+    if any(
+        evaluation_ids & set(partition.ordered_event_ids)
+        for arm in trained.arms
+        for partition in arm.spec.training_partitions
+    ):
+        raise ValueError("evaluation support overlaps a model-development partition")
     derived_trust_failures = derive_v5_trust_failures(support, execution_artifacts)
     if trust_failures != derived_trust_failures:
         raise ValueError("trust failures disagree with retained verifier evidence")

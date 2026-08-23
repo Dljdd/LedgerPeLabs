@@ -87,6 +87,25 @@ def test_runner_scores_four_arms_over_identical_real_execution_support() -> None
         catalog_sha256=catalog.catalog_sha256,
     )
     assert len(development.result_sha256) == 64
+    with pytest.raises(TypeError):
+        development.arms[V5Arm.RULES_ONLY.value] = development.arms[
+            V5Arm.RULES_ONLY.value
+        ]
+    assert development.model_dump_json() == development.model_dump_json()
+    full_result = development.arms[V5Arm.FULL_SENTINEL.value]
+    assert full_result.arm_spec is not None
+    training_event_id = full_result.arm_spec.training_partitions[0].ordered_event_ids[0]
+    overlap_support = full_result.row_evidence[0].support.model_copy(
+        update={"event_id": training_event_id}
+    )
+    overlap_row = full_result.row_evidence[0].model_copy(
+        update={"support": overlap_support}
+    )
+    overlap_result = full_result.model_copy(
+        update={"row_evidence": (overlap_row, *full_result.row_evidence[1:])}
+    )
+    with pytest.raises(ValueError, match="evaluation.*overlap|training partition"):
+        overlap_result.evidence_is_consistent()
 
     def independent_digest(document: object) -> str:
         return hashlib.sha256(

@@ -94,15 +94,35 @@ def test_arm_implementation_inventory_binds_execution_and_trust_dependencies() -
         (ROOT / "config/defense/defense-v5-arms.json").read_text()
     )
     required = {
+        "src/apar/contracts/_validation.py",
+        "src/apar/contracts/decisions.py",
+        "src/apar/contracts/events.py",
+        "src/apar/contracts/scenarios.py",
+        "src/apar/defense/contracts.py",
+        "src/apar/defense/rules.py",
+        "src/apar/defense/sentinel.py",
+        "src/apar/evaluation/v5_arms.py",
+        "src/apar/evaluation/v5_evaluation.py",
         "src/apar/evaluation/v5_execution.py",
+        "src/apar/evaluation/v5_fidelity.py",
+        "src/apar/evaluation/v5_hardening.py",
         "src/apar/evaluation/v5_population.py",
+        "src/apar/evaluation/v5_protocol.py",
+        "src/apar/evaluation/v5_reporting.py",
+        "src/apar/features/catalog.py",
+        "src/apar/features/sentinel.py",
+        "src/apar/features/state.py",
         "src/apar/generators/campaigns.py",
         "src/apar/generators/population.py",
         "src/apar/simulator/engine.py",
         "src/apar/simulator/ledger.py",
+        "src/apar/simulator/clock.py",
+        "src/apar/simulator/rails/__init__.py",
         "src/apar/simulator/rails/agentic.py",
         "src/apar/simulator/rails/a2a.py",
+        "src/apar/simulator/rails/base.py",
         "src/apar/simulator/rails/card.py",
         "src/apar/trust/verifier.py",
+        "scripts/run_defense_v5_development.py",
     }
-    assert required <= set(document["implementation_paths"])
+    assert required == set(document["implementation_paths"])

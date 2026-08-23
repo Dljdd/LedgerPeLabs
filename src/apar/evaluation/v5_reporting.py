@@ -5,8 +5,16 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
+from types import MappingProxyType
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from apar.evaluation.v5_evaluation import V5Arm, V5EvaluationResult
 from apar.evaluation.v5_hardening import V5HardeningResult
@@ -49,9 +57,22 @@ class V5DevelopmentResult(BaseModel):
     corpus_sha256: str = ""
     fidelity_status: str = ""
     failed_gates: tuple[str, ...] = ()
-    arms: dict[str, V5EvaluationResult] = Field(default_factory=dict)
+    arms: Mapping[str, V5EvaluationResult] = Field(default_factory=dict)
     hardening: V5HardeningResult | None = None
     result_sha256: str = ""
+
+    @field_validator("arms", mode="after")
+    @classmethod
+    def arm_mapping_is_immutable(
+        cls, value: Mapping[str, V5EvaluationResult]
+    ) -> Mapping[str, V5EvaluationResult]:
+        return MappingProxyType(dict(value))
+
+    @field_serializer("arms")
+    def serialize_arm_mapping(
+        self, value: Mapping[str, V5EvaluationResult]
+    ) -> dict[str, V5EvaluationResult]:
+        return dict(value)
 
     @field_validator("status")
     @classmethod
