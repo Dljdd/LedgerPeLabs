@@ -10,13 +10,28 @@ from pathlib import Path
 import numpy as np
 
 from apar.defense.sentinel import SentinelAction, train_sentinel_defender
+from apar.evaluation.v5_evaluation import V5Arm, evaluate_v5_arm
 from apar.evaluation.v5_population import build_v5_corpus
 from apar.evaluation.v5_protocol import V5Profile, load_v5_development_protocol
 from apar.evaluation.v5_reporting import build_v5_development_result
+from apar.features.sentinel import (
+    SentinelFeatureCatalog,
+    build_sentinel_features,
+)
 
-_FORBIDDEN_FEATURE_NAMES = {
-    "family", "campaign_id", "is_fraud", "seed", "split", "scenario_id",
-}
+
+def _build_partition_matrix(
+    partition_decisions,
+    catalog: SentinelFeatureCatalog,
+):
+    """Build features for one partition and return (matrix, labels, metadata)."""
+    batch = build_sentinel_features(partition_decisions, catalog=catalog)
+    matrix = np.array(batch.matrix, dtype=np.float64)
+    labels = np.array([1 if row.is_fraud else 0 for row in partition_decisions], dtype=int)
+    event_ids = [row.event_id for row in partition_decisions]
+    campaign_ids = [row.campaign_id for row in partition_decisions]
+    amounts = [float(row.amount) for row in partition_decisions]
+    return matrix, labels, event_ids, campaign_ids, amounts, batch
 
 
 def _score_and_evaluate(
@@ -25,85 +40,73 @@ def _score_and_evaluate(
     calibration_decisions,
     threshold_decisions,
     dev_test_decisions,
+    catalog: SentinelFeatureCatalog,
     protocol_seeds: tuple[int, ...],
     bootstrap_seed: int,
 ) -> dict:
-    """Score the partition with a trained Sentinel defender and evaluate arms."""
-    from apar.evaluation.v5_evaluation import V5Arm, evaluate_v5_arm
-
-    train_fraud = [r for r in train_decisions if r.is_fraud]
-    train_benign = [r for r in train_decisions if not r.is_fraud]
-
-    cal_fraud = [r for r in calibration_decisions if r.is_fraud]
-    cal_benign = [r for r in calibration_decisions if not r.is_fraud]
-    thr_fraud = [r for r in threshold_decisions if r.is_fraud]
-    thr_benign = [r for r in threshold_decisions if not r.is_fraud]
-
-    if not train_fraud or not train_benign:
-        return {"error": "insufficient mixed data for training"}
-    if not cal_fraud or not cal_benign:
-        return {"error": "one-class calibration partition"}
-    if not thr_fraud or not thr_benign:
-        return {"error": "one-class threshold partition"}
-
-    feature_names = sorted(
-        {key for row in train_decisions for key in row.predictive_features}
-        - _FORBIDDEN_FEATURE_NAMES
+    """Build features via the catalog, train, score, and evaluate."""
+    x_train, y_train, _, _, _, _ = _build_partition_matrix(train_decisions, catalog)
+    x_cal, y_cal, _, _, _, _ = _build_partition_matrix(calibration_decisions, catalog)
+    x_threshold, y_threshold, _, _, _, _ = _build_partition_matrix(threshold_decisions, catalog)
+    x_test, y_test, test_event_ids, test_campaign_ids, test_amounts, _ = _build_partition_matrix(
+        dev_test_decisions, catalog
     )
 
-    def _matrix(selected_rows):
-        return np.array([
-            [row.predictive_features.get(name, 0.0) for name in feature_names]
-            for row in selected_rows
-        ], dtype=np.float64)
-
-    x_train = np.vstack([_matrix(train_benign), _matrix(train_fraud)])
-    y_train = np.concatenate([
-        np.zeros(len(train_benign), dtype=int),
-        np.ones(len(train_fraud), dtype=int),
-    ])
-    x_cal = _matrix(calibration_decisions)
-    y_cal = np.array([0 if not r.is_fraud else 1 for r in calibration_decisions])
-    x_threshold = _matrix(threshold_decisions)
-    y_threshold = np.array([0 if not r.is_fraud else 1 for r in threshold_decisions])
-    x_test = _matrix(dev_test_decisions)
-    y_test = np.array([0 if not r.is_fraud else 1 for r in dev_test_decisions])
+    train_fraud = int(y_train.sum())
+    train_benign = len(y_train) - train_fraud
+    if not train_fraud or not train_benign:
+        return {"error": "one-class training partition"}
+    cal_fraud = int(y_cal.sum())
+    cal_benign = len(y_cal) - cal_fraud
+    if not cal_fraud or not cal_benign:
+        return {"error": "one-class calibration partition"}
+    thr_fraud = int(y_threshold.sum())
+    thr_benign = len(y_threshold) - thr_fraud
+    if not thr_fraud or not thr_benign:
+        return {"error": "one-class threshold partition"}
 
     defender = train_sentinel_defender(
         x_train=x_train,
         y_train=y_train,
-        x_calibration=x_cal if len(x_cal) > 1 else x_threshold,
-        y_calibration=y_cal if len(y_cal) > 1 else y_threshold,
+        x_calibration=x_cal,
+        y_calibration=y_cal,
         x_threshold=x_threshold,
         y_threshold=y_threshold,
         catboost_seeds=protocol_seeds,
         bootstrap_seed=bootstrap_seed,
     )
 
-    start = time.perf_counter()
+    # Real inference latency: measure each row individually after warm-up.
+    warmup = defender.decide_batch(x_test[:min(5, len(x_test))])
+    latencies_ns = []
+    for i in range(len(x_test)):
+        start = time.perf_counter_ns()
+        defender.decide(x_test[i])
+        latencies_ns.append(time.perf_counter_ns() - start)
     decisions = defender.decide_batch(x_test)
-    elapsed_ms = [(time.perf_counter() - start) / max(len(x_test), 1) * 1000] * len(x_test)
 
     actions = [SentinelAction(d.action) for d in decisions]
     probs = np.array([d.ensemble_probability for d in decisions])
-    campaign_ids = np.array([r.campaign_id for r in dev_test_decisions])
-    amounts = np.array([float(r.amount) for r in dev_test_decisions])
+    campaign_ids_arr = np.array(test_campaign_ids)
+    amounts_arr = np.array(test_amounts)
 
     arm_result = evaluate_v5_arm(
         arm=V5Arm.FULL_SENTINEL,
         y_true=y_test,
         actions=actions,
         probabilities=probs,
-        campaign_ids=campaign_ids,
-        amounts=amounts,
+        campaign_ids=campaign_ids_arr,
+        amounts=amounts_arr,
     )
 
-    return {
-        "arm_result": arm_result.model_dump(mode="json"),
-        "latencies": elapsed_ms,
-    }
+    latencies_ms = [ns / 1_000_000 for ns in latencies_ns]
+    arm_dict = arm_result.model_dump(mode="json")
+    arm_dict["p50_latency_ms"] = float(np.percentile(latencies_ms, 50))
+    arm_dict["p95_latency_ms"] = float(np.percentile(latencies_ms, 95))
+    arm_dict["p99_latency_ms"] = float(np.percentile(latencies_ms, 99))
+    arm_dict["catalog_sha256"] = catalog.catalog_sha256
 
-
+    return {"arm_result": arm_dict}
 
 
 def main() -> int:
@@ -114,6 +117,9 @@ def main() -> int:
 
     root = Path(__file__).resolve().parents[1]
     protocol = load_v5_development_protocol(root / "config/defense/defense-v5-development.json")
+    catalog = SentinelFeatureCatalog.from_config(
+        root / protocol.feature_catalog_path
+    )
     profile = V5Profile(args.profile)
     corpus = build_v5_corpus(protocol, profile=profile)
 
@@ -133,6 +139,7 @@ def main() -> int:
             calibration_decisions=calibration_partition.decisions,
             threshold_decisions=threshold_partition.decisions,
             dev_test_decisions=dev_test_partition.decisions,
+            catalog=catalog,
             protocol_seeds=protocol.seeds.catboost_seeds,
             bootstrap_seed=protocol.seeds.bootstrap,
         )
@@ -140,7 +147,10 @@ def main() -> int:
             arm_metrics["full_sentinel"] = scoring_output["arm_result"]
 
     result = build_v5_development_result(
-        protocol=protocol, corpus=corpus, arms=arm_metrics,
+        protocol=protocol,
+        corpus=corpus,
+        arms=arm_metrics,
+        catalog_sha256=catalog.catalog_sha256,
     )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)

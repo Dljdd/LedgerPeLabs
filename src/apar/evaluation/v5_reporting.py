@@ -23,6 +23,7 @@ class V5DevelopmentResult(BaseModel):
     status: str
     profile: str = ""
     protocol_sha256: str = ""
+    catalog_sha256: str = ""
     corpus_sha256: str = ""
     fidelity_status: str = ""
     failed_gates: tuple[str, ...] = ()
@@ -44,6 +45,7 @@ def build_v5_development_result(
     protocol: V5DevelopmentProtocol,
     corpus: V5Corpus,
     arms: dict | None = None,
+    catalog_sha256: str = "",
 ) -> V5DevelopmentResult:
     """Build a development evidence artifact from the completed pipeline."""
     from apar.evaluation.v5_fidelity import audit_v5_fidelity
@@ -101,6 +103,7 @@ def build_v5_development_result(
         status=status,
         profile=corpus.profile.value,
         protocol_sha256=protocol.protocol_sha256,
+        catalog_sha256=catalog_sha256,
         corpus_sha256=corpus.corpus_sha256,
         fidelity_status=audit.overall_status,
         arms=dict(parsed_arms),
