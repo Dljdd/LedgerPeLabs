@@ -229,12 +229,23 @@ def build_v5_corpus(
         if profile is V5Profile.SMOKE
         else protocol.production_profile
     )
-    legitimate_total = (
-        min(profile_counts.legitimate_decisions, 500)
-        if profile is V5Profile.SMOKE
-        else profile_counts.legitimate_decisions
-    )
-    per_operational = legitimate_total // len(_OPERATIONAL_PARTITIONS)
+    if profile is V5Profile.SMOKE:
+        legitimate_total = min(profile_counts.legitimate_decisions, 500)
+        per_operational = legitimate_total // len(_OPERATIONAL_PARTITIONS)
+        partition_legitimate_counts = {
+            name: per_operational for name in _OPERATIONAL_PARTITIONS
+        }
+        partition_legitimate_counts["hardening_train"] = max(per_operational // 2, 10)
+        partition_legitimate_counts["adaptive_holdout"] = max(per_operational // 2, 10)
+    else:
+        partition_legitimate_counts = {
+            "train": protocol.production_profile.legitimate_decisions // 4,
+            "calibration": protocol.production_profile.legitimate_decisions // 8,
+            "threshold": protocol.production_profile.legitimate_decisions // 8,
+            "development_test": protocol.production_dev_test_legitimate,
+            "hardening_train": protocol.production_profile.legitimate_decisions // 8,
+            "adaptive_holdout": protocol.production_profile.legitimate_decisions // 8,
+        }
 
     partitions: dict[str, list[V5DecisionRow]] = {}
     all_actors: dict[str, set[str]] = {name: set() for name in _PARTITION_SEED_KEYS}
@@ -257,7 +268,8 @@ def build_v5_corpus(
 
     for partition_name in _PARTITION_SEED_KEYS:
         seed = seed_map[partition_name]
-        benign_rows = _build_benign_partition(partition_name, per_operational, seed)
+        benign_count = partition_legitimate_counts.get(partition_name, per_operational)
+        benign_rows = _build_benign_partition(partition_name, benign_count, seed)
         fraud_rows = _build_fraud_campaigns_for_partition(
             partition_name, campaigns_for_profile, seed
         )
