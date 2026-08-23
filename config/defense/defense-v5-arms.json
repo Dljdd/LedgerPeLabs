@@ -4,9 +4,13 @@
   "threshold_source_partition": "threshold",
   "implementation_version": "sentinel-v5-arms-1.0.0",
   "implementation_paths": [
+    "src/apar/defense/rules.py",
     "src/apar/defense/sentinel.py",
-    "src/apar/evaluation/v5_evaluation.py",
     "src/apar/evaluation/v5_arms.py",
+    "src/apar/evaluation/v5_evaluation.py",
+    "src/apar/evaluation/v5_protocol.py",
+    "src/apar/evaluation/v5_reporting.py",
+    "src/apar/features/sentinel.py",
     "scripts/run_defense_v5_development.py"
   ],
   "arms": [

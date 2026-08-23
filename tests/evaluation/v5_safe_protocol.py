@@ -5,6 +5,7 @@ from pathlib import Path
 from apar.evaluation.v5_protocol import (
     V5DevelopmentProtocol,
     load_v5_development_protocol,
+    v5_protocol_digest,
 )
 
 
@@ -14,10 +15,12 @@ def load_safe_v5_test_protocol(root: Path) -> V5DevelopmentProtocol:
     )
     if locked.seeds.development_test != 2404:
         raise AssertionError("locked development-test seed changed unexpectedly")
-    return locked.model_copy(
+    safe = locked.model_copy(
         update={
             "seeds": locked.seeds.model_copy(
                 update={"development_test": 404}
-            )
+            ),
+            "protocol_sha256": "",
         }
     )
+    return safe.model_copy(update={"protocol_sha256": v5_protocol_digest(safe)})

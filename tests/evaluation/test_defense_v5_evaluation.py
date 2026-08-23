@@ -55,3 +55,32 @@ class TestMetrics:
                 campaign_ids=np.array([]),
                 amounts=np.array([]),
             )
+
+    def test_operational_rates_use_legitimate_denominators_and_retain_ece_p99(self) -> None:
+        result = evaluate_v5_arm(
+            arm=V5Arm.ENSEMBLE_NO_GRAPH,
+            y_true=np.array([0, 0, 1]),
+            actions=[
+                SentinelAction.CHALLENGE,
+                SentinelAction.APPROVE,
+                SentinelAction.REVIEW_HOLD,
+            ],
+            probabilities=np.array([0.2, 0.1, 0.8]),
+            campaign_ids=np.array(["c0", "c1", "c2"]),
+            amounts=np.ones(3),
+        )
+        assert result.challenge_rate == pytest.approx(1 / 2)
+        assert result.review_rate == 0.0
+        assert result.expected_calibration_error is not None
+        assert result.p99_latency_ms is None
+
+    def test_one_class_evaluation_fails_closed(self) -> None:
+        with pytest.raises(ValueError, match="both classes"):
+            evaluate_v5_arm(
+                arm=V5Arm.RULES_ONLY,
+                y_true=np.array([0, 0]),
+                actions=[SentinelAction.APPROVE, SentinelAction.APPROVE],
+                probabilities=np.array([0.1, 0.2]),
+                campaign_ids=np.array(["c0", "c1"]),
+                amounts=np.ones(2),
+            )

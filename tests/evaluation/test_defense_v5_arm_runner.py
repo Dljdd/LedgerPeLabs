@@ -2,11 +2,24 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+from copy import deepcopy
 from pathlib import Path
 
-from apar.evaluation.v5_evaluation import V5Arm, load_v5_arm_configuration
+import pytest
+
+from apar.evaluation.v5_evaluation import (
+    V5Arm,
+    V5EvaluationResult,
+    load_v5_arm_configuration,
+)
 from apar.evaluation.v5_population import build_v5_corpus
 from apar.evaluation.v5_protocol import V5Profile
+from apar.evaluation.v5_reporting import (
+    V5DevelopmentResult,
+    build_v5_development_result,
+)
 from apar.features.sentinel import SentinelFeatureCatalog
 from scripts import run_defense_v5_development as runner
 from tests.evaluation.v5_safe_protocol import load_safe_v5_test_protocol
@@ -62,3 +75,83 @@ def test_runner_scores_four_arms_over_identical_real_execution_support() -> None
         for arm in (V5Arm.ENSEMBLE_NO_GRAPH, V5Arm.ENSEMBLE_WITH_GRAPH)
         for row in results[arm.value]["row_evidence"]
     )
+
+    development = build_v5_development_result(
+        protocol=protocol,
+        corpus=corpus,
+        arms=results,
+        catalog_sha256=catalog.catalog_sha256,
+    )
+    assert len(development.result_sha256) == 64
+
+    def independent_digest(document: object) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                document,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode()
+        ).hexdigest()
+
+    assert development.result_sha256 == independent_digest(
+        development.model_dump(mode="json", exclude={"result_sha256"})
+    )
+    metric_tamper = deepcopy(results[V5Arm.FULL_SENTINEL.value])
+    metric_tamper["recall"] = 0.0 if metric_tamper["recall"] != 0.0 else 1.0
+    metric_tamper["result_sha256"] = independent_digest(
+        {key: value for key, value in metric_tamper.items() if key != "result_sha256"}
+    )
+    with pytest.raises(ValueError, match="metric recall"):
+        V5EvaluationResult.model_validate(metric_tamper)
+
+    with pytest.raises(ValueError, match="exact four|complete"):
+        build_v5_development_result(
+            protocol=protocol,
+            corpus=corpus,
+            arms={V5Arm.FULL_SENTINEL.value: results[V5Arm.FULL_SENTINEL.value]},
+            catalog_sha256=catalog.catalog_sha256,
+        )
+    cloned = development.model_dump(mode="json")
+    cloned["arms"][V5Arm.ENSEMBLE_NO_GRAPH.value] = deepcopy(
+        cloned["arms"][V5Arm.FULL_SENTINEL.value]
+    )
+    cloned["result_sha256"] = independent_digest(
+        {key: value for key, value in cloned.items() if key != "result_sha256"}
+    )
+    with pytest.raises(ValueError, match="key|cloned"):
+        V5DevelopmentResult.model_validate(cloned)
+
+    mixed = development.model_dump(mode="json")
+    mixed_arm = mixed["arms"][V5Arm.ENSEMBLE_NO_GRAPH.value]
+    mixed_arm["arm_spec"]["training_partitions"][0]["feature_batch_sha256"] = "1" * 64
+    mixed_spec_digest = independent_digest(
+        {
+            key: value
+            for key, value in mixed_arm["arm_spec"].items()
+            if key != "spec_sha256"
+        }
+    )
+    mixed_arm["arm_spec"]["spec_sha256"] = mixed_spec_digest
+    mixed_arm["arm_spec_sha256"] = mixed_spec_digest
+    for row in mixed_arm["row_evidence"]:
+        row["arm_spec_sha256"] = mixed_spec_digest
+        row["row_output_sha256"] = independent_digest(
+            {key: value for key, value in row.items() if key != "row_output_sha256"}
+        )
+    mixed_arm["score_sha256"] = independent_digest(
+        {
+            "spec": mixed_arm["arm_spec"],
+            "support_sha256": mixed_arm["support_sha256"],
+            "rows": mixed_arm["row_evidence"],
+        }
+    )
+    mixed_arm["result_sha256"] = independent_digest(
+        {key: value for key, value in mixed_arm.items() if key != "result_sha256"}
+    )
+    mixed["result_sha256"] = independent_digest(
+        {key: value for key, value in mixed.items() if key != "result_sha256"}
+    )
+    with pytest.raises(ValueError, match="mixed|training provenance"):
+        V5DevelopmentResult.model_validate(mixed)

@@ -5,10 +5,10 @@ from __future__ import annotations
 from enum import StrEnum
 
 import numpy as np
-from catboost import CatBoostClassifier
+from catboost import CatBoostClassifier  # type: ignore[import-untyped]
 from pydantic import BaseModel, ConfigDict
-from sklearn.ensemble import IsolationForest
-from sklearn.isotonic import IsotonicRegression
+from sklearn.ensemble import IsolationForest  # type: ignore[import-untyped]
+from sklearn.isotonic import IsotonicRegression  # type: ignore[import-untyped]
 
 
 class SentinelAction(StrEnum):
@@ -74,6 +74,7 @@ def train_sentinel_defender(
     y_threshold: np.ndarray,
     catboost_seeds: tuple[int, ...],
     bootstrap_seed: int,
+    enable_novelty: bool = True,
 ) -> SentinelDefender:
     """Train a three-seed calibrated CatBoost ensemble with novelty router."""
     calibration_labels = set(y_calibration.tolist())
@@ -103,17 +104,18 @@ def train_sentinel_defender(
         members.append(model)
         calibrators.append(calibrator)
 
-    benign_mask = y_train == 0
-    benign_features = x_train[benign_mask]
-    iso_forest = IsolationForest(random_state=bootstrap_seed, contamination=0.05)
-    iso_forest.fit(benign_features)
+    iso_forest: IsolationForest | None = None
+    if enable_novelty:
+        benign_mask = y_train == 0
+        benign_features = x_train[benign_mask]
+        iso_forest = IsolationForest(random_state=bootstrap_seed, contamination=0.05)
+        iso_forest.fit(benign_features)
 
     thresholds = _select_thresholds(
         members=members,
         calibrators=calibrators,
         x_threshold=x_threshold,
         y_threshold=y_threshold,
-        iso_forest=iso_forest,
     )
 
     return SentinelDefender(
@@ -134,19 +136,39 @@ def _ensemble_probability(
     members: list[CatBoostClassifier],
     calibrators: list[IsotonicRegression],
 ) -> tuple[float, float]:
+    _raw, _calibrated_scores, mean_prob, disagreement = _ensemble_trace(
+        features, members, calibrators
+    )
+    return mean_prob, disagreement
+
+
+def _ensemble_trace(
+    features: np.ndarray,
+    members: list[CatBoostClassifier],
+    calibrators: list[IsotonicRegression],
+) -> tuple[tuple[float, ...], tuple[float, ...], float, float]:
+    raw_scores: list[float] = []
     calibrated_scores = []
     for model, calibrator in zip(members, calibrators, strict=True):
-        raw = model.predict_proba(features.reshape(1, -1))[:, 1][0]
+        raw = float(model.predict_proba(features.reshape(1, -1))[:, 1][0])
+        raw_scores.append(raw)
         calibrated = float(calibrator.predict([raw])[0])
         calibrated_scores.append(max(0.0, min(1.0, calibrated)))
     mean_prob = float(np.mean(calibrated_scores))
     disagreement = float(np.std(calibrated_scores))
-    return mean_prob, disagreement
+    return tuple(raw_scores), tuple(calibrated_scores), mean_prob, disagreement
 
 
 def _novelty_score(iso_forest: IsolationForest, features: np.ndarray) -> float:
-    raw = iso_forest.decision_function(features.reshape(1, -1))[0]
-    return float(max(0.0, min(1.0, 0.5 - raw)))
+    _raw, bounded = _novelty_trace(iso_forest, features)
+    return bounded
+
+
+def _novelty_trace(
+    iso_forest: IsolationForest, features: np.ndarray
+) -> tuple[float, float]:
+    raw = float(iso_forest.decision_function(features.reshape(1, -1))[0])
+    return raw, float(max(0.0, min(1.0, 0.5 - raw)))
 
 
 def _select_thresholds(
@@ -155,7 +177,6 @@ def _select_thresholds(
     calibrators: list[IsotonicRegression],
     x_threshold: np.ndarray,
     y_threshold: np.ndarray,
-    iso_forest: IsolationForest,
 ) -> SentinelThresholds:
     """Select operating thresholds on the threshold partition only."""
     probs = []
@@ -185,13 +206,25 @@ class SentinelDefender(BaseModel):
 
     model_members: list[CatBoostClassifier]
     calibrators: list[IsotonicRegression]
-    iso_forest: IsolationForest
+    iso_forest: IsolationForest | None
     thresholds: SentinelThresholds
     manifest: SentinelModelManifest
 
     def predict_probability(self, features: np.ndarray) -> tuple[float, float]:
         """Return calibrated ensemble probability and member disagreement only."""
         return _ensemble_probability(features, self.model_members, self.calibrators)
+
+    def predict_member_scores(
+        self, features: np.ndarray
+    ) -> tuple[tuple[float, ...], tuple[float, ...], float, float]:
+        """Return every raw/calibrated member score plus aggregate evidence."""
+        return _ensemble_trace(features, self.model_members, self.calibrators)
+
+    def predict_novelty(self, features: np.ndarray) -> tuple[float, float]:
+        """Return raw IsolationForest decision function and bounded novelty."""
+        if self.iso_forest is None:
+            raise ValueError("novelty model is disabled for this defender")
+        return _novelty_trace(self.iso_forest, features)
 
     def decide(
         self,
@@ -215,7 +248,11 @@ class SentinelDefender(BaseModel):
         novelty = (
             novelty_score
             if novelty_score is not None
-            else _novelty_score(self.iso_forest, features)
+            else (
+                _novelty_score(self.iso_forest, features)
+                if self.iso_forest is not None
+                else 0.0
+            )
         )
         t = self.thresholds
 

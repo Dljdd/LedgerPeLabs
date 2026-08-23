@@ -19,7 +19,8 @@ from apar.evaluation.v5_arms import score_v5_arm_set, train_v5_arm_set
 from apar.evaluation.v5_evaluation import (
     V5ArmConfiguration,
     V5ArmSupportRow,
-    V5EvaluationResult,
+    bind_v5_evaluation_result,
+    build_v5_training_partition_evidence,
     evaluate_v5_arm,
     load_v5_arm_configuration,
 )
@@ -85,6 +86,20 @@ def _derive_trust_failures(
     return failures
 
 
+def _arm_support(rows: Sequence[V5DecisionRow]) -> tuple[V5ArmSupportRow, ...]:
+    return tuple(
+        V5ArmSupportRow(
+            event_id=row.event_id,
+            label=1 if row.is_fraud else 0,
+            campaign_id=row.campaign_id,
+            amount=float(row.amount),
+            family=row.family,
+            execution_evidence_sha256=row.execution_evidence_sha256,
+        )
+        for row in rows
+    )
+
+
 def _decide_with_trust(
     defender: SentinelDefender,
     features_matrix: np.ndarray,
@@ -110,9 +125,15 @@ def _score_all_arms_and_evaluate(
     bootstrap_seed: int,
 ) -> _ScoringOutput:
     """Train and independently score all frozen arms over identical support."""
-    x_train, y_train, _, _, _, _ = _build_partition_matrix(train_decisions, catalog)
-    x_cal, y_cal, _, _, _, _ = _build_partition_matrix(calibration_decisions, catalog)
-    x_threshold, y_threshold, _, _, _, _ = _build_partition_matrix(threshold_decisions, catalog)
+    x_train, y_train, train_event_ids, _, _, train_batch = _build_partition_matrix(
+        train_decisions, catalog
+    )
+    x_cal, y_cal, cal_event_ids, _, _, cal_batch = _build_partition_matrix(
+        calibration_decisions, catalog
+    )
+    x_threshold, y_threshold, threshold_event_ids, _, _, threshold_batch = (
+        _build_partition_matrix(threshold_decisions, catalog)
+    )
     x_test, y_test, test_event_ids, test_campaign_ids, test_amounts, _ = _build_partition_matrix(
         dev_test_decisions, catalog
     )
@@ -121,15 +142,46 @@ def _score_all_arms_and_evaluate(
     train_fraud = int(y_train.sum())
     train_benign = len(y_train) - train_fraud
     if not train_fraud or not train_benign:
-        return {"error": "one-class training partition"}
+        raise ValueError("one-class training partition")
     cal_fraud = int(y_cal.sum())
     cal_benign = len(y_cal) - cal_fraud
     if not cal_fraud or not cal_benign:
-        return {"error": "one-class calibration partition"}
+        raise ValueError("one-class calibration partition")
     thr_fraud = int(y_threshold.sum())
     thr_benign = len(y_threshold) - thr_fraud
     if not thr_fraud or not thr_benign:
-        return {"error": "one-class threshold partition"}
+        raise ValueError("one-class threshold partition")
+
+    train_support = _arm_support(train_decisions)
+    calibration_support = _arm_support(calibration_decisions)
+    threshold_support = _arm_support(threshold_decisions)
+    train_evidence = build_v5_training_partition_evidence(
+        partition="train",
+        event_ids=train_event_ids,
+        labels=y_train,
+        support=train_support,
+        feature_batch_sha256=train_batch.batch_sha256,
+        feature_matrix=x_train,
+        catalog_sha256=catalog.catalog_sha256,
+    )
+    calibration_evidence = build_v5_training_partition_evidence(
+        partition="calibration",
+        event_ids=cal_event_ids,
+        labels=y_cal,
+        support=calibration_support,
+        feature_batch_sha256=cal_batch.batch_sha256,
+        feature_matrix=x_cal,
+        catalog_sha256=catalog.catalog_sha256,
+    )
+    threshold_evidence = build_v5_training_partition_evidence(
+        partition="threshold",
+        event_ids=threshold_event_ids,
+        labels=y_threshold,
+        support=threshold_support,
+        feature_batch_sha256=threshold_batch.batch_sha256,
+        feature_matrix=x_threshold,
+        catalog_sha256=catalog.catalog_sha256,
+    )
 
     trained = train_v5_arm_set(
         configuration=configuration,
@@ -141,18 +193,11 @@ def _score_all_arms_and_evaluate(
         x_threshold=x_threshold,
         y_threshold=y_threshold,
         bootstrap_seed=bootstrap_seed,
+        train_evidence=train_evidence,
+        calibration_evidence=calibration_evidence,
+        threshold_evidence=threshold_evidence,
     )
-    support = tuple(
-        V5ArmSupportRow(
-            event_id=row.event_id,
-            label=1 if row.is_fraud else 0,
-            campaign_id=row.campaign_id,
-            amount=float(row.amount),
-            family=row.family,
-            execution_evidence_sha256=row.execution_evidence_sha256,
-        )
-        for row in dev_test_decisions
-    )
+    support = _arm_support(dev_test_decisions)
     scores = score_v5_arm_set(
         trained=trained,
         catalog=catalog,
@@ -174,20 +219,7 @@ def _score_all_arms_and_evaluate(
             campaign_ids=campaign_ids_arr,
             amounts=amounts_arr,
         )
-        latencies_ms = [row.latency_ms for row in score.rows]
-        values = base.model_dump(mode="json")
-        values.update(
-            {
-                "p50_latency_ms": float(np.percentile(latencies_ms, 50)),
-                "p95_latency_ms": float(np.percentile(latencies_ms, 95)),
-                "arm_spec_sha256": score.spec.spec_sha256,
-                "support_sha256": score.support_sha256,
-                "feature_count": len(score.spec.feature_names),
-                "arm_spec": score.spec.model_dump(mode="json"),
-                "row_evidence": [row.model_dump(mode="json") for row in score.rows],
-            }
-        )
-        result = V5EvaluationResult.model_validate(values)
+        result = bind_v5_evaluation_result(base=base, score=score)
         arm_results[arm.value] = result.model_dump(mode="json")
     return {"arm_results": arm_results}
 

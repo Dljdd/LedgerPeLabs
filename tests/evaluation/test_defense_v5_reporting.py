@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
@@ -17,22 +16,20 @@ PROTOCOL = load_safe_v5_test_protocol(ROOT)
 
 
 class TestReporting:
-    def test_result_has_valid_status(self) -> None:
+    def test_incomplete_smoke_result_is_rejected(self) -> None:
         corpus = build_v5_corpus(PROTOCOL, profile=V5Profile.SMOKE)
-        result = build_v5_development_result(
-            protocol=PROTOCOL, corpus=corpus
-        )
-        assert result.status in (
-            "development_ready", "development_not_ready", "invalid_corpus", "smoke",
-        )
+        with pytest.raises(ValueError, match="exact four"):
+            build_v5_development_result(protocol=PROTOCOL, corpus=corpus)
 
     def test_forbidden_claims_rejected(self) -> None:
         with pytest.raises(ValueError, match="forbidden status"):
             V5DevelopmentResult(status="winner")
 
-    def test_result_serializes_to_json(self) -> None:
+    def test_partial_arm_map_is_rejected_before_serialization(self) -> None:
         corpus = build_v5_corpus(PROTOCOL, profile=V5Profile.SMOKE)
-        result = build_v5_development_result(protocol=PROTOCOL, corpus=corpus)
-        payload = result.model_dump_json()
-        parsed = json.loads(payload)
-        assert "status" in parsed
+        with pytest.raises(ValueError, match="exact four"):
+            build_v5_development_result(
+                protocol=PROTOCOL,
+                corpus=corpus,
+                arms={"full_sentinel": {}},
+            )

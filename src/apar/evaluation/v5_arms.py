@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import pickle
 import time
 from dataclasses import dataclass
 
@@ -26,6 +27,8 @@ from apar.evaluation.v5_evaluation import (
     V5ArmScoreSet,
     V5ArmSpecification,
     V5ArmSupportRow,
+    V5CalibratorManifest,
+    V5TrainingPartitionEvidence,
 )
 from apar.features.sentinel import SentinelFeatureCatalog
 
@@ -49,23 +52,95 @@ def _bound_spec(
     template: V5ArmSpecification,
     *,
     thresholds: SentinelThresholds | None,
+    training_partitions: tuple[V5TrainingPartitionEvidence, ...],
+    defender: SentinelDefender | None,
 ) -> V5ArmSpecification:
-    threshold_facts: dict[str, object] = {
+    threshold_values: dict[str, float] = {}
+    if template.rules:
+        threshold_values.update(
+            {
+                "rules_challenge": _RULE_CHALLENGE_THRESHOLD,
+                "rules_decline": _RULE_DECLINE_THRESHOLD,
+            }
+        )
+    if thresholds is not None:
+        threshold_values.update(
+            {
+                "model_challenge": thresholds.challenge_threshold,
+                "model_decline": thresholds.decline_threshold,
+                "model_review": thresholds.review_threshold,
+            }
+        )
+        if template.disagreement:
+            threshold_values["disagreement_review"] = (
+                thresholds.disagreement_review_threshold
+            )
+        if template.novelty:
+            threshold_values.update(
+                {
+                    "novelty_challenge": thresholds.novelty_challenge_threshold,
+                    "novelty_review": thresholds.novelty_review_threshold,
+                }
+            )
+    ordered_thresholds = tuple(sorted(threshold_values.items()))
+    threshold_facts = {
         "source_partition": template.threshold_source_partition,
         "method": template.threshold_method,
+        "threshold_ordered_rows_sha256": training_partitions[2].ordered_rows_sha256,
+        "threshold_support_sha256": training_partitions[2].ordered_support_sha256,
+        "threshold_feature_batch_sha256": training_partitions[2].feature_batch_sha256,
+        "threshold_feature_matrix_sha256": training_partitions[2].feature_matrix_sha256,
+        "threshold_values": ordered_thresholds,
     }
-    if template.rules:
-        threshold_facts["rules"] = {
-            "challenge": _RULE_CHALLENGE_THRESHOLD,
-            "decline": _RULE_DECLINE_THRESHOLD,
-            "manifest": RuleManifest.default().model_dump(mode="json"),
-        }
-    if thresholds is not None:
-        threshold_facts["model"] = thresholds.model_dump(mode="json")
+    calibrator_manifests = (
+        tuple(_calibrator_manifest(calibrator) for calibrator in defender.calibrators)
+        if defender is not None
+        else ()
+    )
     values = template.model_dump(mode="json", exclude={"spec_sha256"})
     values["threshold_digest"] = _digest(threshold_facts)
+    values["threshold_values"] = ordered_thresholds
+    values["execution_bound"] = True
+    values["training_partitions"] = [
+        item.model_dump(mode="json") for item in training_partitions
+    ]
+    values["model_artifact_sha256"] = (
+        [_model_artifact_digest(model) for model in defender.model_members]
+        if defender is not None
+        else []
+    )
+    values["calibrator_artifact_sha256"] = [
+        manifest.artifact_sha256 for manifest in calibrator_manifests
+    ]
+    values["calibrator_manifests"] = [
+        manifest.model_dump(mode="json") for manifest in calibrator_manifests
+    ]
+    values["novelty_artifact_sha256"] = (
+        hashlib.sha256(pickle.dumps(defender.iso_forest, protocol=5)).hexdigest()
+        if defender is not None and defender.iso_forest is not None
+        else None
+    )
     values["spec_sha256"] = _digest(values)
     return V5ArmSpecification.model_validate(values)
+
+
+def _model_artifact_digest(model: object) -> str:
+    serialized = model._serialize_model()  # type: ignore[attr-defined]
+    if type(serialized) is not bytes:
+        raise TypeError("CatBoost artifact serialization must return bytes")
+    return hashlib.sha256(serialized).hexdigest()
+
+
+def _calibrator_manifest(calibrator: object) -> V5CalibratorManifest:
+    values = {
+        "x_thresholds": calibrator.X_thresholds_.tolist(),  # type: ignore[attr-defined]
+        "y_thresholds": calibrator.y_thresholds_.tolist(),  # type: ignore[attr-defined]
+        "out_of_bounds": calibrator.out_of_bounds,  # type: ignore[attr-defined]
+    }
+    return V5CalibratorManifest(
+        **values,
+        artifact_sha256=_digest(values),
+    )
 
 
 def _validate_partition(
@@ -137,6 +212,9 @@ def train_v5_arm_set(
     x_threshold: NDArray[np.float64],
     y_threshold: NDArray[np.int_],
     bootstrap_seed: int,
+    train_evidence: V5TrainingPartitionEvidence,
+    calibration_evidence: V5TrainingPartitionEvidence,
+    threshold_evidence: V5TrainingPartitionEvidence,
 ) -> V5TrainedArmSet:
     """Train every declared learned arm without evaluating development-test rows."""
     if type(configuration) is not V5ArmConfiguration:
@@ -148,6 +226,34 @@ def train_v5_arm_set(
         for template in configuration.arms
     ):
         raise ValueError("arm specification catalog digest mismatch")
+    if any(template.bootstrap_seed != bootstrap_seed for template in configuration.arms):
+        raise ValueError("bootstrap seed disagrees with the frozen arm specification")
+    training_partitions = (train_evidence, calibration_evidence, threshold_evidence)
+    matrices = (x_train, x_calibration, x_threshold)
+    labels_by_partition = (y_train, y_calibration, y_threshold)
+    expected_names = ("train", "calibration", "threshold")
+    for expected_name, evidence, matrix, labels in zip(
+        expected_names,
+        training_partitions,
+        matrices,
+        labels_by_partition,
+        strict=True,
+    ):
+        if evidence.partition != expected_name:
+            raise ValueError("training partition provenance is swapped")
+        if evidence.catalog_sha256 != catalog.catalog_sha256:
+            raise ValueError("training partition catalog provenance mismatch")
+        if evidence.feature_matrix_sha256 != _digest(matrix.tolist()):
+            raise ValueError("training partition feature matrix digest mismatch")
+        if evidence.labels != tuple(int(value) for value in labels.tolist()):
+            raise ValueError("training partition labels disagree with provenance")
+    partition_event_sets = [set(item.ordered_event_ids) for item in training_partitions]
+    if any(
+        left & right
+        for index, left in enumerate(partition_event_sets)
+        for right in partition_event_sets[index + 1 :]
+    ):
+        raise ValueError("training partition event provenance overlaps")
     for name, matrix, labels in (
         ("train", x_train, y_train),
         ("calibration", x_calibration, y_calibration),
@@ -161,7 +267,12 @@ def train_v5_arm_set(
         if not template.model:
             trained_arms.append(
                 V5TrainedArm(
-                    spec=_bound_spec(template, thresholds=None),
+                    spec=_bound_spec(
+                        template,
+                        thresholds=None,
+                        training_partitions=training_partitions,
+                        defender=None,
+                    ),
                     feature_indices=indices,
                     defender=None,
                 )
@@ -176,10 +287,16 @@ def train_v5_arm_set(
             y_threshold=y_threshold,
             catboost_seeds=template.model_seeds,
             bootstrap_seed=bootstrap_seed,
+            enable_novelty=template.novelty,
         )
         trained_arms.append(
             V5TrainedArm(
-                spec=_bound_spec(template, thresholds=defender.thresholds),
+                spec=_bound_spec(
+                    template,
+                    thresholds=defender.thresholds,
+                    training_partitions=training_partitions,
+                    defender=defender,
+                ),
                 feature_indices=indices,
                 defender=defender,
             )
@@ -197,7 +314,7 @@ def _rule_score(
     row: NDArray[np.float64],
     *,
     catalog: SentinelFeatureCatalog,
-) -> float:
+) -> tuple[float, tuple[tuple[str, float], ...]]:
     values = {
         name: float(row[index])
         for index, name in enumerate(catalog.feature_names)
@@ -218,19 +335,24 @@ def _rule_score(
         abs(values.get("actor_amount_zscore_24h", 0.0)),
         abs(values.get("counterparty_amount_zscore_24h", 0.0)),
     )
-    components = (
-        actor_velocity,
-        _component_score(values.get("graph_counterparty_fanin", 0.0), manifest.counterparty_fanin),
-        _component_score(values.get("graph_actor_fanout", 0.0), manifest.actor_fanout),
-        _component_score(amount_deviation, manifest.amount_zscore),
-        _component_score(values.get("graph_shared_neighbor_count", 0.0), manifest.shared_neighbors),
-        _component_score(values.get("pair_prior_count", 0.0), manifest.repeated_pair_count),
-        manifest.threshold_score
-        if values.get("dq_degraded_state", 0.0) >= manifest.degraded_state
-        else None,
+    candidates = (
+        ("actor_velocity", actor_velocity),
+        ("amount_deviation", _component_score(amount_deviation, manifest.amount_zscore)),
+        (
+            "repeated_pair",
+            _component_score(values.get("pair_prior_count", 0.0), manifest.repeated_pair_count),
+        ),
+        (
+            "degraded_state",
+            manifest.threshold_score
+            if values.get("dq_degraded_state", 0.0) >= manifest.degraded_state
+            else None,
+        ),
     )
-    scores = tuple(score for score in components if score is not None)
-    return 1.0 - math.prod(1.0 - score for score in scores)
+    components = tuple(
+        sorted((name, score) for name, score in candidates if score is not None)
+    )
+    return 1.0 - math.prod(1.0 - score for _name, score in components), components
 
 
 def _model_action(probability: float, thresholds: SentinelThresholds) -> SentinelAction:
@@ -255,6 +377,87 @@ def _more_severe(left: SentinelAction, right: SentinelAction) -> SentinelAction:
     return left if left.severity >= right.severity else right
 
 
+def _full_model_policy(
+    probability: float,
+    disagreement: float,
+    novelty: float,
+    thresholds: SentinelThresholds,
+) -> tuple[SentinelAction, bool, bool]:
+    disagreement_routed = False
+    novelty_routed = False
+    if (
+        probability >= thresholds.decline_threshold
+        and disagreement < thresholds.disagreement_review_threshold
+    ):
+        return SentinelAction.DECLINE_HOLD, False, False
+    if probability >= thresholds.review_threshold:
+        return SentinelAction.REVIEW_HOLD, False, False
+    if (
+        disagreement >= thresholds.disagreement_review_threshold
+        and probability >= thresholds.challenge_threshold
+    ):
+        disagreement_routed = True
+        return SentinelAction.REVIEW_HOLD, disagreement_routed, False
+    if probability >= thresholds.challenge_threshold:
+        return SentinelAction.CHALLENGE, False, False
+    if novelty >= thresholds.novelty_challenge_threshold and probability >= 0.3:
+        novelty_routed = True
+        return SentinelAction.CHALLENGE, False, novelty_routed
+    if novelty >= thresholds.novelty_review_threshold:
+        novelty_routed = True
+        return SentinelAction.REVIEW_HOLD, False, novelty_routed
+    return SentinelAction.APPROVE, False, False
+
+
+def route_full_sentinel_components(
+    *,
+    probability: float,
+    disagreement: float,
+    novelty: float,
+    thresholds: SentinelThresholds,
+) -> tuple[SentinelAction, bool, bool]:
+    """Replay full-model routing from explicit bounded component evidence."""
+    if any(
+        not math.isfinite(value) or not 0.0 <= value <= 1.0
+        for value in (probability, disagreement, novelty)
+    ):
+        raise ValueError("full sentinel component inputs must be finite values in [0, 1]")
+    return _full_model_policy(probability, disagreement, novelty, thresholds)
+
+
+def _threshold_trace(
+    spec: V5ArmSpecification,
+    defender: SentinelDefender | None,
+) -> dict[str, float]:
+    values: dict[str, float] = {}
+    if spec.rules:
+        values.update(
+            {
+                "rules_challenge": _RULE_CHALLENGE_THRESHOLD,
+                "rules_decline": _RULE_DECLINE_THRESHOLD,
+            }
+        )
+    if defender is not None:
+        thresholds = defender.thresholds
+        values.update(
+            {
+                "model_challenge": thresholds.challenge_threshold,
+                "model_review": thresholds.review_threshold,
+                "model_decline": thresholds.decline_threshold,
+            }
+        )
+        if spec.disagreement:
+            values["disagreement_review"] = thresholds.disagreement_review_threshold
+        if spec.novelty:
+            values.update(
+                {
+                    "novelty_challenge": thresholds.novelty_challenge_threshold,
+                    "novelty_review": thresholds.novelty_review_threshold,
+                }
+            )
+    return values
+
+
 def _score_one_arm(
     *,
     trained: V5TrainedArm,
@@ -267,58 +470,104 @@ def _score_one_arm(
     evidence: list[V5ArmRowEvidence] = []
     for index, source_row in enumerate(features_matrix):
         start = time.perf_counter_ns()
-        rule_score = _rule_score(source_row, catalog=catalog) if trained.spec.rules else None
+        if trained.spec.rules:
+            rule_score, rule_components = _rule_score(source_row, catalog=catalog)
+        else:
+            rule_score, rule_components = None, ()
         trust_failure = trust_failures[index]
+        subset = source_row[list(trained.feature_indices)]
+        model_raw_scores: tuple[float, ...] = ()
+        model_calibrated_scores: tuple[float, ...] = ()
+        probability_action: SentinelAction | None = None
+        model_action: SentinelAction | None = None
+        rule_action = _rule_action(rule_score) if rule_score is not None else None
+        trust_action = (
+            SentinelAction.DECLINE_HOLD
+            if trained.spec.trust and trust_failure
+            else None
+        )
+        novelty_raw: float | None = None
+        novelty_routed = False
+        disagreement_routed = False
         if trained.defender is None:
             assert rule_score is not None
-            action = (
-                SentinelAction.DECLINE_HOLD
-                if trained.spec.trust and trust_failure
-                else _rule_action(rule_score)
-            )
+            assert rule_action is not None
+            action = trust_action or rule_action
             probability = 1.0 if trained.spec.trust and trust_failure else rule_score
             novelty = None
             disagreement = None
         elif trained.spec.arm is V5Arm.FULL_SENTINEL:
-            vector = source_row[list(trained.feature_indices)]
-            decision = trained.defender.decide(
-                vector,
-                novelty_score=(novelty_scores[index] if novelty_scores is not None else None),
-                trust_failure=trust_failure,
+            (
+                model_raw_scores,
+                model_calibrated_scores,
+                probability,
+                disagreement,
+            ) = trained.defender.predict_member_scores(subset)
+            probability_action = _model_action(probability, trained.defender.thresholds)
+            if novelty_scores is None:
+                novelty_raw, novelty = trained.defender.predict_novelty(subset)
+            else:
+                novelty = novelty_scores[index]
+            model_action, disagreement_routed, novelty_routed = route_full_sentinel_components(
+                probability=probability,
+                disagreement=disagreement,
+                novelty=novelty,
+                thresholds=trained.defender.thresholds,
             )
-            action = decision.action
-            if not trust_failure:
-                assert rule_score is not None
-                action = _more_severe(action, _rule_action(rule_score))
-            probability = decision.ensemble_probability
-            novelty = decision.novelty_score
-            disagreement = decision.disagreement
+            assert rule_action is not None
+            action = trust_action or _more_severe(model_action, rule_action)
         else:
-            vector = source_row[list(trained.feature_indices)]
-            probability, _raw_disagreement = trained.defender.predict_probability(vector)
-            action = _model_action(probability, trained.defender.thresholds)
+            (
+                model_raw_scores,
+                model_calibrated_scores,
+                probability,
+                _raw_disagreement,
+            ) = trained.defender.predict_member_scores(subset)
+            probability_action = _model_action(probability, trained.defender.thresholds)
+            model_action = probability_action
+            action = model_action
             novelty = None
             disagreement = None
         latency_ms = (time.perf_counter_ns() - start) / 1_000_000
-        evidence.append(
-            V5ArmRowEvidence(
-                support=support[index],
-                action=action,
-                probability=probability,
-                rule_score=rule_score,
-                trust_routed=bool(trained.spec.trust and trust_failure),
-                novelty_score=novelty,
-                disagreement=disagreement,
-                latency_ms=latency_ms,
-                arm_spec_sha256=trained.spec.spec_sha256,
-            )
-        )
+        row_values = {
+            "support": support[index].model_dump(mode="json"),
+            "catalog_feature_values": tuple(float(value) for value in source_row),
+            "subset_feature_values": tuple(float(value) for value in subset),
+            "catalog_feature_sha256": _digest(tuple(float(value) for value in source_row)),
+            "subset_feature_sha256": _digest(tuple(float(value) for value in subset)),
+            "model_raw_scores": model_raw_scores,
+            "model_calibrated_scores": model_calibrated_scores,
+            "threshold_trace": _threshold_trace(trained.spec, trained.defender),
+            "rule_components": rule_components,
+            "action": action,
+            "probability": probability,
+            "probability_action": probability_action,
+            "model_action": model_action,
+            "rule_action": rule_action,
+            "trust_action": trust_action,
+            "rule_score": rule_score,
+            "trust_routed": bool(trained.spec.trust and trust_failure),
+            "novelty_score": novelty,
+            "novelty_raw_score": novelty_raw,
+            "novelty_overridden": bool(
+                trained.spec.novelty and novelty_scores is not None
+            ),
+            "disagreement": disagreement,
+            "novelty_routed": novelty_routed,
+            "disagreement_routed": disagreement_routed,
+            "latency_ms": latency_ms,
+            "arm_spec_sha256": trained.spec.spec_sha256,
+        }
+        row_values["row_output_sha256"] = _digest(row_values)
+        evidence.append(V5ArmRowEvidence.model_validate(row_values))
     support_sha256 = _digest([row.model_dump(mode="json") for row in support])
-    return V5ArmScore(
-        spec=trained.spec,
-        support_sha256=support_sha256,
-        rows=tuple(evidence),
-    )
+    score_values = {
+        "spec": trained.spec.model_dump(mode="json"),
+        "support_sha256": support_sha256,
+        "rows": [row.model_dump(mode="json") for row in evidence],
+    }
+    score_values["score_sha256"] = _digest(score_values)
+    return V5ArmScore.model_validate(score_values)
 
 
 def score_v5_arm_set(
@@ -367,4 +616,5 @@ __all__ = [
     "V5TrainedArmSet",
     "score_v5_arm_set",
     "train_v5_arm_set",
+    "route_full_sentinel_components",
 ]

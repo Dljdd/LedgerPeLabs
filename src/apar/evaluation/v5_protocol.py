@@ -136,6 +136,14 @@ def _canonical_json_bytes(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
 
 
+def v5_protocol_digest(protocol: V5DevelopmentProtocol) -> str:
+    """Recompute the digest of any validated protocol copy from its current fields."""
+    if type(protocol) is not V5DevelopmentProtocol:
+        raise TypeError("protocol must be an exact V5DevelopmentProtocol")
+    document = protocol.model_dump(mode="json", exclude={"protocol_sha256"})
+    return hashlib.sha256(_canonical_json_bytes(document)).hexdigest()
+
+
 def load_v5_development_protocol(path: Path) -> V5DevelopmentProtocol:
     """Load, validate, freeze, and digest the development protocol."""
     raw = path.read_bytes()
@@ -153,4 +161,5 @@ __all__ = [
     "V5Profile",
     "V5ReadinessTargets",
     "load_v5_development_protocol",
+    "v5_protocol_digest",
 ]
