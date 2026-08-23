@@ -103,6 +103,8 @@ class V5DevelopmentProtocol(BaseModel):
     seeds: V5SeedSets
     smoke_profile: V5PopulationCounts
     production_profile: V5PopulationCounts
+    production_dev_test_legitimate: int = Field(gt=0)
+    production_dev_test_campaigns_per_family: dict[str, int]
     bootstrap_replicates: int = Field(ge=2000)
     feature_catalog_path: str = "config/defense/feature-catalog-v5.json"
     protocol_sha256: str = ""
@@ -113,6 +115,9 @@ class V5DevelopmentProtocol(BaseModel):
             raise ValueError("v5 protocol is development-only")
         if self.sealed_evaluation_allowed:
             raise ValueError("sealed evaluation must be forbidden in v5")
+        expected_families = {member.value for member in V5Family}
+        if set(self.production_dev_test_campaigns_per_family.keys()) != expected_families:
+            raise ValueError("dev-test campaign counts must contain exactly the four v5 families")
         return self
 
 

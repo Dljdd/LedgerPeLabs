@@ -1,6 +1,6 @@
 {
   "protocol_id": "apar-sentinel-v5-development",
-  "schema_version": "1.0.0",
+  "schema_version": "2.0.0",
   "development_only": true,
   "sealed_evaluation_allowed": false,
   "readiness": {
@@ -16,7 +16,7 @@
     "train": 101,
     "calibration": 202,
     "threshold": 303,
-    "development_test": 404,
+    "development_test": 1404,
     "hardening_train": 505,
     "adaptive_holdout": 606,
     "bootstrap": 707,
@@ -39,6 +39,13 @@
       "card_testing_cnp": 100,
       "synthetic_merchant_refund": 100
     }
+  },
+  "production_dev_test_legitimate": 50000,
+  "production_dev_test_campaigns_per_family": {
+    "agentic_intent_abuse": 100,
+    "app_scam_mule": 100,
+    "card_testing_cnp": 100,
+    "synthetic_merchant_refund": 100
   },
   "bootstrap_replicates": 2000,
   "feature_catalog_path": "config/defense/feature-catalog-v5.json"
