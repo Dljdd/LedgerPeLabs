@@ -15,7 +15,10 @@ sys.path.insert(0, {root!r})
 from pathlib import Path
 from apar.evaluation.v5_population import build_v5_corpus
 from apar.evaluation.v5_protocol import V5Profile, load_v5_development_protocol
-protocol = load_v5_development_protocol(Path({root!r}) / "config/defense/defense-v5-development.json")
+locked = load_v5_development_protocol(Path({root!r}) / "config/defense/defense-v5-development.json")
+protocol = locked.model_copy(update={{
+    "seeds": locked.seeds.model_copy(update={{"development_test": 404}})
+}})
 corpus = build_v5_corpus(protocol, profile=V5Profile.SMOKE)
 counts = {{name: len(p.decisions) for name, p in corpus.partitions.items()}}
 print(json.dumps({{"digest": corpus.corpus_sha256, "counts": counts}}))

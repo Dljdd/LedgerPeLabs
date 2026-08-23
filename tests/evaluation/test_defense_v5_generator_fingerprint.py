@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
-import numpy as np
-import pytest
 from pathlib import Path
 
-from apar.evaluation.v5_population import build_v5_corpus
-from apar.evaluation.v5_protocol import V5Profile, load_v5_development_protocol
+import pytest
+
+from apar.evaluation.v5_population import V5Corpus, build_v5_corpus
+from apar.evaluation.v5_protocol import V5Profile
 from apar.features.sentinel import SentinelFeatureCatalog, build_sentinel_features
+from tests.evaluation.v5_safe_protocol import load_safe_v5_test_protocol
 
 ROOT = Path(__file__).resolve().parents[2]
-PROTOCOL = load_v5_development_protocol(ROOT / "config/defense/defense-v5-development.json")
+PROTOCOL = load_safe_v5_test_protocol(ROOT)
 
 _NON_TRUST_FEATURES = [
     name for name in SentinelFeatureCatalog.default().feature_names
@@ -19,25 +20,31 @@ _NON_TRUST_FEATURES = [
 ]
 
 
-class TestGeneratorFingerprint:
-    @pytest.fixture(scope="class")
-    def smoke_corpus(self):
-        return build_v5_corpus(PROTOCOL, profile=V5Profile.SMOKE)
+@pytest.fixture(scope="module")
+def smoke_corpus() -> V5Corpus:
+    return build_v5_corpus(PROTOCOL, profile=V5Profile.SMOKE)
 
+
+class TestGeneratorFingerprint:
     def test_no_single_feature_perfectly_separates(self, smoke_corpus) -> None:
         catalog = SentinelFeatureCatalog.default()
         train = smoke_corpus.partitions["train"]
         rows = train.decisions
         batch = build_sentinel_features(rows, catalog=catalog)
         labels = [r.is_fraud for r in rows]
-        n_fraud = sum(labels)
-        n_benign = len(labels) - n_fraud
-
         for feature_name in _NON_TRUST_FEATURES:
             idx = catalog.feature_names.index(feature_name)
             values = [row[idx] for row in batch.matrix]
-            fraud_values = sorted(v for v, y in zip(values, labels) if y)
-            benign_values = sorted(v for v, y in zip(values, labels) if not y)
+            fraud_values = sorted(
+                value
+                for value, label in zip(values, labels, strict=True)
+                if label
+            )
+            benign_values = sorted(
+                value
+                for value, label in zip(values, labels, strict=True)
+                if not label
+            )
             if not fraud_values or not benign_values:
                 continue
             # Perfect separation: max(benign) < min(fraud) or max(fraud) < min(benign).

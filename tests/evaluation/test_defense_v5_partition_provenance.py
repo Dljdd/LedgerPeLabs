@@ -2,17 +2,16 @@
 
 from __future__ import annotations
 
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
 
 from apar.evaluation.v5_population import build_v5_corpus
-from apar.evaluation.v5_protocol import V5Profile, load_v5_development_protocol
+from apar.evaluation.v5_protocol import V5Profile
+from tests.evaluation.v5_safe_protocol import load_safe_v5_test_protocol
 
 ROOT = Path(__file__).resolve().parents[2]
-PROTOCOL = load_v5_development_protocol(ROOT / "config/defense/defense-v5-development.json")
+PROTOCOL = load_safe_v5_test_protocol(ROOT)
 
 
 @pytest.fixture(scope="module")
@@ -41,7 +40,10 @@ class TestPartitionProvenance:
         for name in ("train", "calibration", "threshold"):
             other_ids = {r.event_id for r in smoke_corpus.partitions[name].decisions}
             overlap = dev_test_ids & other_ids
-            assert not overlap, f"event_id contamination: development_test ∩ {name} = {len(overlap)} rows"
+            assert not overlap, (
+                "event_id contamination: "
+                f"development_test ∩ {name} = {len(overlap)} rows"
+            )
 
     def test_no_identity_crosses_partitions(self, smoke_corpus) -> None:
         identity_fields = ["actor_id", "counterparty_id", "campaign_id", "payment_id", "event_id"]

@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import pytest
-
-from apar.evaluation.v5_population import build_v5_corpus
-from apar.evaluation.v5_protocol import V5Profile, load_v5_development_protocol
 from pathlib import Path
 
+from apar.evaluation.v5_population import build_v5_corpus
+from apar.evaluation.v5_protocol import V5Profile
+from tests.evaluation.v5_safe_protocol import load_safe_v5_test_protocol
+
 ROOT = Path(__file__).resolve().parents[2]
-PROTOCOL = load_v5_development_protocol(ROOT / "config/defense/defense-v5-development.json")
+PROTOCOL = load_safe_v5_test_protocol(ROOT)
 
 
 class TestProductionDevTestSupport:
@@ -32,7 +32,10 @@ class TestProductionDevTestSupport:
     def test_production_builder_uses_partition_specific_counts(self, monkeypatch) -> None:
         """Verify build_v5_corpus consumes production_dev_test_legitimate."""
         source = __import__("inspect").getsource(
-            __import__("apar.evaluation.v5_population", fromlist=["build_v5_corpus"]).build_v5_corpus
+            __import__(
+                "apar.evaluation.v5_population",
+                fromlist=["build_v5_corpus"],
+            ).build_v5_corpus
         )
         assert "production_dev_test_legitimate" in source or "profile_counts" in source, (
             "build_v5_corpus must consume partition-specific counts"

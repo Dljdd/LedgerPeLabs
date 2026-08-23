@@ -8,20 +8,24 @@ import pytest
 
 from apar.evaluation.v5_population import (
     V5Corpus,
+    V5ExecutionManifest,
+    V5PartitionCorpus,
     build_v5_corpus,
 )
-from apar.evaluation.v5_protocol import V5Family, V5Profile, load_v5_development_protocol
+from apar.evaluation.v5_protocol import V5Family, V5Profile
+from tests.evaluation.v5_safe_protocol import load_safe_v5_test_protocol
 
 ROOT = Path(__file__).resolve().parents[2]
-PROTOCOL = load_v5_development_protocol(ROOT / "config/defense/defense-v5-development.json")
+PROTOCOL = load_safe_v5_test_protocol(ROOT)
 ALL_FAMILIES = {f.value for f in V5Family}
 
 
-class TestSmokeCorpus:
-    @pytest.fixture(scope="class")
-    def smoke_corpus(self) -> V5Corpus:
-        return build_v5_corpus(PROTOCOL, profile=V5Profile.SMOKE)
+@pytest.fixture(scope="module")
+def smoke_corpus() -> V5Corpus:
+    return build_v5_corpus(PROTOCOL, profile=V5Profile.SMOKE)
 
+
+class TestSmokeCorpus:
     def test_legitimate_and_fraud_coexist(self, smoke_corpus: V5Corpus) -> None:
         for partition_name, partition in smoke_corpus.partitions.items():
             if partition_name in ("hardening_train", "adaptive_holdout"):
@@ -40,12 +44,69 @@ class TestSmokeCorpus:
         }
         assert all_families_in_fraud == ALL_FAMILIES
 
+    def test_every_campaign_row_is_backed_by_real_execution_manifest(
+        self,
+        smoke_corpus: V5Corpus,
+    ) -> None:
+        for partition in smoke_corpus.partitions.values():
+            manifests = {
+                execution.evidence_sha256: execution
+                for execution in partition.executions
+            }
+            assert {execution.family for execution in partition.executions} == ALL_FAMILIES
+            for row in partition.decisions:
+                if row.family == "legitimate":
+                    assert row.execution_evidence_sha256 == ""
+                    continue
+                execution = manifests[row.execution_evidence_sha256]
+                lineage = {
+                    item.event_id: item for item in execution.lineage
+                }[row.source_event_id]
+                assert lineage.command_id == row.source_command_id
+                assert lineage.payment_id == row.payment_id
+                assert lineage.is_fraud is row.is_fraud
+
+    def test_every_agentic_row_has_real_verifier_execution(
+        self,
+        smoke_corpus: V5Corpus,
+    ) -> None:
+        for partition in smoke_corpus.partitions.values():
+            for row in partition.decisions:
+                if row.rail == "agentic":
+                    assert row.execution_evidence_sha256
+                    assert row.source_command_id
+                    assert row.source_event_id
+
+    def test_partition_rejects_unbacked_campaign_row(
+        self,
+        smoke_corpus: V5Corpus,
+    ) -> None:
+        row = next(
+            row
+            for row in smoke_corpus.partitions["train"].decisions
+            if row.family != "legitimate"
+        )
+
+        with pytest.raises(ValueError, match="real execution evidence"):
+            empty_executions: tuple[V5ExecutionManifest, ...] = ()
+            V5PartitionCorpus(
+                partition_name="train",
+                decisions=(row,),
+                executions=empty_executions,
+            )
+
     def test_identity_disjoint_across_partitions(self, smoke_corpus: V5Corpus) -> None:
         actor_sets: dict[str, set[str]] = {}
+        counterparty_sets: dict[str, set[str]] = {}
         campaign_sets: dict[str, set[str]] = {}
+        payment_sets: dict[str, set[str]] = {}
         for name, partition in smoke_corpus.partitions.items():
             actor_sets[name] = {row.actor_id for row in partition.decisions}
+            counterparty_sets[name] = {
+                row.counterparty_id for row in partition.decisions
+            }
             campaign_sets[name] = {row.campaign_id for row in partition.decisions}
+            payment_sets[name] = {row.payment_id for row in partition.decisions}
         names = list(smoke_corpus.partitions.keys())
         for i, left in enumerate(names):
             for right in names[i + 1 :]:
@@ -53,6 +114,12 @@ class TestSmokeCorpus:
                 assert not (
                     campaign_sets[left] & campaign_sets[right]
                 ), f"campaign overlap {left}/{right}"
+                assert not (
+                    counterparty_sets[left] & counterparty_sets[right]
+                ), f"counterparty overlap {left}/{right}"
+                assert not (
+                    payment_sets[left] & payment_sets[right]
+                ), f"payment overlap {left}/{right}"
 
     def test_predictive_projection_omits_forbidden_fields(self, smoke_corpus: V5Corpus) -> None:
         forbidden = {"family", "campaign_id", "scenario_id", "seed", "split", "is_fraud"}

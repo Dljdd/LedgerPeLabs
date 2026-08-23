@@ -5,25 +5,46 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from collections.abc import Sequence
 from pathlib import Path
+from typing import TypedDict
 
 import numpy as np
+from numpy.typing import NDArray
 
-from apar.defense.sentinel import SentinelAction, train_sentinel_defender
+from apar.defense.sentinel import (
+    SentinelAction,
+    SentinelDecision,
+    SentinelDefender,
+    train_sentinel_defender,
+)
 from apar.evaluation.v5_evaluation import V5Arm, evaluate_v5_arm
-from apar.evaluation.v5_population import build_v5_corpus
+from apar.evaluation.v5_population import V5DecisionRow, build_v5_corpus
 from apar.evaluation.v5_protocol import V5Profile, load_v5_development_protocol
 from apar.evaluation.v5_reporting import build_v5_development_result
 from apar.features.sentinel import (
+    SentinelFeatureBatch,
     SentinelFeatureCatalog,
     build_sentinel_features,
 )
 
 
+class _ScoringOutput(TypedDict, total=False):
+    error: str
+    arm_result: dict[str, object]
+
+
 def _build_partition_matrix(
-    partition_decisions,
+    partition_decisions: Sequence[V5DecisionRow],
     catalog: SentinelFeatureCatalog,
-):
+) -> tuple[
+    NDArray[np.float64],
+    NDArray[np.int_],
+    list[str],
+    list[str],
+    list[float],
+    SentinelFeatureBatch,
+]:
     """Build features for one partition and return (matrix, labels, metadata)."""
     batch = build_sentinel_features(partition_decisions, catalog=catalog)
     matrix = np.array(batch.matrix, dtype=np.float64)
@@ -34,23 +55,61 @@ def _build_partition_matrix(
     return matrix, labels, event_ids, campaign_ids, amounts, batch
 
 
+def _derive_trust_failures(
+    ordered_rows: Sequence[V5DecisionRow],
+) -> list[bool]:
+    """Return one explicit verifier-failure value in exact feature-row order."""
+    failures: list[bool] = []
+    for row in ordered_rows:
+        if row.rail == "agentic":
+            if not (
+                row.execution_evidence_sha256
+                and row.source_command_id
+                and row.source_event_id
+            ):
+                raise ValueError("agentic row lacks real verifier execution evidence")
+            if row.integrity_status not in {"pass", "fail"}:
+                raise ValueError("agentic row is missing a validated verifier outcome")
+            failures.append(row.integrity_status == "fail")
+        else:
+            if row.integrity_status != "not_applicable":
+                raise ValueError("non-agentic row cannot contain a verifier outcome")
+            failures.append(False)
+    return failures
+
+
+def _decide_with_trust(
+    defender: SentinelDefender,
+    features_matrix: np.ndarray,
+    ordered_rows: Sequence[V5DecisionRow],
+) -> list[SentinelDecision]:
+    """Score an ordered feature matrix with its exact real-verifier outcomes."""
+    if len(features_matrix) != len(ordered_rows):
+        raise ValueError("feature rows and trust evidence rows must align exactly")
+    return defender.decide_batch(
+        features_matrix,
+        trust_failures=_derive_trust_failures(ordered_rows),
+    )
+
+
 def _score_and_evaluate(
     *,
-    train_decisions,
-    calibration_decisions,
-    threshold_decisions,
-    dev_test_decisions,
+    train_decisions: Sequence[V5DecisionRow],
+    calibration_decisions: Sequence[V5DecisionRow],
+    threshold_decisions: Sequence[V5DecisionRow],
+    dev_test_decisions: Sequence[V5DecisionRow],
     catalog: SentinelFeatureCatalog,
     protocol_seeds: tuple[int, ...],
     bootstrap_seed: int,
-) -> dict:
+) -> _ScoringOutput:
     """Build features via the catalog, train, score, and evaluate."""
     x_train, y_train, _, _, _, _ = _build_partition_matrix(train_decisions, catalog)
     x_cal, y_cal, _, _, _, _ = _build_partition_matrix(calibration_decisions, catalog)
     x_threshold, y_threshold, _, _, _, _ = _build_partition_matrix(threshold_decisions, catalog)
-    x_test, y_test, test_event_ids, test_campaign_ids, test_amounts, _ = _build_partition_matrix(
+    x_test, y_test, _test_event_ids, test_campaign_ids, test_amounts, _ = _build_partition_matrix(
         dev_test_decisions, catalog
     )
+    test_trust_failures = _derive_trust_failures(dev_test_decisions)
 
     train_fraud = int(y_train.sum())
     train_benign = len(y_train) - train_fraud
@@ -77,13 +136,20 @@ def _score_and_evaluate(
     )
 
     # Real inference latency: measure each row individually after warm-up.
-    defender.decide_batch(x_test[: min(5, len(x_test))])
-    latencies_ns = []
+    warmup_size = min(5, len(x_test))
+    defender.decide_batch(
+        x_test[:warmup_size],
+        trust_failures=test_trust_failures[:warmup_size],
+    )
+    latencies_ns: list[int] = []
     for i in range(len(x_test)):
         start = time.perf_counter_ns()
-        defender.decide(x_test[i])
+        defender.decide(
+            x_test[i],
+            trust_failure=test_trust_failures[i],
+        )
         latencies_ns.append(time.perf_counter_ns() - start)
-    decisions = defender.decide_batch(x_test)
+    decisions = _decide_with_trust(defender, x_test, dev_test_decisions)
 
     actions = [SentinelAction(d.action) for d in decisions]
     probs = np.array([d.ensemble_probability for d in decisions])
@@ -123,28 +189,22 @@ def main() -> int:
     profile = V5Profile(args.profile)
     corpus = build_v5_corpus(protocol, profile=profile)
 
-    train_partition = corpus.partitions.get("train")
-    calibration_partition = corpus.partitions.get("calibration")
-    threshold_partition = corpus.partitions.get("threshold")
-    dev_test_partition = corpus.partitions.get("development_test")
-
-    arm_metrics: dict[str, dict] = {}
-    partitions_ready = all(
-        p is not None
-        for p in (train_partition, calibration_partition, threshold_partition, dev_test_partition)
+    arm_metrics: dict[str, dict[str, object]] = {}
+    train_partition = corpus.partitions["train"]
+    calibration_partition = corpus.partitions["calibration"]
+    threshold_partition = corpus.partitions["threshold"]
+    dev_test_partition = corpus.partitions["development_test"]
+    scoring_output = _score_and_evaluate(
+        train_decisions=train_partition.decisions,
+        calibration_decisions=calibration_partition.decisions,
+        threshold_decisions=threshold_partition.decisions,
+        dev_test_decisions=dev_test_partition.decisions,
+        catalog=catalog,
+        protocol_seeds=protocol.seeds.catboost_seeds,
+        bootstrap_seed=protocol.seeds.bootstrap,
     )
-    if partitions_ready:
-        scoring_output = _score_and_evaluate(
-            train_decisions=train_partition.decisions,
-            calibration_decisions=calibration_partition.decisions,
-            threshold_decisions=threshold_partition.decisions,
-            dev_test_decisions=dev_test_partition.decisions,
-            catalog=catalog,
-            protocol_seeds=protocol.seeds.catboost_seeds,
-            bootstrap_seed=protocol.seeds.bootstrap,
-        )
-        if "arm_result" in scoring_output:
-            arm_metrics["full_sentinel"] = scoring_output["arm_result"]
+    if "arm_result" in scoring_output:
+        arm_metrics["full_sentinel"] = scoring_output["arm_result"]
 
     result = build_v5_development_result(
         protocol=protocol,

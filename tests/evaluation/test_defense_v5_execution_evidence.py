@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-from decimal import Decimal
 from typing import cast
 
 import pytest
 
 from apar.contracts.decisions import Action
-from apar.contracts.events import EventKind, Rail
-from apar.generators.campaigns import CampaignGenerator, _CampaignEvaluator
+from apar.contracts.events import Rail
+from apar.generators.campaigns import _CampaignEvaluator
 from apar.generators.population import PopulationGenerator
 from apar.simulator.engine import SimulationEngine
 from apar.simulator.ledger import AccountReference
@@ -36,7 +35,9 @@ def _execute_campaign(family: str, rail: Rail):
     bundle = _bundle(_SEED, rail)
     population = PopulationGenerator(seed=_SEED).generate(bundle)
     params = _params(family, seed=_SEED)
-    commands = CampaignGenerator(seed=_SEED).generate(family, population, params)
+    commands, campaign_evidence = _CampaignEvaluator(seed=_SEED).generate(
+        family, population, params
+    )
     assert len(commands) > 0, f"no commands generated for {family}"
 
     if rail is Rail.A2A:
@@ -46,10 +47,7 @@ def _execute_campaign(family: str, rail: Rail):
         def factory() -> CardRailAdapter():
             return CardRailAdapter()
     else:
-        _, evidence = _CampaignEvaluator(seed=_SEED).generate(
-            family, population, params
-        )
-        fixture = evidence.agentic_fixture
+        fixture = campaign_evidence.agentic_fixture
         assert fixture is not None
         verifier = TrustVerifier(
             registered_agents={(fixture.agent_id, fixture.key_id): fixture.public_key},
@@ -67,31 +65,39 @@ def _execute_campaign(family: str, rail: Rail):
     }
     engine = SimulationEngine(bundle, {rail: factory}, opening_balances=opening)
 
-    from datetime import timedelta
-    start = bundle.replay_manifest.simulation_start
-    for priority, command in enumerate(commands):
-        engine.schedule(start + timedelta(minutes=priority), priority, command)
+    for priority, (scheduled_at, command) in enumerate(
+        zip(campaign_evidence.schedule, commands, strict=True)
+    ):
+        engine.schedule(scheduled_at, priority, command)
 
     events = engine.run()
-    return commands, events, engine, population, params, bundle
+    return commands, events, engine, population, params, bundle, campaign_evidence
 
 
 class TestRealExecutionEvidence:
     @pytest.mark.parametrize(("family", "rail"), FAMILIES_AND_RAILS)
     def test_campaign_executes_and_conserves_ledger(self, family: str, rail: Rail) -> None:
-        commands, events, engine, population, params, bundle = _execute_campaign(family, rail)
+        commands, events, engine, population, params, bundle, campaign_evidence = (
+            _execute_campaign(family, rail)
+        )
         assert len(events) > 0, f"no events emitted for {family} on {rail}"
         engine.ledger.assert_conserved()
 
     @pytest.mark.parametrize(("family", "rail"), FAMILIES_AND_RAILS)
     def test_events_have_multiple_event_kinds(self, family: str, rail: Rail) -> None:
-        commands, events, engine, population, params, bundle = _execute_campaign(family, rail)
+        commands, events, engine, population, params, bundle, campaign_evidence = (
+            _execute_campaign(family, rail)
+        )
         event_kinds = {e.event_type for e in events}
-        assert len(event_kinds) >= 1, f"expected at least one event kind for {family}, got {event_kinds}"
+        assert len(event_kinds) >= 1, (
+            f"expected at least one event kind for {family}, got {event_kinds}"
+        )
 
     @pytest.mark.parametrize(("family", "rail"), FAMILIES_AND_RAILS)
     def test_events_carry_matching_campaign_ids(self, family: str, rail: Rail) -> None:
-        commands, events, engine, population, params, bundle = _execute_campaign(family, rail)
+        commands, events, engine, population, params, bundle, campaign_evidence = (
+            _execute_campaign(family, rail)
+        )
         command_campaign_ids = set()
         for cmd in commands:
             cid = getattr(cmd, 'campaign_id', None) or cmd.payload.get('campaign_id')

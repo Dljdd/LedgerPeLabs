@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from apar.evaluation.v5_fidelity import FidelityDimension, audit_v5_fidelity
 from apar.evaluation.v5_population import build_v5_corpus
-from apar.evaluation.v5_protocol import V5Profile, load_v5_development_protocol
-from pathlib import Path
+from apar.evaluation.v5_protocol import V5Profile
+from tests.evaluation.v5_safe_protocol import load_safe_v5_test_protocol
 
 ROOT = Path(__file__).resolve().parents[2]
-PROTOCOL = load_v5_development_protocol(ROOT / "config/defense/defense-v5-development.json")
+PROTOCOL = load_safe_v5_test_protocol(ROOT)
 
 
 @pytest.fixture(scope="module")
@@ -32,7 +34,9 @@ class TestFidelityMutation:
         partitions = dict(mutated.partitions)
         train = partitions["train"]
         rows = list(train.decisions)
-        rows[0] = rows[0].model_copy(update={"amount": __import__("decimal").Decimal("99999999.00")})
+        rows[0] = rows[0].model_copy(
+            update={"amount": __import__("decimal").Decimal("99999999.00")}
+        )
         partitions["train"] = train.model_copy(update={"decisions": tuple(rows)})
         result = audit_v5_fidelity(mutated.model_copy(update={"partitions": partitions}))
         failed = [c for c in result.checks if not c.passed]
@@ -52,7 +56,7 @@ class TestFidelityMutation:
         for i, row in enumerate(reversed_rows):
             by_campaign[row.campaign_id].append(i)
         new_rows = list(reversed_rows)
-        for campaign_id, indices in by_campaign.items():
+        for _campaign_id, indices in by_campaign.items():
             if len(indices) < 2:
                 continue
             times = [new_rows[i].decision_at for i in indices]
@@ -62,5 +66,9 @@ class TestFidelityMutation:
                 )
         partitions["train"] = train.model_copy(update={"decisions": tuple(new_rows)})
         result = audit_v5_fidelity(mutated.model_copy(update={"partitions": partitions}))
-        temporal_failures = [c for c in result.checks if c.dimension is FidelityDimension.TEMPORAL and not c.passed]
+        temporal_failures = [
+            check
+            for check in result.checks
+            if check.dimension is FidelityDimension.TEMPORAL and not check.passed
+        ]
         assert len(temporal_failures) > 0, "reversed lifecycle did not fail temporal check"

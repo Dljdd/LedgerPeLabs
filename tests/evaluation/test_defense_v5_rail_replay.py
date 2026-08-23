@@ -7,10 +7,11 @@ from pathlib import Path
 import pytest
 
 from apar.evaluation.v5_population import build_v5_corpus
-from apar.evaluation.v5_protocol import V5Family, V5Profile, load_v5_development_protocol
+from apar.evaluation.v5_protocol import V5Family, V5Profile
+from tests.evaluation.v5_safe_protocol import load_safe_v5_test_protocol
 
 ROOT = Path(__file__).resolve().parents[2]
-PROTOCOL = load_v5_development_protocol(ROOT / "config/defense/defense-v5-development.json")
+PROTOCOL = load_safe_v5_test_protocol(ROOT)
 FAMILIES = {f.value for f in V5Family}
 
 
@@ -24,7 +25,9 @@ class TestRailReplay:
         for partition in corpus.partitions.values():
             for row in partition.decisions:
                 if row.is_fraud:
-                    assert hasattr(row, "lifecycle_state"), f"missing lifecycle_state on {row.event_id}"
+                    assert hasattr(row, "lifecycle_state"), (
+                        f"missing lifecycle_state on {row.event_id}"
+                    )
                     assert row.lifecycle_state, f"empty lifecycle_state on {row.event_id}"
 
     def test_all_four_families_have_campaigns_in_train(self, corpus) -> None:

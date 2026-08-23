@@ -8,11 +8,12 @@ from pathlib import Path
 import pytest
 
 from apar.evaluation.v5_population import build_v5_corpus
-from apar.evaluation.v5_protocol import V5Profile, load_v5_development_protocol
+from apar.evaluation.v5_protocol import V5Profile
 from apar.evaluation.v5_reporting import V5DevelopmentResult, build_v5_development_result
+from tests.evaluation.v5_safe_protocol import load_safe_v5_test_protocol
 
 ROOT = Path(__file__).resolve().parents[2]
-PROTOCOL = load_v5_development_protocol(ROOT / "config/defense/defense-v5-development.json")
+PROTOCOL = load_safe_v5_test_protocol(ROOT)
 
 
 class TestReporting:
