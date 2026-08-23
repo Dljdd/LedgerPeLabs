@@ -89,13 +89,19 @@ def build_v5_development_result(
             and arm_result.captured_value_fraction < protocol.readiness.captured_value_fraction_min
         ):
             failed_gates.append("captured_value_fraction_min")
+        if arm_result.p95_latency_ms is None:
+            failed_gates.append("latency_missing")
+        elif arm_result.p95_latency_ms > protocol.readiness.p95_decision_latency_ms_max:
+            failed_gates.append("p95_decision_latency_ms_max")
 
     if not corpus.is_production:
         status = "smoke"
     elif audit.overall_status != "pass":
         status = "invalid_corpus"
-    elif failed_gates or not parsed_arms:
+    elif not parsed_arms:
         status = "development_not_ready"
+    elif not failed_gates:
+        status = "development_ready"
     else:
         status = "development_not_ready"
 
