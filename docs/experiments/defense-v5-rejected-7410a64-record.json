@@ -1,0 +1,25 @@
+{
+  "schema_version": "1.0.0",
+  "record_type": "rejected_experiment",
+  "protocol_id": "apar-sentinel-v5-development",
+  "rejected_commit": "7410a6413803361de057c7b87a717bacaf3d0e90",
+  "original_result_sha256": "20cb69352184010a852aa5911d6c02fa9f54a65692878043eb8fb9f58af1428d",
+  "status": "invalid_experiment",
+  "rejection_reasons": [
+    "future_graph_leakage: _enrich_features computed graph_component_size and graph_edge_density from the complete partition graph including future events",
+    "direct_label_leakage: graph_prior_suspicious_count read is_fraud from other rows",
+    "generator_fingerprint: legitimate and fraud behavior were trivially separable by construction",
+    "missing_real_rail_execution: source_command_id, source_event_id, lifecycle_state were fabricated strings not derived from Task 5 campaigns or real rail adapters",
+    "missing_latency_ece_per_family_gates: latency was null, ECE was not computed, per-family recall was not evaluated",
+    "verifier_forgery: changing status to development_ready with null latency was accepted by the old verifier"
+  ],
+  "empirical_observations": {
+    "graph_component_size_alone_separated_smoke_population": true,
+    "legitimate_component_size_range": [2, 3],
+    "fraud_component_size_range": [8, 14],
+    "adding_three_future_events_changed_first_event_component_size_from": 2,
+    "to": 8,
+    "in_memory_development_ready_accepted_by_old_verifier": true
+  },
+  "evidence_policy": "Perfect metrics from this experiment cannot support model selection, readiness, or competition claims."
+}
