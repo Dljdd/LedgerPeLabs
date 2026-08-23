@@ -155,14 +155,19 @@ def build_sentinel_features(
 
             prior_cp = [
                 r for r in counterparty_events.get(row.counterparty_id, [])
-                if r.decision_at < now and r.event_id != row.event_id
+                if r.decision_at < now
+                and r.event_id != row.event_id
+                and (now - r.decision_at).total_seconds() <= 86400
             ]
             _set_if_in_catalog(values, catalog, "counterparty_count_1h",
                 float(sum(1 for r in prior_cp if (now - r.decision_at).total_seconds() <= 3600)))
             _set_if_in_catalog(values, catalog, "counterparty_count_24h", float(len(prior_cp)))
             _set_if_in_catalog(values, catalog, "counterparty_amount_24h",
                 sum(float(r.amount) for r in prior_cp))
-            distinct_actors = len({r.actor_id for r in prior_cp})
+            distinct_actors = len({
+                r.actor_id for r in prior_cp
+                if (now - r.decision_at).total_seconds() <= 86400
+            })
             _set_if_in_catalog(
                 values, catalog,
                 "counterparty_distinct_actors_24h", float(distinct_actors),
