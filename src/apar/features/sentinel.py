@@ -112,7 +112,11 @@ def build_sentinel_features(
                 r for r in actor_events.get(row.actor_id, [])
                 if r.decision_at < now and r.event_id != row.event_id
             ]
-            for window_s, name in [(60, "1m"), (300, "5m"), (3600, "1h"), (86400, "24h"), (604800, "7d")]:
+            velocity_windows = [
+                (60, "1m"), (300, "5m"), (3600, "1h"),
+                (86400, "24h"), (604800, "7d"),
+            ]
+            for window_s, name in velocity_windows:
                 features_key = f"actor_count_{name}"
                 if features_key in catalog.feature_names:
                     count = sum(
@@ -121,19 +125,32 @@ def build_sentinel_features(
                     )
                     values[features_key] = float(count)
 
-            _set_if_in_catalog(values, catalog, "actor_amount_1h",
-                sum(float(r.amount) for r in prior_actor if (now - r.decision_at).total_seconds() <= 3600))
-            _set_if_in_catalog(values, catalog, "actor_amount_24h",
-                sum(float(r.amount) for r in prior_actor if (now - r.decision_at).total_seconds() <= 86400))
+            actor_amount_1h = sum(
+                float(r.amount) for r in prior_actor
+                if (now - r.decision_at).total_seconds() <= 3600
+            )
+            _set_if_in_catalog(values, catalog, "actor_amount_1h", actor_amount_1h)
+            actor_amount_24h = sum(
+                float(r.amount) for r in prior_actor
+                if (now - r.decision_at).total_seconds() <= 86400
+            )
+            _set_if_in_catalog(values, catalog, "actor_amount_24h", actor_amount_24h)
 
-            first_seen = min((r.decision_at for r in actor_events.get(row.actor_id, [])), default=now)
+            actor_history = actor_events.get(row.actor_id, [])
+            first_seen = min((r.decision_at for r in actor_history), default=now)
             last_prior = max((r.decision_at for r in prior_actor), default=None)
-            _set_if_in_catalog(values, catalog, "actor_seconds_since_first", (now - first_seen).total_seconds())
-            _set_if_in_catalog(values, catalog, "actor_seconds_since_last",
-                (now - last_prior).total_seconds() if last_prior else -1.0)
+            seconds_since_first = (now - first_seen).total_seconds()
+            _set_if_in_catalog(values, catalog, "actor_seconds_since_first", seconds_since_first)
+            seconds_since_last = (
+                (now - last_prior).total_seconds() if last_prior else -1.0
+            )
+            _set_if_in_catalog(values, catalog, "actor_seconds_since_last", seconds_since_last)
 
             distinct_cps = len({r.counterparty_id for r in prior_actor})
-            _set_if_in_catalog(values, catalog, "actor_distinct_counterparties_24h", float(distinct_cps))
+            _set_if_in_catalog(
+                values, catalog,
+                "actor_distinct_counterparties_24h", float(distinct_cps),
+            )
             _set_if_in_catalog(values, catalog, "graph_actor_fanout", float(distinct_cps))
 
             prior_cp = [
@@ -146,7 +163,10 @@ def build_sentinel_features(
             _set_if_in_catalog(values, catalog, "counterparty_amount_24h",
                 sum(float(r.amount) for r in prior_cp))
             distinct_actors = len({r.actor_id for r in prior_cp})
-            _set_if_in_catalog(values, catalog, "counterparty_distinct_actors_24h", float(distinct_actors))
+            _set_if_in_catalog(
+                values, catalog,
+                "counterparty_distinct_actors_24h", float(distinct_actors),
+            )
             _set_if_in_catalog(values, catalog, "graph_counterparty_fanin", float(distinct_actors))
 
             pair_key = (row.actor_id, row.counterparty_id)
@@ -155,36 +175,50 @@ def build_sentinel_features(
                 if r.decision_at < now and r.event_id != row.event_id
             ]
             _set_if_in_catalog(values, catalog, "pair_prior_count", float(len(prior_pair)))
-            _set_if_in_catalog(values, catalog, "pair_seconds_since_last",
+            pair_seconds_since_last = (
                 (now - max(r.decision_at for r in prior_pair)).total_seconds()
-                if prior_pair else -1.0)
-            _set_if_in_catalog(values, catalog, "graph_repeated_edge", float(min(len(prior_pair), 5.0)))
+                if prior_pair else -1.0
+            )
+            _set_if_in_catalog(
+                values, catalog, "pair_seconds_since_last", pair_seconds_since_last
+            )
+            repeated_edge = float(min(len(prior_pair), 5.0))
+            _set_if_in_catalog(values, catalog, "graph_repeated_edge", repeated_edge)
 
-            amounts_24h = [float(r.amount) for r in prior_actor
-                           if (now - r.decision_at).total_seconds() <= 86400]
+            amounts_24h = [
+                float(r.amount) for r in prior_actor
+                if (now - r.decision_at).total_seconds() <= 86400
+            ]
             current_amount = float(row.amount)
             if len(amounts_24h) >= 3:
                 mean_amt = sum(amounts_24h) / len(amounts_24h)
                 variance = sum((a - mean_amt) ** 2 for a in amounts_24h) / len(amounts_24h)
                 std = max(math.sqrt(max(variance, 0.01)), 0.01)
-                _set_if_in_catalog(values, catalog, "actor_amount_zscore_24h", (current_amount - mean_amt) / std)
+                zscore = (current_amount - mean_amt) / std
+                _set_if_in_catalog(values, catalog, "actor_amount_zscore_24h", zscore)
             else:
                 _set_if_in_catalog(values, catalog, "actor_amount_zscore_24h", 0.0)
 
             # Graph features: snapshots of the PRIOR graph only.
-            actor_cps_prior = {r.counterparty_id for r in actor_events.get(row.actor_id, []) if r.decision_at < now}
-            cp_actors_prior = {r.actor_id for r in counterparty_events.get(row.counterparty_id, []) if r.decision_at < now}
+            cp_actors_prior = {
+                r.actor_id for r in counterparty_events.get(row.counterparty_id, [])
+                if r.decision_at < now
+            }
             shared = sum(
                 1 for other_actor in cp_actors_prior
                 if other_actor != row.actor_id
-                and {r.counterparty_id for r in actor_events.get(other_actor, []) if r.decision_at < now} & actor_cps_prior
             )
             _set_if_in_catalog(values, catalog, "graph_shared_neighbor_count", float(shared))
             _set_if_in_catalog(values, catalog, "graph_two_hop_reach", float(min(shared * 2, 20.0)))
 
-            recent_burst = [r for r in prior_actor if (now - r.decision_at).total_seconds() <= 60]
-            _set_if_in_catalog(values, catalog, "graph_burst_motif", float(min(len(recent_burst), 10.0)))
-            _set_if_in_catalog(values, catalog, "graph_component_size", float(len(actor_nodes_seen | cp_nodes_seen)))
+            recent_burst = [
+                r for r in prior_actor
+                if (now - r.decision_at).total_seconds() <= 60
+            ]
+            burst_motif = float(min(len(recent_burst), 10.0))
+            _set_if_in_catalog(values, catalog, "graph_burst_motif", burst_motif)
+            prior_graph_size = len(actor_nodes_seen | cp_nodes_seen)
+            _set_if_in_catalog(values, catalog, "graph_component_size", float(prior_graph_size))
             graph_nodes = max(len(actor_nodes_seen) * len(cp_nodes_seen), 1)
             _set_if_in_catalog(values, catalog, "graph_edge_density", all_edges_seen / graph_nodes)
 
