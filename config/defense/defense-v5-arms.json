@@ -1,0 +1,62 @@
+{
+  "schema_version": "1.0.0",
+  "protocol_id": "apar-sentinel-v5-development",
+  "threshold_source_partition": "threshold",
+  "implementation_version": "sentinel-v5-arms-1.0.0",
+  "implementation_paths": [
+    "src/apar/defense/sentinel.py",
+    "src/apar/evaluation/v5_evaluation.py",
+    "src/apar/evaluation/v5_arms.py",
+    "scripts/run_defense_v5_development.py"
+  ],
+  "arms": [
+    {
+      "arm": "rules_only",
+      "feature_mode": "rules",
+      "model": false,
+      "graph": false,
+      "rules": true,
+      "trust": true,
+      "novelty": false,
+      "disagreement": false,
+      "calibration_method": "none",
+      "threshold_method": "rules_v1_fixed"
+    },
+    {
+      "arm": "ensemble_no_graph",
+      "feature_mode": "approved_non_graph",
+      "model": true,
+      "graph": false,
+      "rules": false,
+      "trust": false,
+      "novelty": false,
+      "disagreement": false,
+      "calibration_method": "isotonic_per_member",
+      "threshold_method": "sentinel_percentile_v1"
+    },
+    {
+      "arm": "ensemble_with_graph",
+      "feature_mode": "approved_with_graph",
+      "model": true,
+      "graph": true,
+      "rules": false,
+      "trust": false,
+      "novelty": false,
+      "disagreement": false,
+      "calibration_method": "isotonic_per_member",
+      "threshold_method": "sentinel_percentile_v1"
+    },
+    {
+      "arm": "full_sentinel",
+      "feature_mode": "approved_with_graph",
+      "model": true,
+      "graph": true,
+      "rules": true,
+      "trust": true,
+      "novelty": true,
+      "disagreement": true,
+      "calibration_method": "isotonic_per_member",
+      "threshold_method": "sentinel_percentile_v1"
+    }
+  ]
+}

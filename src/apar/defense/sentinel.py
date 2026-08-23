@@ -189,6 +189,10 @@ class SentinelDefender(BaseModel):
     thresholds: SentinelThresholds
     manifest: SentinelModelManifest
 
+    def predict_probability(self, features: np.ndarray) -> tuple[float, float]:
+        """Return calibrated ensemble probability and member disagreement only."""
+        return _ensemble_probability(features, self.model_members, self.calibrators)
+
     def decide(
         self,
         features: np.ndarray,

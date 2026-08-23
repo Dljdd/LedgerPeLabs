@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import TypedDict
@@ -13,12 +12,17 @@ import numpy as np
 from numpy.typing import NDArray
 
 from apar.defense.sentinel import (
-    SentinelAction,
     SentinelDecision,
     SentinelDefender,
-    train_sentinel_defender,
 )
-from apar.evaluation.v5_evaluation import V5Arm, evaluate_v5_arm
+from apar.evaluation.v5_arms import score_v5_arm_set, train_v5_arm_set
+from apar.evaluation.v5_evaluation import (
+    V5ArmConfiguration,
+    V5ArmSupportRow,
+    V5EvaluationResult,
+    evaluate_v5_arm,
+    load_v5_arm_configuration,
+)
 from apar.evaluation.v5_population import V5DecisionRow, build_v5_corpus
 from apar.evaluation.v5_protocol import V5Profile, load_v5_development_protocol
 from apar.evaluation.v5_reporting import build_v5_development_result
@@ -31,7 +35,7 @@ from apar.features.sentinel import (
 
 class _ScoringOutput(TypedDict, total=False):
     error: str
-    arm_result: dict[str, object]
+    arm_results: dict[str, dict[str, object]]
 
 
 def _build_partition_matrix(
@@ -46,6 +50,9 @@ def _build_partition_matrix(
     SentinelFeatureBatch,
 ]:
     """Build features for one partition and return (matrix, labels, metadata)."""
+    canonical = sorted(partition_decisions, key=lambda row: (row.decision_at, row.event_id))
+    if list(partition_decisions) != canonical:
+        raise ValueError("partition decisions must use canonical feature-row order")
     batch = build_sentinel_features(partition_decisions, catalog=catalog)
     matrix = np.array(batch.matrix, dtype=np.float64)
     labels = np.array([1 if row.is_fraud else 0 for row in partition_decisions], dtype=int)
@@ -92,21 +99,21 @@ def _decide_with_trust(
     )
 
 
-def _score_and_evaluate(
+def _score_all_arms_and_evaluate(
     *,
     train_decisions: Sequence[V5DecisionRow],
     calibration_decisions: Sequence[V5DecisionRow],
     threshold_decisions: Sequence[V5DecisionRow],
     dev_test_decisions: Sequence[V5DecisionRow],
     catalog: SentinelFeatureCatalog,
-    protocol_seeds: tuple[int, ...],
+    configuration: V5ArmConfiguration,
     bootstrap_seed: int,
 ) -> _ScoringOutput:
-    """Build features via the catalog, train, score, and evaluate."""
+    """Train and independently score all frozen arms over identical support."""
     x_train, y_train, _, _, _, _ = _build_partition_matrix(train_decisions, catalog)
     x_cal, y_cal, _, _, _, _ = _build_partition_matrix(calibration_decisions, catalog)
     x_threshold, y_threshold, _, _, _, _ = _build_partition_matrix(threshold_decisions, catalog)
-    x_test, y_test, _test_event_ids, test_campaign_ids, test_amounts, _ = _build_partition_matrix(
+    x_test, y_test, test_event_ids, test_campaign_ids, test_amounts, _ = _build_partition_matrix(
         dev_test_decisions, catalog
     )
     test_trust_failures = _derive_trust_failures(dev_test_decisions)
@@ -124,55 +131,68 @@ def _score_and_evaluate(
     if not thr_fraud or not thr_benign:
         return {"error": "one-class threshold partition"}
 
-    defender = train_sentinel_defender(
+    trained = train_v5_arm_set(
+        configuration=configuration,
+        catalog=catalog,
         x_train=x_train,
         y_train=y_train,
         x_calibration=x_cal,
         y_calibration=y_cal,
         x_threshold=x_threshold,
         y_threshold=y_threshold,
-        catboost_seeds=protocol_seeds,
         bootstrap_seed=bootstrap_seed,
     )
-
-    # Real inference latency: measure each row individually after warm-up.
-    warmup_size = min(5, len(x_test))
-    defender.decide_batch(
-        x_test[:warmup_size],
-        trust_failures=test_trust_failures[:warmup_size],
-    )
-    latencies_ns: list[int] = []
-    for i in range(len(x_test)):
-        start = time.perf_counter_ns()
-        defender.decide(
-            x_test[i],
-            trust_failure=test_trust_failures[i],
+    support = tuple(
+        V5ArmSupportRow(
+            event_id=row.event_id,
+            label=1 if row.is_fraud else 0,
+            campaign_id=row.campaign_id,
+            amount=float(row.amount),
+            family=row.family,
+            execution_evidence_sha256=row.execution_evidence_sha256,
         )
-        latencies_ns.append(time.perf_counter_ns() - start)
-    decisions = _decide_with_trust(defender, x_test, dev_test_decisions)
-
-    actions = [SentinelAction(d.action) for d in decisions]
-    probs = np.array([d.ensemble_probability for d in decisions])
+        for row in dev_test_decisions
+    )
+    scores = score_v5_arm_set(
+        trained=trained,
+        catalog=catalog,
+        features_matrix=x_test,
+        support=support,
+        trust_failures=test_trust_failures,
+    )
+    if tuple(item.event_id for item in support) != tuple(test_event_ids):
+        raise ValueError("evaluation support order disagrees with feature metadata")
     campaign_ids_arr = np.array(test_campaign_ids)
     amounts_arr = np.array(test_amounts)
+    arm_results: dict[str, dict[str, object]] = {}
+    for arm, score in scores.by_arm.items():
+        base = evaluate_v5_arm(
+            arm=arm,
+            y_true=y_test,
+            actions=[row.action for row in score.rows],
+            probabilities=np.array([row.probability for row in score.rows]),
+            campaign_ids=campaign_ids_arr,
+            amounts=amounts_arr,
+        )
+        latencies_ms = [row.latency_ms for row in score.rows]
+        values = base.model_dump(mode="json")
+        values.update(
+            {
+                "p50_latency_ms": float(np.percentile(latencies_ms, 50)),
+                "p95_latency_ms": float(np.percentile(latencies_ms, 95)),
+                "arm_spec_sha256": score.spec.spec_sha256,
+                "support_sha256": score.support_sha256,
+                "feature_count": len(score.spec.feature_names),
+                "arm_spec": score.spec.model_dump(mode="json"),
+                "row_evidence": [row.model_dump(mode="json") for row in score.rows],
+            }
+        )
+        result = V5EvaluationResult.model_validate(values)
+        arm_results[arm.value] = result.model_dump(mode="json")
+    return {"arm_results": arm_results}
 
-    arm_result = evaluate_v5_arm(
-        arm=V5Arm.FULL_SENTINEL,
-        y_true=y_test,
-        actions=actions,
-        probabilities=probs,
-        campaign_ids=campaign_ids_arr,
-        amounts=amounts_arr,
-    )
 
-    latencies_ms = [ns / 1_000_000 for ns in latencies_ns]
-    arm_dict = arm_result.model_dump(mode="json")
-    arm_dict["p50_latency_ms"] = float(np.percentile(latencies_ms, 50))
-    arm_dict["p95_latency_ms"] = float(np.percentile(latencies_ms, 95))
-    arm_dict["p99_latency_ms"] = float(np.percentile(latencies_ms, 99))
-    arm_dict["catalog_sha256"] = catalog.catalog_sha256
-
-    return {"arm_result": arm_dict}
+_score_and_evaluate = _score_all_arms_and_evaluate
 
 
 def main() -> int:
@@ -186,6 +206,11 @@ def main() -> int:
     catalog = SentinelFeatureCatalog.from_config(
         root / protocol.feature_catalog_path
     )
+    arm_configuration = load_v5_arm_configuration(
+        root / "config/defense/defense-v5-arms.json",
+        catalog=catalog,
+        protocol=protocol,
+    )
     profile = V5Profile(args.profile)
     corpus = build_v5_corpus(protocol, profile=profile)
 
@@ -194,17 +219,17 @@ def main() -> int:
     calibration_partition = corpus.partitions["calibration"]
     threshold_partition = corpus.partitions["threshold"]
     dev_test_partition = corpus.partitions["development_test"]
-    scoring_output = _score_and_evaluate(
+    scoring_output = _score_all_arms_and_evaluate(
         train_decisions=train_partition.decisions,
         calibration_decisions=calibration_partition.decisions,
         threshold_decisions=threshold_partition.decisions,
         dev_test_decisions=dev_test_partition.decisions,
         catalog=catalog,
-        protocol_seeds=protocol.seeds.catboost_seeds,
+        configuration=arm_configuration,
         bootstrap_seed=protocol.seeds.bootstrap,
     )
-    if "arm_result" in scoring_output:
-        arm_metrics["full_sentinel"] = scoring_output["arm_result"]
+    if "arm_results" in scoring_output:
+        arm_metrics.update(scoring_output["arm_results"])
 
     result = build_v5_development_result(
         protocol=protocol,

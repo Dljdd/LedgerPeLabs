@@ -34,14 +34,16 @@ class SentinelFeatureCatalog(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     feature_names: tuple[str, ...]
+    feature_groups: tuple[str, ...] = ()
     catalog_sha256: str
 
     @classmethod
     def from_config(cls, path: Path) -> SentinelFeatureCatalog:
         document = json.loads(path.read_bytes())
         names = tuple(f["name"] for f in document.get("features", []))
+        groups = tuple(f["group"] for f in document.get("features", []))
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        return cls(feature_names=names, catalog_sha256=digest)
+        return cls(feature_names=names, feature_groups=groups, catalog_sha256=digest)
 
     @classmethod
     def default(cls) -> SentinelFeatureCatalog:
@@ -50,6 +52,8 @@ class SentinelFeatureCatalog(BaseModel):
 
     @model_validator(mode="after")
     def no_forbidden_fields(self) -> Self:
+        if self.feature_groups and len(self.feature_groups) != len(self.feature_names):
+            raise ValueError("feature names and groups must align exactly")
         leaks = _FORBIDDEN_FIELDS & set(self.feature_names)
         if leaks:
             raise ValueError(f"catalog contains forbidden predictive fields: {leaks}")
