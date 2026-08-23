@@ -13,6 +13,7 @@ from apar.evaluation.v5_population import (
     build_v5_corpus,
 )
 from apar.evaluation.v5_protocol import V5Family, V5Profile
+from apar.features.sentinel import SentinelFeatureCatalog, build_sentinel_features
 from tests.evaluation.v5_safe_protocol import load_safe_v5_test_protocol
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -26,6 +27,53 @@ def smoke_corpus() -> V5Corpus:
 
 
 class TestSmokeCorpus:
+    def test_legitimate_rows_are_projected_from_real_execution_evidence(
+        self,
+        smoke_corpus: V5Corpus,
+    ) -> None:
+        """Removing real legitimate execution must make this test fail."""
+        for partition in smoke_corpus.partitions.values():
+            manifests = {
+                execution.evidence_sha256: execution
+                for execution in partition.executions
+            }
+            legitimate = [
+                row for row in partition.decisions if row.family == "legitimate"
+            ]
+            assert legitimate
+            for row in legitimate:
+                assert row.execution_evidence_sha256
+                manifest = manifests[row.execution_evidence_sha256]
+                assert manifest.family == "legitimate"
+                assert row.source_command_id.startswith("sha256:")
+                assert row.source_event_id == row.event_id
+
+    def test_every_operational_rail_has_both_classes(self, smoke_corpus: V5Corpus) -> None:
+        """Removing any executed legitimate rail must make this test fail."""
+        expected_rails = {"card", "a2a", "agentic"}
+        for partition_name in ("train", "calibration", "threshold", "development_test"):
+            rows = smoke_corpus.partitions[partition_name].decisions
+            for rail in expected_rails:
+                labels = {row.is_fraud for row in rows if row.rail == rail}
+                assert labels == {False, True}, f"{partition_name}/{rail} lacks a class"
+
+    def test_legitimate_execution_manifest_retains_canonical_economic_and_trust_facts(
+        self,
+        smoke_corpus: V5Corpus,
+    ) -> None:
+        """Dropping immutable ledger or verifier facts must make this test fail."""
+        manifests = smoke_corpus.partitions["train"].executions
+        legitimate = [manifest for manifest in manifests if manifest.family == "legitimate"]
+        assert {manifest.rail for manifest in legitimate} == {"card", "a2a", "agentic"}
+        for manifest in legitimate:
+            assert manifest.event_records
+            assert manifest.ledger_postings or manifest.rail == "agentic"
+            if manifest.rail == "agentic":
+                assert manifest.trust_records
+                assert all(record.request_json for record in manifest.trust_records)
+                assert all(record.mandate_json for record in manifest.trust_records)
+                assert all(record.public_key_hex for record in manifest.trust_records)
+
     def test_legitimate_and_fraud_coexist(self, smoke_corpus: V5Corpus) -> None:
         for partition_name, partition in smoke_corpus.partitions.items():
             if partition_name in ("hardening_train", "adaptive_holdout"):
@@ -53,11 +101,8 @@ class TestSmokeCorpus:
                 execution.evidence_sha256: execution
                 for execution in partition.executions
             }
-            assert {execution.family for execution in partition.executions} == ALL_FAMILIES
+            assert {execution.family for execution in partition.executions} >= ALL_FAMILIES
             for row in partition.decisions:
-                if row.family == "legitimate":
-                    assert row.execution_evidence_sha256 == ""
-                    continue
                 execution = manifests[row.execution_evidence_sha256]
                 lineage = {
                     item.event_id: item for item in execution.lineage
@@ -76,6 +121,50 @@ class TestSmokeCorpus:
                     assert row.execution_evidence_sha256
                     assert row.source_command_id
                     assert row.source_event_id
+
+    def test_executed_traffic_has_no_trivial_provenance_or_rail_fingerprint(
+        self,
+        smoke_corpus: V5Corpus,
+    ) -> None:
+        """Restoring hand-built benign rows or a label-coded rail must fail here."""
+        rows = smoke_corpus.partitions["development_test"].decisions
+        labels = {row.is_fraud for row in rows}
+        assert labels == {False, True}
+        assert {bool(row.execution_evidence_sha256) for row in rows} == {True}
+        for rail in ("card", "a2a", "agentic"):
+            assert {row.is_fraud for row in rows if row.rail == rail} == labels
+        assert {row.source_command_id.split(":", 1)[0] for row in rows} == {"sha256"}
+        assert all(row.campaign_id.count("-") == 4 for row in rows)
+        for state in ("settled", "declined", "refunded", "returned", "recovered"):
+            state_labels = {row.is_fraud for row in rows if row.lifecycle_state == state}
+            assert state_labels != {True}, f"{state} is a fraud-only fingerprint"
+
+    def test_identity_renaming_preserves_numeric_feature_matrix(
+        self,
+        smoke_corpus: V5Corpus,
+    ) -> None:
+        """Introducing raw identity-derived numeric features must make this fail."""
+        rows = smoke_corpus.partitions["train"].decisions
+        identities = {row.actor_id for row in rows} | {
+            row.counterparty_id for row in rows
+        }
+        renamed_identities = {
+            value: f"identity-{index}"
+            for index, value in enumerate(sorted(identities))
+        }
+        renamed = tuple(
+            row.model_copy(
+                update={
+                    "actor_id": renamed_identities[row.actor_id],
+                    "counterparty_id": renamed_identities[row.counterparty_id],
+                }
+            )
+            for row in rows
+        )
+        catalog = SentinelFeatureCatalog.default()
+        original = build_sentinel_features(rows, catalog=catalog)
+        renamed_features = build_sentinel_features(renamed, catalog=catalog)
+        assert renamed_features.matrix == original.matrix
 
     def test_partition_rejects_unbacked_campaign_row(
         self,

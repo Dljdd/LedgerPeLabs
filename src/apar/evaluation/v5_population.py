@@ -1,4 +1,4 @@
-"""Mixed population builder with real executed fraud evidence for Sentinel v5."""
+"""Mixed population builder with real executed evidence for Sentinel v5."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 from collections.abc import Callable
+from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Self, cast
@@ -30,10 +31,13 @@ from apar.generators.campaigns import (
     APP_SCAM_MULE_MOTIF,
     CARD_TESTING_CNP_MOTIF,
     SYNTHETIC_MERCHANT_REFUND_MOTIF,
+    AgenticFixture,
+    CampaignEvidence,
     CampaignParams,
     _CampaignEvaluator,
 )
-from apar.generators.population import PopulationGenerator
+from apar.generators.population import Population, PopulationEntity, PopulationGenerator
+from apar.simulator.clock import Command
 from apar.simulator.engine import SimulationEngine
 from apar.simulator.ledger import AccountReference
 from apar.simulator.rails import (
@@ -41,7 +45,29 @@ from apar.simulator.rails import (
     AgenticRailAdapter,
     CardRailAdapter,
 )
+from apar.simulator.rails.a2a import (
+    AcceptA2A,
+    FreezeA2AFunds,
+    InitiateA2A,
+    PostA2A,
+    RecoverA2A,
+    RejectA2A,
+    ReportA2AFraud,
+    ReturnA2A,
+)
 from apar.simulator.rails.base import AdapterFactory
+from apar.simulator.rails.card import (
+    AuthorizeCard,
+    ChargebackCard,
+    ClearCard,
+    DeclineCardAuthorization,
+    OpenCardDispute,
+    RecoverCard,
+    RefundCard,
+    ReportCardFraud,
+    ReverseCardAuthorization,
+    SettleCard,
+)
 from apar.trust.verifier import TrustVerifier
 
 
@@ -106,6 +132,52 @@ class V5LineageManifest(BaseModel):
     is_fraud: bool
 
 
+class V5EventRecord(BaseModel):
+    """Bounded canonical event facts retained without a live simulator object."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    event_id: str
+    payment_id: str
+    event_type: str
+    amount: Decimal
+    currency: str
+    decision_at: datetime
+    rail_data_json: str
+    lineage_json: str
+
+
+class V5LedgerPosting(BaseModel):
+    """Canonical double-entry posting retained for independent economic replay."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    entry_id: str
+    debit: tuple[tuple[str, Decimal], ...]
+    credit: tuple[tuple[str, Decimal], ...]
+    currency: str
+
+
+class V5TrustRecord(BaseModel):
+    """Bounded public verifier inputs and verdict for a projected agentic event."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    command_id: str
+    event_id: str
+    request_id: str
+    request_json: str
+    mandate_json: str
+    authentication_evidence_json: str | None = None
+    public_key_hex: str
+    receipt_hash: str
+    request_hash: str
+    signature_hash: str
+    allowed: bool
+    reason_code: str | None = None
+    outcome: str
+
+
 class V5ExecutionManifest(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -118,10 +190,13 @@ class V5ExecutionManifest(BaseModel):
     trust_request_ids: tuple[str, ...]
     trust_failure_event_ids: tuple[str, ...]
     account_ids: tuple[str, ...]
+    event_records: tuple[V5EventRecord, ...]
+    ledger_postings: tuple[V5LedgerPosting, ...]
+    trust_records: tuple[V5TrustRecord, ...]
 
     @model_validator(mode="after")
     def validate_manifest(self) -> Self:
-        if self.family not in {family.value for family in V5Family}:
+        if self.family not in {family.value for family in V5Family} | {"legitimate"}:
             raise ValueError("execution manifest family is unknown")
         if self.rail not in {rail.value for rail in Rail}:
             raise ValueError("execution manifest rail is unknown")
@@ -133,6 +208,20 @@ class V5ExecutionManifest(BaseModel):
             raise ValueError("execution manifest event IDs must be unique")
         if len(command_ids) != len(set(command_ids)):
             raise ValueError("execution manifest command IDs must be unique")
+        if tuple(record.event_id for record in self.event_records) != event_ids:
+            raise ValueError("execution manifest canonical event facts disagree with lineage")
+        if any(
+            tuple(sorted(posting.debit)) != posting.debit
+            or tuple(sorted(posting.credit)) != posting.credit
+            for posting in self.ledger_postings
+        ):
+            raise ValueError("ledger postings must use canonical account order")
+        trust_event_ids = tuple(record.event_id for record in self.trust_records)
+        if self.rail == Rail.AGENTIC.value:
+            if trust_event_ids != event_ids:
+                raise ValueError("agentic manifest must retain one verifier record per event")
+        elif self.trust_records:
+            raise ValueError("non-agentic manifest cannot retain verifier records")
         if not set(self.trust_failure_event_ids) <= set(event_ids):
             raise ValueError("trust failures must reference manifest events")
         return self
@@ -160,15 +249,9 @@ class V5PartitionCorpus(BaseModel):
                 manifested_events.add(key)
 
         for row in self.decisions:
-            if row.family == "legitimate":
-                if row.execution_evidence_sha256:
-                    raise ValueError(
-                        "legitimate construction cannot claim fraud execution evidence"
-                    )
-                continue
             manifest_candidate = manifests.get(row.execution_evidence_sha256)
             if manifest_candidate is None:
-                raise ValueError("campaign row lacks real execution evidence")
+                raise ValueError("decision row lacks real execution evidence")
             manifest = manifest_candidate
             if (
                 manifest.campaign_id != row.campaign_id
@@ -221,7 +304,6 @@ class V5Corpus(BaseModel):
     is_production: bool
 
 
-_OPERATIONAL_PARTITIONS = ("train", "calibration", "threshold", "development_test")
 _PARTITION_SEED_KEYS = (
     "train",
     "calibration",
@@ -251,9 +333,6 @@ _PARTITION_OFFSETS_DAYS = {
     "hardening_train": 40,
     "adaptive_holdout": 50,
 }
-_LEGITIMATE_ACTORS_PER_PARTITION = 40
-
-
 class _PopulationIsolationError(ValueError):
     """Raised when corpus identities, time, or provenance cross partitions."""
 
@@ -265,56 +344,6 @@ def _domain_seed(base_seed: int, *labels: object) -> int:
     derived = int.from_bytes(hashlib.sha256(document.encode()).digest()[:8], "big")
     derived &= 2**63 - 1
     return derived or 1
-
-
-def _build_benign_partition(
-    partition_name: str,
-    count: int,
-    seed_value: int,
-) -> list[V5DecisionRow]:
-    import random
-
-    rng = random.Random(_domain_seed(seed_value, partition_name, "benign"))
-    partition_start = _BASE_START + timedelta(
-        days=_PARTITION_OFFSETS_DAYS[partition_name]
-    )
-    window_seconds = 8 * 24 * 60 * 60
-    slot_seconds = max(window_seconds // max(count, 1), 1)
-    rows: list[V5DecisionRow] = []
-    for i in range(count):
-        actor_index = i % _LEGITIMATE_ACTORS_PER_PARTITION
-        actor_id = f"benign-{partition_name}-actor-{actor_index:04d}"
-        counterparty_id = f"benign-{partition_name}-counterparty-{i % 60:04d}"
-        amount_cents = rng.randint(100, 50_000)
-        decision_at = partition_start + timedelta(seconds=i * slot_seconds)
-        event_id = f"{partition_name}-benign-event-{i:06d}"
-        rail = ("card", "a2a")[i % 2]
-        rows.append(
-            V5DecisionRow(
-                event_id=event_id,
-                payment_id=f"payment-{event_id}",
-                campaign_id=f"benign-base-{partition_name}",
-                family="legitimate",
-                actor_id=actor_id,
-                counterparty_id=counterparty_id,
-                amount=Decimal(amount_cents) / Decimal("100"),
-                currency="USD",
-                decision_at=decision_at,
-                is_fraud=False,
-                rail=rail,
-                integrity_status="not_applicable",
-                predictive_features={
-                    "amount": float(amount_cents) / 100.0,
-                    "rail_card": float(rail == "card"),
-                    "rail_a2a": float(rail == "a2a"),
-                    "rail_agentic": 0.0,
-                    "integrity_pass": 0.0,
-                    "txn_hour_sin": math.sin(2 * math.pi * decision_at.hour / 24),
-                    "txn_hour_cos": math.cos(2 * math.pi * decision_at.hour / 24),
-                },
-            )
-        )
-    return rows
 
 
 def _scenario_bundle(
@@ -460,6 +489,35 @@ def _adapter_factory(
     return agentic_factory
 
 
+def _canonical_fact(value: object) -> object:
+    """Encode retained execution facts without preserving mutable runtime objects."""
+    if value is None or type(value) in (bool, int, str):
+        return value
+    if type(value) is Decimal:
+        return {"decimal": str(value)}
+    if type(value) is bytes:
+        return {"bytes": value.hex()}
+    if type(value) is datetime:
+        return {"datetime": value.isoformat().replace("+00:00", "Z")}
+    raw_value = getattr(value, "value", None)
+    if type(raw_value) is str:
+        return raw_value
+    if isinstance(value, tuple):
+        return [_canonical_fact(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _canonical_fact(item) for key, item in sorted(value.items())}
+    raise TypeError(f"unsupported retained execution fact: {type(value).__name__}")
+
+
+def _canonical_fact_json(value: object) -> str:
+    return json.dumps(
+        _canonical_fact(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
 def _manifest_from_evidence(evidence: object) -> V5ExecutionManifest:
     from apar.evaluation.v5_execution import V5ExecutionEvidence
 
@@ -476,6 +534,9 @@ def _manifest_from_evidence(evidence: object) -> V5ExecutionManifest:
     trust_failures = tuple(
         record.event_id for record in evidence.trust_evidence if not record.receipt.allowed
     )
+    fixture = evidence.campaign_evidence.agentic_fixture
+    if evidence.rail is Rail.AGENTIC and fixture is None:
+        raise ValueError("agentic evidence must retain verifier fixture facts")
     return V5ExecutionManifest(
         evidence_sha256=evidence.evidence_sha256,
         campaign_id=evidence.campaign_id,
@@ -500,6 +561,59 @@ def _manifest_from_evidence(evidence: object) -> V5ExecutionManifest:
         ),
         trust_failure_event_ids=trust_failures,
         account_ids=tuple(sorted(account_ids)),
+        event_records=tuple(
+            V5EventRecord(
+                event_id=event.event_id,
+                payment_id=str(event.rail_data["payment_id"]),
+                event_type=event.event_type.value,
+                amount=event.amount,
+                currency=event.currency,
+                decision_at=cast(datetime, event.decision_at),
+                rail_data_json=_canonical_fact_json(event.rail_data),
+                lineage_json=_canonical_fact_json(event.lineage),
+            )
+            for event in evidence.events
+        ),
+        ledger_postings=tuple(
+            V5LedgerPosting(
+                entry_id=entry.entry_id,
+                debit=tuple(sorted(entry.debit.items())),
+                credit=tuple(sorted(entry.credit.items())),
+                currency=entry.currency,
+            )
+            for entry in evidence.ledger_entries
+        ),
+        trust_records=tuple(
+            V5TrustRecord(
+                command_id=record.command_id,
+                event_id=record.event_id,
+                request_id=record.request.request_id,
+                request_json=_canonical_fact_json(
+                    {
+                        "signing": record.request.signing_bytes().decode("utf-8"),
+                        "signature": record.request.signature,
+                    }
+                ),
+                mandate_json=_canonical_fact_json(asdict(record.request.mandate)),
+                authentication_evidence_json=(
+                    _canonical_fact_json(asdict(record.authentication_evidence))
+                    if record.authentication_evidence is not None
+                    else None
+                ),
+                public_key_hex=fixture.public_key.hex() if fixture is not None else "",
+                receipt_hash=record.receipt.receipt_hash,
+                request_hash=record.receipt.request_hash,
+                signature_hash=record.receipt.signature_hash,
+                allowed=record.receipt.allowed,
+                reason_code=(
+                    record.receipt.reason_code.value
+                    if record.receipt.reason_code is not None
+                    else None
+                ),
+                outcome=record.receipt.outcome.value,
+            )
+            for record in evidence.trust_evidence
+        ),
     )
 
 
@@ -568,6 +682,361 @@ def _execute_campaign(
     return project_execution_evidence(evidence), _manifest_from_evidence(evidence)
 
 
+def _legitimate_campaign_evidence(
+    *,
+    campaign_id: str,
+    commands: tuple[Command, ...],
+    schedule: tuple[datetime, ...],
+    declared_entity_ids: tuple[str, ...],
+    account_ids: tuple[str, ...],
+    fixture: AgenticFixture | None = None,
+) -> CampaignEvidence:
+    """Create the explicit all-legitimate ground-truth contract for real traffic."""
+    opening_count = sum(
+        command.name in {"a2a.initiate", "card.authorize", "card.decline", "agentic.pay"}
+        for command in commands
+    )
+    if opening_count == 0:
+        raise ValueError("legitimate execution requires at least one payment opening")
+    if len(commands) != len(schedule):
+        raise ValueError("legitimate execution schedule must cover every command")
+    payload = {
+        "campaign_id": campaign_id,
+        "commands": [command.name for command in commands],
+        "schedule": [time.isoformat().replace("+00:00", "Z") for time in schedule],
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    attempted_value = sum(
+        (
+            cast(Decimal, command.payload["amount"])
+            for command in commands
+            if command.name in {"a2a.initiate", "card.authorize", "card.decline", "agentic.pay"}
+        ),
+        Decimal("0"),
+    )
+    return CampaignEvidence(
+        family="legitimate",
+        campaign_id=campaign_id,
+        motif_signature="legitimate_operational_traffic.v1",
+        payment_count=opening_count,
+        command_count=len(commands),
+        illicit_count=0,
+        illicit_rate=Decimal("0"),
+        value_total=attempted_value,
+        attempted_value=attempted_value,
+        unique_attempted_value=attempted_value,
+        settled_value=attempted_value,
+        schedule=schedule,
+        graph_digest=digest,
+        schedule_digest=digest,
+        declared_entity_ids=tuple(sorted(declared_entity_ids)),
+        account_ids=tuple(sorted(account_ids)),
+        class_labels=tuple(False for _ in range(opening_count)),
+        mutation_kinds=(),
+        dependencies=(),
+        observed_reasons=tuple(None for _ in range(opening_count)),
+        valid_control_count=opening_count,
+        replay_succeeded=True,
+        ledger_conserved=True,
+        attempts=1,
+        agentic_fixture=fixture,
+    )
+
+
+def _legitimate_population(
+    *,
+    partition_name: str,
+    rail: Rail,
+    partition_seed: int,
+) -> tuple[Population, int]:
+    seed = _domain_seed(partition_seed, partition_name, "legitimate", rail.value)
+    bundle = _scenario_bundle(
+        partition_name=partition_name,
+        family=f"legitimate-{rail.value}",
+        campaign_index=0,
+        seed=seed,
+        rail=rail,
+    )
+    return PopulationGenerator(seed=seed).generate(bundle), seed
+
+
+def _population_parties(
+    population: Population,
+) -> tuple[PopulationEntity, PopulationEntity, PopulationEntity]:
+    entities = getattr(population, "entities", ())
+    consumers = [entity for entity in entities if entity.role == "consumer"]
+    merchants = [entity for entity in entities if entity.role == "merchant"]
+    beneficiaries = [entity for entity in entities if entity.role == "beneficiary"]
+    if not consumers or not merchants or not beneficiaries:
+        raise ValueError("legitimate population is missing required operational parties")
+    if any(entity.account_id is None for entity in (consumers[0], merchants[0], beneficiaries[0])):
+        raise ValueError("legitimate population party is missing an account")
+    return consumers[0], merchants[0], beneficiaries[0]
+
+
+def _command_identity(
+    *,
+    partition_name: str,
+    rail: Rail,
+    seed: int,
+) -> tuple[str, Callable[[str], str], Callable[[str], str]]:
+    namespace = uuid5(
+        NAMESPACE_URL,
+        f"apar:sentinel-v5:legitimate:{partition_name}:{rail.value}:{seed}",
+    )
+    campaign_id = str(uuid5(namespace, "campaign"))
+    return (
+        campaign_id,
+        lambda label: f"legitimate:{uuid5(namespace, f'payment:{label}')}",
+        lambda label: str(uuid5(namespace, f"trace:{label}")),
+    )
+
+
+def _lifecycle_key(name: str, payment_id: str, campaign_id: str) -> str:
+    return f"{name}:{payment_id}:campaign:{campaign_id}"
+
+
+def _card_legitimate_commands(
+    *,
+    partition_name: str,
+    partition_seed: int,
+) -> tuple[tuple[Command, ...], tuple[datetime, ...], Population, CampaignEvidence]:
+    population, seed = _legitimate_population(
+        partition_name=partition_name,
+        rail=Rail.CARD,
+        partition_seed=partition_seed,
+    )
+    consumer, merchant, _beneficiary = _population_parties(population)
+    campaign_id, payment, trace = _command_identity(
+        partition_name=partition_name,
+        rail=Rail.CARD,
+        seed=seed,
+    )
+    command_rows: list[Command] = []
+    def authorize(label: str, amount: str) -> AuthorizeCard:
+        return AuthorizeCard(
+            payment(label),
+            amount=Decimal(amount), currency="USD",
+            payer_account=cast(str, consumer.account_id),
+            payee_account=cast(str, merchant.account_id),
+            actor_id=consumer.entity_id, counterparty_id=merchant.entity_id,
+            campaign_id=campaign_id, trace_id=trace(label), fee=Decimal("0.30"),
+        )
+
+    for label, amount, followups in (
+        ("settlement", "34.80", ("clear", "settle")),
+        ("refund", "58.40", ("clear", "settle", "refund")),
+        ("recovery", "76.20", ("clear", "settle", "report", "dispute", "chargeback", "recover")),
+        ("reversal", "26.50", ("reverse",)),
+    ):
+        opening = authorize(label, amount)
+        command_rows.append(opening)
+        for operation in followups:
+            constructors: dict[str, Callable[..., Command]] = {
+                "clear": ClearCard, "settle": SettleCard, "refund": RefundCard,
+                "chargeback": ChargebackCard, "recover": RecoverCard,
+                "reverse": ReverseCardAuthorization, "dispute": OpenCardDispute,
+                "report": ReportCardFraud,
+            }
+            command_rows.append(
+                constructors[operation](
+                    opening.payment_id,
+                    idempotency_key=_lifecycle_key(
+                        f"card.{operation}", opening.payment_id, campaign_id
+                    ),
+                )
+            )
+    declined_payment = payment("declined")
+    command_rows.append(
+        DeclineCardAuthorization(
+            declined_payment,
+            amount=Decimal("45.60"), currency="USD",
+            payer_account=cast(str, consumer.account_id),
+            payee_account=cast(str, merchant.account_id),
+            actor_id=consumer.entity_id, counterparty_id=merchant.entity_id,
+            campaign_id=campaign_id, trace_id=trace("declined"), fee=Decimal("0.30"),
+            idempotency_key=_lifecycle_key("card.decline", declined_payment, campaign_id),
+        )
+    )
+    start = _BASE_START + timedelta(days=_PARTITION_OFFSETS_DAYS[partition_name], hours=2)
+    schedule = tuple(start + timedelta(minutes=index) for index in range(len(command_rows)))
+    commands = tuple(command_rows)
+    evidence = _legitimate_campaign_evidence(
+        campaign_id=campaign_id,
+        commands=commands,
+        schedule=schedule,
+        declared_entity_ids=(consumer.entity_id, merchant.entity_id),
+        account_ids=(cast(str, consumer.account_id), cast(str, merchant.account_id)),
+    )
+    return commands, schedule, population, evidence
+
+
+def _a2a_legitimate_commands(
+    *,
+    partition_name: str,
+    partition_seed: int,
+) -> tuple[tuple[Command, ...], tuple[datetime, ...], Population, CampaignEvidence]:
+    population, seed = _legitimate_population(
+        partition_name=partition_name,
+        rail=Rail.A2A,
+        partition_seed=partition_seed,
+    )
+    consumer, _merchant, beneficiary = _population_parties(population)
+    campaign_id, payment, trace = _command_identity(
+        partition_name=partition_name,
+        rail=Rail.A2A,
+        seed=seed,
+    )
+    command_rows: list[Command] = []
+    def initiate(label: str, amount: str) -> InitiateA2A:
+        return InitiateA2A(
+            payment(label), amount=Decimal(amount), currency="USD",
+            payer_account=cast(str, consumer.account_id),
+            payee_account=cast(str, beneficiary.account_id),
+            actor_id=consumer.entity_id, counterparty_id=beneficiary.entity_id,
+            campaign_id=campaign_id, trace_id=trace(label), fee=Decimal("0.20"),
+        )
+
+    for label, amount, followups in (
+        ("posted", "31.20", ("accept", "post")),
+        ("return", "64.90", ("accept", "post", "return")),
+        ("declined", "22.70", ("reject",)),
+        ("recovery", "81.10", ("accept", "post", "report", "freeze", "recover")),
+    ):
+        opening = initiate(label, amount)
+        command_rows.append(opening)
+        constructors: dict[str, Callable[..., Command]] = {
+            "accept": AcceptA2A, "post": PostA2A, "return": ReturnA2A,
+            "reject": RejectA2A, "report": ReportA2AFraud,
+            "freeze": FreezeA2AFunds, "recover": RecoverA2A,
+        }
+        for operation in followups:
+            command_rows.append(
+                constructors[operation](
+                    opening.payment_id,
+                    idempotency_key=_lifecycle_key(
+                        f"a2a.{operation}", opening.payment_id, campaign_id
+                    ),
+                )
+            )
+    start = _BASE_START + timedelta(days=_PARTITION_OFFSETS_DAYS[partition_name], hours=4)
+    schedule = tuple(start + timedelta(minutes=index) for index in range(len(command_rows)))
+    commands = tuple(command_rows)
+    evidence = _legitimate_campaign_evidence(
+        campaign_id=campaign_id,
+        commands=commands,
+        schedule=schedule,
+        declared_entity_ids=(consumer.entity_id, beneficiary.entity_id),
+        account_ids=(cast(str, consumer.account_id), cast(str, beneficiary.account_id)),
+    )
+    return commands, schedule, population, evidence
+
+
+def _agentic_legitimate_commands(
+    *,
+    partition_name: str,
+    partition_seed: int,
+) -> tuple[tuple[Command, ...], tuple[datetime, ...], Population, CampaignEvidence]:
+    population, seed = _legitimate_population(
+        partition_name=partition_name,
+        rail=Rail.AGENTIC,
+        partition_seed=partition_seed,
+    )
+    params = _campaign_params(
+        partition_name=partition_name,
+        family=V5Family.AGENTIC_INTENT_ABUSE.value,
+        campaign_index=10_000,
+        seed=seed,
+    )
+    generated, source = _CampaignEvaluator(seed=seed).generate(
+        V5Family.AGENTIC_INTENT_ABUSE.value,
+        population,
+        params,
+    )
+    selected = tuple(
+        (command, scheduled_at)
+        for command, scheduled_at, label in zip(
+            generated, source.schedule, source.class_labels, strict=True
+        )
+        if not label
+    )
+    if len(selected) < 2 or source.agentic_fixture is None:
+        raise ValueError("agentic generator did not provide valid authorization controls")
+    commands = tuple(command for command, _scheduled_at in selected)
+    schedule = tuple(scheduled_at for _command, scheduled_at in selected)
+    first = commands[0]
+    evidence = _legitimate_campaign_evidence(
+        campaign_id=cast(str, first.payload["campaign_id"]),
+        commands=commands,
+        schedule=schedule,
+        declared_entity_ids=source.declared_entity_ids,
+        account_ids=source.account_ids,
+        fixture=source.agentic_fixture,
+    )
+    return commands, schedule, population, evidence
+
+
+def _execute_legitimate_traffic(
+    *,
+    partition_name: str,
+    partition_seed: int,
+) -> tuple[list[V5DecisionRow], list[V5ExecutionManifest]]:
+    """Execute real legitimate operations through the same rails and evidence boundary."""
+    from apar.evaluation.v5_execution import (
+        build_execution_evidence,
+        project_execution_evidence,
+    )
+
+    executions: list[V5ExecutionManifest] = []
+    rows: list[V5DecisionRow] = []
+    builders: tuple[
+        tuple[
+            Rail,
+            Callable[
+                ...,
+                tuple[tuple[Command, ...], tuple[datetime, ...], Population, CampaignEvidence],
+            ],
+        ],
+        ...
+    ] = (
+        (Rail.CARD, _card_legitimate_commands),
+        (Rail.A2A, _a2a_legitimate_commands),
+        (Rail.AGENTIC, _agentic_legitimate_commands),
+    )
+    for rail, builder in builders:
+        commands, schedule, population, campaign_evidence = builder(
+            partition_name=partition_name,
+            partition_seed=partition_seed,
+        )
+        factory = _adapter_factory(rail=rail, campaign_evidence=campaign_evidence)
+        opening_balances = {
+            cast(AccountReference, account): amount
+            for account, amount in population.opening_balances.items()
+        }
+        engine = SimulationEngine(
+            population.bundle,
+            {rail: factory},
+            opening_balances=opening_balances,
+        )
+        for priority, (scheduled_at, command) in enumerate(
+            zip(schedule, commands, strict=True)
+        ):
+            engine.schedule(scheduled_at, priority, command)
+        evidence = build_execution_evidence(
+            family="legitimate",
+            commands=commands,
+            campaign_evidence=campaign_evidence,
+            events=engine.run(),
+            ledger_entries=engine.ledger.entries,
+            opening_balances=opening_balances,
+        )
+        rows.extend(project_execution_evidence(evidence))
+        executions.append(_manifest_from_evidence(evidence))
+    return rows, executions
+
+
 def _validate_partition_isolation(partitions: dict[str, V5PartitionCorpus]) -> None:
     identity_extractors: dict[str, Callable[[V5DecisionRow], str]] = {
         "actor": lambda row: row.actor_id,
@@ -621,28 +1090,6 @@ def build_v5_corpus(
         if profile is V5Profile.SMOKE
         else protocol.production_profile
     )
-    if profile is V5Profile.SMOKE:
-        smoke_base = min(profile_counts.legitimate_decisions, 500)
-        smoke_per = max(smoke_base // len(_OPERATIONAL_PARTITIONS), 1)
-        partition_legitimate_counts = {
-            "train": smoke_per,
-            "calibration": smoke_per,
-            "threshold": smoke_per,
-            "development_test": smoke_per,
-            "hardening_train": max(smoke_per // 2, 1),
-            "adaptive_holdout": max(smoke_per // 2, 1),
-        }
-    else:
-        prod_legit = protocol.production_profile.legitimate_decisions
-        partition_legitimate_counts = {
-            "train": prod_legit // 4,
-            "calibration": prod_legit // 8,
-            "threshold": prod_legit // 8,
-            "development_test": protocol.production_dev_test_legitimate,
-            "hardening_train": prod_legit // 8,
-            "adaptive_holdout": prod_legit // 8,
-        }
-
     seed_map = {
         "train": protocol.seeds.train,
         "calibration": protocol.seeds.calibration,
@@ -655,12 +1102,10 @@ def build_v5_corpus(
     partition_models: dict[str, V5PartitionCorpus] = {}
     for partition_name in _PARTITION_SEED_KEYS:
         seed = seed_map[partition_name]
-        rows = _build_benign_partition(
-            partition_name,
-            partition_legitimate_counts[partition_name],
-            seed,
+        rows, executions = _execute_legitimate_traffic(
+            partition_name=partition_name,
+            partition_seed=seed,
         )
-        executions: list[V5ExecutionManifest] = []
         for family in sorted(campaigns_for_profile):
             for campaign_index in range(campaigns_for_profile[family]):
                 projected, execution = _execute_campaign(
@@ -707,8 +1152,11 @@ def build_v5_corpus(
 __all__ = [
     "V5Corpus",
     "V5DecisionRow",
+    "V5EventRecord",
     "V5ExecutionManifest",
+    "V5LedgerPosting",
     "V5LineageManifest",
     "V5PartitionCorpus",
+    "V5TrustRecord",
     "build_v5_corpus",
 ]

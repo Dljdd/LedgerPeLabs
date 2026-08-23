@@ -29,7 +29,7 @@ from apar.trust.verifier import (
     TrustVerifier,
 )
 
-_FAMILIES = frozenset(
+_FRAUD_FAMILIES = frozenset(
     {
         "agentic_intent_abuse",
         "app_scam_mule",
@@ -37,6 +37,7 @@ _FAMILIES = frozenset(
         "synthetic_merchant_refund",
     }
 )
+_EXECUTION_FAMILIES = _FRAUD_FAMILIES | frozenset({"legitimate"})
 _COMMAND_EVENT_KINDS: Mapping[str, EventKind] = MappingProxyType(
     {
         "a2a.initiate": EventKind.TRANSFER_INITIATED,
@@ -513,12 +514,14 @@ def _validate_and_derive(
     tuple[V5AgenticVerifierEvidence, ...],
     str,
 ]:
-    if type(family) is not str or family not in _FAMILIES:
+    if type(family) is not str or family not in _EXECUTION_FAMILIES:
         raise ValueError("family is not part of the configured ground-truth contract")
     if type(campaign_evidence) is not CampaignEvidence:
         raise TypeError("campaign_evidence must be exact Task 5 evidence")
     if campaign_evidence.family != family:
         raise ValueError("family does not match campaign ground truth")
+    if family == "legitimate" and any(campaign_evidence.class_labels):
+        raise ValueError("legitimate execution evidence cannot contain fraud labels")
     if type(commands) is not tuple or not commands:
         raise ValueError("execution commands must be a non-empty exact tuple")
     if type(events) is not tuple or len(events) != len(commands):
