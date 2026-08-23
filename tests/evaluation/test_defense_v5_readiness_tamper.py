@@ -42,6 +42,7 @@ def valid_result() -> dict:
                 "false_decline_rate": 0.0,
                 "challenge_rate": 0.0,
                 "captured_value_fraction": 0.0,
+                "escaped_value_fraction": 1.0,
                 "support_total": 100,
                 "support_fraud": 30,
                 "support_legitimate": 70,
@@ -86,3 +87,18 @@ class TestVerifierTamper:
         tampered["fidelity_status"] = "fail"
         code, _ = _run_verifier(tampered)
         assert code != 0, "ready verdict with failed fidelity accepted"
+
+    def test_missing_economics_is_valid_only_as_an_explicit_not_ready_gate(
+        self, valid_result: dict
+    ) -> None:
+        incomplete = copy.deepcopy(valid_result)
+        incomplete["failed_gates"] = ["economics_missing"]
+        incomplete["arms"]["full_sentinel"]["captured_value_fraction"] = None
+        incomplete["arms"]["full_sentinel"]["escaped_value_fraction"] = None
+        code, output = _run_verifier(incomplete)
+        assert code == 0, output
+
+        incomplete["status"] = "development_ready"
+        incomplete["failed_gates"] = []
+        code, _ = _run_verifier(incomplete)
+        assert code != 0

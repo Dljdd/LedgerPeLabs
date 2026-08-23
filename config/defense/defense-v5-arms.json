@@ -86,7 +86,7 @@
       "arm": "rules_only",
       "feature_mode": "rules",
       "model": false,
-      "graph": false,
+      "graph": true,
       "rules": true,
       "trust": true,
       "novelty": false,

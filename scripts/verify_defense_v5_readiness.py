@@ -19,7 +19,7 @@ def _fail(message: str) -> int:
     return 1
 
 
-def verify(document: dict) -> int:
+def verify(document: dict[str, object]) -> int:
     status = document.get("status", "")
 
     if status == "smoke":
@@ -38,9 +38,17 @@ def verify(document: dict) -> int:
     if status == "development_ready" and fidelity_status != "pass":
         return _fail("ready verdict requires fidelity_status='pass'")
 
-    arms = document.get("arms", {})
-    if status != "invalid_corpus" and not isinstance(arms, dict):
-        return _fail("arms must be a mapping")
+    arms_value = document.get("arms", {})
+    if not isinstance(arms_value, dict):
+        if status != "invalid_corpus":
+            return _fail("arms must be a mapping")
+        arms: dict[object, object] = {}
+    else:
+        arms = arms_value
+
+    failed_gates = document.get("failed_gates", [])
+    if not isinstance(failed_gates, list):
+        return _fail("failed_gates must be a list")
 
     if status == "development_ready" and not arms:
         return _fail("ready verdict requires at least one evaluated arm")
@@ -49,7 +57,6 @@ def verify(document: dict) -> int:
         "recall",
         "false_decline_rate",
         "challenge_rate",
-        "captured_value_fraction",
         "support_total",
         "support_fraud",
         "support_legitimate",
@@ -64,6 +71,22 @@ def verify(document: dict) -> int:
             value = arm_data[field]
             if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
                 return _fail(f"arm '{arm_name}' has non-finite {field}")
+        captured = arm_data.get("captured_value_fraction")
+        escaped = arm_data.get("escaped_value_fraction")
+        if captured is None or escaped is None:
+            if status == "development_ready":
+                return _fail(
+                    f"ready verdict requires ledger-derived economics in arm '{arm_name}'"
+                )
+            if "economics_missing" not in failed_gates:
+                return _fail(
+                    f"arm '{arm_name}' missing economics without economics_missing gate"
+                )
+        elif any(
+            isinstance(value, float) and (math.isnan(value) or math.isinf(value))
+            for value in (captured, escaped)
+        ):
+            return _fail(f"arm '{arm_name}' has non-finite economics")
         if status == "development_ready":
             for field in latency_fields:
                 if arm_data.get(field) is None:

@@ -227,8 +227,13 @@ def build_v5_development_result(
         ):
             failed_gates.append("expected_calibration_error_max")
         if (
-            arm_result.captured_value_fraction is not None
-            and arm_result.captured_value_fraction < protocol.readiness.captured_value_fraction_min
+            arm_result.captured_value_fraction is None
+            or arm_result.escaped_value_fraction is None
+        ):
+            failed_gates.append("economics_missing")
+        elif (
+            arm_result.captured_value_fraction
+            < protocol.readiness.captured_value_fraction_min
         ):
             failed_gates.append("captured_value_fraction_min")
         if arm_result.p95_latency_ms is None:

@@ -79,6 +79,11 @@ def test_runner_scores_four_arms_over_identical_real_execution_support() -> None
         for arm in (V5Arm.ENSEMBLE_NO_GRAPH, V5Arm.ENSEMBLE_WITH_GRAPH)
         for row in results[arm.value]["row_evidence"]
     )
+    assert all(
+        result["captured_value_fraction"] is None
+        and result["escaped_value_fraction"] is None
+        for result in results.values()
+    )
 
     development = build_v5_development_result(
         protocol=protocol,
@@ -87,6 +92,7 @@ def test_runner_scores_four_arms_over_identical_real_execution_support() -> None
         catalog_sha256=catalog.catalog_sha256,
     )
     assert len(development.result_sha256) == 64
+    assert "economics_missing" in development.failed_gates
     with pytest.raises(TypeError):
         development.arms[V5Arm.RULES_ONLY.value] = development.arms[
             V5Arm.RULES_ONLY.value
@@ -217,5 +223,7 @@ def test_runner_scores_four_arms_over_identical_real_execution_support() -> None
             if key != "result_sha256"
         }
     )
-    with pytest.raises(ValueError, match="catalog feature|feature stream"):
+    with pytest.raises(
+        ValueError, match="catalog feature|feature stream|rule provenance"
+    ):
         V5DevelopmentResult.model_validate(divergent_features)

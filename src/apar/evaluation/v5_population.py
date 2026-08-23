@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
@@ -820,6 +820,63 @@ _PARTITION_OFFSETS_DAYS = {
     "hardening_train": 40,
     "adaptive_holdout": 50,
 }
+_MAX_LEGITIMATE_EVENTS_PER_MANIFEST = 96
+_LEGITIMATE_BATCH_START_SECONDS = 8 * 60 * 60
+_LEGITIMATE_BATCH_STRIDE_SECONDS = 60
+_LEGITIMATE_EVENT_STRIDE_MILLISECONDS = 500
+_LEGITIMATE_MANIFEST_BASE_ESTIMATE_BYTES = 32_768
+_LEGITIMATE_EVENT_ESTIMATE_BYTES = 3_500
+
+
+@dataclass(frozen=True, slots=True)
+class _LegitimateExecutionBatch:
+    campaign_index: int
+    rail: Rail
+    event_count: int
+    start_offset_seconds: int
+    duration_seconds: int
+    estimated_payload_bytes: int
+
+
+def _plan_legitimate_filler_batches(
+    count: int,
+) -> tuple[_LegitimateExecutionBatch, ...]:
+    """Plan exact bounded real-execution batches without executing a profile."""
+    if type(count) is not int or count < 0:
+        raise ValueError("legitimate filler count must be a non-negative integer")
+    batches: list[_LegitimateExecutionBatch] = []
+    remaining = count
+    campaign_index = 0
+    while remaining:
+        event_count = min(_MAX_LEGITIMATE_EVENTS_PER_MANIFEST, remaining)
+        start_offset = (
+            _LEGITIMATE_BATCH_START_SECONDS
+            + campaign_index * _LEGITIMATE_BATCH_STRIDE_SECONDS
+        )
+        duration_milliseconds = (
+            event_count - 1
+        ) * _LEGITIMATE_EVENT_STRIDE_MILLISECONDS
+        duration = (duration_milliseconds + 999) // 1_000
+        if start_offset + duration >= 24 * 60 * 60:
+            raise ValueError("legitimate batch plan exceeds its partition time window")
+        batches.append(
+            _LegitimateExecutionBatch(
+                campaign_index=campaign_index,
+                rail=Rail.CARD if campaign_index % 2 == 0 else Rail.A2A,
+                event_count=event_count,
+                start_offset_seconds=start_offset,
+                duration_seconds=duration,
+                estimated_payload_bytes=(
+                    _LEGITIMATE_MANIFEST_BASE_ESTIMATE_BYTES
+                    + event_count * _LEGITIMATE_EVENT_ESTIMATE_BYTES
+                ),
+            )
+        )
+        remaining -= event_count
+        campaign_index += 1
+    return tuple(batches)
+
+
 class _PopulationIsolationError(ValueError):
     """Raised when corpus identities, time, or provenance cross partitions."""
 
@@ -1420,12 +1477,19 @@ def _legitimate_population(
     partition_name: str,
     rail: Rail,
     partition_seed: int,
+    campaign_index: int = 0,
 ) -> tuple[Population, int]:
-    seed = _domain_seed(partition_seed, partition_name, "legitimate", rail.value)
+    seed = _domain_seed(
+        partition_seed,
+        partition_name,
+        "legitimate",
+        rail.value,
+        campaign_index,
+    )
     bundle = _scenario_bundle(
         partition_name=partition_name,
         family=f"legitimate-{rail.value}",
-        campaign_index=0,
+        campaign_index=campaign_index,
         seed=seed,
         rail=rail,
     )
@@ -1451,10 +1515,12 @@ def _command_identity(
     partition_name: str,
     rail: Rail,
     seed: int,
+    campaign_index: int = 0,
 ) -> tuple[str, Callable[[str], str], Callable[[str], str]]:
     namespace = uuid5(
         NAMESPACE_URL,
-        f"apar:sentinel-v5:legitimate:{partition_name}:{rail.value}:{seed}",
+        "apar:sentinel-v5:legitimate:"
+        f"{partition_name}:{rail.value}:{seed}:{campaign_index}",
     )
     campaign_id = str(uuid5(namespace, "campaign"))
     return (
@@ -1648,51 +1714,166 @@ def _agentic_legitimate_commands(
     return commands, schedule, population, evidence
 
 
-def _card_legitimate_filler_commands(
+def _scaled_legitimate_commands(
     *,
     partition_name: str,
     partition_seed: int,
-    count: int,
+    batch: _LegitimateExecutionBatch,
 ) -> tuple[tuple[Command, ...], tuple[datetime, ...], Population, CampaignEvidence]:
-    if count <= 0:
-        raise ValueError("legitimate filler count must be positive")
+    """Build one bounded operational batch from generated parties and real commands."""
     population, seed = _legitimate_population(
         partition_name=partition_name,
-        rail=Rail.CARD,
-        partition_seed=_domain_seed(partition_seed, "legitimate-filler"),
+        rail=batch.rail,
+        partition_seed=partition_seed,
+        campaign_index=batch.campaign_index + 1,
     )
-    consumer, merchant, _beneficiary = _population_parties(population)
+    consumers = [entity for entity in population.entities if entity.role == "consumer"]
+    counterparties = [
+        entity
+        for entity in population.entities
+        if entity.role == ("merchant" if batch.rail is Rail.CARD else "beneficiary")
+    ]
+    if not consumers or not counterparties or any(
+        entity.account_id is None for entity in (*consumers, *counterparties)
+    ):
+        raise ValueError("scaled legitimate population lacks operational parties")
     campaign_id, payment, trace = _command_identity(
         partition_name=partition_name,
-        rail=Rail.CARD,
+        rail=batch.rail,
         seed=seed,
+        campaign_index=batch.campaign_index + 1,
     )
-    commands = tuple(
-        DeclineCardAuthorization(
-            payment(f"filler-{index}"),
-            amount=Decimal("40.00"),
-            currency="USD",
-            payer_account=cast(str, consumer.account_id),
-            payee_account=cast(str, merchant.account_id),
-            actor_id=consumer.entity_id,
-            counterparty_id=merchant.entity_id,
-            campaign_id=campaign_id,
-            trace_id=trace(f"filler-{index}"),
-            fee=Decimal("0.30"),
-            idempotency_key=_lifecycle_key(
-                "card.decline", payment(f"filler-{index}"), campaign_id
-            ),
+    commands_list: list[Command] = []
+    used_entities: set[str] = set()
+    used_accounts: set[str] = set()
+    recipe_index = 0
+    remaining = batch.event_count
+    card_recipes = (
+        ("refund", ("clear", "settle", "refund")),
+        ("settle", ("clear", "settle")),
+        ("reverse", ("reverse",)),
+        ("decline", ()),
+    )
+    a2a_recipes = (
+        ("return", ("accept", "post", "return")),
+        ("post", ("accept", "post")),
+        ("reject", ("reject",)),
+        ("initiate", ()),
+    )
+    recipes = card_recipes if batch.rail is Rail.CARD else a2a_recipes
+    while remaining:
+        ordered = (
+            recipes[(batch.campaign_index + recipe_index) % len(recipes) :]
+            + recipes[: (batch.campaign_index + recipe_index) % len(recipes)]
         )
-        for index in range(count)
+        recipe_name, followups = next(
+            recipe for recipe in ordered if 1 + len(recipe[1]) <= remaining
+        )
+        consumer = consumers[recipe_index % len(consumers)]
+        counterparty = counterparties[
+            (batch.campaign_index + recipe_index) % len(counterparties)
+        ]
+        label = f"batch-{batch.campaign_index:04d}-{recipe_index:04d}-{recipe_name}"
+        payment_id = payment(label)
+        amount = (
+            Decimal("20.00")
+            + Decimal(
+                (batch.campaign_index * 1703 + recipe_index * 1301) % 7000
+            )
+            / Decimal("100")
+        ).quantize(Decimal("0.01"))
+        payer_account = cast(str, consumer.account_id)
+        payee_account = cast(str, counterparty.account_id)
+        used_entities.update((consumer.entity_id, counterparty.entity_id))
+        used_accounts.update((payer_account, payee_account))
+        if batch.rail is Rail.CARD:
+            opening: Command
+            if recipe_name == "decline":
+                opening = DeclineCardAuthorization(
+                    payment_id,
+                    amount=amount,
+                    currency="USD",
+                    payer_account=payer_account,
+                    payee_account=payee_account,
+                    actor_id=consumer.entity_id,
+                    counterparty_id=counterparty.entity_id,
+                    campaign_id=campaign_id,
+                    trace_id=trace(label),
+                    fee=Decimal("0.30"),
+                    idempotency_key=_lifecycle_key(
+                        "card.decline", payment_id, campaign_id
+                    ),
+                )
+            else:
+                opening = AuthorizeCard(
+                    payment_id,
+                    amount=amount,
+                    currency="USD",
+                    payer_account=payer_account,
+                    payee_account=payee_account,
+                    actor_id=consumer.entity_id,
+                    counterparty_id=counterparty.entity_id,
+                    campaign_id=campaign_id,
+                    trace_id=trace(label),
+                    fee=Decimal("0.30"),
+                )
+            commands_list.append(opening)
+            constructors: dict[str, Callable[..., Command]] = {
+                "clear": ClearCard,
+                "settle": SettleCard,
+                "refund": RefundCard,
+                "reverse": ReverseCardAuthorization,
+            }
+        else:
+            commands_list.append(
+                InitiateA2A(
+                    payment_id,
+                    amount=amount,
+                    currency="USD",
+                    payer_account=payer_account,
+                    payee_account=payee_account,
+                    actor_id=consumer.entity_id,
+                    counterparty_id=counterparty.entity_id,
+                    campaign_id=campaign_id,
+                    trace_id=trace(label),
+                    fee=Decimal("0.20"),
+                )
+            )
+            constructors = {
+                "accept": AcceptA2A,
+                "post": PostA2A,
+                "return": ReturnA2A,
+                "reject": RejectA2A,
+            }
+        for operation in followups:
+            commands_list.append(
+                constructors[operation](
+                    payment_id,
+                    idempotency_key=_lifecycle_key(
+                        f"{batch.rail.value}.{operation}", payment_id, campaign_id
+                    ),
+                )
+            )
+        remaining -= 1 + len(followups)
+        recipe_index += 1
+    commands = tuple(commands_list)
+    start = _BASE_START + timedelta(
+        days=_PARTITION_OFFSETS_DAYS[partition_name],
+        seconds=batch.start_offset_seconds,
     )
-    start = _BASE_START + timedelta(days=_PARTITION_OFFSETS_DAYS[partition_name], hours=8)
-    schedule = tuple(start + timedelta(minutes=index) for index in range(count))
+    schedule = tuple(
+        start
+        + timedelta(
+            milliseconds=index * _LEGITIMATE_EVENT_STRIDE_MILLISECONDS
+        )
+        for index in range(batch.event_count)
+    )
     evidence = _legitimate_campaign_evidence(
         campaign_id=campaign_id,
         commands=commands,
         schedule=schedule,
-        declared_entity_ids=(consumer.entity_id, merchant.entity_id),
-        account_ids=(cast(str, consumer.account_id), cast(str, merchant.account_id)),
+        declared_entity_ids=tuple(sorted(used_entities)),
+        account_ids=tuple(sorted(used_accounts)),
     )
     return commands, schedule, population, evidence
 
@@ -1765,11 +1946,11 @@ def _execute_legitimate_traffic(
     remaining = requested_decisions - len(rows)
     if remaining < 0:
         raise ValueError("requested legitimate cardinality is below required rail coverage")
-    if remaining:
-        commands, schedule, population, campaign_evidence = _card_legitimate_filler_commands(
+    for batch in _plan_legitimate_filler_batches(remaining):
+        commands, schedule, population, campaign_evidence = _scaled_legitimate_commands(
             partition_name=partition_name,
             partition_seed=partition_seed,
-            count=remaining,
+            batch=batch,
         )
         opening_balances = {
             cast(AccountReference, account): amount
@@ -1777,7 +1958,12 @@ def _execute_legitimate_traffic(
         }
         engine = SimulationEngine(
             population.bundle,
-            {Rail.CARD: _adapter_factory(rail=Rail.CARD, campaign_evidence=campaign_evidence)},
+            {
+                batch.rail: _adapter_factory(
+                    rail=batch.rail,
+                    campaign_evidence=campaign_evidence,
+                )
+            },
             opening_balances=opening_balances,
         )
         for priority, (scheduled_at, command) in enumerate(

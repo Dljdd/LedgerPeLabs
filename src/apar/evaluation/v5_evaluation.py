@@ -31,14 +31,19 @@ from sklearn.metrics import (  # type: ignore[import-untyped]
     roc_auc_score,
 )
 
-from apar.defense.rules import RuleManifest
+from apar.contracts.events import PaymentEvent
+from apar.defense.contracts import scrub_event
+from apar.defense.rules import RuleEngine, RuleManifest, RuleResult
 from apar.defense.sentinel import (
     FULL_SENTINEL_DISAGREEMENT_REVIEW_THRESHOLD,
     FULL_SENTINEL_NOVELTY_CHALLENGE_THRESHOLD,
     FULL_SENTINEL_NOVELTY_REVIEW_THRESHOLD,
     SentinelAction,
+    SentinelThresholds,
+    route_sentinel_components,
 )
 from apar.evaluation.v5_population import V5DecisionRow, V5ExecutionManifest
+from apar.features.state import FeatureVector
 
 _INTERVENTION_ACTIONS = {
     SentinelAction.CHALLENGE,
@@ -79,15 +84,18 @@ _CURRENT_ARMS = (
 _RULE_FEATURES = (
     "actor_count_1m",
     "actor_count_10m",
+    "graph_counterparty_fanin",
+    "graph_actor_fanout",
     "actor_amount_zscore_24h",
     "counterparty_amount_zscore_24h",
+    "graph_shared_neighbor_count",
     "pair_prior_count",
     "dq_degraded_state",
 )
 _RULE_CHALLENGE_THRESHOLD = 0.60
 _RULE_DECLINE_THRESHOLD = 0.90
 _EXPECTED_SWITCHES = {
-    V5Arm.RULES_ONLY: (False, False, True, True, False, False),
+    V5Arm.RULES_ONLY: (False, True, True, True, False, False),
     V5Arm.ENSEMBLE_NO_GRAPH: (True, False, False, False, False, False),
     V5Arm.ENSEMBLE_WITH_GRAPH: (True, True, False, False, False, False),
     V5Arm.FULL_SENTINEL: (True, True, True, True, True, True),
@@ -116,7 +124,10 @@ def _expected_rule_parameters() -> tuple[tuple[str, float], ...]:
             {
                 "actor_count_1m_threshold": manifest.actor_count_1m,
                 "actor_count_10m_threshold": manifest.actor_count_10m,
+                "counterparty_fanin_threshold": manifest.counterparty_fanin,
+                "actor_fanout_threshold": manifest.actor_fanout,
                 "amount_zscore_threshold": manifest.amount_zscore,
+                "shared_neighbors_threshold": manifest.shared_neighbors,
                 "degraded_score": manifest.threshold_score,
                 "degraded_state_threshold": manifest.degraded_state,
                 "repeated_pair_threshold": manifest.repeated_pair_count,
@@ -471,6 +482,48 @@ def _execution_manifest_map(
     if len(by_evidence) != len(artifacts):
         raise ValueError("execution artifacts must have unique evidence digests")
     return by_evidence
+
+
+def replay_v5_rule_result(
+    *,
+    support: V5ArmSupportRow,
+    catalog_feature_names: Sequence[str],
+    catalog_feature_values: Sequence[float],
+    catalog_sha256: str,
+    manifests: Mapping[str, V5ExecutionManifest],
+) -> RuleResult:
+    """Execute the repository RuleEngine over one retained real event and feature row."""
+    manifest = manifests.get(support.execution_evidence_sha256)
+    if manifest is None:
+        raise ValueError("rule event execution evidence cannot be resolved")
+    matching = [
+        record for record in manifest.event_records if record.event_id == support.event_id
+    ]
+    if len(matching) != 1:
+        raise ValueError("rule event must resolve exactly once in execution evidence")
+    event = PaymentEvent.model_validate_json(matching[0].event_json)
+    observed = scrub_event(event)
+    if (
+        observed.payment_id != support.payment_id
+        or observed.actor_id != support.actor_id
+        or observed.counterparty_id != support.counterparty_id
+        or observed.integrity_status != support.integrity_status
+    ):
+        raise ValueError("rule observation disagrees with retained evaluation support")
+    values = dict(
+        zip(catalog_feature_names, catalog_feature_values, strict=True)
+    )
+    if observed.decision_at is None:
+        raise ValueError("rule observation lacks a decision timestamp")
+    vector = FeatureVector(
+        event_id=observed.event_id,
+        decision_at=observed.decision_at,
+        source_event_ids=(),
+        max_source_available_at=None,
+        catalog_digest=catalog_sha256,
+        values=values,
+    )
+    return RuleEngine.default().evaluate(observed, vector)
 
 
 def _support_trust_failure_from_manifests(
@@ -1015,8 +1068,8 @@ class V5ArmSpecification(BaseModel):
         if switches != _EXPECTED_SWITCHES.get(self.arm):
             raise ValueError("arm switches do not match frozen semantics")
         if self.arm is V5Arm.RULES_ONLY:
-            if self.feature_names != _RULE_FEATURES or self.graph_feature_names:
-                raise ValueError("rules-only specification must be graph-free")
+            if self.feature_names != _RULE_FEATURES or not self.graph_feature_names:
+                raise ValueError("rules-only specification must bind RuleEngine graph inputs")
             if self.threshold_method != "rules_v1_fixed":
                 raise ValueError("rules-only threshold method mismatch")
         elif self.threshold_method != "sentinel_percentile_v1":
@@ -1312,6 +1365,13 @@ class V5ArmRowEvidence(BaseModel):
     model_calibrated_scores: tuple[float, ...] = ()
     threshold_trace: Mapping[str, float]
     rule_components: tuple[tuple[str, float], ...] = ()
+    rule_manifest_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    rule_vector_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    rule_evidence_source_ids: tuple[str, ...] = ()
     action: SentinelAction
     probability: float = Field(ge=0.0, le=1.0)
     probability_action: SentinelAction | None = None
@@ -1381,6 +1441,10 @@ class V5ArmRowEvidence(BaseModel):
         component_names = tuple(name for name, _score in self.rule_components)
         if component_names != tuple(sorted(set(component_names))):
             raise ValueError("rule component trace names must be unique and canonical")
+        if self.rule_evidence_source_ids != tuple(
+            sorted(set(self.rule_evidence_source_ids))
+        ):
+            raise ValueError("rule evidence source IDs must be unique and canonical")
         if self.catalog_feature_sha256 != _canonical_digest(self.catalog_feature_values):
             raise ValueError("catalog feature values digest mismatch")
         if self.subset_feature_sha256 != _canonical_digest(self.subset_feature_values):
@@ -1415,7 +1479,21 @@ class V5ArmScore(BaseModel):
         if len(self.rows) > _MAX_SCORE_ROWS:
             raise ValueError("arm score row count exceeds production profile limit")
         _validate_execution_artifact_bounds(self.execution_artifacts)
-        evaluation_ids = {row.support.event_id for row in self.rows}
+        ordered_evaluation_ids = tuple(row.support.event_id for row in self.rows)
+        evaluation_ids = set(ordered_evaluation_ids)
+        if len(evaluation_ids) != len(ordered_evaluation_ids):
+            raise ValueError("arm evaluation event IDs must be unique")
+        artifact_event_ids = tuple(
+            link.event_id
+            for artifact in self.execution_artifacts
+            for link in artifact.manifest().lineage
+        )
+        if len(set(artifact_event_ids)) != len(artifact_event_ids):
+            raise ValueError("execution artifact lineage event IDs must be unique")
+        if evaluation_ids != set(artifact_event_ids):
+            raise ValueError(
+                "arm evaluation support must exactly cover complete execution lineage"
+            )
         if any(
             evaluation_ids & set(partition.ordered_event_ids)
             for partition in self.spec.training_partitions
@@ -1459,10 +1537,22 @@ class V5ArmScore(BaseModel):
             trust_failure = _support_trust_failure_from_manifests(
                 row.support, execution_manifests
             )
+            rule_result = (
+                replay_v5_rule_result(
+                    support=row.support,
+                    catalog_feature_names=self.spec.catalog_feature_names,
+                    catalog_feature_values=row.catalog_feature_values,
+                    catalog_sha256=self.spec.catalog_sha256,
+                    manifests=execution_manifests,
+                )
+                if self.spec.rules
+                else None
+            )
             self._validate_row_components(
                 row,
                 loaded_models=loaded_models,
                 trust_failure=trust_failure,
+                rule_result=rule_result,
             )
         if self.score_sha256 != self.computed_digest():
             raise ValueError("arm score digest mismatch")
@@ -1511,6 +1601,7 @@ class V5ArmScore(BaseModel):
         *,
         loaded_models: tuple[CatBoostClassifier, ...],
         trust_failure: bool,
+        rule_result: RuleResult | None,
     ) -> None:
         if self.spec.model:
             if (
@@ -1558,16 +1649,42 @@ class V5ArmScore(BaseModel):
             raise ValueError("rules-only row cannot contain model member traces")
 
         if self.spec.rules:
-            expected_components = _recompute_rule_components(row, self.spec)
+            if rule_result is None:
+                raise ValueError("enabled rules lack a RuleEngine result")
+            expected_components = tuple(
+                sorted((hit.reason.value, hit.score) for hit in rule_result.hits)
+            )
             if row.rule_components != expected_components:
-                raise ValueError("arm row rule components failed independent recomputation")
-            score = 1.0 - math.prod(1.0 - value for _name, value in row.rule_components)
+                raise ValueError("arm row rule components failed RuleEngine replay")
+            score = rule_result.score
             if row.rule_score is None or not math.isclose(row.rule_score, score, abs_tol=1e-12):
                 raise ValueError("arm row rule component aggregation mismatch")
+            expected_evidence = tuple(
+                sorted(
+                    {
+                        source_id
+                        for hit in rule_result.hits
+                        for source_id in hit.evidence_source_ids
+                    }
+                )
+            )
+            if (
+                row.rule_manifest_sha256 != rule_result.manifest_digest
+                or row.rule_vector_sha256 != rule_result.vector_digest
+                or row.rule_evidence_source_ids != expected_evidence
+            ):
+                raise ValueError("arm row rule provenance failed RuleEngine replay")
             rule_action = _rules_action(row.rule_score, row.threshold_trace)
             if row.rule_action is not rule_action:
                 raise ValueError("arm row rule action trace mismatch")
-        elif row.rule_score is not None or row.rule_components or row.rule_action is not None:
+        elif (
+            row.rule_score is not None
+            or row.rule_components
+            or row.rule_action is not None
+            or row.rule_manifest_sha256 is not None
+            or row.rule_vector_sha256 is not None
+            or row.rule_evidence_source_ids
+        ):
             raise ValueError("rules-disabled row contains rule component evidence")
 
         expected_trust_action = (
@@ -1666,49 +1783,6 @@ def _spec_feature_indices(spec: V5ArmSpecification) -> tuple[int, ...]:
     return tuple(indices)
 
 
-def _recompute_rule_components(
-    row: V5ArmRowEvidence,
-    spec: V5ArmSpecification,
-) -> tuple[tuple[str, float], ...]:
-    values = dict(zip(spec.catalog_feature_names, row.catalog_feature_values, strict=True))
-    parameters = dict(spec.component_parameters)
-
-    def component(value: float, threshold_name: str) -> float | None:
-        threshold = parameters[threshold_name]
-        if value < threshold:
-            return None
-        return min(1.0, 0.60 + 0.20 * (value / threshold - 1.0))
-
-    velocity_values = tuple(
-        value
-        for value in (
-            component(values.get("actor_count_1m", 0.0), "actor_count_1m_threshold"),
-            component(values.get("actor_count_10m", 0.0), "actor_count_10m_threshold"),
-        )
-        if value is not None
-    )
-    amount_deviation = max(
-        abs(values.get("actor_amount_zscore_24h", 0.0)),
-        abs(values.get("counterparty_amount_zscore_24h", 0.0)),
-    )
-    candidates = {
-        "actor_velocity": max(velocity_values, default=None),
-        "amount_deviation": component(amount_deviation, "amount_zscore_threshold"),
-        "repeated_pair": component(
-            values.get("pair_prior_count", 0.0), "repeated_pair_threshold"
-        ),
-        "degraded_state": (
-            parameters["degraded_score"]
-            if values.get("dq_degraded_state", 0.0)
-            >= parameters["degraded_state_threshold"]
-            else None
-        ),
-    }
-    return tuple(
-        sorted((name, value) for name, value in candidates.items() if value is not None)
-    )
-
-
 def _probability_action(
     probability: float, threshold_trace: Mapping[str, float]
 ) -> SentinelAction:
@@ -1734,25 +1808,19 @@ def _full_model_action(
 ) -> tuple[SentinelAction, bool, bool]:
     assert row.disagreement is not None and row.novelty_score is not None
     thresholds = row.threshold_trace
-    if (
-        row.probability >= thresholds["model_decline"]
-        and row.disagreement < thresholds["disagreement_review"]
-    ):
-        return SentinelAction.DECLINE_HOLD, False, False
-    if row.probability >= thresholds["model_review"]:
-        return SentinelAction.REVIEW_HOLD, False, False
-    if (
-        row.disagreement >= thresholds["disagreement_review"]
-        and row.probability >= thresholds["model_challenge"]
-    ):
-        return SentinelAction.REVIEW_HOLD, True, False
-    if row.probability >= thresholds["model_challenge"]:
-        return SentinelAction.CHALLENGE, False, False
-    if row.novelty_score >= thresholds["novelty_challenge"] and row.probability >= 0.3:
-        return SentinelAction.CHALLENGE, False, True
-    if row.novelty_score >= thresholds["novelty_review"]:
-        return SentinelAction.REVIEW_HOLD, False, True
-    return SentinelAction.APPROVE, False, False
+    return route_sentinel_components(
+        probability=row.probability,
+        disagreement=row.disagreement,
+        novelty=row.novelty_score,
+        thresholds=SentinelThresholds(
+            challenge_threshold=thresholds["model_challenge"],
+            review_threshold=thresholds["model_review"],
+            decline_threshold=thresholds["model_decline"],
+            disagreement_review_threshold=thresholds["disagreement_review"],
+            novelty_challenge_threshold=thresholds["novelty_challenge"],
+            novelty_review_threshold=thresholds["novelty_review"],
+        ),
+    )
 
 
 class V5ArmScoreSet(BaseModel):
@@ -2237,17 +2305,6 @@ def evaluate_v5_arm(
     challenge_rate = _safe_div(float(challenges), float(n_benign))
     review_rate = _safe_div(float(reviews), float(n_benign))
 
-    captured_value = sum(
-        float(amounts[i])
-        for i in range(n_total)
-        if detected[i] and y_true[i] == 1
-    )
-    total_fraud_value = sum(
-        float(amounts[i]) for i in range(n_total) if y_true[i] == 1
-    )
-    captured_fraction = _safe_div(captured_value, total_fraud_value)
-    escaped_fraction = 1.0 - captured_fraction if captured_fraction is not None else None
-
     return V5EvaluationResult(
         arm=arm.value,
         recall=recall,
@@ -2260,8 +2317,11 @@ def evaluate_v5_arm(
         false_decline_rate=false_decline_rate,
         challenge_rate=challenge_rate,
         review_rate=review_rate,
-        captured_value_fraction=captured_fraction,
-        escaped_value_fraction=escaped_fraction,
+        # Lifecycle rows repeat payment amounts. Ledger-derived, once-per-payment
+        # economics are intentionally withheld until the independent metric
+        # verifier consumes the retained execution postings.
+        captured_value_fraction=None,
+        escaped_value_fraction=None,
         support_total=n_total,
         support_fraud=n_fraud,
         support_legitimate=n_benign,

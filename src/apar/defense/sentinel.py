@@ -73,6 +73,41 @@ class SentinelModelManifest(BaseModel):
     thresholds: SentinelThresholds
 
 
+def route_sentinel_components(
+    *,
+    probability: float,
+    disagreement: float,
+    novelty: float,
+    thresholds: SentinelThresholds,
+) -> tuple[SentinelAction, bool, bool]:
+    """Apply the frozen monotonic model, disagreement, and novelty policy."""
+    values = (probability, disagreement, novelty)
+    if any(not np.isfinite(value) or not 0.0 <= value <= 1.0 for value in values):
+        raise ValueError("sentinel component inputs must be finite values in [0, 1]")
+    if (
+        probability >= thresholds.decline_threshold
+        and disagreement < thresholds.disagreement_review_threshold
+    ):
+        return SentinelAction.DECLINE_HOLD, False, False
+    if probability >= thresholds.review_threshold:
+        return SentinelAction.REVIEW_HOLD, False, False
+    if (
+        disagreement >= thresholds.disagreement_review_threshold
+        and probability >= thresholds.challenge_threshold
+    ):
+        return SentinelAction.REVIEW_HOLD, True, False
+    if (
+        novelty >= thresholds.novelty_review_threshold
+        and probability >= 0.3
+    ):
+        return SentinelAction.REVIEW_HOLD, False, True
+    if probability >= thresholds.challenge_threshold:
+        return SentinelAction.CHALLENGE, False, False
+    if novelty >= thresholds.novelty_challenge_threshold:
+        return SentinelAction.CHALLENGE, False, True
+    return SentinelAction.APPROVE, False, False
+
+
 def _fit_calibrator(
     raw_scores: np.ndarray, labels: np.ndarray
 ) -> IsotonicRegression:
@@ -271,22 +306,12 @@ class SentinelDefender(BaseModel):
                 else 0.0
             )
         )
-        t = self.thresholds
-
-        if prob >= t.decline_threshold and disagreement < t.disagreement_review_threshold:
-            action = SentinelAction.DECLINE_HOLD
-        elif prob >= t.review_threshold or (
-            disagreement >= t.disagreement_review_threshold and prob >= t.challenge_threshold
-        ):
-            action = SentinelAction.REVIEW_HOLD
-        elif prob >= t.challenge_threshold or (
-            novelty >= t.novelty_challenge_threshold and prob >= 0.3
-        ):
-            action = SentinelAction.CHALLENGE
-        elif novelty >= t.novelty_review_threshold:
-            action = SentinelAction.REVIEW_HOLD
-        else:
-            action = SentinelAction.APPROVE
+        action, _disagreement_routed, _novelty_routed = route_sentinel_components(
+            probability=prob,
+            disagreement=disagreement,
+            novelty=novelty,
+            thresholds=self.thresholds,
+        )
 
         return SentinelDecision(
             action=action,

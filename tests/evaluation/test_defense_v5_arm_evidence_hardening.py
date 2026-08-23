@@ -90,8 +90,8 @@ def test_trainer_requires_exact_partition_evidence_arguments() -> None:
     assert callable(getattr(v5_arms, "route_full_sentinel_components", None))
 
 
-def test_rules_only_frozen_spec_is_graph_free() -> None:
-    """A graph=false rules arm cannot retain graph feature inputs."""
+def test_rules_only_frozen_spec_truthfully_binds_rule_engine_graph_inputs() -> None:
+    """The real RuleEngine graph rules must be declared in the rules arm."""
     protocol = load_safe_v5_test_protocol(ROOT)
     configuration = load_v5_arm_configuration(
         ROOT / "config/defense/defense-v5-arms.json",
@@ -99,9 +99,13 @@ def test_rules_only_frozen_spec_is_graph_free() -> None:
         protocol=protocol,
     )
     rules = next(spec for spec in configuration.arms if spec.arm is V5Arm.RULES_ONLY)
-    assert rules.graph is False
-    assert rules.graph_feature_names == ()
-    assert all(not name.startswith("graph_") for name in rules.feature_names)
+    assert rules.graph is True
+    assert rules.graph_feature_names == (
+        "graph_counterparty_fanin",
+        "graph_actor_fanout",
+        "graph_shared_neighbor_count",
+    )
+    assert set(rules.graph_feature_names) <= set(rules.feature_names)
 
 
 def test_safe_404_protocol_copy_has_its_own_verified_digest() -> None:

@@ -831,3 +831,54 @@ class TestProductionBounds:
     def test_production_has_100_campaigns_per_family(self) -> None:
         counts = PROTOCOL.production_profile.campaigns_per_family
         assert all(v >= 100 for v in counts.values())
+
+    def test_test_only_medium_legitimate_scaling_is_exact_bounded_and_diverse(self) -> None:
+        """A single constant filler campaign cannot satisfy operational scaling."""
+        from apar.evaluation import v5_population
+
+        rows, executions = v5_population._execute_legitimate_traffic(
+            partition_name="development_test",
+            partition_seed=404,
+            requested_decisions=512,
+        )
+
+        assert len(rows) == 512
+        assert sum(len(execution.lineage) for execution in executions) == 512
+        assert max(len(execution.lineage) for execution in executions) <= 128
+        assert all(
+            len(execution.model_dump_json().encode()) < 16_000_000
+            for execution in executions
+        )
+        assert max(row.decision_at for row in rows) - min(
+            row.decision_at for row in rows
+        ) < timedelta(days=1)
+        assert {row.rail for row in rows} == {"card", "a2a", "agentic"}
+        assert len({row.campaign_id for row in rows}) >= 8
+        assert len({row.actor_id for row in rows}) >= 12
+        assert len({row.counterparty_id for row in rows}) >= 12
+        assert len({row.amount for row in rows}) >= 16
+        assert len({row.lifecycle_state for row in rows}) >= 8
+
+    def test_declared_50k_legitimate_target_has_a_static_bounded_execution_plan(self) -> None:
+        """The locked cardinality must be feasible without executing production."""
+        from apar.evaluation import v5_population
+
+        planner = getattr(v5_population, "_plan_legitimate_filler_batches", None)
+        assert callable(planner), "bounded legitimate execution planner is missing"
+        base_count = 24
+        plan = planner(PROTOCOL.production_dev_test_legitimate - base_count)
+
+        assert base_count + sum(batch.event_count for batch in plan) == 50_000
+        assert len(plan) + 3 <= 4_096
+        assert max(batch.event_count for batch in plan) <= 128
+        assert max(batch.estimated_payload_bytes for batch in plan) < 16_000_000
+        assert sum(batch.estimated_payload_bytes for batch in plan) < 268_435_456
+        assert all(
+            current.start_offset_seconds + current.duration_seconds
+            < following.start_offset_seconds
+            for current, following in zip(plan, plan[1:], strict=False)
+        )
+        assert max(
+            batch.start_offset_seconds + batch.duration_seconds for batch in plan
+        ) < 24 * 60 * 60
+        assert {batch.rail.value for batch in plan} == {"card", "a2a"}

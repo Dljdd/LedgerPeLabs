@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import time
 from base64 import b64encode
 from dataclasses import dataclass
@@ -12,11 +11,11 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import NDArray
 
-from apar.defense.rules import RuleManifest
 from apar.defense.sentinel import (
     SentinelAction,
     SentinelDefender,
     SentinelThresholds,
+    route_sentinel_components,
     train_sentinel_defender,
 )
 from apar.evaluation.v5_evaluation import (
@@ -34,6 +33,7 @@ from apar.evaluation.v5_evaluation import (
     V5SerializedModelArtifact,
     V5TrainingPartitionEvidence,
     derive_v5_trust_failures,
+    replay_v5_rule_result,
 )
 from apar.features.sentinel import SentinelFeatureCatalog
 
@@ -381,57 +381,6 @@ def train_v5_arm_set(
     return V5TrainedArmSet(arms=tuple(trained_arms))
 
 
-def _component_score(value: float, threshold: float) -> float | None:
-    if value < threshold:
-        return None
-    return min(1.0, 0.60 + 0.20 * (value / threshold - 1.0))
-
-
-def _rule_score(
-    row: NDArray[np.float64],
-    *,
-    catalog: SentinelFeatureCatalog,
-) -> tuple[float, tuple[tuple[str, float], ...]]:
-    values = {
-        name: float(row[index])
-        for index, name in enumerate(catalog.feature_names)
-    }
-    manifest = RuleManifest.default()
-    actor_velocity = max(
-        (
-            score
-            for score in (
-                _component_score(values.get("actor_count_1m", 0.0), manifest.actor_count_1m),
-                _component_score(values.get("actor_count_10m", 0.0), manifest.actor_count_10m),
-            )
-            if score is not None
-        ),
-        default=None,
-    )
-    amount_deviation = max(
-        abs(values.get("actor_amount_zscore_24h", 0.0)),
-        abs(values.get("counterparty_amount_zscore_24h", 0.0)),
-    )
-    candidates = (
-        ("actor_velocity", actor_velocity),
-        ("amount_deviation", _component_score(amount_deviation, manifest.amount_zscore)),
-        (
-            "repeated_pair",
-            _component_score(values.get("pair_prior_count", 0.0), manifest.repeated_pair_count),
-        ),
-        (
-            "degraded_state",
-            manifest.threshold_score
-            if values.get("dq_degraded_state", 0.0) >= manifest.degraded_state
-            else None,
-        ),
-    )
-    components = tuple(
-        sorted((name, score) for name, score in candidates if score is not None)
-    )
-    return 1.0 - math.prod(1.0 - score for _name, score in components), components
-
-
 def _model_action(probability: float, thresholds: SentinelThresholds) -> SentinelAction:
     if probability >= thresholds.decline_threshold:
         return SentinelAction.DECLINE_HOLD
@@ -454,38 +403,6 @@ def _more_severe(left: SentinelAction, right: SentinelAction) -> SentinelAction:
     return left if left.severity >= right.severity else right
 
 
-def _full_model_policy(
-    probability: float,
-    disagreement: float,
-    novelty: float,
-    thresholds: SentinelThresholds,
-) -> tuple[SentinelAction, bool, bool]:
-    disagreement_routed = False
-    novelty_routed = False
-    if (
-        probability >= thresholds.decline_threshold
-        and disagreement < thresholds.disagreement_review_threshold
-    ):
-        return SentinelAction.DECLINE_HOLD, False, False
-    if probability >= thresholds.review_threshold:
-        return SentinelAction.REVIEW_HOLD, False, False
-    if (
-        disagreement >= thresholds.disagreement_review_threshold
-        and probability >= thresholds.challenge_threshold
-    ):
-        disagreement_routed = True
-        return SentinelAction.REVIEW_HOLD, disagreement_routed, False
-    if probability >= thresholds.challenge_threshold:
-        return SentinelAction.CHALLENGE, False, False
-    if novelty >= thresholds.novelty_challenge_threshold and probability >= 0.3:
-        novelty_routed = True
-        return SentinelAction.CHALLENGE, False, novelty_routed
-    if novelty >= thresholds.novelty_review_threshold:
-        novelty_routed = True
-        return SentinelAction.REVIEW_HOLD, False, novelty_routed
-    return SentinelAction.APPROVE, False, False
-
-
 def route_full_sentinel_components(
     *,
     probability: float,
@@ -494,12 +411,12 @@ def route_full_sentinel_components(
     thresholds: SentinelThresholds,
 ) -> tuple[SentinelAction, bool, bool]:
     """Replay full-model routing from explicit bounded component evidence."""
-    if any(
-        not math.isfinite(value) or not 0.0 <= value <= 1.0
-        for value in (probability, disagreement, novelty)
-    ):
-        raise ValueError("full sentinel component inputs must be finite values in [0, 1]")
-    return _full_model_policy(probability, disagreement, novelty, thresholds)
+    return route_sentinel_components(
+        probability=probability,
+        disagreement=disagreement,
+        novelty=novelty,
+        thresholds=thresholds,
+    )
 
 
 def _threshold_trace(
@@ -545,12 +462,40 @@ def _score_one_arm(
     trust_failures: list[bool],
 ) -> V5ArmScore:
     evidence: list[V5ArmRowEvidence] = []
+    execution_manifests = {
+        artifact.evidence_sha256: artifact.manifest()
+        for artifact in execution_artifacts
+    }
     for index, source_row in enumerate(features_matrix):
         start = time.perf_counter_ns()
         if trained.spec.rules:
-            rule_score, rule_components = _rule_score(source_row, catalog=catalog)
+            rule_result = replay_v5_rule_result(
+                support=support[index],
+                catalog_feature_names=catalog.feature_names,
+                catalog_feature_values=source_row,
+                catalog_sha256=catalog.catalog_sha256,
+                manifests=execution_manifests,
+            )
+            rule_score = rule_result.score
+            rule_components = tuple(
+                sorted((hit.reason.value, hit.score) for hit in rule_result.hits)
+            )
+            rule_manifest_sha256 = rule_result.manifest_digest
+            rule_vector_sha256 = rule_result.vector_digest
+            rule_evidence_source_ids = tuple(
+                sorted(
+                    {
+                        source_id
+                        for hit in rule_result.hits
+                        for source_id in hit.evidence_source_ids
+                    }
+                )
+            )
         else:
             rule_score, rule_components = None, ()
+            rule_manifest_sha256 = None
+            rule_vector_sha256 = None
+            rule_evidence_source_ids = ()
         trust_failure = trust_failures[index]
         subset = source_row[list(trained.feature_indices)]
         model_raw_scores: tuple[float, ...] = ()
@@ -613,6 +558,9 @@ def _score_one_arm(
             "model_calibrated_scores": model_calibrated_scores,
             "threshold_trace": _threshold_trace(trained.spec, trained.defender),
             "rule_components": rule_components,
+            "rule_manifest_sha256": rule_manifest_sha256,
+            "rule_vector_sha256": rule_vector_sha256,
+            "rule_evidence_source_ids": rule_evidence_source_ids,
             "action": action,
             "probability": probability,
             "probability_action": probability_action,
