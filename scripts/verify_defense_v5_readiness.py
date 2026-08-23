@@ -54,6 +54,7 @@ def verify(document: dict) -> int:
         "support_fraud",
         "support_legitimate",
     ]
+    latency_fields = ["p50_latency_ms", "p95_latency_ms", "p99_latency_ms"]
     for arm_name, arm_data in arms.items():
         if not isinstance(arm_data, dict):
             return _fail(f"arm '{arm_name}' must be a mapping")
@@ -63,6 +64,12 @@ def verify(document: dict) -> int:
             value = arm_data[field]
             if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
                 return _fail(f"arm '{arm_name}' has non-finite {field}")
+        if status == "development_ready":
+            for field in latency_fields:
+                if arm_data.get(field) is None:
+                    return _fail(
+                        f"ready verdict requires non-null {field} in arm '{arm_name}'"
+                    )
 
     if document.get("sealed_evaluation_allowed") is True:
         return _fail("sealed_evaluation_allowed must be false")
