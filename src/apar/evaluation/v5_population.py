@@ -5,11 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Self, cast
+from types import SimpleNamespace
+from typing import Any, Self, cast
 from uuid import NAMESPACE_URL, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -130,6 +131,7 @@ class V5LineageManifest(BaseModel):
     counterparty_id: str
     lifecycle_position: int = Field(ge=0)
     is_fraud: bool
+    command_payload_json: str
 
 
 class V5EventRecord(BaseModel):
@@ -198,6 +200,7 @@ class V5ExecutionManifest(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     campaign_id: str
     family: str
     rail: str
@@ -211,10 +214,22 @@ class V5ExecutionManifest(BaseModel):
     credential_ids: tuple[str, ...]
     merchant_ids: tuple[str, ...]
     payee_ids: tuple[str, ...]
+    agent_ids: tuple[str, ...]
+    key_ids: tuple[str, ...]
+    mandate_ids: tuple[str, ...]
+    authentication_evidence_ids: tuple[str, ...]
     event_records: tuple[V5EventRecord, ...]
     ledger_postings: tuple[V5LedgerPosting, ...]
     trust_records: tuple[V5TrustRecord, ...]
     trust_registry: V5TrustRegistry | None = None
+
+    def artifact_digest(self) -> str:
+        """Digest all retained immutable facts so serialized artifacts cannot drift."""
+        document = self.model_dump(mode="json")
+        document.pop("artifact_sha256", None)
+        return hashlib.sha256(
+            json.dumps(document, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+        ).hexdigest()
 
     @model_validator(mode="after")
     def validate_manifest(self) -> Self:
@@ -266,6 +281,10 @@ class V5ExecutionManifest(BaseModel):
             "credential_ids",
             "merchant_ids",
             "payee_ids",
+            "agent_ids",
+            "key_ids",
+            "mandate_ids",
+            "authentication_evidence_ids",
         ):
             domain_values = getattr(self, domain_name)
             if domain_values != tuple(sorted(set(domain_values))):
@@ -276,6 +295,7 @@ class V5ExecutionManifest(BaseModel):
             for posting in self.ledger_postings
         ):
             raise ValueError("ledger postings must use canonical account order")
+        self._validate_manifest_ledger()
         trust_event_ids = tuple(record.event_id for record in self.trust_records)
         if self.rail == Rail.AGENTIC.value:
             if trust_event_ids != event_ids:
@@ -299,13 +319,184 @@ class V5ExecutionManifest(BaseModel):
                 for record in self.trust_records
             ):
                 raise ValueError("allowed verifier records disagree with registry facts")
+            expected_domains = {
+                "agent_ids": tuple(sorted({record.agent_id for record in self.trust_records})),
+                "key_ids": tuple(sorted({record.key_id for record in self.trust_records})),
+                "mandate_ids": tuple(sorted({record.mandate_id for record in self.trust_records})),
+                "authentication_evidence_ids": tuple(
+                    sorted(
+                        {
+                            record.authentication_evidence_id
+                            for record in self.trust_records
+                            if record.authentication_evidence_id is not None
+                        }
+                    )
+                ),
+            }
+            if any(getattr(self, name) != values for name, values in expected_domains.items()):
+                raise ValueError("agentic identity domains disagree with verifier records")
         elif self.trust_records:
             raise ValueError("non-agentic manifest cannot retain verifier records")
         elif self.trust_registry is not None:
             raise ValueError("non-agentic manifest cannot retain verifier registry facts")
+        elif any(
+            getattr(self, domain)
+            for domain in (
+                "agent_ids",
+                "key_ids",
+                "mandate_ids",
+                "authentication_evidence_ids",
+            )
+        ):
+            raise ValueError("non-agentic manifest cannot retain verifier identity domains")
         if not set(self.trust_failure_event_ids) <= set(event_ids):
             raise ValueError("trust failures must reference manifest events")
+        self._validate_manifest_trust()
+        if self.artifact_sha256 != self.artifact_digest():
+            raise ValueError("execution manifest artifact digest was tampered")
         return self
+
+    def _validate_manifest_ledger(self) -> None:
+        """Recompute postings from retained source commands and emitted event facts."""
+        from apar.evaluation.v5_execution import _expected_ledger_entry
+
+        states: dict[str, dict[str, object]] = {}
+        expected: list[V5LedgerPosting] = []
+        opening = dict(self.opening_balances)
+        for link, event in zip(self.lineage, self.event_records, strict=True):
+            state = cast(dict[str, object], _decode_canonical_json(link.command_payload_json))
+            if state.get("payment_id") != link.payment_id:
+                raise ValueError("command payload payment lineage disagrees")
+            if link.command_name in {
+                "a2a.initiate",
+                "card.authorize",
+                "card.decline",
+                "agentic.pay",
+            }:
+                states[link.payment_id] = state
+            source = states.get(link.payment_id)
+            if source is None:
+                raise ValueError("retained event lacks opening command facts")
+            try:
+                event_type = EventKind(event.event_type)
+            except ValueError as error:
+                raise ValueError("retained event type is unknown") from error
+            expected_entry = _expected_ledger_entry(
+                cast(
+                    PaymentEvent,
+                    SimpleNamespace(
+                        event_id=event.event_id,
+                        rail=Rail(self.rail),
+                        event_type=event_type,
+                    ),
+                ),
+                source,
+            )
+            if expected_entry is not None:
+                expected.append(
+                    V5LedgerPosting(
+                        entry_id=expected_entry.entry_id,
+                        debit=tuple(sorted(expected_entry.debit.items())),
+                        credit=tuple(sorted(expected_entry.credit.items())),
+                        currency=expected_entry.currency,
+                    )
+                )
+        if tuple(expected) != self.ledger_postings:
+            raise ValueError("ledger postings do not reconcile to event facts")
+        try:
+            ledger = Ledger(cast(dict[AccountReference, Decimal], opening))
+            for posting in self.ledger_postings:
+                private_accounts = {
+                    account
+                    for account, _amount in (*posting.debit, *posting.credit)
+                    if account.startswith("acct:")
+                }
+                if not private_accounts <= set(opening):
+                    raise ValueError("ledger posting references an account without opening facts")
+                ledger.post(
+                    LedgerEntry(
+                        posting.entry_id,
+                        dict(posting.debit),
+                        dict(posting.credit),
+                        posting.currency,
+                    )
+                )
+            ledger.assert_conserved()
+        except (AssertionError, TypeError, ValueError) as error:
+            raise ValueError("ledger postings do not conserve opening balances") from error
+
+    def _validate_manifest_trust(self) -> None:
+        """Re-run verifier records from retained registry, request, and receipt facts."""
+        if self.rail != Rail.AGENTIC.value:
+            return
+        assert self.trust_registry is not None
+        from apar.trust.verifier import (
+            IntegrityReceipt,
+            ReceiptOutcome,
+            TrustCommitPlan,
+            TrustVerifier,
+        )
+
+        registry_mandate = _agent_mandate_from_json(self.trust_registry.mandate_json)
+        registry_evidence = tuple(
+            _authentication_evidence_from_json(item)
+            for item in self.trust_registry.authentication_evidence_json
+        )
+        verifier = TrustVerifier(
+            registered_agents={
+                (self.trust_registry.agent_id, self.trust_registry.key_id): bytes.fromhex(
+                    self.trust_registry.public_key_hex
+                )
+            },
+            mandates={registry_mandate.mandate_id: registry_mandate},
+            authentication_evidence={item.evidence_id: item for item in registry_evidence},
+        )
+        event_by_id = {record.event_id: record for record in self.event_records}
+        for record in self.trust_records:
+            request = _agent_request_from_json(record.request_json)
+            if (
+                request.request_id != record.request_id
+                or request.agent_id != record.agent_id
+                or request.key_id != record.key_id
+                or request.mandate.mandate_id != record.mandate_id
+                or request.authentication_evidence_ref != record.authentication_evidence_id
+                or request.mandate.canonical_bytes()
+                != _agent_mandate_from_json(record.mandate_json).canonical_bytes()
+                or record.public_key_hex != self.trust_registry.public_key_hex
+            ):
+                raise ValueError("verifier record identifiers disagree with retained request facts")
+            event = event_by_id[record.event_id]
+            now = event.decision_at.astimezone(UTC).replace(tzinfo=UTC)
+            preview = verifier.preview(request, now)
+            if preview.allowed:
+                rail_data = cast(
+                    dict[str, object], _decode_canonical_json(event.rail_data_json)
+                )
+                action = cast(str, rail_data["action"])
+                try:
+                    outcome = ReceiptOutcome(action)
+                except ValueError as error:
+                    raise ValueError("verifier replay has unknown emitted action") from error
+                prepared = verifier.prepare_commit(request, preview, outcome, now)
+                if type(prepared) is TrustCommitPlan:
+                    receipt = verifier.apply_commit(prepared)
+                else:
+                    receipt = cast(IntegrityReceipt, prepared)
+            else:
+                receipt = preview
+            if type(receipt) is not IntegrityReceipt:
+                raise TypeError("TrustVerifier returned an unknown verdict")
+            reason_code = receipt.reason_code.value if receipt.reason_code is not None else None
+            if (
+                receipt.request_id != record.request_id
+                or receipt.receipt_hash != record.receipt_hash
+                or receipt.request_hash != record.request_hash
+                or receipt.signature_hash != record.signature_hash
+                or receipt.allowed is not record.allowed
+                or reason_code != record.reason_code
+                or receipt.outcome.value != record.outcome
+            ):
+                raise ValueError("verifier replay disagrees with retained receipt facts")
 
 
 class V5PartitionCorpus(BaseModel):
@@ -585,7 +776,7 @@ def _canonical_fact(value: object) -> object:
         return raw_value
     if isinstance(value, tuple):
         return [_canonical_fact(item) for item in value]
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return {str(key): _canonical_fact(item) for key, item in sorted(value.items())}
     raise TypeError(f"unsupported retained execution fact: {type(value).__name__}")
 
@@ -597,6 +788,57 @@ def _canonical_fact_json(value: object) -> str:
         separators=(",", ":"),
         allow_nan=False,
     )
+
+
+def _decode_canonical_fact(value: object) -> object:
+    """Restore the closed canonical representation retained in a manifest."""
+    if isinstance(value, list):
+        return tuple(_decode_canonical_fact(item) for item in value)
+    if isinstance(value, dict):
+        if set(value) == {"decimal"}:
+            return Decimal(cast(str, value["decimal"]))
+        if set(value) == {"bytes"}:
+            return bytes.fromhex(cast(str, value["bytes"]))
+        if set(value) == {"datetime"}:
+            parsed = datetime.fromisoformat(
+                cast(str, value["datetime"]).replace("Z", "+00:00")
+            )
+            return parsed.astimezone(UTC).replace(tzinfo=UTC)
+        return {str(key): _decode_canonical_fact(item) for key, item in value.items()}
+    return value
+
+
+def _decode_canonical_json(value: str) -> object:
+    if type(value) is not str:
+        raise TypeError("canonical retained fact must be JSON text")
+    return _decode_canonical_fact(json.loads(value))
+
+
+def _agent_mandate_from_json(value: str) -> Any:
+    from apar.trust.verifier import AgentMandate, AuthenticationRequirement
+
+    document = cast(dict[str, object], _decode_canonical_json(value))
+    document["required_authentication"] = AuthenticationRequirement(
+        cast(str, document["required_authentication"])
+    )
+    return AgentMandate(**cast(Any, document))
+
+
+def _authentication_evidence_from_json(value: str) -> Any:
+    from apar.trust.verifier import AuthenticationEvidence, AuthenticationOutcome
+
+    document = cast(dict[str, object], _decode_canonical_json(value))
+    document["outcome"] = AuthenticationOutcome(cast(str, document["outcome"]))
+    return AuthenticationEvidence(**cast(Any, document))
+
+
+def _agent_request_from_json(value: str) -> Any:
+    from apar.trust.verifier import AgentPaymentRequest
+
+    document = cast(dict[str, object], _decode_canonical_json(value))
+    mandate_data = document.pop("mandate")
+    document["mandate"] = _agent_mandate_from_json(_canonical_fact_json(mandate_data))
+    return AgentPaymentRequest(**cast(Any, document))
 
 
 def _manifest_from_evidence(
@@ -619,8 +861,9 @@ def _manifest_from_evidence(
     fixture = evidence.campaign_evidence.agentic_fixture
     if evidence.rail is Rail.AGENTIC and fixture is None:
         raise ValueError("agentic evidence must retain verifier fixture facts")
-    return V5ExecutionManifest(
+    candidate = V5ExecutionManifest.model_construct(
         evidence_sha256=evidence.evidence_sha256,
+        artifact_sha256="0" * 64,
         campaign_id=evidence.campaign_id,
         family=evidence.family,
         rail=evidence.rail.value,
@@ -634,8 +877,9 @@ def _manifest_from_evidence(
                 counterparty_id=item.counterparty_id,
                 lifecycle_position=item.lifecycle_position,
                 is_fraud=item.is_fraud,
+                command_payload_json=_canonical_fact_json(command.payload),
             )
-            for item in evidence.lineage
+            for item, command in zip(evidence.lineage, evidence.commands, strict=True)
         ),
         ledger_entry_ids=tuple(entry.entry_id for entry in evidence.ledger_entries),
         trust_request_ids=tuple(
@@ -681,6 +925,20 @@ def _manifest_from_evidence(
                 }
             )
         ),
+        agent_ids=tuple(sorted({record.request.agent_id for record in evidence.trust_evidence})),
+        key_ids=tuple(sorted({record.request.key_id for record in evidence.trust_evidence})),
+        mandate_ids=tuple(
+            sorted({record.request.mandate.mandate_id for record in evidence.trust_evidence})
+        ),
+        authentication_evidence_ids=tuple(
+            sorted(
+                {
+                    record.request.authentication_evidence_ref
+                    for record in evidence.trust_evidence
+                    if record.request.authentication_evidence_ref is not None
+                }
+            )
+        ),
         event_records=tuple(
             V5EventRecord(
                 event_id=event.event_id,
@@ -712,12 +970,7 @@ def _manifest_from_evidence(
                 key_id=record.request.key_id,
                 mandate_id=record.request.mandate.mandate_id,
                 authentication_evidence_id=record.request.authentication_evidence_ref,
-                request_json=_canonical_fact_json(
-                    {
-                        "signing": record.request.signing_bytes().decode("utf-8"),
-                        "signature": record.request.signature,
-                    }
-                ),
+                request_json=_canonical_fact_json(asdict(record.request)),
                 mandate_json=_canonical_fact_json(asdict(record.request.mandate)),
                 authentication_evidence_json=(
                     _canonical_fact_json(asdict(record.authentication_evidence))
@@ -753,6 +1006,9 @@ def _manifest_from_evidence(
             else None
         ),
     )
+    document = candidate.model_dump(mode="python")
+    document["artifact_sha256"] = candidate.artifact_digest()
+    return V5ExecutionManifest.model_validate(document)
 
 
 def _execute_campaign(
@@ -894,7 +1150,7 @@ def _realize_legitimate_campaign_evidence(
     ledger_entries: tuple[LedgerEntry, ...],
     opening_balances: dict[AccountReference, Decimal],
 ) -> CampaignEvidence:
-    """Derive execution economics only after the rail and ledger have completed."""
+    """Derive lifecycle-net economics; execution evidence validates the actual ledger."""
     if contract.family != "legitimate":
         raise ValueError("only an all-legitimate ground-truth contract can be realized")
     attempted_value = sum(
@@ -905,27 +1161,31 @@ def _realize_legitimate_campaign_evidence(
         ),
         Decimal("0"),
     )
-    settled_value = sum(
-        (
-            event.amount
-            for event in events
-            if event.event_type
-            in {EventKind.SETTLEMENT, EventKind.TRANSFER_POSTED, EventKind.AUTHORIZATION}
-        ),
-        Decimal("0"),
-    )
-    replay = Ledger(opening_balances)
-    for entry in ledger_entries:
-        replay.post(entry)
-    replay.assert_conserved()
+    del ledger_entries, opening_balances
+    settled_value = Decimal("0")
+    for event in events:
+        if (
+            event.event_type in {EventKind.SETTLEMENT, EventKind.TRANSFER_POSTED}
+            or event.rail is Rail.AGENTIC
+            and event.event_type is EventKind.AUTHORIZATION
+        ):
+            settled_value += event.amount
+        elif (
+            event.event_type in {EventKind.REFUND, EventKind.CHARGEBACK}
+            or event.rail is Rail.A2A
+            and event.event_type in {EventKind.TRANSFER_RETURNED, EventKind.RECOVERY}
+        ):
+            settled_value -= event.amount
     return replace(
         contract,
         value_total=attempted_value,
         attempted_value=attempted_value,
         unique_attempted_value=attempted_value,
         settled_value=settled_value,
-        replay_succeeded=True,
-        ledger_conserved=True,
+        # These flags remain false until a full build_execution_evidence call
+        # revalidates actual engine events and ledger postings below the generator.
+        replay_succeeded=False,
+        ledger_conserved=False,
     )
 
 
@@ -1011,6 +1271,11 @@ def _card_legitimate_commands(
 
     for label, amount, followups in (
         ("refund", "58.40", ("clear", "settle", "refund")),
+        (
+            "chargeback_recovery",
+            "57.70",
+            ("clear", "settle", "report", "dispute", "chargeback", "recover"),
+        ),
     ):
         opening = authorize(label, amount)
         command_rows.append(opening)
@@ -1081,7 +1346,7 @@ def _a2a_legitimate_commands(
         )
 
     for label, amount, followups in (
-        ("return", "64.90", ("accept", "post", "return")),
+        ("successful", "64.90", ("accept", "post")),
         ("recovery", "81.10", ("accept", "post", "report", "freeze", "recover")),
     ):
         opening = initiate(label, amount)
@@ -1347,20 +1612,32 @@ def _validate_partition_isolation(partitions: dict[str, V5PartitionCorpus]) -> N
                     raise _PopulationIsolationError(
                         f"{identity_name} identity overlap between {left} and {right}"
                     )
-    accounts = {
-        name: {
-            account
-            for execution in partitions[name].executions
-            for account in execution.account_ids
+    manifest_domains = (
+        "account_ids",
+        "device_ids",
+        "credential_ids",
+        "merchant_ids",
+        "payee_ids",
+        "agent_ids",
+        "key_ids",
+        "mandate_ids",
+        "authentication_evidence_ids",
+    )
+    for domain in manifest_domains:
+        values = {
+            name: {
+                identity
+                for execution in partitions[name].executions
+                for identity in getattr(execution, domain)
+            }
+            for name in names
         }
-        for name in names
-    }
-    for index, left in enumerate(names):
-        for right in names[index + 1 :]:
-            if accounts[left] & accounts[right]:
-                raise _PopulationIsolationError(
-                    f"account identity overlap between {left} and {right}"
-                )
+        for index, left in enumerate(names):
+            for right in names[index + 1 :]:
+                if values[left] & values[right]:
+                    raise _PopulationIsolationError(
+                        f"{domain.removesuffix('_ids')} identity overlap between {left} and {right}"
+                    )
     for left, right in zip(names, names[1:], strict=False):
         if max(row.decision_at for row in partitions[left].decisions) >= min(
             row.decision_at for row in partitions[right].decisions

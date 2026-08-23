@@ -1490,7 +1490,11 @@ class CampaignGenerator:
             )
             issued_at = base_created[index] - timedelta(seconds=1)
             expires_at = base_expires[index]
-            evidence_nonce = "mismatched-nonce" if kind == "auth_mismatch" else nonce
+            evidence_nonce = (
+                f"mismatched-nonce-{params.campaign_id}"
+                if kind == "auth_mismatch"
+                else nonce
+            )
             if kind == "auth_expired":
                 issued_at = schedule[index] - timedelta(seconds=2)
                 expires_at = schedule[index] - timedelta(seconds=1)
@@ -1538,8 +1542,16 @@ class CampaignGenerator:
                 if kind == "mandate"
                 else mandate
             )
-            request_agent = "unregistered-synthetic-agent" if kind == "identity" else agent_id
-            request_key = "unregistered-key" if kind == "identity" else key_id
+            request_agent = (
+                f"unregistered-synthetic-agent-{params.campaign_id}"
+                if kind == "identity"
+                else agent_id
+            )
+            request_key = (
+                f"unregistered-key-{params.campaign_id}"
+                if kind == "identity"
+                else key_id
+            )
             actor_id = (
                 attackers[0].entity_id
                 if kind == "authority_identity"
@@ -1593,7 +1605,9 @@ class CampaignGenerator:
                     else mandate.consent_ref
                 ),
                 authentication_evidence_ref=(
-                    "synthetic-auth-missing" if kind == "auth_missing" else auth_ref
+                    f"synthetic-auth-missing-{params.campaign_id}"
+                    if kind == "auth_missing"
+                    else auth_ref
                 ),
                 nonce=nonce,
                 created_at=created_at,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from pathlib import Path
 
 import numpy as np
@@ -23,12 +24,91 @@ PROTOCOL = load_safe_v5_test_protocol(ROOT)
 ALL_FAMILIES = {f.value for f in V5Family}
 
 
+def _has_perfect_one_dimensional_threshold(values: np.ndarray, labels: np.ndarray) -> bool:
+    """Search every legal cut between distinct observed values in either direction."""
+    for threshold in np.unique(values)[:-1]:
+        left = labels[values <= threshold]
+        right = labels[values > threshold]
+        if left.size and right.size and (
+            (left.all() and not right.any()) or (not left.any() and right.all())
+        ):
+            return True
+    return False
+
+
 @pytest.fixture(scope="module")
 def smoke_corpus() -> V5Corpus:
     return build_v5_corpus(PROTOCOL, profile=V5Profile.SMOKE)
 
 
 class TestSmokeCorpus:
+    def test_manifest_rejects_tampered_ledger_economics_and_trust_request(
+        self,
+        smoke_corpus: V5Corpus,
+    ) -> None:
+        """A serialized posting or signed request must be independently replayed."""
+        agentic = next(
+            execution
+            for execution in smoke_corpus.partitions["train"].executions
+            if execution.rail == "agentic"
+        )
+        document = agentic.model_dump(mode="python")
+        posting = dict(document["ledger_postings"][0])
+        posting["debit"] = ((posting["debit"][0][0], posting["debit"][0][1] + 1),)
+        document["ledger_postings"] = (posting, *document["ledger_postings"][1:])
+        with pytest.raises(ValueError, match="ledger postings.*event facts"):
+            V5ExecutionManifest.model_validate(document)
+
+        document = agentic.model_dump(mode="python")
+        request = document["trust_records"][0]["request_json"]
+        tampered_request = request.replace(
+            '"signature":{"bytes":"',
+            '"signature":{"bytes":"00',
+        )
+        document["trust_records"] = (
+            {
+                **document["trust_records"][0],
+                "request_json": tampered_request,
+            },
+            *document["trust_records"][1:],
+        )
+        with pytest.raises(ValueError, match="verifier replay"):
+            V5ExecutionManifest.model_validate(document)
+
+    def test_partition_isolation_rejects_all_retained_identity_domains(
+        self,
+        smoke_corpus: V5Corpus,
+    ) -> None:
+        """Omitting an identity domain from partition checks must be observable."""
+        from apar.evaluation.v5_population import _validate_partition_isolation
+
+        partitions = dict(smoke_corpus.partitions)
+        train = partitions["train"]
+        calibration = partitions["calibration"]
+        source = train.executions[0]
+        target = calibration.executions[0]
+        for domain in (
+            "device_ids",
+            "credential_ids",
+            "merchant_ids",
+            "payee_ids",
+            "account_ids",
+            "agent_ids",
+            "key_ids",
+            "mandate_ids",
+            "authentication_evidence_ids",
+        ):
+            source_values = getattr(source, domain)
+            if not source_values:
+                continue
+            changed = target.model_copy(update={domain: (source_values[0],)})
+            partitions["calibration"] = calibration.model_copy(
+                update={"executions": (changed, *calibration.executions[1:])}
+            )
+            with pytest.raises(ValueError, match="identity overlap"):
+                _validate_partition_isolation(partitions)
+            partitions["calibration"] = calibration
+
     def test_test_only_mock_production_target_uses_declared_dev_test_cardinality(
         self,
     ) -> None:
@@ -56,6 +136,40 @@ class TestSmokeCorpus:
         assert not contract.replay_succeeded
         assert not contract.ledger_conserved
         assert contract.settled_value == 0
+
+    def test_realized_legitimate_economics_is_lifecycle_net_not_authorization_plus_settlement(
+        self,
+    ) -> None:
+        """Counting authorization and settlement as separate value must fail here."""
+        from apar.contracts.events import Rail
+        from apar.evaluation.v5_population import (
+            _adapter_factory,
+            _card_legitimate_commands,
+            _realize_legitimate_campaign_evidence,
+        )
+        from apar.simulator.engine import SimulationEngine
+
+        commands, schedule, population, contract = _card_legitimate_commands(
+            partition_name="train",
+            partition_seed=PROTOCOL.seeds.train,
+        )
+        engine = SimulationEngine(
+            population.bundle,
+            {Rail.CARD: _adapter_factory(rail=Rail.CARD, campaign_evidence=contract)},
+            opening_balances=population.opening_balances,
+        )
+        for priority, (at, command) in enumerate(zip(schedule, commands, strict=True)):
+            engine.schedule(at, priority, command)
+        realized = _realize_legitimate_campaign_evidence(
+            contract,
+            commands=commands,
+            events=engine.run(),
+            ledger_entries=engine.ledger.entries,
+            opening_balances=population.opening_balances,
+        )
+        assert realized.settled_value == Decimal("0")
+        assert not realized.replay_succeeded
+        assert not realized.ledger_conserved
 
     def test_realized_legitimate_cardinality_honors_profile_partition_targets(
         self,
@@ -260,16 +374,37 @@ class TestSmokeCorpus:
             labels = np.asarray([row.is_fraud for row in rows], dtype=bool)
             for index, name in enumerate(catalog.feature_names):
                 values = np.asarray([row[index] for row in feature_batch.matrix])
-                legitimate = values[~labels]
-                fraud = values[labels]
-                assert not (
-                    legitimate.max() < fraud.min() or fraud.max() < legitimate.min()
-                ), f"{partition_name}/{name} perfectly separates class by threshold"
+                assert not _has_perfect_one_dimensional_threshold(values, labels), (
+                    f"{partition_name}/{name} perfectly separates class by threshold"
+                )
             assert {row.source_event_id.count("-") for row in rows} == {4}
             assert {row.payment_id.split(":", 1)[0] for row in rows} == {"payment"}
             assert {row.source_command_id.split(":", 1)[0] for row in rows} == {"sha256"}
             assert len({row.lifecycle_state for row in rows if not row.is_fraud}) > 1
             assert len({row.lifecycle_state for row in rows if row.is_fraud}) > 1
+
+            for label, shape in {
+                "source-event": lambda row: (
+                    len(row.source_event_id),
+                    row.source_event_id.count("-"),
+                ),
+                "payment": lambda row: (
+                    row.payment_id.split(":", 1)[0],
+                    row.payment_id.count("-"),
+                ),
+                "source-command": lambda row: (
+                    row.source_command_id.split(":", 1)[0],
+                    len(row.source_command_id),
+                ),
+                "campaign": lambda row: (len(row.campaign_id), row.campaign_id.count("-")),
+                "lifecycle": lambda row: row.lifecycle_state,
+            }.items():
+                grouped: dict[object, set[bool]] = {}
+                for row in rows:
+                    grouped.setdefault(shape(row), set()).add(row.is_fraud)
+                assert not all(len(class_labels) == 1 for class_labels in grouped.values()), (
+                    f"{partition_name}/{label} shape perfectly determines the class"
+                )
 
     def test_identity_renaming_preserves_numeric_feature_matrix(
         self,
@@ -298,7 +433,7 @@ class TestSmokeCorpus:
         renamed_features = build_sentinel_features(renamed, catalog=catalog)
         assert renamed_features.matrix == original.matrix
 
-    def test_identity_renaming_preserves_real_model_predictions(
+    def test_full_retained_identity_renaming_preserves_features_and_real_model_predictions(
         self,
         smoke_corpus: V5Corpus,
     ) -> None:
@@ -322,29 +457,65 @@ class TestSmokeCorpus:
             catboost_seeds=PROTOCOL.seeds.catboost_seeds,
             bootstrap_seed=PROTOCOL.seeds.bootstrap,
         )
-        rows = partitions["development_test"].decisions
-        identity_map = {
-            value: f"identity-{index}"
-            for index, value in enumerate(
-                sorted({r.actor_id for r in rows} | {r.counterparty_id for r in rows})
-            )
-        }
-        renamed = tuple(
-            row.model_copy(
-                update={
-                    "actor_id": identity_map[row.actor_id],
-                    "counterparty_id": identity_map[row.counterparty_id],
+        retained_fields = (
+            "event_id",
+            "payment_id",
+            "campaign_id",
+            "actor_id",
+            "counterparty_id",
+            "source_command_id",
+            "source_event_id",
+            "execution_evidence_sha256",
+        )
+        for partition_name in ("train", "calibration", "threshold", "development_test"):
+            rows = partitions[partition_name].decisions
+            renames = {
+                field: {
+                    value: f"renamed-{field}-{index:08d}"
+                    for index, value in enumerate(sorted({getattr(row, field) for row in rows}))
                 }
+                for field in retained_fields
+                if field not in {"event_id", "source_event_id", "actor_id", "counterparty_id"}
+            }
+            party_renames = {
+                value: f"renamed-party-{index:08d}"
+                for index, value in enumerate(
+                    sorted({row.actor_id for row in rows} | {row.counterparty_id for row in rows})
+                )
+            }
+            event_renames = {
+                value: f"renamed-event-{index:08d}"
+                for index, value in enumerate(
+                    sorted({row.event_id for row in rows} | {row.source_event_id for row in rows})
+                )
+            }
+            renamed = tuple(
+                row.model_copy(
+                    update={
+                        **{
+                            field: renames[field][getattr(row, field)]
+                            for field in retained_fields
+                            if field not in {
+                                "event_id",
+                                "source_event_id",
+                                "actor_id",
+                                "counterparty_id",
+                            }
+                        },
+                        "actor_id": party_renames[row.actor_id],
+                        "counterparty_id": party_renames[row.counterparty_id],
+                        "event_id": event_renames[row.event_id],
+                        "source_event_id": event_renames[row.source_event_id],
+                    }
+                )
+                for row in rows
             )
-            for row in rows
-        )
-        original = defender.decide_batch(
-            np.asarray(build_sentinel_features(rows, catalog=catalog).matrix)
-        )
-        renamed_predictions = defender.decide_batch(
-            np.asarray(build_sentinel_features(renamed, catalog=catalog).matrix)
-        )
-        assert renamed_predictions == original
+            original_features = build_sentinel_features(rows, catalog=catalog).matrix
+            renamed_features = build_sentinel_features(renamed, catalog=catalog).matrix
+            assert renamed_features == original_features
+            original = defender.decide_batch(np.asarray(original_features))
+            renamed_predictions = defender.decide_batch(np.asarray(renamed_features))
+            assert renamed_predictions == original
 
     def test_partition_rejects_unbacked_campaign_row(
         self,
