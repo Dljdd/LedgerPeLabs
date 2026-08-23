@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import math
@@ -52,6 +53,11 @@ _MAX_SCORE_ROWS = 100_000
 _MAX_CATBOOST_ARTIFACT_BYTES = 67_108_864
 _MAX_ISOLATION_TREES = 512
 _MAX_ISOLATION_NODES = 262_144
+_MAX_CALIBRATOR_KNOTS = _MAX_SCORE_ROWS
+_MAX_ESTIMATOR_FEATURES_PER_TREE = 256
+_MAX_ISOLATION_ESTIMATOR_FEATURES = (
+    _MAX_ISOLATION_TREES * _MAX_ESTIMATOR_FEATURES_PER_TREE
+)
 
 
 class V5Arm(StrEnum):
@@ -84,13 +90,9 @@ _EXPECTED_SWITCHES = {
     V5Arm.ENSEMBLE_WITH_GRAPH: (True, True, False, False, False, False),
     V5Arm.FULL_SENTINEL: (True, True, True, True, True, True),
 }
-_EXPECTED_IMPLEMENTATION_PATHS = (
-    "src/apar/contracts/_validation.py",
-    "src/apar/contracts/decisions.py",
-    "src/apar/contracts/events.py",
-    "src/apar/contracts/scenarios.py",
+_V5_IMPLEMENTATION_SEED_PATHS = (
+    "scripts/run_defense_v5_development.py",
     "src/apar/defense/rules.py",
-    "src/apar/defense/contracts.py",
     "src/apar/defense/sentinel.py",
     "src/apar/evaluation/v5_arms.py",
     "src/apar/evaluation/v5_evaluation.py",
@@ -101,21 +103,8 @@ _EXPECTED_IMPLEMENTATION_PATHS = (
     "src/apar/evaluation/v5_protocol.py",
     "src/apar/evaluation/v5_reporting.py",
     "src/apar/features/sentinel.py",
-    "src/apar/features/catalog.py",
-    "src/apar/features/state.py",
-    "src/apar/generators/campaigns.py",
-    "src/apar/generators/population.py",
-    "src/apar/simulator/clock.py",
-    "src/apar/simulator/engine.py",
-    "src/apar/simulator/ledger.py",
-    "src/apar/simulator/rails/__init__.py",
-    "src/apar/simulator/rails/a2a.py",
-    "src/apar/simulator/rails/agentic.py",
-    "src/apar/simulator/rails/base.py",
-    "src/apar/simulator/rails/card.py",
-    "src/apar/trust/verifier.py",
-    "scripts/run_defense_v5_development.py",
 )
+_V5_FIRST_PARTY_PACKAGE_ROOT = "src/apar"
 
 
 def _expected_rule_parameters() -> tuple[tuple[str, float], ...]:
@@ -144,6 +133,192 @@ def _canonical_digest(document: object) -> str:
             allow_nan=False,
         ).encode("utf-8")
     ).hexdigest()
+
+
+def _module_name_for_v5_source(root: Path, source_path: Path) -> str | None:
+    package_root = (root / _V5_FIRST_PARTY_PACKAGE_ROOT).resolve()
+    resolved = source_path.resolve()
+    if not resolved.is_relative_to(package_root) or source_path.suffix != ".py":
+        return None
+    relative = resolved.relative_to((root / "src").resolve()).with_suffix("")
+    parts = list(relative.parts)
+    if parts[-1] == "__init__":
+        parts.pop()
+    return ".".join(parts)
+
+
+def _resolve_v5_first_party_module(
+    root: Path,
+    module_name: str,
+    *,
+    required: bool,
+) -> tuple[str, ...]:
+    if module_name != "apar" and not module_name.startswith("apar."):
+        return ()
+    root = root.resolve()
+    package_root = (root / _V5_FIRST_PARTY_PACKAGE_ROOT).resolve()
+    parts = module_name.split(".")[1:]
+    module_file = package_root.joinpath(*parts).with_suffix(".py")
+    module_directory = package_root.joinpath(*parts)
+    if module_file.is_file():
+        package_parts = parts[:-1]
+        source_path: Path | None = module_file
+    elif module_directory.is_dir():
+        package_parts = parts
+        package_init = module_directory / "__init__.py"
+        source_path = package_init if package_init.is_file() else None
+    elif required:
+        raise ValueError(f"unresolved first-party implementation import: {module_name}")
+    else:
+        return ()
+
+    paths: set[Path] = set()
+    apar_init = package_root / "__init__.py"
+    if not apar_init.is_file():
+        raise ValueError("first-party apar package initializer is missing")
+    paths.add(apar_init)
+    current = package_root
+    for part in package_parts:
+        current /= part
+        package_init = current / "__init__.py"
+        if package_init.is_file():
+            paths.add(package_init)
+    if source_path is not None:
+        paths.add(source_path)
+    if any(not path.resolve().is_relative_to(package_root) for path in paths):
+        raise ValueError("first-party implementation import escaped its allowed root")
+    return tuple(
+        sorted(path.resolve().relative_to(root).as_posix() for path in paths)
+    )
+
+
+def _v5_imported_module_names(root: Path, relative_path: str) -> tuple[str, ...]:
+    source_path = root / relative_path
+    try:
+        tree = ast.parse(
+            source_path.read_text(encoding="utf-8"),
+            filename=relative_path,
+        )
+    except (OSError, SyntaxError, UnicodeError) as error:
+        raise ValueError(f"cannot scan v5 implementation source: {relative_path}") from error
+    current_module = _module_name_for_v5_source(root, source_path)
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(
+                alias.name
+                for alias in node.names
+                if alias.name == "apar" or alias.name.startswith("apar.")
+            )
+            continue
+        if isinstance(node, ast.ImportFrom):
+            module_name: str | None = node.module
+            if node.level:
+                if current_module is None:
+                    raise ValueError("relative import is outside the first-party package")
+                package_parts = current_module.split(".")
+                if source_path.name != "__init__.py":
+                    package_parts.pop()
+                if node.level > len(package_parts):
+                    raise ValueError("relative first-party import escapes the apar package")
+                package_parts = package_parts[: len(package_parts) - node.level + 1]
+                if node.module:
+                    package_parts.extend(node.module.split("."))
+                module_name = ".".join(package_parts)
+            if module_name == "apar" or (
+                module_name is not None and module_name.startswith("apar.")
+            ):
+                imported.add(module_name)
+                for alias in node.names:
+                    if alias.name != "*":
+                        candidate = f"{module_name}.{alias.name}"
+                        if _resolve_v5_first_party_module(
+                            root,
+                            candidate,
+                            required=False,
+                        ):
+                            imported.add(candidate)
+            continue
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        function = node.func
+        is_dynamic_import = (
+            isinstance(function, ast.Name)
+            and function.id in {"__import__", "import_module"}
+        ) or (isinstance(function, ast.Attribute) and function.attr == "import_module")
+        literal = node.args[0]
+        if (
+            is_dynamic_import
+            and isinstance(literal, ast.Constant)
+            and type(literal.value) is str
+            and (literal.value == "apar" or literal.value.startswith("apar."))
+        ):
+            imported.add(literal.value)
+    return tuple(sorted(imported))
+
+
+def discover_v5_implementation_paths(root: Path) -> tuple[str, ...]:
+    """Discover the deterministic recursive first-party source dependency closure."""
+    root = root.resolve()
+    package_root = (root / _V5_FIRST_PARTY_PACKAGE_ROOT).resolve()
+    if not package_root.is_dir():
+        raise ValueError("v5 first-party package root is missing")
+    pending: set[str] = set()
+    for relative in _V5_IMPLEMENTATION_SEED_PATHS:
+        source_path = (root / relative).resolve()
+        if not source_path.is_file():
+            raise ValueError(f"v5 implementation seed is missing: {relative}")
+        module_name = _module_name_for_v5_source(root, source_path)
+        if module_name is None:
+            if relative != "scripts/run_defense_v5_development.py":
+                raise ValueError("v5 implementation seed is outside fixed allowed roots")
+            pending.add(relative)
+        else:
+            pending.update(
+                _resolve_v5_first_party_module(root, module_name, required=True)
+            )
+
+    discovered: set[str] = set()
+    while pending:
+        relative = min(pending)
+        pending.remove(relative)
+        if relative in discovered:
+            continue
+        source_path = (root / relative).resolve()
+        if relative != "scripts/run_defense_v5_development.py" and not (
+            source_path.is_relative_to(package_root)
+        ):
+            raise ValueError("v5 implementation dependency escaped fixed allowed roots")
+        discovered.add(relative)
+        for module_name in _v5_imported_module_names(root, relative):
+            pending.update(
+                path
+                for path in _resolve_v5_first_party_module(
+                    root,
+                    module_name,
+                    required=True,
+                )
+                if path not in discovered
+            )
+    return tuple(sorted(discovered))
+
+
+def validate_v5_implementation_paths(
+    root: Path,
+    declared_paths: Sequence[str],
+) -> tuple[str, ...]:
+    """Fail closed unless configuration declares the exact dependency closure."""
+    declared = tuple(declared_paths)
+    discovered = discover_v5_implementation_paths(root)
+    if declared != discovered:
+        raise ValueError("v5 implementation paths must equal the exact dependency closure")
+    return discovered
+
+
+def _validate_v5_predictive_feature_names(feature_names: Sequence[str]) -> None:
+    from apar.features.sentinel import validate_sentinel_predictive_feature_names
+
+    validate_sentinel_predictive_feature_names(feature_names)
 
 
 class V5ArmSupportRow(BaseModel):
@@ -369,6 +544,7 @@ class V5TrainingPartitionEvidence(BaseModel):
 
     @model_validator(mode="after")
     def ordered_provenance_is_complete(self) -> Self:
+        _validate_v5_predictive_feature_names(self.feature_names)
         if len(self.feature_batch_payload_json.encode()) > _MAX_FEATURE_BATCH_BYTES:
             raise ValueError("feature batch bytes exceed production profile limit")
         if sum(len(row) for row in self.feature_matrix) > _MAX_FEATURE_MATRIX_CELLS:
@@ -458,6 +634,11 @@ class V5CalibratorManifest(BaseModel):
     @model_validator(mode="after")
     def knots_are_replayable(self) -> Self:
         if (
+            len(self.x_thresholds) > _MAX_CALIBRATOR_KNOTS
+            or len(self.y_thresholds) > _MAX_CALIBRATOR_KNOTS
+        ):
+            raise ValueError("calibrator knot count exceeds production profile limit")
+        if (
             len(self.x_thresholds) < 2
             or len(self.x_thresholds) != len(self.y_thresholds)
         ):
@@ -539,8 +720,20 @@ class V5IsolationTreeManifest(BaseModel):
             len(self.decision_path_lengths),
             len(self.average_path_lengths),
         }
-        if len(lengths) != 1 or not self.children_left or len(self.children_left) > 1_000_000:
+        if (
+            len(lengths) != 1
+            or not self.children_left
+            or len(self.children_left) > _MAX_ISOLATION_NODES
+        ):
             raise ValueError("isolation tree arrays must align and remain bounded")
+        if len(self.estimator_features) > _MAX_ESTIMATOR_FEATURES_PER_TREE:
+            raise ValueError(
+                "estimator feature count exceeds production profile limit"
+            )
+        if not self.estimator_features or any(
+            index < 0 for index in self.estimator_features
+        ):
+            raise ValueError("isolation tree estimator feature indices are invalid")
         if any(
             not math.isfinite(value)
             for value in (
@@ -550,6 +743,39 @@ class V5IsolationTreeManifest(BaseModel):
             )
         ):
             raise ValueError("isolation tree numeric arrays must be finite")
+        child_nodes: list[int] = []
+        for node_index, (left, right, feature) in enumerate(
+            zip(
+                self.children_left,
+                self.children_right,
+                self.feature,
+                strict=True,
+            )
+        ):
+            is_leaf = left == -1 and right == -1
+            if (left == -1) != (right == -1):
+                raise ValueError("isolation tree child indices must align")
+            if is_leaf:
+                if feature != -2:
+                    raise ValueError("isolation tree leaf feature marker is invalid")
+                continue
+            if (
+                left <= node_index
+                or right <= node_index
+                or left >= len(self.children_left)
+                or right >= len(self.children_left)
+                or left == right
+            ):
+                raise ValueError("isolation tree child indices are invalid")
+            if feature < 0 or feature >= len(self.estimator_features):
+                raise ValueError("isolation tree split feature is invalid")
+            child_nodes.extend((left, right))
+        if sorted(child_nodes) != list(range(1, len(self.children_left))):
+            raise ValueError("isolation tree nodes must form one exact rooted tree")
+        if any(value <= 0.0 for value in self.decision_path_lengths) or any(
+            value < 0.0 for value in self.average_path_lengths
+        ):
+            raise ValueError("isolation tree path lengths are invalid")
         return self
 
     def leaf_index(self, features: tuple[float, ...]) -> int:
@@ -630,13 +856,25 @@ class V5IsolationForestManifest(BaseModel):
             raise ValueError("isolation forest tree count exceeds production profile limit")
         if sum(len(tree.children_left) for tree in self.trees) > _MAX_ISOLATION_NODES:
             raise ValueError("isolation forest node count exceeds production profile limit")
+        if self.feature_count > _MAX_ESTIMATOR_FEATURES_PER_TREE:
+            raise ValueError("isolation forest feature count exceeds production profile limit")
+        if (
+            sum(len(tree.estimator_features) for tree in self.trees)
+            > _MAX_ISOLATION_ESTIMATOR_FEATURES
+        ):
+            raise ValueError(
+                "isolation forest estimator feature count exceeds production profile limit"
+            )
         if not math.isfinite(self.offset):
             raise ValueError("isolation forest offset must be finite")
+        expected_estimator_features = tuple(range(self.feature_count))
         if any(
-            any(index < 0 or index >= self.feature_count for index in tree.estimator_features)
+            tree.estimator_features != expected_estimator_features
             for tree in self.trees
         ):
-            raise ValueError("isolation forest estimator features are invalid")
+            raise ValueError(
+                "isolation forest requires exact ordered estimator features"
+            )
         if self.artifact_sha256 != self.computed_digest():
             raise ValueError("IsolationForest artifact digest mismatch")
         return self
@@ -688,6 +926,14 @@ class V5ArmSpecification(BaseModel):
 
     @model_validator(mode="after")
     def specification_is_bound(self) -> Self:
+        for feature_names in (
+            self.catalog_feature_names,
+            self.feature_names,
+            self.graph_feature_names,
+            self.non_graph_feature_names,
+            *(item.feature_names for item in self.training_partitions),
+        ):
+            _validate_v5_predictive_feature_names(feature_names)
         model_artifact_bytes = sum(
             len(artifact.payload_base64) * 3 // 4
             - artifact.payload_base64.endswith("=")
@@ -1588,10 +1834,8 @@ def load_v5_arm_configuration(
         raise ValueError("arm configuration requires catalog feature groups")
     if tuple(entry.arm for entry in document.arms) != _CURRENT_ARMS:
         raise ValueError("arm configuration must list the exact ordered current arms")
-    if document.implementation_paths != _EXPECTED_IMPLEMENTATION_PATHS:
-        raise ValueError("arm implementation inventory does not match the frozen exact path set")
-
     root = path.resolve().parents[2]
+    validate_v5_implementation_paths(root, document.implementation_paths)
     implementation_facts: list[tuple[str, str]] = []
     for relative in document.implementation_paths:
         source_path = root / relative

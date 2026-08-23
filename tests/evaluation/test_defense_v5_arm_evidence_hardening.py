@@ -2,16 +2,41 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
+from copy import deepcopy
 from pathlib import Path
 
+import pytest
+
 import apar.evaluation.v5_evaluation as v5_evaluation
-from apar.evaluation.v5_evaluation import V5Arm, load_v5_arm_configuration
+from apar.evaluation.v5_evaluation import (
+    V5Arm,
+    V5ArmSpecification,
+    V5CalibratorManifest,
+    V5IsolationForestManifest,
+    V5IsolationTreeManifest,
+    V5TrainingPartitionEvidence,
+    load_v5_arm_configuration,
+)
+from apar.features import sentinel as sentinel_features
 from apar.features.sentinel import SentinelFeatureCatalog
 from tests.evaluation.v5_safe_protocol import load_safe_v5_test_protocol
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def _independent_digest(document: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            document,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode()
+    ).hexdigest()
 
 
 def test_arm_evidence_contracts_exist_before_training() -> None:
@@ -89,18 +114,27 @@ def test_safe_404_protocol_copy_has_its_own_verified_digest() -> None:
     assert safe.protocol_sha256 == digest(safe)
 
 
-def test_arm_implementation_inventory_binds_execution_and_trust_dependencies() -> None:
+def test_arm_implementation_inventory_is_recursive_and_exact() -> None:
     document = json.loads(
         (ROOT / "config/defense/defense-v5-arms.json").read_text()
     )
     required = {
+        "src/apar/__init__.py",
+        "src/apar/contracts/__init__.py",
         "src/apar/contracts/_validation.py",
         "src/apar/contracts/decisions.py",
         "src/apar/contracts/events.py",
+        "src/apar/contracts/reports.py",
         "src/apar/contracts/scenarios.py",
+        "src/apar/defense/__init__.py",
         "src/apar/defense/contracts.py",
         "src/apar/defense/rules.py",
         "src/apar/defense/sentinel.py",
+        "src/apar/evaluation/__init__.py",
+        "src/apar/evaluation/contracts.py",
+        "src/apar/evaluation/corpus.py",
+        "src/apar/evaluation/regimes.py",
+        "src/apar/evaluation/splits.py",
         "src/apar/evaluation/v5_arms.py",
         "src/apar/evaluation/v5_evaluation.py",
         "src/apar/evaluation/v5_execution.py",
@@ -109,20 +143,221 @@ def test_arm_implementation_inventory_binds_execution_and_trust_dependencies() -
         "src/apar/evaluation/v5_population.py",
         "src/apar/evaluation/v5_protocol.py",
         "src/apar/evaluation/v5_reporting.py",
+        "src/apar/features/__init__.py",
+        "src/apar/features/builders.py",
         "src/apar/features/catalog.py",
         "src/apar/features/sentinel.py",
         "src/apar/features/state.py",
+        "src/apar/generators/__init__.py",
         "src/apar/generators/campaigns.py",
         "src/apar/generators/population.py",
+        "src/apar/redteam/__init__.py",
+        "src/apar/redteam/llm_policy.py",
+        "src/apar/redteam/policies.py",
+        "src/apar/redteam/search.py",
+        "src/apar/runs/__init__.py",
+        "src/apar/runs/runner.py",
+        "src/apar/runs/wire.py",
         "src/apar/simulator/engine.py",
         "src/apar/simulator/ledger.py",
         "src/apar/simulator/clock.py",
+        "src/apar/simulator/__init__.py",
         "src/apar/simulator/rails/__init__.py",
         "src/apar/simulator/rails/agentic.py",
         "src/apar/simulator/rails/a2a.py",
         "src/apar/simulator/rails/base.py",
         "src/apar/simulator/rails/card.py",
+        "src/apar/storage/artifacts.py",
+        "src/apar/trust/__init__.py",
         "src/apar/trust/verifier.py",
         "scripts/run_defense_v5_development.py",
     }
-    assert required == set(document["implementation_paths"])
+    declared = tuple(document["implementation_paths"])
+    discovered = v5_evaluation.discover_v5_implementation_paths(ROOT)
+    assert required <= set(discovered)
+    assert declared == discovered
+    with pytest.raises(ValueError, match="exact dependency closure"):
+        v5_evaluation.validate_v5_implementation_paths(ROOT, declared[:-1])
+    with pytest.raises(ValueError, match="exact dependency closure"):
+        v5_evaluation.validate_v5_implementation_paths(
+            ROOT,
+            (*declared, "src/apar/evaluation/unexecuted_extra.py"),
+        )
+
+
+@pytest.mark.parametrize(
+    "forbidden_name",
+    (
+        "is_fraud",
+        "training_label",
+        "campaign_family",
+        "generator_seed",
+        "development_split",
+        "future_outcome_probability",
+    ),
+)
+def test_public_sentinel_semantic_validator_rejects_predictive_leaks(
+    forbidden_name: str,
+) -> None:
+    validator = getattr(
+        sentinel_features,
+        "validate_sentinel_predictive_feature_names",
+        None,
+    )
+    assert callable(validator), "public Sentinel feature semantic validator is missing"
+    with pytest.raises(ValueError, match="forbidden predictive feature semantics"):
+        validator(("txn_log_amount", forbidden_name))
+
+
+def test_arm_spec_rejects_consistently_rehashed_forbidden_catalog_and_subsets() -> None:
+    protocol = load_safe_v5_test_protocol(ROOT)
+    configuration = load_v5_arm_configuration(
+        ROOT / "config/defense/defense-v5-arms.json",
+        catalog=SentinelFeatureCatalog.default(),
+        protocol=protocol,
+    )
+    full = next(spec for spec in configuration.arms if spec.arm is V5Arm.FULL_SENTINEL)
+    forged = deepcopy(full.model_dump(mode="json"))
+    original = "amount"
+    assert original in full.catalog_feature_names
+    replacement = "future_outcome_probability"
+    for field in (
+        "catalog_feature_names",
+        "feature_names",
+        "graph_feature_names",
+        "non_graph_feature_names",
+    ):
+        forged[field] = [
+            replacement if name == original else name for name in forged[field]
+        ]
+    forged["spec_sha256"] = _independent_digest(
+        {key: value for key, value in forged.items() if key != "spec_sha256"}
+    )
+    with pytest.raises(ValueError, match="forbidden predictive feature semantics"):
+        V5ArmSpecification.model_validate(forged)
+
+
+def test_arm_spec_rejects_forbidden_names_in_all_bound_training_evidence() -> None:
+    protocol = load_safe_v5_test_protocol(ROOT)
+    configuration = load_v5_arm_configuration(
+        ROOT / "config/defense/defense-v5-arms.json",
+        catalog=SentinelFeatureCatalog.default(),
+        protocol=protocol,
+    )
+    rules = next(spec for spec in configuration.arms if spec.arm is V5Arm.RULES_ONLY)
+    original = "amount"
+    assert original in rules.catalog_feature_names
+    replacement = "is_fraud"
+    forged_catalog = tuple(
+        replacement if name == original else name
+        for name in rules.catalog_feature_names
+    )
+
+    def evidence(partition: str, suffix: str) -> V5TrainingPartitionEvidence:
+        return V5TrainingPartitionEvidence.model_construct(
+            partition=partition,
+            ordered_event_ids=(f"{suffix}-0", f"{suffix}-1"),
+            labels=(0, 1),
+            feature_names=forged_catalog,
+            feature_matrix=(
+                tuple(0.0 for _ in forged_catalog),
+                tuple(1.0 for _ in forged_catalog),
+            ),
+            support_records=(),
+            execution_artifacts=(),
+            catalog_sha256=rules.catalog_sha256,
+            feature_batch_sha256="1" * 64,
+            feature_batch_payload_json="{}",
+            feature_matrix_sha256="2" * 64,
+            ordered_rows_sha256="3" * 64,
+            ordered_support_sha256="4" * 64,
+        )
+
+    partitions = (
+        evidence("train", "train"),
+        evidence("calibration", "calibration"),
+        evidence("threshold", "threshold"),
+    )
+    threshold_values = (("rules_challenge", 0.6), ("rules_decline", 0.9))
+    threshold_digest = _independent_digest(
+        {
+            "source_partition": "threshold",
+            "method": "rules_v1_fixed",
+            "threshold_ordered_rows_sha256": partitions[2].ordered_rows_sha256,
+            "threshold_support_sha256": partitions[2].ordered_support_sha256,
+            "threshold_feature_batch_sha256": partitions[2].feature_batch_sha256,
+            "threshold_feature_matrix_sha256": partitions[2].feature_matrix_sha256,
+            "threshold_values": threshold_values,
+        }
+    )
+    values = {name: getattr(rules, name) for name in V5ArmSpecification.model_fields}
+    values.update(
+        catalog_feature_names=forged_catalog,
+        execution_bound=True,
+        training_partitions=partitions,
+        threshold_values=threshold_values,
+        threshold_digest=threshold_digest,
+        spec_sha256="",
+    )
+    unchecked = V5ArmSpecification.model_construct(**values)
+    unchecked = unchecked.model_copy(
+        update={"spec_sha256": unchecked.computed_digest()}
+    )
+    with pytest.raises(ValueError, match="forbidden predictive feature semantics"):
+        unchecked.specification_is_bound()
+
+
+def test_calibrator_rejects_more_knots_than_one_production_partition() -> None:
+    knot_count = 100_001
+    values = {
+        "x_thresholds": tuple(index / (knot_count - 1) for index in range(knot_count)),
+        "y_thresholds": tuple(index / (knot_count - 1) for index in range(knot_count)),
+        "out_of_bounds": "clip",
+    }
+    with pytest.raises(ValueError, match="calibrator.*production profile limit"):
+        V5CalibratorManifest(
+            **values,
+            artifact_sha256=_independent_digest(values),
+        )
+
+
+def test_isolation_tree_rejects_unbounded_estimator_feature_indices() -> None:
+    with pytest.raises(ValueError, match="estimator feature.*production profile limit"):
+        V5IsolationTreeManifest(
+            children_left=(-1,),
+            children_right=(-1,),
+            feature=(-2,),
+            threshold=(-2.0,),
+            decision_path_lengths=(1.0,),
+            average_path_lengths=(0.0,),
+            estimator_features=tuple(0 for _ in range(10_000)),
+        )
+
+
+def test_isolation_forest_rejects_rehashed_appended_unused_estimator_feature() -> None:
+    tree = V5IsolationTreeManifest(
+        children_left=(-1,),
+        children_right=(-1,),
+        feature=(-2,),
+        threshold=(-2.0,),
+        decision_path_lengths=(1.0,),
+        average_path_lengths=(0.0,),
+        estimator_features=(0, 1, 0),
+    )
+    values = {
+        "serialization": "sklearn-isolation-forest-tree-arrays-v1",
+        "feature_count": 2,
+        "max_samples": 2,
+        "offset": -0.5,
+        "trees": (tree,),
+    }
+    with pytest.raises(ValueError, match="exact ordered estimator features"):
+        V5IsolationForestManifest(
+            **values,
+            artifact_sha256=_independent_digest(
+                {
+                    **values,
+                    "trees": [tree.model_dump(mode="json")],
+                }
+            ),
+        )

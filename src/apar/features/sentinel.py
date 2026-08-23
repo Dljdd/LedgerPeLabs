@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from collections import defaultdict
 from collections.abc import Sequence
 from pathlib import Path
@@ -14,10 +15,51 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from apar.evaluation.v5_population import V5DecisionRow
 
-_FORBIDDEN_FIELDS = frozenset(
-    {"family", "campaign_id", "scenario_id", "seed", "split", "is_fraud",
-     "generator", "label", "outcome"}
+_FORBIDDEN_PREDICTIVE_TOKENS = frozenset(
+    {
+        "campaign",
+        "campaigns",
+        "family",
+        "families",
+        "fraud",
+        "future",
+        "generator",
+        "generators",
+        "groundtruth",
+        "label",
+        "labels",
+        "outcome",
+        "outcomes",
+        "scenario",
+        "scenarios",
+        "seed",
+        "seeds",
+        "split",
+        "splits",
+        "target",
+        "targets",
+    }
 )
+
+
+def validate_sentinel_predictive_feature_names(
+    feature_names: Sequence[str],
+) -> tuple[str, ...]:
+    """Reject evaluator-only or future-result semantics from predictive inputs."""
+    names = tuple(feature_names)
+    leaks: list[str] = []
+    for name in names:
+        if type(name) is not str or not name:
+            raise ValueError("predictive feature names must be non-empty strings")
+        snake_name = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name).lower()
+        tokens = frozenset(re.findall(r"[a-z0-9]+", snake_name))
+        if tokens & _FORBIDDEN_PREDICTIVE_TOKENS:
+            leaks.append(name)
+    if leaks:
+        raise ValueError(
+            "forbidden predictive feature semantics: " + ", ".join(sorted(leaks))
+        )
+    return names
 
 
 def _set_if_in_catalog(
@@ -54,9 +96,7 @@ class SentinelFeatureCatalog(BaseModel):
     def no_forbidden_fields(self) -> Self:
         if self.feature_groups and len(self.feature_groups) != len(self.feature_names):
             raise ValueError("feature names and groups must align exactly")
-        leaks = _FORBIDDEN_FIELDS & set(self.feature_names)
-        if leaks:
-            raise ValueError(f"catalog contains forbidden predictive fields: {leaks}")
+        validate_sentinel_predictive_feature_names(self.feature_names)
         return self
 
 
@@ -260,4 +300,9 @@ def build_sentinel_features(
 )
 
 
-__all__ = ["SentinelFeatureBatch", "SentinelFeatureCatalog", "build_sentinel_features"]
+__all__ = [
+    "SentinelFeatureBatch",
+    "SentinelFeatureCatalog",
+    "build_sentinel_features",
+    "validate_sentinel_predictive_feature_names",
+]
