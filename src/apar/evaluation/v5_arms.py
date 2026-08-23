@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import NDArray
 
+from apar.contracts.events import PaymentEvent
 from apar.defense.sentinel import (
     SentinelAction,
     SentinelDefender,
@@ -34,8 +35,9 @@ from apar.evaluation.v5_evaluation import (
     V5TrainingPartitionEvidence,
     derive_v5_trust_failures,
     replay_v5_rule_result,
+    validate_v5_rule_feature_provenance,
 )
-from apar.features.sentinel import SentinelFeatureCatalog
+from apar.features.sentinel import SentinelFeatureCatalog, SentinelFeatureProvenance
 
 _RULE_CHALLENGE_THRESHOLD = 0.60
 _RULE_DECLINE_THRESHOLD = 0.90
@@ -460,11 +462,17 @@ def _score_one_arm(
     support: tuple[V5ArmSupportRow, ...],
     execution_artifacts: tuple[V5ExecutionArtifact, ...],
     trust_failures: list[bool],
+    feature_provenance: tuple[SentinelFeatureProvenance, ...],
 ) -> V5ArmScore:
     evidence: list[V5ArmRowEvidence] = []
     execution_manifests = {
         artifact.evidence_sha256: artifact.manifest()
         for artifact in execution_artifacts
+    }
+    execution_events = {
+        record.event_id: PaymentEvent.model_validate_json(record.event_json)
+        for manifest in execution_manifests.values()
+        for record in manifest.event_records
     }
     for index, source_row in enumerate(features_matrix):
         start = time.perf_counter_ns()
@@ -475,6 +483,11 @@ def _score_one_arm(
                 catalog_feature_values=source_row,
                 catalog_sha256=catalog.catalog_sha256,
                 manifests=execution_manifests,
+                source_event_ids=feature_provenance[index].source_event_ids,
+                max_source_available_at=(
+                    feature_provenance[index].max_source_available_at
+                ),
+                resolved_events=execution_events,
             )
             rule_score = rule_result.score
             rule_components = tuple(
@@ -560,6 +573,10 @@ def _score_one_arm(
             "rule_components": rule_components,
             "rule_manifest_sha256": rule_manifest_sha256,
             "rule_vector_sha256": rule_vector_sha256,
+            "rule_source_event_ids": feature_provenance[index].source_event_ids,
+            "rule_max_source_available_at": (
+                feature_provenance[index].max_source_available_at
+            ),
             "rule_evidence_source_ids": rule_evidence_source_ids,
             "action": action,
             "probability": probability,
@@ -582,6 +599,9 @@ def _score_one_arm(
             {
                 **row_values,
                 "support": support[index].model_dump(mode="json"),
+                "rule_max_source_available_at": feature_provenance[
+                    index
+                ].model_dump(mode="json")["max_source_available_at"],
             }
         )
         evidence.append(V5ArmRowEvidence.model_validate(row_values))
@@ -611,6 +631,7 @@ def score_v5_arm_set(
     support: tuple[V5ArmSupportRow, ...],
     execution_artifacts: tuple[V5ExecutionArtifact, ...],
     trust_failures: list[bool],
+    feature_provenance: tuple[SentinelFeatureProvenance, ...],
 ) -> V5ArmScoreSet:
     """Score each arm independently over one immutable ordered support."""
     if any(
@@ -636,6 +657,12 @@ def score_v5_arm_set(
     derived_trust_failures = derive_v5_trust_failures(support, execution_artifacts)
     if trust_failures != derived_trust_failures:
         raise ValueError("trust failures disagree with retained verifier evidence")
+    feature_provenance = validate_v5_rule_feature_provenance(
+        support=support,
+        provenance=feature_provenance,
+        catalog=catalog,
+        artifacts=execution_artifacts,
+    )
     scores = {
         arm.spec.arm: _score_one_arm(
             trained=arm,
@@ -644,6 +671,7 @@ def score_v5_arm_set(
             support=support,
             execution_artifacts=execution_artifacts,
             trust_failures=trust_failures,
+            feature_provenance=feature_provenance,
         )
         for arm in trained.arms
     }

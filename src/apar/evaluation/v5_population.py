@@ -9,7 +9,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Any, Self, cast
 from uuid import NAMESPACE_URL, uuid5
 
@@ -825,7 +825,23 @@ _LEGITIMATE_BATCH_START_SECONDS = 8 * 60 * 60
 _LEGITIMATE_BATCH_STRIDE_SECONDS = 60
 _LEGITIMATE_EVENT_STRIDE_MILLISECONDS = 500
 _LEGITIMATE_MANIFEST_BASE_ESTIMATE_BYTES = 32_768
-_LEGITIMATE_EVENT_ESTIMATE_BYTES = 3_500
+_LEGITIMATE_EVENT_ESTIMATE_BYTES = 3_000
+_AGENTIC_MANIFEST_BASE_ESTIMATE_BYTES = 65_536
+_AGENTIC_EVENT_ESTIMATE_BYTES = 12_000
+_FRAUD_EVENT_COUNTS = {
+    V5Family.AGENTIC_INTENT_ABUSE.value: 25,
+    V5Family.APP_SCAM_MULE.value: 36,
+    V5Family.CARD_TESTING_CNP.value: 26,
+    V5Family.SYNTHETIC_MERCHANT_REFUND.value: 46,
+}
+_FRAUD_EVENT_ESTIMATE_BYTES = {
+    V5Family.AGENTIC_INTENT_ABUSE.value: 12_000,
+    V5Family.APP_SCAM_MULE.value: 3_000,
+    V5Family.CARD_TESTING_CNP.value: 3_000,
+    V5Family.SYNTHETIC_MERCHANT_REFUND.value: 3_000,
+}
+_MAX_SINGLE_EXECUTION_ARTIFACT_BYTES = 16 * 1024 * 1024
+_MAX_AGGREGATE_EXECUTION_ARTIFACT_BYTES = 256 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -836,6 +852,83 @@ class _LegitimateExecutionBatch:
     start_offset_seconds: int
     duration_seconds: int
     estimated_payload_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class _PlannedExecutionArtifact:
+    category: str
+    rail: Rail
+    event_count: int
+    estimated_payload_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class _DevelopmentExecutionArtifactPlan:
+    artifacts: tuple[_PlannedExecutionArtifact, ...]
+    legitimate_event_count: int
+
+    @property
+    def artifact_counts_by_category(self) -> Mapping[str, int]:
+        counts: dict[str, int] = {}
+        for artifact in self.artifacts:
+            counts[artifact.category] = counts.get(artifact.category, 0) + 1
+        return MappingProxyType(dict(sorted(counts.items())))
+
+    @property
+    def artifact_count(self) -> int:
+        return len(self.artifacts)
+
+    @property
+    def max_artifact_payload_bytes(self) -> int:
+        return max(artifact.estimated_payload_bytes for artifact in self.artifacts)
+
+    @property
+    def aggregate_payload_bytes(self) -> int:
+        return sum(artifact.estimated_payload_bytes for artifact in self.artifacts)
+
+
+def _estimate_execution_shape_payload_bytes(
+    *,
+    family: str,
+    rail: Rail,
+    event_count: int,
+) -> int:
+    """Conservatively bound canonical retained facts for one known execution shape."""
+    if type(event_count) is not int or event_count <= 0:
+        raise ValueError("execution artifact event count must be positive")
+    if family == "legitimate":
+        if rail is Rail.AGENTIC:
+            return (
+                _AGENTIC_MANIFEST_BASE_ESTIMATE_BYTES
+                + event_count * _AGENTIC_EVENT_ESTIMATE_BYTES
+            )
+        return (
+            _LEGITIMATE_MANIFEST_BASE_ESTIMATE_BYTES
+            + event_count * _LEGITIMATE_EVENT_ESTIMATE_BYTES
+        )
+    try:
+        per_event = _FRAUD_EVENT_ESTIMATE_BYTES[family]
+    except KeyError as error:
+        raise ValueError("execution artifact family is unknown") from error
+    base = (
+        _AGENTIC_MANIFEST_BASE_ESTIMATE_BYTES
+        if rail is Rail.AGENTIC
+        else _LEGITIMATE_MANIFEST_BASE_ESTIMATE_BYTES
+    )
+    return base + event_count * per_event
+
+
+def _estimate_execution_artifact_payload_bytes(
+    manifest: V5ExecutionManifest,
+) -> int:
+    """Estimate one validated canonical manifest without trusting serialized byte size."""
+    if type(manifest) is not V5ExecutionManifest:
+        raise TypeError("artifact estimator requires an exact execution manifest")
+    return _estimate_execution_shape_payload_bytes(
+        family=manifest.family,
+        rail=Rail(manifest.rail),
+        event_count=len(manifest.lineage),
+    )
 
 
 def _plan_legitimate_filler_batches(
@@ -875,6 +968,78 @@ def _plan_legitimate_filler_batches(
         remaining -= event_count
         campaign_index += 1
     return tuple(batches)
+
+
+def _plan_production_development_execution_artifacts(
+    protocol: V5DevelopmentProtocol,
+) -> _DevelopmentExecutionArtifactPlan:
+    """Statically bound every declared production development-test execution artifact."""
+    if type(protocol) is not V5DevelopmentProtocol:
+        raise TypeError("artifact planning requires an exact v5 protocol")
+    base_shapes = (
+        (Rail.CARD, 12),
+        (Rail.A2A, 10),
+        (Rail.AGENTIC, 2),
+    )
+    base_event_count = sum(event_count for _rail, event_count in base_shapes)
+    legitimate_target = protocol.production_dev_test_legitimate
+    if legitimate_target < base_event_count:
+        raise ValueError("production legitimate target cannot cover base rail traffic")
+    artifacts = [
+        _PlannedExecutionArtifact(
+            category="legitimate_base",
+            rail=rail,
+            event_count=event_count,
+            estimated_payload_bytes=_estimate_execution_shape_payload_bytes(
+                family="legitimate",
+                rail=rail,
+                event_count=event_count,
+            ),
+        )
+        for rail, event_count in base_shapes
+    ]
+    for batch in _plan_legitimate_filler_batches(
+        legitimate_target - base_event_count
+    ):
+        artifacts.append(
+            _PlannedExecutionArtifact(
+                category="legitimate_filler",
+                rail=batch.rail,
+                event_count=batch.event_count,
+                estimated_payload_bytes=batch.estimated_payload_bytes,
+            )
+        )
+    campaign_counts = protocol.production_profile.campaigns_per_family
+    if set(campaign_counts) != set(_FRAUD_EVENT_COUNTS):
+        raise ValueError("production campaign families differ from artifact planner")
+    for family in sorted(campaign_counts):
+        rail = _FAMILY_RAILS[family]
+        event_count = _FRAUD_EVENT_COUNTS[family]
+        estimate = _estimate_execution_shape_payload_bytes(
+            family=family,
+            rail=rail,
+            event_count=event_count,
+        )
+        artifacts.extend(
+            _PlannedExecutionArtifact(
+                category=family,
+                rail=rail,
+                event_count=event_count,
+                estimated_payload_bytes=estimate,
+            )
+            for _ in range(campaign_counts[family])
+        )
+    plan = _DevelopmentExecutionArtifactPlan(
+        artifacts=tuple(artifacts),
+        legitimate_event_count=legitimate_target,
+    )
+    if plan.artifact_count > 4_096:
+        raise ValueError("development execution artifact count exceeds profile limit")
+    if plan.max_artifact_payload_bytes >= _MAX_SINGLE_EXECUTION_ARTIFACT_BYTES:
+        raise ValueError("development execution artifact exceeds individual byte limit")
+    if plan.aggregate_payload_bytes >= _MAX_AGGREGATE_EXECUTION_ARTIFACT_BYTES:
+        raise ValueError("development execution artifacts exceed aggregate byte limit")
+    return plan
 
 
 class _PopulationIsolationError(ValueError):

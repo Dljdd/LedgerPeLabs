@@ -22,7 +22,7 @@ from apar.evaluation.v5_evaluation import (
 )
 from apar.evaluation.v5_population import V5DecisionRow, build_v5_corpus
 from apar.evaluation.v5_protocol import V5Profile, load_v5_development_protocol
-from apar.features.sentinel import SentinelFeatureCatalog
+from apar.features.sentinel import SentinelFeatureCatalog, build_sentinel_features
 from tests.evaluation.v5_safe_protocol import load_safe_v5_test_protocol
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -321,6 +321,10 @@ def test_four_arms_train_and_score_independent_component_paths() -> None:
     support = build_v5_arm_support_rows(test_rows)
     execution_artifacts = build_v5_execution_artifacts((test_execution,))
     trust_failures = [row.integrity_status == "fail" for row in test_rows]
+    test_feature_provenance = build_sentinel_features(
+        test_rows,
+        catalog=catalog,
+    ).provenance
     with pytest.raises(ValueError, match="evaluation.*overlap|training partition"):
         score(
             trained=trained,
@@ -331,6 +335,7 @@ def test_four_arms_train_and_score_independent_component_paths() -> None:
                 corpus.partitions["train"].executions
             ),
             trust_failures=[row.integrity_status == "fail" for row in train_rows],
+            feature_provenance=(),
         )
     scored = score(
         trained=trained,
@@ -339,6 +344,7 @@ def test_four_arms_train_and_score_independent_component_paths() -> None:
         support=support,
         execution_artifacts=execution_artifacts,
         trust_failures=trust_failures,
+        feature_provenance=test_feature_provenance,
     )
 
     assert tuple(scored.by_arm) == (
@@ -514,6 +520,7 @@ def test_four_arms_train_and_score_independent_component_paths() -> None:
         support=support,
         execution_artifacts=execution_artifacts,
         trust_failures=trust_failures,
+        feature_provenance=test_feature_provenance,
     )
     baseline = score(
         trained=trained,
@@ -522,6 +529,7 @@ def test_four_arms_train_and_score_independent_component_paths() -> None:
         support=support,
         execution_artifacts=execution_artifacts,
         trust_failures=trust_failures,
+        feature_provenance=test_feature_provenance,
     )
 
     def probabilities(result: V5ArmScore) -> tuple[float, ...]:
@@ -559,6 +567,7 @@ def test_four_arms_train_and_score_independent_component_paths() -> None:
         support=support,
         execution_artifacts=execution_artifacts,
         trust_failures=trust_failures,
+        feature_provenance=test_feature_provenance,
     )
     full_rule_row = rule_mutated.by_arm[V5Arm.FULL_SENTINEL].rows[
         rule_target_index
@@ -590,6 +599,34 @@ def test_four_arms_train_and_score_independent_component_paths() -> None:
         document["score_sha256"] = independent_digest(
             {key: value for key, value in document.items() if key != "score_sha256"}
         )
+
+    rule_score = scored.by_arm[V5Arm.RULES_ONLY]
+    for row in rule_score.rows:
+        if row.rule_components:
+            assert row.rule_evidence_source_ids == tuple(
+                sorted({row.support.event_id, *row.rule_source_event_ids})
+            )
+    source_row_index = next(
+        index
+        for index, row in enumerate(rule_score.rows)
+        if row.rule_source_event_ids
+    )
+    source_row = rule_score.rows[source_row_index]
+    source_row_max_json = rule_score.model_dump(mode="json")["rows"][
+        source_row_index
+    ]["rule_max_source_available_at"]
+    for source_ids, max_available_at in (
+        ((), None),
+        (("forged-event",), source_row_max_json),
+        ((source_row.support.event_id,), source_row_max_json),
+    ):
+        provenance_forge = deepcopy(rule_score.model_dump(mode="json"))
+        forged_row = provenance_forge["rows"][source_row_index]
+        forged_row["rule_source_event_ids"] = list(source_ids)
+        forged_row["rule_max_source_available_at"] = max_available_at
+        rebind_score(provenance_forge)
+        with pytest.raises(ValueError, match="provenance|source|strictly before"):
+            V5ArmScore.model_validate(provenance_forge)
 
     for threshold_name, forged_value in (
         ("disagreement_review", 0.150000001),

@@ -10,6 +10,8 @@ from base64 import b64decode
 from binascii import Error as Base64Error
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from datetime import datetime
+from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
@@ -43,6 +45,11 @@ from apar.defense.sentinel import (
     route_sentinel_components,
 )
 from apar.evaluation.v5_population import V5DecisionRow, V5ExecutionManifest
+from apar.features.sentinel import (
+    SentinelFeatureCatalog,
+    SentinelFeatureProvenance,
+    build_sentinel_features,
+)
 from apar.features.state import FeatureVector
 
 _INTERVENTION_ACTIONS = {
@@ -484,6 +491,114 @@ def _execution_manifest_map(
     return by_evidence
 
 
+def _execution_event_map_from_manifests(
+    manifests: Mapping[str, V5ExecutionManifest],
+) -> dict[str, PaymentEvent]:
+    events: dict[str, PaymentEvent] = {}
+    for manifest in manifests.values():
+        for record in manifest.event_records:
+            if record.event_id in events:
+                raise ValueError("execution artifacts contain duplicate event IDs")
+            events[record.event_id] = PaymentEvent.model_validate_json(record.event_json)
+    return events
+
+
+def _decision_rows_from_retained_support(
+    support: Sequence[V5ArmSupportRow],
+    manifests: Mapping[str, V5ExecutionManifest],
+) -> tuple[V5DecisionRow, ...]:
+    events = _execution_event_map_from_manifests(manifests)
+    rows: list[V5DecisionRow] = []
+    for item in support:
+        _support_trust_failure_from_manifests(item, dict(manifests))
+        event = events.get(item.event_id)
+        if event is None or event.decision_at is None:
+            raise ValueError("feature provenance target event cannot be resolved")
+        rows.append(
+            V5DecisionRow(
+                event_id=item.event_id,
+                payment_id=item.payment_id,
+                campaign_id=item.campaign_id,
+                family=item.family,
+                actor_id=item.actor_id,
+                counterparty_id=item.counterparty_id,
+                amount=Decimal(str(item.amount)),
+                currency=item.currency,
+                decision_at=event.decision_at,
+                is_fraud=bool(item.label),
+                rail=item.rail,
+                integrity_status=item.integrity_status,
+                lifecycle_state="",
+                source_command_id=item.source_command_id,
+                source_event_id=item.source_event_id,
+                execution_evidence_sha256=item.execution_evidence_sha256,
+                predictive_features={},
+            )
+        )
+    return tuple(rows)
+
+
+def validate_v5_rule_feature_provenance(
+    *,
+    support: Sequence[V5ArmSupportRow],
+    provenance: Sequence[SentinelFeatureProvenance],
+    catalog: SentinelFeatureCatalog,
+    artifacts: Sequence[V5ExecutionArtifact],
+) -> tuple[SentinelFeatureProvenance, ...]:
+    """Recompute exact RuleEngine history and resolve every retained source event."""
+    if type(catalog) is not SentinelFeatureCatalog:
+        raise TypeError("feature provenance requires an exact Sentinel catalog")
+    manifests = _execution_manifest_map(artifacts)
+    events = _execution_event_map_from_manifests(manifests)
+    validated = tuple(
+        SentinelFeatureProvenance.model_validate(item.model_dump(mode="python"))
+        for item in provenance
+    )
+    if tuple(item.event_id for item in validated) != tuple(
+        item.event_id for item in support
+    ):
+        raise ValueError("feature provenance order disagrees with evaluation support")
+    expected = derive_v5_rule_feature_provenance(
+        support=support,
+        catalog=catalog,
+        artifacts=artifacts,
+    )
+    if validated != expected:
+        raise ValueError("retained RuleEngine provenance disagrees with causal construction")
+    for item in validated:
+        target = events.get(item.event_id)
+        if target is None or target.decision_at is None:
+            raise ValueError("feature provenance target event cannot be resolved")
+        source_times: list[datetime] = []
+        for source_id in item.source_event_ids:
+            source = events.get(source_id)
+            if source is None:
+                raise ValueError("feature provenance source event cannot be resolved")
+            if source.available_at >= target.decision_at:
+                raise ValueError(
+                    "feature provenance source must be available strictly before target"
+                )
+            source_times.append(source.available_at)
+        expected_max = max(source_times) if source_times else None
+        if item.max_source_available_at != expected_max:
+            raise ValueError("feature provenance maximum source availability mismatch")
+    return validated
+
+
+def derive_v5_rule_feature_provenance(
+    *,
+    support: Sequence[V5ArmSupportRow],
+    catalog: SentinelFeatureCatalog,
+    artifacts: Sequence[V5ExecutionArtifact],
+) -> tuple[SentinelFeatureProvenance, ...]:
+    """Derive exact RuleEngine sources from retained execution support only."""
+    manifests = _execution_manifest_map(artifacts)
+    return build_sentinel_features(
+        _decision_rows_from_retained_support(support, manifests),
+        catalog=catalog,
+    ).provenance
+
+
 def replay_v5_rule_result(
     *,
     support: V5ArmSupportRow,
@@ -491,6 +606,9 @@ def replay_v5_rule_result(
     catalog_feature_values: Sequence[float],
     catalog_sha256: str,
     manifests: Mapping[str, V5ExecutionManifest],
+    source_event_ids: Sequence[str],
+    max_source_available_at: datetime | None,
+    resolved_events: Mapping[str, PaymentEvent] | None = None,
 ) -> RuleResult:
     """Execute the repository RuleEngine over one retained real event and feature row."""
     manifest = manifests.get(support.execution_evidence_sha256)
@@ -515,11 +633,30 @@ def replay_v5_rule_result(
     )
     if observed.decision_at is None:
         raise ValueError("rule observation lacks a decision timestamp")
+    canonical_source_ids = tuple(source_event_ids)
+    if canonical_source_ids != tuple(sorted(set(canonical_source_ids))):
+        raise ValueError("rule feature source IDs must be unique and canonical")
+    event_map = (
+        dict(resolved_events)
+        if resolved_events is not None
+        else _execution_event_map_from_manifests(manifests)
+    )
+    source_times: list[datetime] = []
+    for source_id in canonical_source_ids:
+        source = event_map.get(source_id)
+        if source is None:
+            raise ValueError("rule feature source event cannot be resolved")
+        if source.available_at >= observed.decision_at:
+            raise ValueError("rule feature source is not strictly before the decision")
+        source_times.append(source.available_at)
+    expected_max = max(source_times) if source_times else None
+    if max_source_available_at != expected_max:
+        raise ValueError("rule feature maximum source availability mismatch")
     vector = FeatureVector(
         event_id=observed.event_id,
         decision_at=observed.decision_at,
-        source_event_ids=(),
-        max_source_available_at=None,
+        source_event_ids=canonical_source_ids,
+        max_source_available_at=max_source_available_at,
         catalog_digest=catalog_sha256,
         values=values,
     )
@@ -1371,6 +1508,8 @@ class V5ArmRowEvidence(BaseModel):
     rule_vector_sha256: str | None = Field(
         default=None, pattern=r"^[0-9a-f]{64}$"
     )
+    rule_source_event_ids: tuple[str, ...]
+    rule_max_source_available_at: datetime | None
     rule_evidence_source_ids: tuple[str, ...] = ()
     action: SentinelAction
     probability: float = Field(ge=0.0, le=1.0)
@@ -1445,6 +1584,12 @@ class V5ArmRowEvidence(BaseModel):
             sorted(set(self.rule_evidence_source_ids))
         ):
             raise ValueError("rule evidence source IDs must be unique and canonical")
+        if self.rule_source_event_ids != tuple(sorted(set(self.rule_source_event_ids))):
+            raise ValueError("rule feature source IDs must be unique and canonical")
+        if (self.rule_max_source_available_at is None) != (
+            not self.rule_source_event_ids
+        ):
+            raise ValueError("rule feature source IDs and maximum availability disagree")
         if self.catalog_feature_sha256 != _canonical_digest(self.catalog_feature_values):
             raise ValueError("catalog feature values digest mismatch")
         if self.subset_feature_sha256 != _canonical_digest(self.subset_feature_values):
@@ -1514,6 +1659,32 @@ class V5ArmScore(BaseModel):
             artifact.load_model() for artifact in self.spec.model_artifacts
         )
         execution_manifests = _execution_manifest_map(self.execution_artifacts)
+        execution_events = _execution_event_map_from_manifests(execution_manifests)
+        provenance_items: list[SentinelFeatureProvenance] = []
+        for row in self.rows:
+            event = execution_events.get(row.support.event_id)
+            if event is None or event.decision_at is None:
+                raise ValueError("arm rule provenance target event cannot be resolved")
+            provenance_items.append(
+                SentinelFeatureProvenance(
+                    event_id=row.support.event_id,
+                    decision_at=event.decision_at,
+                    source_event_ids=row.rule_source_event_ids,
+                    max_source_available_at=row.rule_max_source_available_at,
+                )
+            )
+        provenance = tuple(provenance_items)
+        catalog = SentinelFeatureCatalog(
+            feature_names=self.spec.catalog_feature_names,
+            feature_groups=self.spec.catalog_feature_groups,
+            catalog_sha256=self.spec.catalog_sha256,
+        )
+        validate_v5_rule_feature_provenance(
+            support=tuple(row.support for row in self.rows),
+            provenance=provenance,
+            catalog=catalog,
+            artifacts=self.execution_artifacts,
+        )
         indices = _spec_feature_indices(self.spec)
         if self.spec.model:
             self._validate_replayed_thresholds(loaded_models, indices)
@@ -1544,6 +1715,9 @@ class V5ArmScore(BaseModel):
                     catalog_feature_values=row.catalog_feature_values,
                     catalog_sha256=self.spec.catalog_sha256,
                     manifests=execution_manifests,
+                    source_event_ids=row.rule_source_event_ids,
+                    max_source_available_at=row.rule_max_source_available_at,
+                    resolved_events=execution_events,
                 )
                 if self.spec.rules
                 else None
@@ -1872,6 +2046,15 @@ class V5ArmScoreSet(BaseModel):
         }
         if len(feature_streams) != 1:
             raise ValueError("arms do not share an identical full catalog feature stream")
+        provenance_streams = {
+            tuple(
+                (row.rule_source_event_ids, row.rule_max_source_available_at)
+                for row in result.rows
+            )
+            for result in results
+        }
+        if len(provenance_streams) != 1:
+            raise ValueError("arms do not share identical RuleEngine feature provenance")
         execution_streams = {
             tuple(artifact.model_dump_json() for artifact in result.execution_artifacts)
             for result in results
@@ -2391,8 +2574,11 @@ __all__ = [
     "build_v5_arm_support_rows",
     "build_v5_execution_artifacts",
     "build_v5_training_partition_evidence",
+    "derive_v5_rule_feature_provenance",
     "derive_v5_trust_failures",
     "evaluate_v5_arm",
     "load_v5_arm_configuration",
+    "replay_v5_rule_result",
     "run_v5_controls",
+    "validate_v5_rule_feature_provenance",
 ]

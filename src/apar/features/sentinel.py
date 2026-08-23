@@ -8,10 +8,12 @@ import math
 import re
 from collections import defaultdict
 from collections.abc import Sequence
+from datetime import datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from apar.evaluation.v5_population import V5DecisionRow
 
@@ -40,6 +42,19 @@ _FORBIDDEN_PREDICTIVE_TOKENS = frozenset(
         "targets",
     }
 )
+_RULE_PROVENANCE_FEATURES = frozenset(
+    {
+        "actor_count_1m",
+        "actor_count_10m",
+        "graph_counterparty_fanin",
+        "graph_actor_fanout",
+        "actor_amount_zscore_24h",
+        "counterparty_amount_zscore_24h",
+        "graph_shared_neighbor_count",
+        "pair_prior_count",
+        "dq_degraded_state",
+    }
+)
 
 
 def validate_sentinel_predictive_feature_names(
@@ -62,14 +77,19 @@ def validate_sentinel_predictive_feature_names(
     return names
 
 
-def _set_if_in_catalog(
+def _set_historical_feature(
     values: dict[str, float],
     catalog: SentinelFeatureCatalog,
+    source_rows: dict[str, V5DecisionRow],
     name: str,
     value: float,
+    sources: Sequence[V5DecisionRow],
 ) -> None:
-    if name in catalog.feature_names:
-        values[name] = value
+    if name not in catalog.feature_names:
+        return
+    values[name] = value
+    if name in _RULE_PROVENANCE_FEATURES:
+        source_rows.update((source.event_id, source) for source in sources)
 
 
 class SentinelFeatureCatalog(BaseModel):
@@ -105,8 +125,42 @@ class SentinelFeatureBatch(BaseModel):
 
     rows: tuple[dict[str, float], ...]
     matrix: list[list[float]] = Field(default_factory=list)
+    provenance: tuple[SentinelFeatureProvenance, ...]
     batch_sha256: str
     catalog_sha256: str
+
+
+class SentinelFeatureProvenance(BaseModel):
+    """Immutable historical sources actually used by one Sentinel rule row."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    event_id: str
+    decision_at: datetime
+    source_event_ids: tuple[str, ...]
+    max_source_available_at: datetime | None
+
+    @field_validator("decision_at", "max_source_available_at")
+    @classmethod
+    def timestamps_are_utc(cls, value: datetime | None) -> datetime | None:
+        if value is not None and (
+            value.tzinfo is None or value.utcoffset() != timedelta(0)
+        ):
+            raise ValueError("feature provenance timestamps must be UTC")
+        return value
+
+    @model_validator(mode="after")
+    def sources_are_canonical_and_strictly_prior(self) -> Self:
+        if self.source_event_ids != tuple(sorted(set(self.source_event_ids))):
+            raise ValueError("feature source event IDs must be unique and canonical")
+        if (self.max_source_available_at is None) != (not self.source_event_ids):
+            raise ValueError("feature source maximum and source IDs must agree")
+        if (
+            self.max_source_available_at is not None
+            and self.max_source_available_at >= self.decision_at
+        ):
+            raise ValueError("feature sources must be available strictly before decision")
+        return self
 
 
 def build_sentinel_features(
@@ -117,6 +171,7 @@ def build_sentinel_features(
     """Build a causal feature matrix using strict history-only cohort processing."""
     feature_rows: list[dict[str, float]] = []
     matrix: list[list[float]] = []
+    provenance: list[SentinelFeatureProvenance] = []
 
     # Build history-only indexes.
     actor_events: dict[str, list[V5DecisionRow]] = defaultdict(list)
@@ -125,6 +180,7 @@ def build_sentinel_features(
     all_edges_seen = 0
     actor_nodes_seen: set[str] = set()
     cp_nodes_seen: set[str] = set()
+    all_prior_rows: list[V5DecisionRow] = []
 
     # Sort rows into canonical timestamp cohorts.
     sorted_rows = sorted(rows, key=lambda r: (r.decision_at, r.event_id))
@@ -147,6 +203,14 @@ def build_sentinel_features(
         for row in cohort:
             now = row.decision_at
             values = dict(row.predictive_features)
+            source_rows: dict[str, V5DecisionRow] = {}
+            set_historical_feature = partial(
+                _set_historical_feature,
+                values,
+                catalog,
+                source_rows,
+            )
+
             total_minutes = row.decision_at.hour * 60 + row.decision_at.minute
             values["txn_hour_sin"] = math.sin(2 * math.pi * total_minutes / (24 * 60))
             values["txn_hour_cos"] = math.cos(2 * math.pi * total_minutes / (24 * 60))
@@ -163,39 +227,65 @@ def build_sentinel_features(
             for window_s, name in velocity_windows:
                 features_key = f"actor_count_{name}"
                 if features_key in catalog.feature_names:
-                    count = sum(
-                        1 for r in prior_actor
+                    window_rows = [
+                        r
+                        for r in prior_actor
                         if (now - r.decision_at).total_seconds() <= window_s
+                    ]
+                    set_historical_feature(
+                        features_key,
+                        float(len(window_rows)),
+                        window_rows,
                     )
-                    values[features_key] = float(count)
 
-            actor_amount_1h = sum(
-                float(r.amount) for r in prior_actor
+            actor_rows_1h = [
+                r for r in prior_actor
                 if (now - r.decision_at).total_seconds() <= 3600
+            ]
+            set_historical_feature(
+                "actor_amount_1h",
+                sum(float(r.amount) for r in actor_rows_1h),
+                actor_rows_1h,
             )
-            _set_if_in_catalog(values, catalog, "actor_amount_1h", actor_amount_1h)
-            actor_amount_24h = sum(
-                float(r.amount) for r in prior_actor
+            actor_rows_24h = [
+                r for r in prior_actor
                 if (now - r.decision_at).total_seconds() <= 86400
+            ]
+            set_historical_feature(
+                "actor_amount_24h",
+                sum(float(r.amount) for r in actor_rows_24h),
+                actor_rows_24h,
             )
-            _set_if_in_catalog(values, catalog, "actor_amount_24h", actor_amount_24h)
 
             actor_history = actor_events.get(row.actor_id, [])
             first_seen = min((r.decision_at for r in actor_history), default=now)
             last_prior = max((r.decision_at for r in prior_actor), default=None)
             seconds_since_first = (now - first_seen).total_seconds()
-            _set_if_in_catalog(values, catalog, "actor_seconds_since_first", seconds_since_first)
+            set_historical_feature(
+                "actor_seconds_since_first",
+                seconds_since_first,
+                actor_history,
+            )
             seconds_since_last = (
                 (now - last_prior).total_seconds() if last_prior else -1.0
             )
-            _set_if_in_catalog(values, catalog, "actor_seconds_since_last", seconds_since_last)
+            set_historical_feature(
+                "actor_seconds_since_last",
+                seconds_since_last,
+                prior_actor,
+            )
 
             distinct_cps = len({r.counterparty_id for r in prior_actor})
-            _set_if_in_catalog(
-                values, catalog,
-                "actor_distinct_counterparties_24h", float(distinct_cps),
+            set_historical_feature(
+                "actor_distinct_counterparties_24h",
+                float(distinct_cps),
+                prior_actor,
             )
-            _set_if_in_catalog(values, catalog, "graph_actor_fanout", float(distinct_cps))
+            set_historical_feature(
+                "graph_actor_fanout",
+                float(distinct_cps),
+                prior_actor,
+            )
 
             prior_cp = [
                 r for r in counterparty_events.get(row.counterparty_id, [])
@@ -203,50 +293,69 @@ def build_sentinel_features(
                 and r.event_id != row.event_id
                 and (now - r.decision_at).total_seconds() <= 86400
             ]
-            _set_if_in_catalog(values, catalog, "counterparty_count_1h",
-                float(sum(1 for r in prior_cp if (now - r.decision_at).total_seconds() <= 3600)))
-            _set_if_in_catalog(values, catalog, "counterparty_count_24h", float(len(prior_cp)))
-            _set_if_in_catalog(values, catalog, "counterparty_amount_24h",
-                sum(float(r.amount) for r in prior_cp))
+            prior_cp_1h = [
+                r
+                for r in prior_cp
+                if (now - r.decision_at).total_seconds() <= 3600
+            ]
+            set_historical_feature(
+                "counterparty_count_1h", float(len(prior_cp_1h)), prior_cp_1h
+            )
+            set_historical_feature(
+                "counterparty_count_24h", float(len(prior_cp)), prior_cp
+            )
+            set_historical_feature(
+                "counterparty_amount_24h",
+                sum(float(r.amount) for r in prior_cp),
+                prior_cp,
+            )
             distinct_actors = len({
                 r.actor_id for r in prior_cp
                 if (now - r.decision_at).total_seconds() <= 86400
             })
-            _set_if_in_catalog(
-                values, catalog,
-                "counterparty_distinct_actors_24h", float(distinct_actors),
+            set_historical_feature(
+                "counterparty_distinct_actors_24h",
+                float(distinct_actors),
+                prior_cp,
             )
-            _set_if_in_catalog(values, catalog, "graph_counterparty_fanin", float(distinct_actors))
+            set_historical_feature(
+                "graph_counterparty_fanin",
+                float(distinct_actors),
+                prior_cp,
+            )
 
             pair_key = (row.actor_id, row.counterparty_id)
             prior_pair = [
                 r for r in pair_events.get(pair_key, [])
                 if r.decision_at < now and r.event_id != row.event_id
             ]
-            _set_if_in_catalog(values, catalog, "pair_prior_count", float(len(prior_pair)))
+            set_historical_feature(
+                "pair_prior_count", float(len(prior_pair)), prior_pair
+            )
             pair_seconds_since_last = (
                 (now - max(r.decision_at for r in prior_pair)).total_seconds()
                 if prior_pair else -1.0
             )
-            _set_if_in_catalog(
-                values, catalog, "pair_seconds_since_last", pair_seconds_since_last
+            set_historical_feature(
+                "pair_seconds_since_last", pair_seconds_since_last, prior_pair
             )
             repeated_edge = float(min(len(prior_pair), 5.0))
-            _set_if_in_catalog(values, catalog, "graph_repeated_edge", repeated_edge)
+            set_historical_feature("graph_repeated_edge", repeated_edge, prior_pair)
 
-            amounts_24h = [
-                float(r.amount) for r in prior_actor
-                if (now - r.decision_at).total_seconds() <= 86400
-            ]
+            amounts_24h = [float(r.amount) for r in actor_rows_24h]
             current_amount = float(row.amount)
             if len(amounts_24h) >= 3:
                 mean_amt = sum(amounts_24h) / len(amounts_24h)
                 variance = sum((a - mean_amt) ** 2 for a in amounts_24h) / len(amounts_24h)
                 std = max(math.sqrt(max(variance, 0.01)), 0.01)
                 zscore = (current_amount - mean_amt) / std
-                _set_if_in_catalog(values, catalog, "actor_amount_zscore_24h", zscore)
+                set_historical_feature(
+                    "actor_amount_zscore_24h", zscore, actor_rows_24h
+                )
             else:
-                _set_if_in_catalog(values, catalog, "actor_amount_zscore_24h", 0.0)
+                set_historical_feature(
+                    "actor_amount_zscore_24h", 0.0, actor_rows_24h
+                )
 
             # Graph features: snapshots of the PRIOR graph only.
             cp_actors_prior = {
@@ -257,19 +366,32 @@ def build_sentinel_features(
                 1 for other_actor in cp_actors_prior
                 if other_actor != row.actor_id
             )
-            _set_if_in_catalog(values, catalog, "graph_shared_neighbor_count", float(shared))
-            _set_if_in_catalog(values, catalog, "graph_two_hop_reach", float(min(shared * 2, 20.0)))
+            graph_cp_rows = [
+                r
+                for r in counterparty_events.get(row.counterparty_id, [])
+                if r.decision_at < now
+            ]
+            set_historical_feature(
+                "graph_shared_neighbor_count", float(shared), graph_cp_rows
+            )
+            set_historical_feature(
+                "graph_two_hop_reach", float(min(shared * 2, 20.0)), graph_cp_rows
+            )
 
             recent_burst = [
                 r for r in prior_actor
                 if (now - r.decision_at).total_seconds() <= 60
             ]
             burst_motif = float(min(len(recent_burst), 10.0))
-            _set_if_in_catalog(values, catalog, "graph_burst_motif", burst_motif)
+            set_historical_feature("graph_burst_motif", burst_motif, recent_burst)
             prior_graph_size = len(actor_nodes_seen | cp_nodes_seen)
-            _set_if_in_catalog(values, catalog, "graph_component_size", float(prior_graph_size))
+            set_historical_feature(
+                "graph_component_size", float(prior_graph_size), all_prior_rows
+            )
             graph_nodes = max(len(actor_nodes_seen) * len(cp_nodes_seen), 1)
-            _set_if_in_catalog(values, catalog, "graph_edge_density", all_edges_seen / graph_nodes)
+            set_historical_feature(
+                "graph_edge_density", all_edges_seen / graph_nodes, all_prior_rows
+            )
 
             # Canonicalize before hashing so the persisted numeric matrix can
             # independently reproduce the feature-batch content address.
@@ -278,6 +400,20 @@ def build_sentinel_features(
                 raise ValueError(f"non-finite feature value in event {row.event_id}")
             feature_rows.append(values)
             matrix.append(vector)
+            source_event_ids = tuple(sorted(source_rows))
+            max_source_available_at = (
+                max(source_rows[event_id].decision_at for event_id in source_event_ids)
+                if source_event_ids
+                else None
+            )
+            provenance.append(
+                SentinelFeatureProvenance(
+                    event_id=row.event_id,
+                    decision_at=now,
+                    source_event_ids=source_event_ids,
+                    max_source_available_at=max_source_available_at,
+                )
+            )
 
         # Phase 2: update state with all events from this cohort AFTER emitting features.
         for row in cohort:
@@ -287,6 +423,7 @@ def build_sentinel_features(
             actor_nodes_seen.add(row.actor_id)
             cp_nodes_seen.add(row.counterparty_id)
             all_edges_seen += 1
+            all_prior_rows.append(row)
 
     content = json.dumps(
         {"rows": matrix, "names": list(catalog.feature_names)},
@@ -295,6 +432,7 @@ def build_sentinel_features(
     return SentinelFeatureBatch(
         rows=tuple(feature_rows),
         matrix=matrix,
+        provenance=tuple(provenance),
         batch_sha256=hashlib.sha256(content).hexdigest(),
         catalog_sha256=catalog.catalog_sha256,
 )
@@ -303,6 +441,7 @@ def build_sentinel_features(
 __all__ = [
     "SentinelFeatureBatch",
     "SentinelFeatureCatalog",
+    "SentinelFeatureProvenance",
     "build_sentinel_features",
     "validate_sentinel_predictive_feature_names",
 ]

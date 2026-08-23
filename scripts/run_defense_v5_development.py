@@ -134,9 +134,14 @@ def _score_all_arms_and_evaluate(
     x_threshold, y_threshold, threshold_event_ids, _, _, threshold_batch = (
         _build_partition_matrix(threshold_decisions, catalog)
     )
-    x_test, y_test, test_event_ids, test_campaign_ids, test_amounts, _ = _build_partition_matrix(
-        dev_test_decisions, catalog
-    )
+    (
+        x_test,
+        y_test,
+        test_event_ids,
+        test_campaign_ids,
+        test_amounts,
+        test_batch,
+    ) = _build_partition_matrix(dev_test_decisions, catalog)
     test_trust_failures = _derive_trust_failures(dev_test_decisions)
 
     train_fraud = int(y_train.sum())
@@ -214,6 +219,7 @@ def _score_all_arms_and_evaluate(
         support=support,
         execution_artifacts=build_v5_execution_artifacts(dev_test_executions),
         trust_failures=test_trust_failures,
+        feature_provenance=test_batch.provenance,
     )
     if tuple(item.event_id for item in support) != tuple(test_event_ids):
         raise ValueError("evaluation support order disagrees with feature metadata")
