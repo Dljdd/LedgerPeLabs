@@ -927,7 +927,7 @@ class CampaignGenerator:
             agentic_kinds = (*mandatory, *extras, *controls)
 
         for index in range(params.payment_count):
-            payment_id = f"{family}:{uuid5(namespace, f'payment:{index}')}"
+            payment_id = f"payment:{uuid5(namespace, f'payment:{index}')}"
             illicit = labels[index]
             if family == "app_scam_mule":
                 attack_count = illicit_count
@@ -1422,7 +1422,7 @@ class CampaignGenerator:
         private_key = Ed25519PrivateKey.from_private_bytes(self._rng.bytes(32))
         public_key = private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
         agent_id = f"synthetic-agent-{plans[0].actor.entity_id}"
-        key_id = "synthetic-key-1"
+        key_id = f"synthetic-key-{params.campaign_id}"
         merchant = next(
             entity
             for entity in population.entities
@@ -1437,14 +1437,14 @@ class CampaignGenerator:
             user_ref=plans[0].payer_account,
             user_entity_id=plans[0].actor.entity_id,
             beneficiary_entity_id=merchant.entity_id,
-            consent_ref="synthetic-consent-1",
+            consent_ref=f"synthetic-consent-{params.campaign_id}",
             merchant_id=merchant.entity_id,
             payee_id=cast(str, merchant.account_id),
             cart_hash=hashlib.sha256(b"synthetic-cart-v1").hexdigest(),
             payment_intent_hash=hashlib.sha256(b"synthetic-intent-v1").hexdigest(),
             permitted_categories=("TRAVEL",),
             permitted_products=("synthetic-flight",),
-            credential_id="synthetic-token-1",
+            credential_id=f"synthetic-token-{params.campaign_id}",
             credential_scope="single_merchant_single_use",
             required_authentication=AuthenticationRequirement.STEP_UP,
             max_amount=mandate_cap,
@@ -1464,15 +1464,23 @@ class CampaignGenerator:
         first_control_index = next(
             index for index, plan in enumerate(plans) if plan.mutation_kind == "valid_control"
         )
-        first_auth_ref = f"synthetic-auth-{first_control_index}"
-        first_nonce = f"synthetic-nonce-{first_control_index}"
+        first_auth_ref = f"synthetic-auth-{params.campaign_id}-{first_control_index}"
+        first_nonce = f"synthetic-nonce-{params.campaign_id}-{first_control_index}"
         for index, plan in enumerate(plans):
             kind = plan.mutation_kind
             if kind == "auth_missing":
                 continue
-            request_id = f"agentic-request-{index}"
-            nonce = first_nonce if kind == "nonce_replay" else f"synthetic-nonce-{index}"
-            auth_ref = first_auth_ref if kind == "auth_replay" else f"synthetic-auth-{index}"
+            request_id = f"agentic-request-{params.campaign_id}-{index}"
+            nonce = (
+                first_nonce
+                if kind == "nonce_replay"
+                else f"synthetic-nonce-{params.campaign_id}-{index}"
+            )
+            auth_ref = (
+                first_auth_ref
+                if kind == "auth_replay"
+                else f"synthetic-auth-{params.campaign_id}-{index}"
+            )
             if kind == "auth_replay":
                 continue
             intent_hash = (
@@ -1510,11 +1518,23 @@ class CampaignGenerator:
         previous_receipt = ""
         for index, (plan, amount) in enumerate(zip(plans, amounts, strict=True)):
             kind = plan.mutation_kind
-            request_id = f"agentic-request-{index}"
-            nonce = first_nonce if kind == "nonce_replay" else f"synthetic-nonce-{index}"
-            auth_ref = first_auth_ref if kind == "auth_replay" else f"synthetic-auth-{index}"
+            request_id = f"agentic-request-{params.campaign_id}-{index}"
+            nonce = (
+                first_nonce
+                if kind == "nonce_replay"
+                else f"synthetic-nonce-{params.campaign_id}-{index}"
+            )
+            auth_ref = (
+                first_auth_ref
+                if kind == "auth_replay"
+                else f"synthetic-auth-{params.campaign_id}-{index}"
+            )
             request_mandate = (
-                mandate.model_copy(update={"consent_ref": "substituted-mandate-consent"})
+                mandate.model_copy(
+                    update={
+                        "consent_ref": f"substituted-mandate-consent-{params.campaign_id}"
+                    }
+                )
                 if kind == "mandate"
                 else mandate
             )
@@ -1558,7 +1578,7 @@ class CampaignGenerator:
                 category="RETAIL" if kind == "category" else "TRAVEL",
                 product_id="substituted-product" if kind == "product" else "synthetic-flight",
                 credential_id=(
-                    "synthetic-token-substituted"
+                    f"synthetic-token-substituted-{params.campaign_id}"
                     if kind == "credential"
                     else mandate.credential_id
                 ),
@@ -1568,7 +1588,7 @@ class CampaignGenerator:
                     else mandate.credential_scope
                 ),
                 consent_ref=(
-                    "synthetic-consent-substituted"
+                    f"synthetic-consent-substituted-{params.campaign_id}"
                     if kind == "consent"
                     else mandate.consent_ref
                 ),
@@ -1764,7 +1784,7 @@ class CampaignGenerator:
             f"apar:campaign:{params.campaign_id}:{params.seed}",
         )
         expected_payment_ids = tuple(
-            f"{family}:{uuid5(payment_namespace, f'payment:{index}')}"
+            f"payment:{uuid5(payment_namespace, f'payment:{index}')}"
             for index in range(params.payment_count)
         )
         if payment_ids != expected_payment_ids:
@@ -1797,7 +1817,7 @@ class CampaignGenerator:
                     raise ValueError("trace ID differs from canonical lineage")
                 if family == "agentic_intent_abuse" and command.payload.get(
                     "request_id"
-                ) != f"agentic-request-{position}":
+                ) != f"agentic-request-{params.campaign_id}-{position}":
                     raise ValueError("agentic request ID differs from canonical lineage")
 
         entity_by_id = {entity.entity_id: entity for entity in population.entities}

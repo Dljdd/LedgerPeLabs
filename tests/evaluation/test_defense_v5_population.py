@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pytest
 
+from apar.defense.sentinel import train_sentinel_defender
 from apar.evaluation.v5_population import (
     V5Corpus,
     V5ExecutionManifest,
@@ -27,6 +29,110 @@ def smoke_corpus() -> V5Corpus:
 
 
 class TestSmokeCorpus:
+    def test_test_only_mock_production_target_uses_declared_dev_test_cardinality(
+        self,
+    ) -> None:
+        """Changing a declared dev-test target must change its partition target."""
+        from apar.evaluation.v5_population import _partition_legitimate_target
+
+        mock_protocol = PROTOCOL.model_copy(
+            update={"production_dev_test_legitimate": 73}
+        )
+        assert _partition_legitimate_target(
+            mock_protocol,
+            profile=V5Profile.PRODUCTION,
+            partition_name="development_test",
+        ) == 73
+
+    def test_pre_execution_legitimate_contract_does_not_claim_success(self) -> None:
+        """Pre-execution ground truth must not fabricate replay or settlement success."""
+        from apar.evaluation.v5_population import _card_legitimate_commands
+
+        _commands, _schedule, _population, contract = _card_legitimate_commands(
+            partition_name="train",
+            partition_seed=PROTOCOL.seeds.train,
+        )
+        assert contract.class_labels and not any(contract.class_labels)
+        assert not contract.replay_succeeded
+        assert not contract.ledger_conserved
+        assert contract.settled_value == 0
+
+    def test_realized_legitimate_cardinality_honors_profile_partition_targets(
+        self,
+        smoke_corpus: V5Corpus,
+    ) -> None:
+        """Ignoring a requested legitimate count must make this test fail."""
+        expected = {
+            "train": 50,
+            "calibration": 50,
+            "threshold": 50,
+            "development_test": 50,
+            "hardening_train": 25,
+            "adaptive_holdout": 25,
+        }
+        for name, target in expected.items():
+            actual = sum(
+                row.family == "legitimate"
+                for row in smoke_corpus.partitions[name].decisions
+            )
+            assert actual == target, f"{name}: {actual} != requested {target}"
+
+    def test_manifest_retains_complete_isolated_identity_and_trust_domains(
+        self,
+        smoke_corpus: V5Corpus,
+    ) -> None:
+        """Reusing device, credential, merchant, or payee IDs must make this fail."""
+        domain_names = (
+            "account_ids",
+            "device_ids",
+            "credential_ids",
+            "merchant_ids",
+            "payee_ids",
+        )
+        values = {
+            name: {
+                domain: {
+                    value
+                    for execution in partition.executions
+                    for value in getattr(execution, domain)
+                }
+                for domain in domain_names
+            }
+            for name, partition in smoke_corpus.partitions.items()
+        }
+        names = tuple(values)
+        for index, left in enumerate(names):
+            for right in names[index + 1 :]:
+                for domain in domain_names:
+                    assert not (values[left][domain] & values[right][domain]), (
+                        f"{domain} overlap {left}/{right}"
+                    )
+        for execution in smoke_corpus.partitions["train"].executions:
+            assert execution.opening_balances
+            if execution.rail == "agentic":
+                assert execution.trust_registry is not None
+                assert execution.trust_registry.authentication_evidence_json
+
+    def test_manifest_rejects_tampered_record_cross_links(
+        self,
+        smoke_corpus: V5Corpus,
+    ) -> None:
+        """Dropping record-to-lineage validation must make this test fail."""
+        manifest = next(
+            execution
+            for execution in smoke_corpus.partitions["train"].executions
+            if execution.rail == "agentic"
+        )
+        document = manifest.model_dump(mode="python")
+        tampered_event = dict(document["event_records"][0])
+        tampered_event["payment_id"] = "payment:tampered"
+        document["event_records"] = (
+            tampered_event,
+            *document["event_records"][1:],
+        )
+        with pytest.raises(ValueError, match="payment lineage"):
+            V5ExecutionManifest.model_validate(document)
+
     def test_legitimate_rows_are_projected_from_real_execution_evidence(
         self,
         smoke_corpus: V5Corpus,
@@ -67,7 +173,10 @@ class TestSmokeCorpus:
         assert {manifest.rail for manifest in legitimate} == {"card", "a2a", "agentic"}
         for manifest in legitimate:
             assert manifest.event_records
-            assert manifest.ledger_postings or manifest.rail == "agentic"
+            assert manifest.ledger_postings or all(
+                event.event_type == "authorization_declined"
+                for event in manifest.event_records
+            )
             if manifest.rail == "agentic":
                 assert manifest.trust_records
                 assert all(record.request_json for record in manifest.trust_records)
@@ -139,6 +248,29 @@ class TestSmokeCorpus:
             state_labels = {row.is_fraud for row in rows if row.lifecycle_state == state}
             assert state_labels != {True}, f"{state} is a fraud-only fingerprint"
 
+    def test_every_ordinary_numeric_feature_has_empirical_overlap(
+        self,
+        smoke_corpus: V5Corpus,
+    ) -> None:
+        """A rail, amount, velocity, graph, or lifecycle proxy must not split a partition."""
+        catalog = SentinelFeatureCatalog.default()
+        for partition_name in ("train", "calibration", "threshold", "development_test"):
+            rows = smoke_corpus.partitions[partition_name].decisions
+            feature_batch = build_sentinel_features(rows, catalog=catalog)
+            labels = np.asarray([row.is_fraud for row in rows], dtype=bool)
+            for index, name in enumerate(catalog.feature_names):
+                values = np.asarray([row[index] for row in feature_batch.matrix])
+                legitimate = values[~labels]
+                fraud = values[labels]
+                assert not (
+                    legitimate.max() < fraud.min() or fraud.max() < legitimate.min()
+                ), f"{partition_name}/{name} perfectly separates class by threshold"
+            assert {row.source_event_id.count("-") for row in rows} == {4}
+            assert {row.payment_id.split(":", 1)[0] for row in rows} == {"payment"}
+            assert {row.source_command_id.split(":", 1)[0] for row in rows} == {"sha256"}
+            assert len({row.lifecycle_state for row in rows if not row.is_fraud}) > 1
+            assert len({row.lifecycle_state for row in rows if row.is_fraud}) > 1
+
     def test_identity_renaming_preserves_numeric_feature_matrix(
         self,
         smoke_corpus: V5Corpus,
@@ -165,6 +297,54 @@ class TestSmokeCorpus:
         original = build_sentinel_features(rows, catalog=catalog)
         renamed_features = build_sentinel_features(renamed, catalog=catalog)
         assert renamed_features.matrix == original.matrix
+
+    def test_identity_renaming_preserves_real_model_predictions(
+        self,
+        smoke_corpus: V5Corpus,
+    ) -> None:
+        """Using raw identities in a trained prediction path must make this fail."""
+        catalog = SentinelFeatureCatalog.default()
+        partitions = smoke_corpus.partitions
+        def matrix(name: str) -> np.ndarray:
+            return np.asarray(
+                build_sentinel_features(partitions[name].decisions, catalog=catalog).matrix
+            )
+
+        defender = train_sentinel_defender(
+            x_train=matrix("train"),
+            y_train=np.asarray([row.is_fraud for row in partitions["train"].decisions]),
+            x_calibration=matrix("calibration"),
+            y_calibration=np.asarray(
+                [row.is_fraud for row in partitions["calibration"].decisions]
+            ),
+            x_threshold=matrix("threshold"),
+            y_threshold=np.asarray([row.is_fraud for row in partitions["threshold"].decisions]),
+            catboost_seeds=PROTOCOL.seeds.catboost_seeds,
+            bootstrap_seed=PROTOCOL.seeds.bootstrap,
+        )
+        rows = partitions["development_test"].decisions
+        identity_map = {
+            value: f"identity-{index}"
+            for index, value in enumerate(
+                sorted({r.actor_id for r in rows} | {r.counterparty_id for r in rows})
+            )
+        }
+        renamed = tuple(
+            row.model_copy(
+                update={
+                    "actor_id": identity_map[row.actor_id],
+                    "counterparty_id": identity_map[row.counterparty_id],
+                }
+            )
+            for row in rows
+        )
+        original = defender.decide_batch(
+            np.asarray(build_sentinel_features(rows, catalog=catalog).matrix)
+        )
+        renamed_predictions = defender.decide_batch(
+            np.asarray(build_sentinel_features(renamed, catalog=catalog).matrix)
+        )
+        assert renamed_predictions == original
 
     def test_partition_rejects_unbacked_campaign_row(
         self,
