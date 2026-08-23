@@ -570,6 +570,115 @@ def test_four_arms_train_and_score_independent_component_paths() -> None:
     assert scored.model_dump_json() == scored.model_dump_json()
 
     full_score = scored.by_arm[V5Arm.FULL_SENTINEL]
+    source_spec = full_score.spec.model_dump(mode="json")
+
+    too_many_members = deepcopy(source_spec)
+    too_many_members["model_seeds"] = list(range(1_101, 1_107))
+    too_many_members["model_artifacts"] = [source_spec["model_artifacts"][0]] * 6
+    too_many_members["model_artifact_sha256"] = [
+        source_spec["model_artifact_sha256"][0]
+    ] * 6
+    too_many_members["calibrator_manifests"] = [
+        source_spec["calibrator_manifests"][0]
+    ] * 6
+    too_many_members["calibrator_artifact_sha256"] = [
+        source_spec["calibrator_artifact_sha256"][0]
+    ] * 6
+    too_many_members["spec_sha256"] = independent_digest(
+        {
+            key: value
+            for key, value in too_many_members.items()
+            if key != "spec_sha256"
+        }
+    )
+    with pytest.raises(ValueError, match="model member count.*production profile"):
+        V5ArmSpecification.model_validate(too_many_members)
+
+    too_few_members = deepcopy(source_spec)
+    too_few_members["model_seeds"] = [1_101, 1_102]
+    too_few_members["model_artifacts"] = source_spec["model_artifacts"][:2]
+    too_few_members["model_artifact_sha256"] = source_spec[
+        "model_artifact_sha256"
+    ][:2]
+    too_few_members["calibrator_manifests"] = source_spec[
+        "calibrator_manifests"
+    ][:2]
+    too_few_members["calibrator_artifact_sha256"] = source_spec[
+        "calibrator_artifact_sha256"
+    ][:2]
+    too_few_members["spec_sha256"] = independent_digest(
+        {
+            key: value
+            for key, value in too_few_members.items()
+            if key != "spec_sha256"
+        }
+    )
+    with pytest.raises(ValueError, match="model member count.*production profile"):
+        V5ArmSpecification.model_validate(too_few_members)
+
+    knot_count = 20_001
+    aggregate_calibrator = {
+        "x_thresholds": [
+            index / (knot_count - 1) for index in range(knot_count)
+        ],
+        "y_thresholds": [
+            index / (knot_count - 1) for index in range(knot_count)
+        ],
+        "out_of_bounds": "clip",
+    }
+    aggregate_calibrator["artifact_sha256"] = independent_digest(
+        aggregate_calibrator
+    )
+    excessive_aggregate_knots = deepcopy(source_spec)
+    excessive_aggregate_knots["model_seeds"] = list(range(1_201, 1_206))
+    excessive_aggregate_knots["model_artifacts"] = [
+        source_spec["model_artifacts"][0]
+    ] * 5
+    excessive_aggregate_knots["model_artifact_sha256"] = [
+        source_spec["model_artifact_sha256"][0]
+    ] * 5
+    excessive_aggregate_knots["calibrator_manifests"] = [
+        aggregate_calibrator
+    ] * 5
+    excessive_aggregate_knots["calibrator_artifact_sha256"] = [
+        aggregate_calibrator["artifact_sha256"]
+    ] * 5
+    excessive_aggregate_knots["spec_sha256"] = independent_digest(
+        {
+            key: value
+            for key, value in excessive_aggregate_knots.items()
+            if key != "spec_sha256"
+        }
+    )
+    with pytest.raises(ValueError, match="aggregate calibrator knot count.*limit"):
+        V5ArmSpecification.model_validate(excessive_aggregate_knots)
+
+    synchronized_novelty_expansion = deepcopy(source_spec)
+    novelty_document = synchronized_novelty_expansion["novelty_manifest"]
+    original_feature_count = novelty_document["feature_count"]
+    novelty_document["feature_count"] = original_feature_count + 1
+    for tree in novelty_document["trees"]:
+        tree["estimator_features"].append(original_feature_count)
+    novelty_document["artifact_sha256"] = independent_digest(
+        {
+            key: value
+            for key, value in novelty_document.items()
+            if key != "artifact_sha256"
+        }
+    )
+    synchronized_novelty_expansion["novelty_artifact_sha256"] = novelty_document[
+        "artifact_sha256"
+    ]
+    synchronized_novelty_expansion["spec_sha256"] = independent_digest(
+        {
+            key: value
+            for key, value in synchronized_novelty_expansion.items()
+            if key != "spec_sha256"
+        }
+    )
+    with pytest.raises(ValueError, match="novelty feature count.*arm features"):
+        V5ArmSpecification.model_validate(synchronized_novelty_expansion)
+
     oversized_rows = full_score.model_copy(
         update={"rows": (full_score.rows[0],) * 100_001}
     )

@@ -51,6 +51,8 @@ _MAX_FEATURE_BATCH_BYTES = 134_217_728
 _MAX_FEATURE_MATRIX_CELLS = 10_000_000
 _MAX_SCORE_ROWS = 100_000
 _MAX_CATBOOST_ARTIFACT_BYTES = 67_108_864
+_MIN_MODEL_MEMBERS = 3
+_MAX_MODEL_MEMBERS = 5
 _MAX_ISOLATION_TREES = 512
 _MAX_ISOLATION_NODES = 262_144
 _MAX_CALIBRATOR_KNOTS = _MAX_SCORE_ROWS
@@ -942,6 +944,18 @@ class V5ArmSpecification(BaseModel):
         )
         if model_artifact_bytes > _MAX_CATBOOST_ARTIFACT_BYTES:
             raise ValueError("CatBoost artifact bytes exceed production profile limit")
+        model_member_count = len(self.model_seeds)
+        if self.model and not (
+            _MIN_MODEL_MEMBERS <= model_member_count <= _MAX_MODEL_MEMBERS
+        ):
+            raise ValueError("model member count exceeds production profile bounds")
+        aggregate_calibrator_knots = sum(
+            len(manifest.x_thresholds) for manifest in self.calibrator_manifests
+        )
+        if aggregate_calibrator_knots > _MAX_CALIBRATOR_KNOTS:
+            raise ValueError(
+                "aggregate calibrator knot count exceeds production profile limit"
+            )
         if self.spec_sha256 != self.computed_digest():
             raise ValueError("arm specification digest mismatch")
         if Counter(self.graph_feature_names + self.non_graph_feature_names) != Counter(
@@ -1072,6 +1086,19 @@ class V5ArmSpecification(BaseModel):
                 != self.novelty_manifest.artifact_sha256
             ):
                 raise ValueError("novelty manifest disagrees with artifact digest")
+            if self.novelty_manifest is not None:
+                expected_novelty_features = tuple(range(len(self.feature_names)))
+                if self.novelty_manifest.feature_count != len(self.feature_names):
+                    raise ValueError(
+                        "novelty feature count must match the exact arm features"
+                    )
+                if any(
+                    tree.estimator_features != expected_novelty_features
+                    for tree in self.novelty_manifest.trees
+                ):
+                    raise ValueError(
+                        "novelty tree estimator features must match the exact arm range"
+                    )
             if not self.threshold_values:
                 raise ValueError("executed arm must bind actual threshold values")
             expected_threshold_names = {
