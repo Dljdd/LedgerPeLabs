@@ -229,21 +229,25 @@ def build_v5_corpus(
         else protocol.production_profile
     )
     if profile is V5Profile.SMOKE:
-        legitimate_total = min(profile_counts.legitimate_decisions, 500)
-        per_operational = legitimate_total // len(_OPERATIONAL_PARTITIONS)
+        smoke_base = min(profile_counts.legitimate_decisions, 500)
+        smoke_per = max(smoke_base // len(_OPERATIONAL_PARTITIONS), 1)
         partition_legitimate_counts = {
-            name: per_operational for name in _OPERATIONAL_PARTITIONS
+            "train": smoke_per,
+            "calibration": smoke_per,
+            "threshold": smoke_per,
+            "development_test": smoke_per,
+            "hardening_train": max(smoke_per // 2, 1),
+            "adaptive_holdout": max(smoke_per // 2, 1),
         }
-        partition_legitimate_counts["hardening_train"] = max(per_operational // 2, 10)
-        partition_legitimate_counts["adaptive_holdout"] = max(per_operational // 2, 10)
     else:
+        prod_legit = protocol.production_profile.legitimate_decisions
         partition_legitimate_counts = {
-            "train": protocol.production_profile.legitimate_decisions // 4,
-            "calibration": protocol.production_profile.legitimate_decisions // 8,
-            "threshold": protocol.production_profile.legitimate_decisions // 8,
+            "train": prod_legit // 4,
+            "calibration": prod_legit // 8,
+            "threshold": prod_legit // 8,
             "development_test": protocol.production_dev_test_legitimate,
-            "hardening_train": protocol.production_profile.legitimate_decisions // 8,
-            "adaptive_holdout": protocol.production_profile.legitimate_decisions // 8,
+            "hardening_train": prod_legit // 8,
+            "adaptive_holdout": prod_legit // 8,
         }
 
     partitions: dict[str, list[V5DecisionRow]] = {}
@@ -262,12 +266,12 @@ def build_v5_corpus(
     campaigns_for_profile = (
         {f: _CAMPAIGNS_PER_FAMILY_SMOKE for f in _FAMILY_PREFIXES}
         if profile is V5Profile.SMOKE
-        else profile_counts.campaigns_per_family
+        else protocol.production_dev_test_campaigns_per_family
     )
 
     for partition_name in _PARTITION_SEED_KEYS:
         seed = seed_map[partition_name]
-        benign_count = partition_legitimate_counts.get(partition_name, per_operational)
+        benign_count = partition_legitimate_counts[partition_name]
         benign_rows = _build_benign_partition(partition_name, benign_count, seed)
         fraud_rows = _build_fraud_campaigns_for_partition(
             partition_name, campaigns_for_profile, seed
