@@ -1,0 +1,20 @@
+{
+  "schema_version": "1.0.0",
+  "record_type": "rejected_experiment",
+  "protocol_id": "apar-sentinel-v5-development",
+  "rejected_commit": "7f3b78df65796c7931b62f06ee3f0b19a246c6e1",
+  "original_result_sha256": "af326f3a0fcbbe12c9b8623fc7d82a1ba6d0f327ec9a80f462cacd4bea1dd185",
+  "status": "invalid_experiment",
+  "rejection_reasons": [
+    "runner_used_only_seven_raw_features: the runner built a dynamic feature union from row.predictive_features instead of invoking the 47-feature SentinelFeatureCatalog",
+    "forty_seven_feature_builder_not_invoked: build_sentinel_features was never called by the production runner",
+    "declared_fifty_thousand_support_not_consumed: production_dev_test_legitimate=50000 was declared but build_v5_corpus divided production_profile.legitimate_decisions across four partitions",
+    "actual_legitimate_support_was_12500: development-test contained only 12500 legitimate decisions, far below the 50000 requirement",
+    "no_real_task5_rail_ledger_execution: fraud rows were fabricated with string provenance, not derived from Task 5 campaigns or real rail adapters",
+    "no_real_trust_integration: trust_failure was never passed to SentinelDefender from the runner",
+    "null_latency_and_missing_ece: p50/p95/p99 latency were null and ECE was not computed",
+    "only_one_arm: comparison arms (rules_only, ensemble_no_graph, ensemble_with_graph) were absent",
+    "independent_verifier_remained_forgeable: verifier did not reject ready with null latency before the fix"
+  ],
+  "evidence_policy": "Metrics from this experiment cannot support readiness, adaptive search, or competition claims."
+}
