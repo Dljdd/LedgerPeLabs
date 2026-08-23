@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from apar.evaluation.v5_population import (
     V5Corpus,
     V5ExecutionManifest,
     V5PartitionCorpus,
+    V5TrustRecord,
     build_v5_corpus,
 )
 from apar.evaluation.v5_protocol import V5Family, V5Profile
@@ -54,6 +56,135 @@ def smoke_corpus() -> V5Corpus:
 
 
 class TestSmokeCorpus:
+    @pytest.mark.parametrize("payload_field", ("campaign_id", "idempotency_key"))
+    def test_rehashed_artifact_rejects_canonical_command_payload_tampering(
+        self,
+        smoke_corpus: V5Corpus,
+        payload_field: str,
+    ) -> None:
+        """Changing canonical command inputs must invalidate the retained command ID."""
+        manifest = next(
+            execution
+            for execution in smoke_corpus.partitions["train"].executions
+            if execution.rail == "card"
+            and payload_field
+            in json.loads(execution.lineage[0].command_payload_json)
+        )
+        for position, source in enumerate(manifest.lineage):
+            payload = json.loads(source.command_payload_json)
+            if payload_field not in payload:
+                continue
+            payload[payload_field] = (
+                "00000000-0000-4000-8000-000000000001"
+                if payload_field == "campaign_id"
+                else f"tampered-idempotency-{position}"
+            )
+            document = manifest.model_dump(mode="json")
+            link = dict(document["lineage"][position])
+            link["command_payload_json"] = json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            document["lineage"] = (
+                *document["lineage"][:position],
+                link,
+                *document["lineage"][position + 1 :],
+            )
+            with pytest.raises(ValueError, match="canonical command ID"):
+                V5ExecutionManifest.model_validate(_rehash_manifest_document(document))
+
+    def test_rehashed_artifact_rejects_event_decision_timestamp_tampering(
+        self,
+        smoke_corpus: V5Corpus,
+    ) -> None:
+        """The retained decision timestamp must remain bound to canonical event JSON."""
+        manifest = next(
+            execution
+            for execution in smoke_corpus.partitions["train"].executions
+            if execution.rail == "card"
+        )
+        document = manifest.model_dump(mode="json")
+        event = dict(document["event_records"][0])
+        event["decision_at"] = (
+            datetime.fromisoformat(event["decision_at"].replace("Z", "+00:00"))
+            + timedelta(seconds=1)
+        ).isoformat().replace("+00:00", "Z")
+        document["event_records"] = (event, *document["event_records"][1:])
+        with pytest.raises(ValueError, match="decision timestamp"):
+            V5ExecutionManifest.model_validate(_rehash_manifest_document(document))
+
+    def test_broken_receipt_hash_is_campaign_bound_and_isolation_checked(
+        self,
+        smoke_corpus: V5Corpus,
+    ) -> None:
+        """A static broken-chain reference must not alias agentic campaigns or splits."""
+        from apar.evaluation.v5_population import (
+            _retained_reference_domains,
+            _validate_partition_isolation,
+        )
+
+        partitions = dict(smoke_corpus.partitions)
+        chain_records: dict[str, tuple[V5ExecutionManifest, V5TrustRecord]] = {}
+        observed_hashes: set[str] = set()
+        for partition_name in ("train", "calibration", "threshold", "development_test"):
+            manifest = next(
+                execution
+                for execution in partitions[partition_name].executions
+                if execution.family == V5Family.AGENTIC_INTENT_ABUSE.value
+            )
+            record = next(
+                item
+                for item in manifest.trust_records
+                if item.reason_code == "RECEIPT_CHAIN_BROKEN"
+            )
+            request = json.loads(record.request_json)
+            prior_receipt_hash = request["prior_receipt_hash"]
+            assert prior_receipt_hash != "f" * 64
+            assert prior_receipt_hash not in observed_hashes
+            assert prior_receipt_hash in _retained_reference_domains(manifest)[
+                "prior_receipt_hash"
+            ]
+            observed_hashes.add(prior_receipt_hash)
+            chain_records[partition_name] = (manifest, record)
+
+        train_manifest, train_record = chain_records["train"]
+        calibration_manifest, calibration_record = chain_records["calibration"]
+        train_request = json.loads(train_record.request_json)
+        calibration_request = json.loads(calibration_record.request_json)
+        calibration_request["prior_receipt_hash"] = train_request["prior_receipt_hash"]
+        changed_record = calibration_record.model_copy(
+            update={
+                "request_json": json.dumps(
+                    calibration_request,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+            }
+        )
+        changed_manifest = calibration_manifest.model_copy(
+            update={
+                "trust_records": tuple(
+                    changed_record if item is calibration_record else item
+                    for item in calibration_manifest.trust_records
+                )
+            }
+        )
+        calibration = partitions["calibration"]
+        partitions["calibration"] = calibration.model_copy(
+            update={
+                "executions": tuple(
+                    changed_manifest if item is calibration_manifest else item
+                    for item in calibration.executions
+                )
+            }
+        )
+        assert train_manifest.campaign_id != changed_manifest.campaign_id
+        with pytest.raises(ValueError, match="prior_receipt_hash identity overlap"):
+            _validate_partition_isolation(partitions)
+
     def test_rehashed_artifact_rejects_event_lineage_and_auth_evidence_tampering(
         self,
         smoke_corpus: V5Corpus,

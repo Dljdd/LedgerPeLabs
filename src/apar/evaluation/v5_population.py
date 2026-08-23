@@ -124,6 +124,7 @@ class V5LineageManifest(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     command_id: str
+    command_type: str
     command_name: str
     event_id: str
     payment_id: str
@@ -244,6 +245,21 @@ class V5ExecutionManifest(BaseModel):
             raise ValueError("execution manifest lineage must not be empty")
         event_ids = tuple(item.event_id for item in self.lineage)
         command_ids = tuple(item.command_id for item in self.lineage)
+        from apar.evaluation.v5_execution import _command_id_from_facts
+
+        expected_command_ids = tuple(
+            _command_id_from_facts(
+                command_type=item.command_type,
+                command_name=item.command_name,
+                command_payload=cast(
+                    Mapping[str, object],
+                    _decode_canonical_json(item.command_payload_json),
+                ),
+            )
+            for item in self.lineage
+        )
+        if command_ids != expected_command_ids:
+            raise ValueError("execution manifest canonical command ID disagrees with payload")
         if len(event_ids) != len(set(event_ids)):
             raise ValueError("execution manifest event IDs must be unique")
         if len(command_ids) != len(set(command_ids)):
@@ -364,6 +380,8 @@ class V5ExecutionManifest(BaseModel):
 
     def evidence_digest(self) -> str:
         """Recompute the execution-evidence digest solely from retained raw facts."""
+        from apar.evaluation.v5_execution import _command_id_from_facts
+
         document = {
             "domain": "apar.sentinel-v5.execution-evidence.v1",
             "family": self.family,
@@ -371,7 +389,14 @@ class V5ExecutionManifest(BaseModel):
             "rail": self.rail,
             "lineage": [
                 {
-                    "command_id": link.command_id,
+                    "command_id": _command_id_from_facts(
+                        command_type=link.command_type,
+                        command_name=link.command_name,
+                        command_payload=cast(
+                            Mapping[str, object],
+                            _decode_canonical_json(link.command_payload_json),
+                        ),
+                    ),
                     "command_name": link.command_name,
                     "event_id": link.event_id,
                     "campaign_id": self.campaign_id,
@@ -436,6 +461,15 @@ class V5ExecutionManifest(BaseModel):
         for link, event in zip(self.lineage, self.event_records, strict=True):
             payload = cast(dict[str, object], _decode_canonical_json(link.command_payload_json))
             raw_event = cast(dict[str, object], json.loads(event.event_json))
+            canonical_decision_at = event.decision_at.isoformat().replace("+00:00", "Z")
+            canonical_scheduled_at = link.scheduled_at.isoformat().replace("+00:00", "Z")
+            if (
+                raw_event.get("decision_at") != canonical_decision_at
+                or raw_event.get("available_at") != canonical_decision_at
+            ):
+                raise ValueError("event decision timestamp disagrees with retained raw event")
+            if raw_event.get("event_time") != canonical_scheduled_at:
+                raise ValueError("event scheduled timestamp disagrees with retained raw event")
             if (
                 raw_event.get("event_id") != event.event_id
                 or raw_event.get("campaign_id") != self.campaign_id
@@ -1051,6 +1085,7 @@ def _manifest_from_evidence(
         lineage=tuple(
             V5LineageManifest(
                 command_id=item.command_id,
+                command_type=type(command).__qualname__,
                 command_name=item.command_name,
                 event_id=item.event_id,
                 payment_id=item.payment_id,
@@ -1799,6 +1834,7 @@ def _retained_reference_domains(execution: V5ExecutionManifest) -> dict[str, set
         "receipt_hash": set(),
         "request_hash": set(),
         "signature_hash": set(),
+        "prior_receipt_hash": set(),
         "authentication_fact": set(),
     }
     for record in execution.trust_records:
@@ -1815,6 +1851,7 @@ def _retained_reference_domains(execution: V5ExecutionManifest) -> dict[str, set
             ("receipt_hash", record.receipt_hash),
             ("request_hash", record.request_hash),
             ("signature_hash", record.signature_hash),
+            ("prior_receipt_hash", request["prior_receipt_hash"]),
         ):
             if type(value) is str and value:
                 domains[domain].add(value)

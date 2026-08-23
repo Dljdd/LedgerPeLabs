@@ -189,14 +189,22 @@ def _canonical_value(value: object) -> object:
     raise TypeError(f"unsupported command payload value: {type(value).__name__}")
 
 
-def _command_id(command: Command) -> str:
-    if not isinstance(command, Command):
-        raise TypeError("execution evidence commands must be generated Commands")
+def _command_id_from_facts(
+    *,
+    command_type: str,
+    command_name: str,
+    command_payload: Mapping[str, object],
+) -> str:
+    """Derive one command ID from the complete canonical retained envelope."""
+    if type(command_type) is not str or not command_type:
+        raise ValueError("canonical command type must be a non-empty exact string")
+    if type(command_name) is not str or not command_name:
+        raise ValueError("canonical command name must be a non-empty exact string")
     document = {
         "domain": "apar.sentinel-v5.generated-command.v1",
-        "type": type(command).__qualname__,
-        "name": command.name,
-        "payload": _canonical_value(command.payload),
+        "type": command_type,
+        "name": command_name,
+        "payload": _canonical_value(command_payload),
     }
     encoded = json.dumps(
         document,
@@ -205,6 +213,16 @@ def _command_id(command: Command) -> str:
         allow_nan=False,
     ).encode()
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _command_id(command: Command) -> str:
+    if not isinstance(command, Command):
+        raise TypeError("execution evidence commands must be generated Commands")
+    return _command_id_from_facts(
+        command_type=type(command).__qualname__,
+        command_name=command.name,
+        command_payload=command.payload,
+    )
 
 
 def _rail_for_command(command: Command) -> Rail:

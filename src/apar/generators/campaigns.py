@@ -1572,7 +1572,16 @@ class CampaignGenerator:
                 expires_at = mandate.issued_at + timedelta(seconds=1)
             elif kind == "expiry":
                 expires_at = schedule[index]
-            prior_hash = "f" * 64 if kind == "receipt_chain" else previous_receipt
+            prior_hash = (
+                hashlib.sha256(
+                    (
+                        "apar.task5.agentic.broken-receipt.v1:"
+                        f"{params.campaign_id}"
+                    ).encode()
+                ).hexdigest()
+                if kind == "receipt_chain"
+                else previous_receipt
+            )
             unsigned = AgentPaymentRequest(
                 request_id=request_id,
                 payment_id=plan.payment_id,
