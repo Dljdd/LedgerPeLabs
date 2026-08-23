@@ -132,6 +132,8 @@ class V5LineageManifest(BaseModel):
     lifecycle_position: int = Field(ge=0)
     is_fraud: bool
     command_payload_json: str
+    trace_id: str
+    scheduled_at: datetime
 
 
 class V5EventRecord(BaseModel):
@@ -147,6 +149,7 @@ class V5EventRecord(BaseModel):
     decision_at: datetime
     rail_data_json: str
     lineage_json: str
+    event_json: str
 
 
 class V5LedgerPosting(BaseModel):
@@ -253,6 +256,7 @@ class V5ExecutionManifest(BaseModel):
             for event, link in zip(self.event_records, self.lineage, strict=True)
         ):
             raise ValueError("execution manifest event payment lineage disagrees")
+        self._validate_manifest_event_facts()
         if tuple(posting.entry_id for posting in self.ledger_postings) != self.ledger_entry_ids:
             raise ValueError("execution manifest ledger posting IDs disagree with ledger index")
         if tuple(record.request_id for record in self.trust_records) != self.trust_request_ids:
@@ -352,9 +356,169 @@ class V5ExecutionManifest(BaseModel):
         if not set(self.trust_failure_event_ids) <= set(event_ids):
             raise ValueError("trust failures must reference manifest events")
         self._validate_manifest_trust()
+        if self.evidence_sha256 != self.evidence_digest():
+            raise ValueError("execution manifest evidence digest disagrees with retained facts")
         if self.artifact_sha256 != self.artifact_digest():
             raise ValueError("execution manifest artifact digest was tampered")
         return self
+
+    def evidence_digest(self) -> str:
+        """Recompute the execution-evidence digest solely from retained raw facts."""
+        document = {
+            "domain": "apar.sentinel-v5.execution-evidence.v1",
+            "family": self.family,
+            "campaign_id": self.campaign_id,
+            "rail": self.rail,
+            "lineage": [
+                {
+                    "command_id": link.command_id,
+                    "command_name": link.command_name,
+                    "event_id": link.event_id,
+                    "campaign_id": self.campaign_id,
+                    "payment_id": link.payment_id,
+                    "actor_id": link.actor_id,
+                    "counterparty_id": link.counterparty_id,
+                    "rail": self.rail,
+                    "scheduled_at": link.scheduled_at.isoformat().replace("+00:00", "Z"),
+                    "lifecycle_position": link.lifecycle_position,
+                    "is_fraud": link.is_fraud,
+                }
+                for link in self.lineage
+            ],
+            "events": [json.loads(record.event_json) for record in self.event_records],
+            "ledger_entries": [
+                {
+                    "entry_id": posting.entry_id,
+                    "debit": {account: str(amount) for account, amount in posting.debit},
+                    "credit": {account: str(amount) for account, amount in posting.credit},
+                    "currency": posting.currency,
+                }
+                for posting in self.ledger_postings
+            ],
+            "opening_balances": [
+                {"account": account, "amount": str(amount)}
+                for account, amount in self.opening_balances
+            ],
+            "trust": [
+                {
+                    "command_id": record.command_id,
+                    "event_id": record.event_id,
+                    "request_id": record.request_id,
+                    "authentication_evidence_id": (
+                        record.authentication_evidence_id
+                        if record.authentication_evidence_json is not None
+                        else None
+                    ),
+                    "authentication_evidence": (
+                        json.loads(record.authentication_evidence_json)
+                        if record.authentication_evidence_json is not None
+                        else None
+                    ),
+                    "receipt_hash": record.receipt_hash,
+                    "allowed": record.allowed,
+                    "reason_code": record.reason_code,
+                    "outcome": record.outcome,
+                }
+                for record in self.trust_records
+            ],
+        }
+        return hashlib.sha256(
+            json.dumps(document, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+        ).hexdigest()
+
+    def _validate_manifest_event_facts(self) -> None:
+        """Cross-bind every serialized event to its command, lifecycle, and raw event."""
+        from apar.evaluation.v5_execution import _COMMAND_EVENT_KINDS, _expected_kind
+
+        opening_states: dict[str, dict[str, object]] = {}
+        previous_events: dict[str, str] = {}
+        trust_by_event = {record.event_id: record for record in self.trust_records}
+        for link, event in zip(self.lineage, self.event_records, strict=True):
+            payload = cast(dict[str, object], _decode_canonical_json(link.command_payload_json))
+            raw_event = cast(dict[str, object], json.loads(event.event_json))
+            if (
+                raw_event.get("event_id") != event.event_id
+                or raw_event.get("campaign_id") != self.campaign_id
+                or raw_event.get("rail") != self.rail
+                or raw_event.get("event_type") != event.event_type
+                or raw_event.get("amount") != str(event.amount)
+                or raw_event.get("currency") != event.currency
+                or raw_event.get("rail_data") != json.loads(event.rail_data_json)
+                or raw_event.get("lineage") != json.loads(event.lineage_json)
+            ):
+                raise ValueError("event facts disagree with retained raw event")
+            if payload.get("payment_id") != link.payment_id:
+                raise ValueError("event facts disagree with command payment")
+            if link.command_name in {
+                "a2a.initiate",
+                "card.authorize",
+                "card.decline",
+                "agentic.pay",
+            }:
+                opening_states[link.payment_id] = payload
+            state = opening_states.get(link.payment_id)
+            if state is None:
+                raise ValueError("event facts lack an opening command state")
+            if (
+                event.amount != state.get("amount")
+                or event.currency != state.get("currency")
+                or link.actor_id != state.get("actor_id")
+                or link.counterparty_id != state.get("counterparty_id")
+                or link.trace_id != state.get("trace_id")
+            ):
+                raise ValueError("event facts disagree with command state")
+            expected_previous = previous_events.get(link.payment_id, "")
+            if json.loads(event.lineage_json).get("previous_event_id", "") != expected_previous:
+                raise ValueError("event facts disagree with lifecycle lineage")
+            previous_events[link.payment_id] = event.event_id
+            if link.command_name == "agentic.pay":
+                record = trust_by_event.get(event.event_id)
+                if record is None:
+                    raise ValueError("agentic event facts lack a verifier record")
+                request = _agent_request_from_json(record.request_json)
+                request_fields = {
+                    "request_id": request.request_id,
+                    "payment_id": request.payment_id,
+                    "amount": request.amount,
+                    "currency": request.currency,
+                    "campaign_id": request.campaign_id,
+                    "trace_id": request.trace_id,
+                    "actor_id": request.actor_id,
+                    "counterparty_id": request.counterparty_id,
+                    "nonce": request.nonce,
+                    "consent_ref": request.consent_ref,
+                    "cart_hash": request.cart_hash,
+                    "payment_intent_hash": request.payment_intent_hash,
+                    "signature": request.signature,
+                }
+                if any(payload.get(name) != value for name, value in request_fields.items()):
+                    raise ValueError("agentic command facts disagree with signed request")
+                if (
+                    event.amount != request.amount
+                    or event.currency != request.currency
+                    or link.payment_id != request.payment_id
+                    or link.actor_id != request.actor_id
+                    or link.counterparty_id != request.counterparty_id
+                    or link.trace_id != request.trace_id
+                    or json.loads(event.rail_data_json).get("request_id") != request.request_id
+                ):
+                    raise ValueError("event facts disagree with signed request")
+                expected_kind = _expected_kind(
+                    cast(Any, SimpleNamespace(name=link.command_name)),
+                    cast(
+                        Any,
+                        SimpleNamespace(
+                            rail_data=json.loads(event.rail_data_json),
+                        ),
+                    ),
+                )
+            else:
+                try:
+                    expected_kind = _COMMAND_EVENT_KINDS[link.command_name]
+                except KeyError as error:
+                    raise ValueError("event facts have an unknown command lifecycle") from error
+            if event.event_type != expected_kind.value:
+                raise ValueError("event facts disagree with command lifecycle")
 
     def _validate_manifest_ledger(self) -> None:
         """Recompute postings from retained source commands and emitted event facts."""
@@ -442,6 +606,9 @@ class V5ExecutionManifest(BaseModel):
             _authentication_evidence_from_json(item)
             for item in self.trust_registry.authentication_evidence_json
         )
+        registry_evidence_by_id = {
+            item.evidence_id: item for item in registry_evidence
+        }
         verifier = TrustVerifier(
             registered_agents={
                 (self.trust_registry.agent_id, self.trust_registry.key_id): bytes.fromhex(
@@ -465,6 +632,20 @@ class V5ExecutionManifest(BaseModel):
                 or record.public_key_hex != self.trust_registry.public_key_hex
             ):
                 raise ValueError("verifier record identifiers disagree with retained request facts")
+            expected_authentication = registry_evidence_by_id.get(
+                request.authentication_evidence_ref or ""
+            )
+            if expected_authentication is None:
+                if record.authentication_evidence_json is not None:
+                    raise ValueError("verifier record retains unexpected authentication evidence")
+            elif (
+                record.authentication_evidence_json is None
+                or _authentication_evidence_from_json(
+                    record.authentication_evidence_json
+                )
+                != expected_authentication
+            ):
+                raise ValueError("verifier authentication evidence disagrees with registry facts")
             event = event_by_id[record.event_id]
             now = event.decision_at.astimezone(UTC).replace(tzinfo=UTC)
             preview = verifier.preview(request, now)
@@ -878,8 +1059,12 @@ def _manifest_from_evidence(
                 lifecycle_position=item.lifecycle_position,
                 is_fraud=item.is_fraud,
                 command_payload_json=_canonical_fact_json(command.payload),
+                trace_id=event.trace_id,
+                scheduled_at=item.scheduled_at,
             )
-            for item, command in zip(evidence.lineage, evidence.commands, strict=True)
+            for item, command, event in zip(
+                evidence.lineage, evidence.commands, evidence.events, strict=True
+            )
         ),
         ledger_entry_ids=tuple(entry.entry_id for entry in evidence.ledger_entries),
         trust_request_ids=tuple(
@@ -949,6 +1134,12 @@ def _manifest_from_evidence(
                 decision_at=cast(datetime, event.decision_at),
                 rail_data_json=_canonical_fact_json(event.rail_data),
                 lineage_json=_canonical_fact_json(event.lineage),
+                event_json=json.dumps(
+                    event.model_dump(mode="json", warnings=False),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ),
             )
             for event in evidence.events
         ),
@@ -1346,7 +1537,7 @@ def _a2a_legitimate_commands(
         )
 
     for label, amount, followups in (
-        ("successful", "64.90", ("accept", "post")),
+        ("return", "64.90", ("accept", "post", "return")),
         ("recovery", "81.10", ("accept", "post", "report", "freeze", "recover")),
     ):
         opening = initiate(label, amount)
@@ -1593,6 +1784,53 @@ def _partition_legitimate_target(
     return counts.legitimate_decisions // 8
 
 
+def _retained_reference_domains(execution: V5ExecutionManifest) -> dict[str, set[str]]:
+    """Extract every retained identifier/security reference that must not cross splits."""
+    domains = {
+        "command": {link.command_id for link in execution.lineage},
+        "event": {link.event_id for link in execution.lineage},
+        "trust_request": set(execution.trust_request_ids),
+        "trace": {link.trace_id for link in execution.lineage},
+        "consent": set(),
+        "nonce": set(),
+        "cart_hash": set(),
+        "payment_intent_hash": set(),
+        "public_key": set(),
+        "receipt_hash": set(),
+        "request_hash": set(),
+        "signature_hash": set(),
+        "authentication_fact": set(),
+    }
+    for record in execution.trust_records:
+        request = cast(dict[str, object], _decode_canonical_json(record.request_json))
+        mandate = cast(dict[str, object], request["mandate"])
+        for domain, value in (
+            ("consent", request["consent_ref"]),
+            ("nonce", request["nonce"]),
+            ("cart_hash", request["cart_hash"]),
+            ("cart_hash", mandate["cart_hash"]),
+            ("payment_intent_hash", request["payment_intent_hash"]),
+            ("payment_intent_hash", mandate["payment_intent_hash"]),
+            ("public_key", record.public_key_hex),
+            ("receipt_hash", record.receipt_hash),
+            ("request_hash", record.request_hash),
+            ("signature_hash", record.signature_hash),
+        ):
+            if type(value) is str and value:
+                domains[domain].add(value)
+        if record.authentication_evidence_json is not None:
+            domains["authentication_fact"].add(
+                hashlib.sha256(record.authentication_evidence_json.encode()).hexdigest()
+            )
+    if execution.trust_registry is not None:
+        domains["public_key"].add(execution.trust_registry.public_key_hex)
+        domains["authentication_fact"].update(
+            hashlib.sha256(value.encode()).hexdigest()
+            for value in execution.trust_registry.authentication_evidence_json
+        )
+    return domains
+
+
 def _validate_partition_isolation(partitions: dict[str, V5PartitionCorpus]) -> None:
     identity_extractors: dict[str, Callable[[V5DecisionRow], str]] = {
         "actor": lambda row: row.actor_id,
@@ -1637,6 +1875,29 @@ def _validate_partition_isolation(partitions: dict[str, V5PartitionCorpus]) -> N
                 if values[left] & values[right]:
                     raise _PopulationIsolationError(
                         f"{domain.removesuffix('_ids')} identity overlap between {left} and {right}"
+                    )
+    reference_domains = {
+        name: {
+            reference: {
+                value
+                for execution in partitions[name].executions
+                for value in _retained_reference_domains(execution)[reference]
+            }
+            for reference in _retained_reference_domains(
+                partitions[name].executions[0]
+            )
+        }
+        for name in names
+    }
+    all_references = set().union(
+        *(set(domains) for domains in reference_domains.values())
+    )
+    for reference in all_references:
+        for index, left in enumerate(names):
+            for right in names[index + 1 :]:
+                if reference_domains[left][reference] & reference_domains[right][reference]:
+                    raise _PopulationIsolationError(
+                        f"{reference} identity overlap between {left} and {right}"
                     )
     for left, right in zip(names, names[1:], strict=False):
         if max(row.decision_at for row in partitions[left].decisions) >= min(

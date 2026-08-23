@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from decimal import Decimal
 from pathlib import Path
 
@@ -36,12 +38,109 @@ def _has_perfect_one_dimensional_threshold(values: np.ndarray, labels: np.ndarra
     return False
 
 
+def _rehash_manifest_document(document: dict[str, object]) -> dict[str, object]:
+    """Model the artifact consumer that legitimately recomputes its content hash."""
+    updated = dict(document)
+    updated.pop("artifact_sha256", None)
+    document["artifact_sha256"] = hashlib.sha256(
+        json.dumps(updated, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    ).hexdigest()
+    return document
+
+
 @pytest.fixture(scope="module")
 def smoke_corpus() -> V5Corpus:
     return build_v5_corpus(PROTOCOL, profile=V5Profile.SMOKE)
 
 
 class TestSmokeCorpus:
+    def test_rehashed_artifact_rejects_event_lineage_and_auth_evidence_tampering(
+        self,
+        smoke_corpus: V5Corpus,
+    ) -> None:
+        """Rehashing must not make cross-bound event or trust facts acceptable."""
+        agentic = next(
+            execution
+            for execution in smoke_corpus.partitions["train"].executions
+            if execution.rail == "agentic"
+            and execution.trust_records[0].authentication_evidence_json
+        )
+        document = agentic.model_dump(mode="json")
+        event = dict(document["event_records"][0])
+        event["amount"] = "11.00"
+        document["event_records"] = (event, *document["event_records"][1:])
+        event["lineage_json"] = event["lineage_json"].replace(
+            '"previous_event_id":""',
+            '"previous_event_id":"tampered"',
+        )
+        document["event_records"] = (event, *document["event_records"][1:])
+        trust = dict(document["trust_records"][0])
+        trust["authentication_evidence_json"] = trust[
+            "authentication_evidence_json"
+        ].replace('"nonce":"', '"nonce":"tampered-')
+        document["trust_records"] = (trust, *document["trust_records"][1:])
+        with pytest.raises(ValueError, match="event facts disagree with retained raw event"):
+            V5ExecutionManifest.model_validate(_rehash_manifest_document(document))
+
+    def test_partition_isolation_rejects_retained_security_reference_overlap(
+        self,
+        smoke_corpus: V5Corpus,
+    ) -> None:
+        """Security references omitted from isolation must cause this mutation to pass."""
+        from apar.evaluation.v5_population import _validate_partition_isolation
+
+        partitions = dict(smoke_corpus.partitions)
+        train_agentic = next(
+            item for item in partitions["train"].executions if item.rail == "agentic"
+        )
+        calibration = partitions["calibration"]
+        calibration_agentic = next(
+            item for item in calibration.executions if item.rail == "agentic"
+        )
+        source_request = train_agentic.trust_records[0]
+        changed_record = calibration_agentic.trust_records[0].model_copy(
+            update={"request_json": source_request.request_json}
+        )
+        changed_manifest = calibration_agentic.model_copy(
+            update={
+                "trust_records": (changed_record, *calibration_agentic.trust_records[1:]),
+                "trust_request_ids": (
+                    source_request.request_id,
+                    *calibration_agentic.trust_request_ids[1:],
+                ),
+            }
+        )
+        partitions["calibration"] = calibration.model_copy(
+            update={
+                "executions": tuple(
+                    changed_manifest if item is calibration_agentic else item
+                    for item in calibration.executions
+                )
+            }
+        )
+        with pytest.raises(ValueError, match="identity overlap"):
+            _validate_partition_isolation(partitions)
+
+    def test_rehashed_artifact_rejects_authentication_evidence_tampering(
+        self,
+        smoke_corpus: V5Corpus,
+    ) -> None:
+        """A verifier record must retain the same evidence as its registry entry."""
+        agentic = next(
+            execution
+            for execution in smoke_corpus.partitions["train"].executions
+            if execution.rail == "agentic"
+            and execution.trust_records[0].authentication_evidence_json
+        )
+        document = agentic.model_dump(mode="json")
+        trust = dict(document["trust_records"][0])
+        trust["authentication_evidence_json"] = trust[
+            "authentication_evidence_json"
+        ].replace('"nonce":"', '"nonce":"tampered-')
+        document["trust_records"] = (trust, *document["trust_records"][1:])
+        with pytest.raises(ValueError, match="authentication evidence"):
+            V5ExecutionManifest.model_validate(_rehash_manifest_document(document))
+
     def test_manifest_rejects_tampered_ledger_economics_and_trust_request(
         self,
         smoke_corpus: V5Corpus,
@@ -72,7 +171,7 @@ class TestSmokeCorpus:
             },
             *document["trust_records"][1:],
         )
-        with pytest.raises(ValueError, match="verifier replay"):
+        with pytest.raises(ValueError, match="signed request|verifier replay"):
             V5ExecutionManifest.model_validate(document)
 
     def test_partition_isolation_rejects_all_retained_identity_domains(
@@ -276,6 +375,22 @@ class TestSmokeCorpus:
             for rail in expected_rails:
                 labels = {row.is_fraud for row in rows if row.rail == rail}
                 assert labels == {False, True}, f"{partition_name}/{rail} lacks a class"
+
+    def test_executed_a2a_returned_lifecycle_is_present_with_rail_class_support(
+        self,
+        smoke_corpus: V5Corpus,
+    ) -> None:
+        """Removing the real legitimate return or a rail class must not pass vacuously."""
+        for partition_name in ("train", "calibration", "threshold", "development_test"):
+            rows = smoke_corpus.partitions[partition_name].decisions
+            manifests = smoke_corpus.partitions[partition_name].executions
+            assert any(
+                manifest.family == "legitimate"
+                and manifest.rail == "a2a"
+                and any(event.event_type == "transfer_returned" for event in manifest.event_records)
+                for manifest in manifests
+            ), f"{partition_name} missing legitimate A2A return"
+            assert {row.is_fraud for row in rows if row.rail == "a2a"} == {False, True}
 
     def test_legitimate_execution_manifest_retains_canonical_economic_and_trust_facts(
         self,

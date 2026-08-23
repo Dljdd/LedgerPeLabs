@@ -1440,8 +1440,12 @@ class CampaignGenerator:
             consent_ref=f"synthetic-consent-{params.campaign_id}",
             merchant_id=merchant.entity_id,
             payee_id=cast(str, merchant.account_id),
-            cart_hash=hashlib.sha256(b"synthetic-cart-v1").hexdigest(),
-            payment_intent_hash=hashlib.sha256(b"synthetic-intent-v1").hexdigest(),
+            cart_hash=hashlib.sha256(
+                f"synthetic-cart-v1:{params.campaign_id}".encode()
+            ).hexdigest(),
+            payment_intent_hash=hashlib.sha256(
+                f"synthetic-intent-v1:{params.campaign_id}".encode()
+            ).hexdigest(),
             permitted_categories=("TRAVEL",),
             permitted_products=("synthetic-flight",),
             credential_id=f"synthetic-token-{params.campaign_id}",
@@ -1484,7 +1488,9 @@ class CampaignGenerator:
             if kind == "auth_replay":
                 continue
             intent_hash = (
-                hashlib.sha256(f"mutated-intent-{index}".encode()).hexdigest()
+                hashlib.sha256(
+                    f"mutated-intent-{params.campaign_id}-{index}".encode()
+                ).hexdigest()
                 if kind == "intent"
                 else mandate.payment_intent_hash
             )
@@ -1578,12 +1584,16 @@ class CampaignGenerator:
                 merchant_id=merchant_id,
                 payee_id=payee_id,
                 cart_hash=(
-                    hashlib.sha256(f"mutated-cart-{index}".encode()).hexdigest()
+                    hashlib.sha256(
+                        f"mutated-cart-{params.campaign_id}-{index}".encode()
+                    ).hexdigest()
                     if kind == "cart"
                     else mandate.cart_hash
                 ),
                 payment_intent_hash=(
-                    hashlib.sha256(f"mutated-intent-{index}".encode()).hexdigest()
+                    hashlib.sha256(
+                        f"mutated-intent-{params.campaign_id}-{index}".encode()
+                    ).hexdigest()
                     if kind == "intent"
                     else mandate.payment_intent_hash
                 ),
@@ -1623,7 +1633,13 @@ class CampaignGenerator:
                 update={"signature": private_key.sign(unsigned.signing_bytes())}
             )
             if kind == "signature":
-                request = request.model_copy(update={"signature": bytes(64)})
+                request = request.model_copy(
+                    update={
+                        "signature": hashlib.sha512(
+                            f"invalid-signature-{params.campaign_id}-{index}".encode()
+                        ).digest()
+                    }
+                )
             if kind == "valid_control":
                 preview = chain_verifier.preview(request, schedule[index])
                 if not preview.allowed:
