@@ -77,7 +77,7 @@ def _score_and_evaluate(
     )
 
     # Real inference latency: measure each row individually after warm-up.
-    warmup = defender.decide_batch(x_test[:min(5, len(x_test))])
+    defender.decide_batch(x_test[: min(5, len(x_test))])
     latencies_ns = []
     for i in range(len(x_test)):
         start = time.perf_counter_ns()
