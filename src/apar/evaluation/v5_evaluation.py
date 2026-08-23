@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from base64 import b64decode
+from binascii import Error as Base64Error
 from collections import Counter
 from collections.abc import Sequence
 from enum import StrEnum
@@ -12,6 +14,7 @@ from pathlib import Path
 from typing import Literal, Self, cast
 
 import numpy as np
+from catboost import CatBoostClassifier  # type: ignore[import-untyped]
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sklearn.metrics import (  # type: ignore[import-untyped]
     average_precision_score,
@@ -21,6 +24,7 @@ from sklearn.metrics import (  # type: ignore[import-untyped]
 
 from apar.defense.rules import RuleManifest
 from apar.defense.sentinel import SentinelAction
+from apar.evaluation.v5_population import V5DecisionRow, V5ExecutionManifest
 
 _INTERVENTION_ACTIONS = {
     SentinelAction.CHALLENGE,
@@ -60,13 +64,31 @@ _EXPECTED_SWITCHES = {
     V5Arm.FULL_SENTINEL: (True, True, True, True, True, True),
 }
 _EXPECTED_IMPLEMENTATION_PATHS = (
+    "src/apar/contracts/decisions.py",
+    "src/apar/contracts/events.py",
+    "src/apar/contracts/scenarios.py",
     "src/apar/defense/rules.py",
     "src/apar/defense/sentinel.py",
     "src/apar/evaluation/v5_arms.py",
     "src/apar/evaluation/v5_evaluation.py",
+    "src/apar/evaluation/v5_execution.py",
+    "src/apar/evaluation/v5_fidelity.py",
+    "src/apar/evaluation/v5_hardening.py",
+    "src/apar/evaluation/v5_population.py",
     "src/apar/evaluation/v5_protocol.py",
     "src/apar/evaluation/v5_reporting.py",
     "src/apar/features/sentinel.py",
+    "src/apar/generators/campaigns.py",
+    "src/apar/generators/population.py",
+    "src/apar/simulator/clock.py",
+    "src/apar/simulator/engine.py",
+    "src/apar/simulator/ledger.py",
+    "src/apar/simulator/rails/__init__.py",
+    "src/apar/simulator/rails/a2a.py",
+    "src/apar/simulator/rails/agentic.py",
+    "src/apar/simulator/rails/base.py",
+    "src/apar/simulator/rails/card.py",
+    "src/apar/trust/verifier.py",
     "scripts/run_defense_v5_development.py",
 )
 
@@ -99,6 +121,193 @@ def _canonical_digest(document: object) -> str:
     ).hexdigest()
 
 
+class V5ArmSupportRow(BaseModel):
+    """Evaluator-only execution facts shared identically by every arm."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    event_id: str
+    label: Literal[0, 1]
+    payment_id: str
+    campaign_id: str
+    actor_id: str
+    counterparty_id: str
+    amount: float = Field(gt=0.0)
+    currency: str
+    family: str
+    rail: str
+    integrity_status: Literal["pass", "fail", "not_applicable"]
+    source_command_id: str
+    source_event_id: str
+    execution_evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("amount")
+    @classmethod
+    def amount_is_finite(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("support amount must be finite")
+        return value
+
+
+class V5ExecutionArtifact(BaseModel):
+    """Canonical content-addressed execution manifest with verifier facts."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    payload_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    payload_json: str = Field(max_length=16_000_000)
+
+    def manifest(self) -> V5ExecutionManifest:
+        return V5ExecutionManifest.model_validate_json(self.payload_json)
+
+    @model_validator(mode="after")
+    def payload_is_canonical_and_validated(self) -> Self:
+        manifest = self.manifest()
+        canonical = json.dumps(
+            manifest.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        if self.payload_json != canonical:
+            raise ValueError("execution artifact payload must use canonical JSON")
+        if (
+            self.evidence_sha256 != manifest.evidence_sha256
+            or self.artifact_sha256 != manifest.artifact_sha256
+        ):
+            raise ValueError("execution artifact digests disagree with validated manifest")
+        if self.payload_sha256 != hashlib.sha256(canonical.encode()).hexdigest():
+            raise ValueError("execution artifact payload digest mismatch")
+        return self
+
+
+def build_v5_execution_artifacts(
+    manifests: Sequence[V5ExecutionManifest],
+) -> tuple[V5ExecutionArtifact, ...]:
+    """Serialize validated execution manifests into canonical bounded artifacts."""
+    artifacts: list[V5ExecutionArtifact] = []
+    for manifest in sorted(manifests, key=lambda item: item.evidence_sha256):
+        validated = V5ExecutionManifest.model_validate(manifest)
+        payload = json.dumps(
+            validated.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        artifacts.append(
+            V5ExecutionArtifact(
+                evidence_sha256=validated.evidence_sha256,
+                artifact_sha256=validated.artifact_sha256,
+                payload_sha256=hashlib.sha256(payload.encode()).hexdigest(),
+                payload_json=payload,
+            )
+        )
+    if len({artifact.evidence_sha256 for artifact in artifacts}) != len(artifacts):
+        raise ValueError("execution artifacts must have unique evidence digests")
+    return tuple(artifacts)
+
+
+def build_v5_arm_support_rows(
+    rows: Sequence[V5DecisionRow],
+) -> tuple[V5ArmSupportRow, ...]:
+    """Retain exact evaluator-only execution facts in canonical row order."""
+    return tuple(
+        V5ArmSupportRow(
+            event_id=row.event_id,
+            label=1 if row.is_fraud else 0,
+            payment_id=row.payment_id,
+            campaign_id=row.campaign_id,
+            actor_id=row.actor_id,
+            counterparty_id=row.counterparty_id,
+            amount=float(row.amount),
+            currency=row.currency,
+            family=row.family,
+            rail=row.rail,
+            integrity_status=cast(
+                Literal["pass", "fail", "not_applicable"], row.integrity_status
+            ),
+            source_command_id=row.source_command_id,
+            source_event_id=row.source_event_id,
+            execution_evidence_sha256=row.execution_evidence_sha256,
+        )
+        for row in rows
+    )
+
+
+def _support_trust_failure(
+    support: V5ArmSupportRow,
+    artifacts: tuple[V5ExecutionArtifact, ...],
+) -> bool:
+    return _support_trust_failure_from_manifests(
+        support, _execution_manifest_map(artifacts)
+    )
+
+
+def _execution_manifest_map(
+    artifacts: Sequence[V5ExecutionArtifact],
+) -> dict[str, V5ExecutionManifest]:
+    by_evidence = {
+        artifact.evidence_sha256: artifact.manifest() for artifact in artifacts
+    }
+    if len(by_evidence) != len(artifacts):
+        raise ValueError("execution artifacts must have unique evidence digests")
+    return by_evidence
+
+
+def _support_trust_failure_from_manifests(
+    support: V5ArmSupportRow,
+    by_evidence: dict[str, V5ExecutionManifest],
+) -> bool:
+    manifest = by_evidence.get(support.execution_evidence_sha256)
+    if manifest is None:
+        raise ValueError("support execution evidence hash cannot be resolved")
+    if (
+        manifest.campaign_id != support.campaign_id
+        or manifest.family != support.family
+        or manifest.rail != support.rail
+    ):
+        raise ValueError("support facts disagree with execution artifact")
+    matching = [link for link in manifest.lineage if link.event_id == support.source_event_id]
+    if len(matching) != 1:
+        raise ValueError("support source event cannot be resolved in execution artifact")
+    link = matching[0]
+    if (
+        support.event_id != link.event_id
+        or support.source_command_id != link.command_id
+        or support.payment_id != link.payment_id
+        or support.actor_id != link.actor_id
+        or support.counterparty_id != link.counterparty_id
+        or support.label != int(link.is_fraud)
+    ):
+        raise ValueError("support lineage disagrees with execution artifact")
+    event = next(record for record in manifest.event_records if record.event_id == link.event_id)
+    if float(event.amount) != support.amount or event.currency != support.currency:
+        raise ValueError("support economics disagree with execution artifact")
+    expected_integrity = (
+        "fail"
+        if support.event_id in manifest.trust_failure_event_ids
+        else "pass"
+        if support.rail == "agentic"
+        else "not_applicable"
+    )
+    if support.integrity_status != expected_integrity:
+        raise ValueError("support verifier outcome disagrees with execution artifact")
+    return expected_integrity == "fail"
+
+
+def derive_v5_trust_failures(
+    support: Sequence[V5ArmSupportRow],
+    artifacts: tuple[V5ExecutionArtifact, ...],
+) -> list[bool]:
+    """Replay actual verifier outcomes in exact evaluator support order."""
+    manifests = _execution_manifest_map(artifacts)
+    return [_support_trust_failure_from_manifests(row, manifests) for row in support]
+
+
 class V5TrainingPartitionEvidence(BaseModel):
     """Bounded ordered provenance for one model-development partition."""
 
@@ -107,8 +316,13 @@ class V5TrainingPartitionEvidence(BaseModel):
     partition: Literal["train", "calibration", "threshold"]
     ordered_event_ids: tuple[str, ...]
     labels: tuple[Literal[0, 1], ...]
+    feature_names: tuple[str, ...]
+    feature_matrix: tuple[tuple[float, ...], ...]
+    support_records: tuple[V5ArmSupportRow, ...]
+    execution_artifacts: tuple[V5ExecutionArtifact, ...]
     catalog_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     feature_batch_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    feature_batch_payload_json: str = Field(max_length=20_000_000)
     feature_matrix_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     ordered_rows_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     ordered_support_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -129,6 +343,46 @@ class V5TrainingPartitionEvidence(BaseModel):
         )
         if self.ordered_rows_sha256 != expected:
             raise ValueError("training partition ordered-row digest mismatch")
+        if tuple(row.event_id for row in self.support_records) != self.ordered_event_ids:
+            raise ValueError("training partition support order disagrees with event IDs")
+        if tuple(row.label for row in self.support_records) != self.labels:
+            raise ValueError("training partition support labels disagree with labels")
+        if len(self.feature_matrix) != len(self.labels) or any(
+            len(row) != len(self.feature_names) for row in self.feature_matrix
+        ):
+            raise ValueError("training partition feature matrix shape is incomplete")
+        if any(not math.isfinite(value) for row in self.feature_matrix for value in row):
+            raise ValueError("training partition feature matrix must be finite")
+        if self.feature_matrix_sha256 != _canonical_digest(self.feature_matrix):
+            raise ValueError("training partition feature matrix digest mismatch")
+        try:
+            batch_payload = json.loads(self.feature_batch_payload_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError("training partition feature batch payload is invalid") from exc
+        if self.feature_batch_payload_json != json.dumps(batch_payload, sort_keys=True):
+            raise ValueError("training partition feature batch payload is not canonical")
+        if not isinstance(batch_payload, dict) or set(batch_payload) != {"names", "rows"}:
+            raise ValueError("training partition feature batch payload is incomplete")
+        if tuple(batch_payload["names"]) != self.feature_names:
+            raise ValueError("training partition feature batch names disagree")
+        try:
+            batch_matrix = tuple(
+                tuple(float(value) for value in row) for row in batch_payload["rows"]
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("training partition feature batch rows are invalid") from exc
+        if batch_matrix != self.feature_matrix:
+            raise ValueError("training partition feature batch rows disagree with matrix")
+        expected_batch = hashlib.sha256(self.feature_batch_payload_json.encode()).hexdigest()
+        if self.feature_batch_sha256 != expected_batch:
+            raise ValueError("training partition feature batch digest mismatch")
+        if self.ordered_support_sha256 != _canonical_digest(
+            [row.model_dump(mode="json") for row in self.support_records]
+        ):
+            raise ValueError("training partition ordered support digest mismatch")
+        manifests = _execution_manifest_map(self.execution_artifacts)
+        for support in self.support_records:
+            _support_trust_failure_from_manifests(support, manifests)
         return self
 
 
@@ -187,6 +441,156 @@ class V5CalibratorManifest(BaseModel):
         return self
 
 
+class V5SerializedModelArtifact(BaseModel):
+    """Bounded content-addressed CatBoost bytes for independent raw-score replay."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    serialization: Literal["catboost-cbm"] = "catboost-cbm"
+    payload_base64: str = Field(max_length=24_000_000)
+    artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    def payload(self) -> bytes:
+        try:
+            payload = b64decode(self.payload_base64, validate=True)
+        except (Base64Error, ValueError) as error:
+            raise ValueError("CatBoost artifact is not valid base64") from error
+        if len(payload) > 16_000_000:
+            raise ValueError("CatBoost artifact exceeds the bounded payload limit")
+        return payload
+
+    def load_model(self) -> CatBoostClassifier:
+        model = CatBoostClassifier()
+        model.load_model(blob=self.payload())
+        return model
+
+    @model_validator(mode="after")
+    def payload_digest_matches(self) -> Self:
+        if hashlib.sha256(self.payload()).hexdigest() != self.artifact_sha256:
+            raise ValueError("CatBoost artifact payload digest mismatch")
+        return self
+
+
+class V5IsolationTreeManifest(BaseModel):
+    """One immutable sklearn isolation tree sufficient for exact traversal."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    children_left: tuple[int, ...]
+    children_right: tuple[int, ...]
+    feature: tuple[int, ...]
+    threshold: tuple[float, ...]
+    decision_path_lengths: tuple[float, ...]
+    average_path_lengths: tuple[float, ...]
+    estimator_features: tuple[int, ...]
+
+    @model_validator(mode="after")
+    def arrays_form_one_bounded_tree(self) -> Self:
+        lengths = {
+            len(self.children_left),
+            len(self.children_right),
+            len(self.feature),
+            len(self.threshold),
+            len(self.decision_path_lengths),
+            len(self.average_path_lengths),
+        }
+        if len(lengths) != 1 or not self.children_left or len(self.children_left) > 1_000_000:
+            raise ValueError("isolation tree arrays must align and remain bounded")
+        if any(
+            not math.isfinite(value)
+            for value in (
+                *self.threshold,
+                *self.decision_path_lengths,
+                *self.average_path_lengths,
+            )
+        ):
+            raise ValueError("isolation tree numeric arrays must be finite")
+        return self
+
+    def leaf_index(self, features: tuple[float, ...]) -> int:
+        values = np.asarray(features, dtype=np.float32)
+        node = 0
+        traversed = 0
+        while self.children_left[node] != -1:
+            split_feature = self.feature[node]
+            if split_feature < 0 or split_feature >= len(self.estimator_features):
+                raise ValueError("isolation tree split feature is invalid")
+            source_feature = self.estimator_features[split_feature]
+            if source_feature < 0 or source_feature >= len(values):
+                raise ValueError("isolation tree source feature is invalid")
+            node = (
+                self.children_left[node]
+                if values[source_feature] <= self.threshold[node]
+                else self.children_right[node]
+            )
+            traversed += 1
+            if node < 0 or node >= len(self.children_left) or traversed > len(
+                self.children_left
+            ):
+                raise ValueError("isolation tree traversal is invalid")
+        return node
+
+
+class V5IsolationForestManifest(BaseModel):
+    """Safe deterministic IsolationForest inference contract without live objects."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    serialization: Literal["sklearn-isolation-forest-tree-arrays-v1"] = (
+        "sklearn-isolation-forest-tree-arrays-v1"
+    )
+    feature_count: int = Field(gt=0)
+    max_samples: int = Field(gt=0)
+    offset: float
+    trees: tuple[V5IsolationTreeManifest, ...] = Field(min_length=1, max_length=512)
+    artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    def computed_digest(self) -> str:
+        return _canonical_digest(
+            self.model_dump(mode="json", exclude={"artifact_sha256"})
+        )
+
+    @staticmethod
+    def _average_path_length(sample_count: int) -> float:
+        if sample_count <= 1:
+            return 0.0
+        if sample_count == 2:
+            return 1.0
+        return 2.0 * (math.log(sample_count - 1.0) + float(np.euler_gamma)) - (
+            2.0 * (sample_count - 1.0) / sample_count
+        )
+
+    def raw_score(self, features: tuple[float, ...]) -> float:
+        if len(features) != self.feature_count or any(
+            not math.isfinite(value) for value in features
+        ):
+            raise ValueError("novelty replay feature vector is invalid")
+        depth = 0.0
+        for tree in self.trees:
+            leaf = tree.leaf_index(features)
+            depth += (
+                tree.decision_path_lengths[leaf]
+                + tree.average_path_lengths[leaf]
+                - 1.0
+            )
+        denominator = len(self.trees) * self._average_path_length(self.max_samples)
+        anomaly_score = 1.0 if denominator == 0.0 else 2.0 ** (-depth / denominator)
+        return -anomaly_score - self.offset
+
+    @model_validator(mode="after")
+    def forest_is_content_addressed(self) -> Self:
+        if not math.isfinite(self.offset):
+            raise ValueError("isolation forest offset must be finite")
+        if any(
+            any(index < 0 or index >= self.feature_count for index in tree.estimator_features)
+            for tree in self.trees
+        ):
+            raise ValueError("isolation forest estimator features are invalid")
+        if self.artifact_sha256 != self.computed_digest():
+            raise ValueError("IsolationForest artifact digest mismatch")
+        return self
+
+
 class V5ArmSpecification(BaseModel):
     """Immutable, executable component contract for one comparison arm."""
 
@@ -210,9 +614,11 @@ class V5ArmSpecification(BaseModel):
     execution_bound: bool = False
     training_partitions: tuple[V5TrainingPartitionEvidence, ...] = ()
     model_artifact_sha256: tuple[str, ...] = ()
+    model_artifacts: tuple[V5SerializedModelArtifact, ...] = ()
     calibrator_artifact_sha256: tuple[str, ...] = ()
     calibrator_manifests: tuple[V5CalibratorManifest, ...] = ()
     novelty_artifact_sha256: str | None = None
+    novelty_manifest: V5IsolationForestManifest | None = None
     model: bool
     graph: bool
     rules: bool
@@ -330,22 +736,37 @@ class V5ArmSpecification(BaseModel):
                 raise ValueError("executed arm must bind exact ordered training partitions")
             if self.model and (
                 len(self.model_artifact_sha256) != len(self.model_seeds)
+                or len(self.model_artifacts) != len(self.model_seeds)
                 or len(self.calibrator_artifact_sha256) != len(self.model_seeds)
                 or len(self.calibrator_manifests) != len(self.model_seeds)
             ):
                 raise ValueError("executed model artifact digests are incomplete")
+            if self.model and self.model_artifact_sha256 != tuple(
+                artifact.artifact_sha256 for artifact in self.model_artifacts
+            ):
+                raise ValueError("CatBoost artifacts disagree with model digests")
             if self.model and self.calibrator_artifact_sha256 != tuple(
                 manifest.artifact_sha256 for manifest in self.calibrator_manifests
             ):
                 raise ValueError("calibrator manifests disagree with artifact digests")
             if not self.model and (
                 self.model_artifact_sha256
+                or self.model_artifacts
                 or self.calibrator_artifact_sha256
                 or self.calibrator_manifests
             ):
                 raise ValueError("rules-only arm cannot bind model artifacts")
-            if self.novelty != (self.novelty_artifact_sha256 is not None):
+            if self.novelty != (
+                self.novelty_artifact_sha256 is not None
+                and self.novelty_manifest is not None
+            ):
                 raise ValueError("novelty artifact and switch disagree")
+            if (
+                self.novelty_manifest is not None
+                and self.novelty_artifact_sha256
+                != self.novelty_manifest.artifact_sha256
+            ):
+                raise ValueError("novelty manifest disagrees with artifact digest")
             if not self.threshold_values:
                 raise ValueError("executed arm must bind actual threshold values")
             expected_threshold_names = {
@@ -411,9 +832,11 @@ class V5ArmSpecification(BaseModel):
         elif (
             self.training_partitions
             or self.model_artifact_sha256
+            or self.model_artifacts
             or self.calibrator_artifact_sha256
             or self.calibrator_manifests
             or self.novelty_artifact_sha256 is not None
+            or self.novelty_manifest is not None
         ):
             raise ValueError("unexecuted arm template cannot claim trained artifacts")
         return self
@@ -468,26 +891,6 @@ class V5ArmConfiguration(BaseModel):
         return self
 
 
-class V5ArmSupportRow(BaseModel):
-    """Evaluator-only support facts shared identically by every arm."""
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    event_id: str
-    label: Literal[0, 1]
-    campaign_id: str
-    amount: float = Field(gt=0.0)
-    family: str
-    execution_evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-
-    @field_validator("amount")
-    @classmethod
-    def amount_is_finite(cls, value: float) -> float:
-        if not math.isfinite(value):
-            raise ValueError("support amount must be finite")
-        return value
-
-
 def build_v5_training_partition_evidence(
     *,
     partition: Literal["train", "calibration", "threshold"],
@@ -496,7 +899,10 @@ def build_v5_training_partition_evidence(
     support: Sequence[V5ArmSupportRow],
     feature_batch_sha256: str,
     feature_matrix: np.ndarray,
+    feature_names: Sequence[str],
     catalog_sha256: str,
+    execution_manifests: Sequence[V5ExecutionManifest],
+    feature_batch_source_matrix: Sequence[Sequence[float | int]] | None = None,
 ) -> V5TrainingPartitionEvidence:
     """Bind exact ordered rows, support, and full-catalog features for training."""
     if len(event_ids) != len(labels) or len(support) != len(labels):
@@ -512,12 +918,30 @@ def build_v5_training_partition_evidence(
         {"event_id": event_id, "label": label}
         for event_id, label in zip(event_ids, integer_labels, strict=True)
     ]
+    batch_payload = json.dumps(
+        {
+            "rows": (
+                feature_matrix.tolist()
+                if feature_batch_source_matrix is None
+                else [list(row) for row in feature_batch_source_matrix]
+            ),
+            "names": list(feature_names),
+        },
+        sort_keys=True,
+    )
     return V5TrainingPartitionEvidence(
         partition=partition,
         ordered_event_ids=tuple(event_ids),
         labels=integer_labels,
+        feature_names=tuple(feature_names),
+        feature_matrix=tuple(
+            tuple(float(value) for value in row) for row in feature_matrix
+        ),
+        support_records=tuple(support),
+        execution_artifacts=build_v5_execution_artifacts(execution_manifests),
         catalog_sha256=catalog_sha256,
         feature_batch_sha256=feature_batch_sha256,
+        feature_batch_payload_json=batch_payload,
         feature_matrix_sha256=_canonical_digest(feature_matrix.tolist()),
         ordered_rows_sha256=_canonical_digest(ordered_rows),
         ordered_support_sha256=_canonical_digest(
@@ -612,6 +1036,7 @@ class V5ArmScore(BaseModel):
 
     spec: V5ArmSpecification
     support_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    execution_artifacts: tuple[V5ExecutionArtifact, ...]
     rows: tuple[V5ArmRowEvidence, ...]
     score_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
@@ -631,7 +1056,17 @@ class V5ArmScore(BaseModel):
         )
         if self.support_sha256 != expected:
             raise ValueError("arm evaluation support digest mismatch")
+        if tuple(artifact.evidence_sha256 for artifact in self.execution_artifacts) != tuple(
+            sorted({artifact.evidence_sha256 for artifact in self.execution_artifacts})
+        ):
+            raise ValueError("arm execution artifacts must be unique and canonical")
+        loaded_models = tuple(
+            artifact.load_model() for artifact in self.spec.model_artifacts
+        )
+        execution_manifests = _execution_manifest_map(self.execution_artifacts)
         indices = _spec_feature_indices(self.spec)
+        if self.spec.model:
+            self._validate_replayed_thresholds(loaded_models, indices)
         expected_threshold_keys = {"rules_challenge", "rules_decline"} if self.spec.rules else set()
         if self.spec.model:
             expected_threshold_keys |= {"model_challenge", "model_review", "model_decline"}
@@ -649,12 +1084,62 @@ class V5ArmScore(BaseModel):
                 raise ValueError("arm row threshold component trace mismatch")
             if tuple(sorted(row.threshold_trace.items())) != self.spec.threshold_values:
                 raise ValueError("arm row thresholds disagree with specification")
-            self._validate_row_components(row)
+            trust_failure = _support_trust_failure_from_manifests(
+                row.support, execution_manifests
+            )
+            self._validate_row_components(
+                row,
+                loaded_models=loaded_models,
+                trust_failure=trust_failure,
+            )
         if self.score_sha256 != self.computed_digest():
             raise ValueError("arm score digest mismatch")
         return self
 
-    def _validate_row_components(self, row: V5ArmRowEvidence) -> None:
+    def _validate_replayed_thresholds(
+        self,
+        loaded_models: tuple[CatBoostClassifier, ...],
+        indices: tuple[int, ...],
+    ) -> None:
+        threshold_partition = self.spec.training_partitions[2]
+        matrix = np.asarray(threshold_partition.feature_matrix, dtype=np.float64)[
+            :, indices
+        ]
+        member_probabilities: list[np.ndarray] = []
+        for model, calibrator in zip(
+            loaded_models, self.spec.calibrator_manifests, strict=True
+        ):
+            raw = model.predict_proba(matrix)[:, 1]
+            member_probabilities.append(
+                np.asarray([calibrator.calibrate(float(value)) for value in raw])
+            )
+        probabilities = np.mean(np.vstack(member_probabilities), axis=0)
+        labels = np.asarray(threshold_partition.labels)
+        fraud_probabilities = probabilities[labels == 1]
+        benign_probabilities = probabilities[labels == 0]
+        raw_challenge = float(np.percentile(benign_probabilities, 95))
+        raw_decline = float(max(0.8, np.percentile(fraud_probabilities, 80)))
+        expected = {
+            "model_challenge": max(0.1, min(0.8, raw_challenge)),
+            "model_review": max(0.3, min(0.9, (raw_challenge + raw_decline) / 2)),
+            "model_decline": max(0.5, min(1.0, raw_decline)),
+        }
+        threshold_map = dict(self.spec.threshold_values)
+        if any(
+            not math.isclose(
+                threshold_map[name], value, rel_tol=1e-12, abs_tol=1e-12
+            )
+            for name, value in expected.items()
+        ):
+            raise ValueError("model thresholds failed retained threshold-partition replay")
+
+    def _validate_row_components(
+        self,
+        row: V5ArmRowEvidence,
+        *,
+        loaded_models: tuple[CatBoostClassifier, ...],
+        trust_failure: bool,
+    ) -> None:
         if self.spec.model:
             if (
                 len(row.model_raw_scores) != len(self.spec.model_seeds)
@@ -662,12 +1147,22 @@ class V5ArmScore(BaseModel):
             ):
                 raise ValueError("arm row model member trace is incomplete")
             probability = float(np.mean(row.model_calibrated_scores))
-            for raw_score, calibrated_score, calibrator in zip(
+            for raw_score, calibrated_score, calibrator, model in zip(
                 row.model_raw_scores,
                 row.model_calibrated_scores,
                 self.spec.calibrator_manifests,
+                loaded_models,
                 strict=True,
             ):
+                replayed_raw = float(
+                    model.predict_proba(
+                        np.asarray(row.subset_feature_values, dtype=np.float64).reshape(1, -1)
+                    )[:, 1][0]
+                )
+                if not math.isclose(
+                    raw_score, replayed_raw, rel_tol=1e-12, abs_tol=1e-12
+                ):
+                    raise ValueError("arm row raw model score failed artifact replay")
                 if not math.isclose(
                     calibrated_score,
                     calibrator.calibrate(raw_score),
@@ -703,13 +1198,16 @@ class V5ArmScore(BaseModel):
         elif row.rule_score is not None or row.rule_components or row.rule_action is not None:
             raise ValueError("rules-disabled row contains rule component evidence")
 
-        if row.trust_action not in {None, SentinelAction.DECLINE_HOLD}:
-            raise ValueError("trust action must be an explicit decline hold")
-        expected_trust = row.trust_action is SentinelAction.DECLINE_HOLD
-        if row.trust_routed != expected_trust or (expected_trust and not self.spec.trust):
-            raise ValueError("arm row trust component trace mismatch")
-        if not self.spec.trust and row.trust_action is not None:
-            raise ValueError("trust-disabled row contains trust action")
+        expected_trust_action = (
+            SentinelAction.DECLINE_HOLD
+            if self.spec.trust and trust_failure
+            else None
+        )
+        if (
+            row.trust_action is not expected_trust_action
+            or row.trust_routed != (expected_trust_action is not None)
+        ):
+            raise ValueError("arm row trust evidence disagrees with verifier artifact")
 
         if self.spec.novelty:
             if row.novelty_score is None or row.disagreement is None:
@@ -718,9 +1216,20 @@ class V5ArmScore(BaseModel):
             if not math.isclose(row.disagreement, expected_disagreement, abs_tol=1e-12):
                 raise ValueError("arm row disagreement trace mismatch")
             if row.novelty_overridden:
-                if row.novelty_raw_score is not None:
-                    raise ValueError("overridden novelty cannot claim a raw model score")
-            elif row.novelty_raw_score is None or not math.isclose(
+                raise ValueError("persisted novelty evidence cannot be overridden")
+            if self.spec.novelty_manifest is None or row.novelty_raw_score is None:
+                raise ValueError("full sentinel row lacks novelty artifact evidence")
+            replayed_novelty_raw = self.spec.novelty_manifest.raw_score(
+                row.subset_feature_values
+            )
+            if not math.isclose(
+                row.novelty_raw_score,
+                replayed_novelty_raw,
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            ):
+                raise ValueError("arm row novelty artifact replay mismatch")
+            if not math.isclose(
                 row.novelty_score,
                 max(0.0, min(1.0, 0.5 - row.novelty_raw_score)),
                 abs_tol=1e-12,
@@ -894,6 +1403,21 @@ class V5ArmScoreSet(BaseModel):
         }
         if len(event_orders) != 1:
             raise ValueError("arms do not share identical event order")
+        feature_streams = {
+            tuple(
+                (row.catalog_feature_sha256, row.catalog_feature_values)
+                for row in result.rows
+            )
+            for result in results
+        }
+        if len(feature_streams) != 1:
+            raise ValueError("arms do not share an identical full catalog feature stream")
+        execution_streams = {
+            tuple(artifact.model_dump_json() for artifact in result.execution_artifacts)
+            for result in results
+        }
+        if len(execution_streams) != 1:
+            raise ValueError("arms do not share identical execution artifacts")
         return self
 
 
@@ -1026,9 +1550,11 @@ def load_v5_arm_configuration(
             "execution_bound": False,
             "training_partitions": (),
             "model_artifact_sha256": (),
+            "model_artifacts": (),
             "calibrator_artifact_sha256": (),
             "calibrator_manifests": (),
             "novelty_artifact_sha256": None,
+            "novelty_manifest": None,
             "model": entry.model,
             "graph": entry.graph,
             "rules": entry.rules,
@@ -1082,6 +1608,7 @@ class V5EvaluationResult(BaseModel):
     support_sha256: str = ""
     feature_count: int = 0
     arm_spec: V5ArmSpecification | None = None
+    execution_artifacts: tuple[V5ExecutionArtifact, ...] = ()
     row_evidence: tuple[V5ArmRowEvidence, ...] = ()
     score_sha256: str = ""
     result_sha256: str = ""
@@ -1094,7 +1621,7 @@ class V5EvaluationResult(BaseModel):
         evidence_present = bool(self.arm_spec or self.row_evidence or self.arm_spec_sha256)
         if not evidence_present:
             return self
-        if self.arm_spec is None or not self.row_evidence:
+        if self.arm_spec is None or not self.execution_artifacts or not self.row_evidence:
             raise ValueError("arm result evidence is incomplete")
         if self.arm_spec_sha256 != self.arm_spec.spec_sha256:
             raise ValueError("arm result specification digest mismatch")
@@ -1111,13 +1638,12 @@ class V5EvaluationResult(BaseModel):
             raise ValueError("arm result support digest mismatch")
         if not self.score_sha256 or not self.result_sha256:
             raise ValueError("arm result output digests are missing")
-        V5ArmScore.model_validate(
-            {
-                "spec": self.arm_spec.model_dump(mode="json"),
-                "support_sha256": self.support_sha256,
-                "rows": [row.model_dump(mode="json") for row in self.row_evidence],
-                "score_sha256": self.score_sha256,
-            }
+        V5ArmScore(
+            spec=self.arm_spec,
+            support_sha256=self.support_sha256,
+            execution_artifacts=self.execution_artifacts,
+            rows=self.row_evidence,
+            score_sha256=self.score_sha256,
         )
         independently_evaluated = evaluate_v5_arm(
             arm=self.arm_spec.arm,
@@ -1187,14 +1713,24 @@ def bind_v5_evaluation_result(
             "arm_spec_sha256": score.spec.spec_sha256,
             "support_sha256": score.support_sha256,
             "feature_count": len(score.spec.feature_names),
-            "arm_spec": score.spec.model_dump(mode="json"),
-            "row_evidence": [row.model_dump(mode="json") for row in score.rows],
+            "arm_spec": score.spec,
+            "execution_artifacts": score.execution_artifacts,
+            "row_evidence": score.rows,
             "score_sha256": score.score_sha256,
         }
     )
-    values["result_sha256"] = _canonical_digest(
-        {key: value for key, value in values.items() if key != "result_sha256"}
-    )
+    digest_values = {
+        key: (
+            value.model_dump(mode="json")
+            if isinstance(value, BaseModel)
+            else [item.model_dump(mode="json") for item in value]
+            if isinstance(value, tuple) and value and isinstance(value[0], BaseModel)
+            else value
+        )
+        for key, value in values.items()
+        if key != "result_sha256"
+    }
+    values["result_sha256"] = _canonical_digest(digest_values)
     return V5EvaluationResult.model_validate(values)
 
 
@@ -1381,11 +1917,18 @@ __all__ = [
     "V5ArmSpecification",
     "V5ArmSupportRow",
     "V5CalibratorManifest",
+    "V5ExecutionArtifact",
+    "V5IsolationForestManifest",
+    "V5IsolationTreeManifest",
+    "V5SerializedModelArtifact",
     "V5TrainingPartitionEvidence",
     "V5ControlResult",
     "V5EvaluationResult",
     "bind_v5_evaluation_result",
+    "build_v5_arm_support_rows",
+    "build_v5_execution_artifacts",
     "build_v5_training_partition_evidence",
+    "derive_v5_trust_failures",
     "evaluate_v5_arm",
     "load_v5_arm_configuration",
     "run_v5_controls",

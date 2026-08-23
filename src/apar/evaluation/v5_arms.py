@@ -5,8 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import pickle
 import time
+from base64 import b64encode
 from dataclasses import dataclass
 
 import numpy as np
@@ -28,7 +28,12 @@ from apar.evaluation.v5_evaluation import (
     V5ArmSpecification,
     V5ArmSupportRow,
     V5CalibratorManifest,
+    V5ExecutionArtifact,
+    V5IsolationForestManifest,
+    V5IsolationTreeManifest,
+    V5SerializedModelArtifact,
     V5TrainingPartitionEvidence,
+    derive_v5_trust_failures,
 )
 from apar.features.sentinel import SentinelFeatureCatalog
 
@@ -97,6 +102,16 @@ def _bound_spec(
         if defender is not None
         else ()
     )
+    model_artifacts = (
+        tuple(_model_artifact(model) for model in defender.model_members)
+        if defender is not None
+        else ()
+    )
+    novelty_manifest = (
+        _isolation_forest_manifest(defender.iso_forest)
+        if defender is not None and defender.iso_forest is not None
+        else None
+    )
     values = template.model_dump(mode="json", exclude={"spec_sha256"})
     values["threshold_digest"] = _digest(threshold_facts)
     values["threshold_values"] = ordered_thresholds
@@ -104,11 +119,12 @@ def _bound_spec(
     values["training_partitions"] = [
         item.model_dump(mode="json") for item in training_partitions
     ]
-    values["model_artifact_sha256"] = (
-        [_model_artifact_digest(model) for model in defender.model_members]
-        if defender is not None
-        else []
-    )
+    values["model_artifact_sha256"] = [
+        artifact.artifact_sha256 for artifact in model_artifacts
+    ]
+    values["model_artifacts"] = [
+        artifact.model_dump(mode="json") for artifact in model_artifacts
+    ]
     values["calibrator_artifact_sha256"] = [
         manifest.artifact_sha256 for manifest in calibrator_manifests
     ]
@@ -116,19 +132,75 @@ def _bound_spec(
         manifest.model_dump(mode="json") for manifest in calibrator_manifests
     ]
     values["novelty_artifact_sha256"] = (
-        hashlib.sha256(pickle.dumps(defender.iso_forest, protocol=5)).hexdigest()
-        if defender is not None and defender.iso_forest is not None
+        novelty_manifest.artifact_sha256 if novelty_manifest is not None else None
+    )
+    values["novelty_manifest"] = (
+        novelty_manifest.model_dump(mode="json")
+        if novelty_manifest is not None
         else None
     )
     values["spec_sha256"] = _digest(values)
-    return V5ArmSpecification.model_validate(values)
+    bound_values = dict(values)
+    bound_values["training_partitions"] = training_partitions
+    bound_values["model_artifacts"] = model_artifacts
+    bound_values["calibrator_manifests"] = calibrator_manifests
+    bound_values["novelty_manifest"] = novelty_manifest
+    return V5ArmSpecification.model_validate(bound_values)
 
 
-def _model_artifact_digest(model: object) -> str:
+def _model_artifact(model: object) -> V5SerializedModelArtifact:
     serialized = model._serialize_model()  # type: ignore[attr-defined]
     if type(serialized) is not bytes:
         raise TypeError("CatBoost artifact serialization must return bytes")
-    return hashlib.sha256(serialized).hexdigest()
+    return V5SerializedModelArtifact(
+        payload_base64=b64encode(serialized).decode("ascii"),
+        artifact_sha256=hashlib.sha256(serialized).hexdigest(),
+    )
+
+
+def _isolation_forest_manifest(model: object) -> V5IsolationForestManifest:
+    trees = tuple(
+        V5IsolationTreeManifest(
+            children_left=tuple(int(value) for value in estimator.tree_.children_left),
+            children_right=tuple(int(value) for value in estimator.tree_.children_right),
+            feature=tuple(int(value) for value in estimator.tree_.feature),
+            threshold=tuple(float(value) for value in estimator.tree_.threshold),
+            decision_path_lengths=tuple(
+                float(value)
+                for value in model._decision_path_lengths[index]  # type: ignore[attr-defined]
+            ),
+            average_path_lengths=tuple(
+                float(value)
+                for value in model._average_path_length_per_tree[index]  # type: ignore[attr-defined]
+            ),
+            estimator_features=tuple(
+                int(value)
+                for value in model.estimators_features_[index]  # type: ignore[attr-defined]
+            ),
+        )
+        for index, estimator in enumerate(model.estimators_)  # type: ignore[attr-defined]
+    )
+    feature_count = int(model.n_features_in_)  # type: ignore[attr-defined]
+    max_samples = int(model._max_samples)  # type: ignore[attr-defined]
+    offset = float(model.offset_)  # type: ignore[attr-defined]
+    digest_values = {
+        "feature_count": feature_count,
+        "max_samples": max_samples,
+        "offset": offset,
+        "trees": [tree.model_dump(mode="json") for tree in trees],
+    }
+    return V5IsolationForestManifest(
+        feature_count=feature_count,
+        max_samples=max_samples,
+        offset=offset,
+        trees=trees,
+        artifact_sha256=_digest(
+            {
+                "serialization": "sklearn-isolation-forest-tree-arrays-v1",
+                **digest_values,
+            }
+        ),
+    )
 
 
 def _calibrator_manifest(calibrator: object) -> V5CalibratorManifest:
@@ -464,8 +536,8 @@ def _score_one_arm(
     catalog: SentinelFeatureCatalog,
     features_matrix: NDArray[np.float64],
     support: tuple[V5ArmSupportRow, ...],
+    execution_artifacts: tuple[V5ExecutionArtifact, ...],
     trust_failures: list[bool],
-    novelty_scores: list[float] | None,
 ) -> V5ArmScore:
     evidence: list[V5ArmRowEvidence] = []
     for index, source_row in enumerate(features_matrix):
@@ -504,10 +576,7 @@ def _score_one_arm(
                 disagreement,
             ) = trained.defender.predict_member_scores(subset)
             probability_action = _model_action(probability, trained.defender.thresholds)
-            if novelty_scores is None:
-                novelty_raw, novelty = trained.defender.predict_novelty(subset)
-            else:
-                novelty = novelty_scores[index]
+            novelty_raw, novelty = trained.defender.predict_novelty(subset)
             model_action, disagreement_routed, novelty_routed = route_full_sentinel_components(
                 probability=probability,
                 disagreement=disagreement,
@@ -530,7 +599,7 @@ def _score_one_arm(
             disagreement = None
         latency_ms = (time.perf_counter_ns() - start) / 1_000_000
         row_values = {
-            "support": support[index].model_dump(mode="json"),
+            "support": support[index],
             "catalog_feature_values": tuple(float(value) for value in source_row),
             "subset_feature_values": tuple(float(value) for value in subset),
             "catalog_feature_sha256": _digest(tuple(float(value) for value in source_row)),
@@ -549,25 +618,36 @@ def _score_one_arm(
             "trust_routed": bool(trained.spec.trust and trust_failure),
             "novelty_score": novelty,
             "novelty_raw_score": novelty_raw,
-            "novelty_overridden": bool(
-                trained.spec.novelty and novelty_scores is not None
-            ),
+            "novelty_overridden": False,
             "disagreement": disagreement,
             "novelty_routed": novelty_routed,
             "disagreement_routed": disagreement_routed,
             "latency_ms": latency_ms,
             "arm_spec_sha256": trained.spec.spec_sha256,
         }
-        row_values["row_output_sha256"] = _digest(row_values)
+        row_values["row_output_sha256"] = _digest(
+            {
+                **row_values,
+                "support": support[index].model_dump(mode="json"),
+            }
+        )
         evidence.append(V5ArmRowEvidence.model_validate(row_values))
     support_sha256 = _digest([row.model_dump(mode="json") for row in support])
-    score_values = {
+    score_digest_values = {
         "spec": trained.spec.model_dump(mode="json"),
         "support_sha256": support_sha256,
+        "execution_artifacts": [
+            artifact.model_dump(mode="json") for artifact in execution_artifacts
+        ],
         "rows": [row.model_dump(mode="json") for row in evidence],
     }
-    score_values["score_sha256"] = _digest(score_values)
-    return V5ArmScore.model_validate(score_values)
+    return V5ArmScore(
+        spec=trained.spec,
+        support_sha256=support_sha256,
+        execution_artifacts=execution_artifacts,
+        rows=tuple(evidence),
+        score_sha256=_digest(score_digest_values),
+    )
 
 
 def score_v5_arm_set(
@@ -576,8 +656,8 @@ def score_v5_arm_set(
     catalog: SentinelFeatureCatalog,
     features_matrix: NDArray[np.float64],
     support: tuple[V5ArmSupportRow, ...],
+    execution_artifacts: tuple[V5ExecutionArtifact, ...],
     trust_failures: list[bool],
-    novelty_scores: list[float] | None = None,
 ) -> V5ArmScoreSet:
     """Score each arm independently over one immutable ordered support."""
     if any(
@@ -589,22 +669,21 @@ def score_v5_arm_set(
     if not np.isfinite(features_matrix).all():
         raise ValueError("evaluation matrix contains non-finite features")
     lengths = {len(features_matrix), len(support), len(trust_failures)}
-    if novelty_scores is not None:
-        lengths.add(len(novelty_scores))
-        if any(not math.isfinite(value) or not 0.0 <= value <= 1.0 for value in novelty_scores):
-            raise ValueError("novelty scores must be finite values in [0, 1]")
     if lengths != {len(features_matrix)} or not len(features_matrix):
-        raise ValueError("evaluation features, support, trust, and novelty must align")
+        raise ValueError("evaluation features, support, and trust must align")
     if len({row.event_id for row in support}) != len(support):
         raise ValueError("evaluation support event IDs must be unique")
+    derived_trust_failures = derive_v5_trust_failures(support, execution_artifacts)
+    if trust_failures != derived_trust_failures:
+        raise ValueError("trust failures disagree with retained verifier evidence")
     scores = {
         arm.spec.arm: _score_one_arm(
             trained=arm,
             catalog=catalog,
             features_matrix=features_matrix,
             support=support,
+            execution_artifacts=execution_artifacts,
             trust_failures=trust_failures,
-            novelty_scores=novelty_scores,
         )
         for arm in trained.arms
     }

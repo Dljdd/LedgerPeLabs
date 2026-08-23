@@ -20,11 +20,17 @@ from apar.evaluation.v5_evaluation import (
     V5ArmConfiguration,
     V5ArmSupportRow,
     bind_v5_evaluation_result,
+    build_v5_arm_support_rows,
+    build_v5_execution_artifacts,
     build_v5_training_partition_evidence,
     evaluate_v5_arm,
     load_v5_arm_configuration,
 )
-from apar.evaluation.v5_population import V5DecisionRow, build_v5_corpus
+from apar.evaluation.v5_population import (
+    V5DecisionRow,
+    V5ExecutionManifest,
+    build_v5_corpus,
+)
 from apar.evaluation.v5_protocol import V5Profile, load_v5_development_protocol
 from apar.evaluation.v5_reporting import build_v5_development_result
 from apar.features.sentinel import (
@@ -87,17 +93,7 @@ def _derive_trust_failures(
 
 
 def _arm_support(rows: Sequence[V5DecisionRow]) -> tuple[V5ArmSupportRow, ...]:
-    return tuple(
-        V5ArmSupportRow(
-            event_id=row.event_id,
-            label=1 if row.is_fraud else 0,
-            campaign_id=row.campaign_id,
-            amount=float(row.amount),
-            family=row.family,
-            execution_evidence_sha256=row.execution_evidence_sha256,
-        )
-        for row in rows
-    )
+    return build_v5_arm_support_rows(rows)
 
 
 def _decide_with_trust(
@@ -117,9 +113,13 @@ def _decide_with_trust(
 def _score_all_arms_and_evaluate(
     *,
     train_decisions: Sequence[V5DecisionRow],
+    train_executions: Sequence[V5ExecutionManifest],
     calibration_decisions: Sequence[V5DecisionRow],
+    calibration_executions: Sequence[V5ExecutionManifest],
     threshold_decisions: Sequence[V5DecisionRow],
+    threshold_executions: Sequence[V5ExecutionManifest],
     dev_test_decisions: Sequence[V5DecisionRow],
+    dev_test_executions: Sequence[V5ExecutionManifest],
     catalog: SentinelFeatureCatalog,
     configuration: V5ArmConfiguration,
     bootstrap_seed: int,
@@ -162,7 +162,10 @@ def _score_all_arms_and_evaluate(
         support=train_support,
         feature_batch_sha256=train_batch.batch_sha256,
         feature_matrix=x_train,
+        feature_names=catalog.feature_names,
         catalog_sha256=catalog.catalog_sha256,
+        execution_manifests=train_executions,
+        feature_batch_source_matrix=train_batch.matrix,
     )
     calibration_evidence = build_v5_training_partition_evidence(
         partition="calibration",
@@ -171,7 +174,10 @@ def _score_all_arms_and_evaluate(
         support=calibration_support,
         feature_batch_sha256=cal_batch.batch_sha256,
         feature_matrix=x_cal,
+        feature_names=catalog.feature_names,
         catalog_sha256=catalog.catalog_sha256,
+        execution_manifests=calibration_executions,
+        feature_batch_source_matrix=cal_batch.matrix,
     )
     threshold_evidence = build_v5_training_partition_evidence(
         partition="threshold",
@@ -180,7 +186,10 @@ def _score_all_arms_and_evaluate(
         support=threshold_support,
         feature_batch_sha256=threshold_batch.batch_sha256,
         feature_matrix=x_threshold,
+        feature_names=catalog.feature_names,
         catalog_sha256=catalog.catalog_sha256,
+        execution_manifests=threshold_executions,
+        feature_batch_source_matrix=threshold_batch.matrix,
     )
 
     trained = train_v5_arm_set(
@@ -203,6 +212,7 @@ def _score_all_arms_and_evaluate(
         catalog=catalog,
         features_matrix=x_test,
         support=support,
+        execution_artifacts=build_v5_execution_artifacts(dev_test_executions),
         trust_failures=test_trust_failures,
     )
     if tuple(item.event_id for item in support) != tuple(test_event_ids):
@@ -253,9 +263,13 @@ def main() -> int:
     dev_test_partition = corpus.partitions["development_test"]
     scoring_output = _score_all_arms_and_evaluate(
         train_decisions=train_partition.decisions,
+        train_executions=train_partition.executions,
         calibration_decisions=calibration_partition.decisions,
+        calibration_executions=calibration_partition.executions,
         threshold_decisions=threshold_partition.decisions,
+        threshold_executions=threshold_partition.executions,
         dev_test_decisions=dev_test_partition.decisions,
+        dev_test_executions=dev_test_partition.executions,
         catalog=catalog,
         configuration=arm_configuration,
         bootstrap_seed=protocol.seeds.bootstrap,

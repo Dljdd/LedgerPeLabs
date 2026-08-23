@@ -16,9 +16,12 @@ from apar.evaluation.v5_evaluation import (
     V5Arm,
     V5ArmScore,
     V5ArmSpecification,
+    build_v5_arm_support_rows,
+    build_v5_execution_artifacts,
     build_v5_training_partition_evidence,
 )
-from apar.evaluation.v5_protocol import load_v5_development_protocol
+from apar.evaluation.v5_population import V5DecisionRow, build_v5_corpus
+from apar.evaluation.v5_protocol import V5Profile, load_v5_development_protocol
 from apar.features.sentinel import SentinelFeatureCatalog
 from tests.evaluation.v5_safe_protocol import load_safe_v5_test_protocol
 
@@ -91,6 +94,7 @@ def test_four_arms_train_and_score_independent_component_paths() -> None:
     assert support_type is not None, "ordered arm support contract is missing"
 
     protocol = load_safe_v5_test_protocol(ROOT)
+    corpus = build_v5_corpus(protocol, profile=V5Profile.SMOKE)
     catalog = SentinelFeatureCatalog.default()
     configuration = v5_evaluation.load_v5_arm_configuration(
         ROOT / "config/defense/defense-v5-arms.json",
@@ -103,17 +107,45 @@ def test_four_arms_train_and_score_independent_component_paths() -> None:
     integrity_index = catalog.feature_groups.index("integrity")
     rng = np.random.RandomState(817)
 
-    def partition(size: int) -> tuple[np.ndarray, np.ndarray]:
-        labels = np.array(([0, 1] * ((size + 1) // 2))[:size], dtype=int)
+    def partition(
+        name: str,
+        size: int,
+        *,
+        trust_failure_first: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray, tuple[V5DecisionRow, ...]]:
+        available = corpus.partitions[name].decisions
+        selected: list[V5DecisionRow] = []
+        if trust_failure_first:
+            selected.append(
+                next(
+                    row
+                    for row in available
+                    if row.rail == "agentic" and row.integrity_status == "fail"
+                )
+            )
+        benign = [row for row in available if not row.is_fraud and row not in selected]
+        fraud = [row for row in available if row.is_fraud and row not in selected]
+        for benign_row, fraud_row in zip(benign, fraud, strict=False):
+            if len(selected) < size:
+                selected.append(benign_row)
+            if len(selected) < size:
+                selected.append(fraud_row)
+            if len(selected) == size:
+                break
+        if len(selected) != size:
+            raise AssertionError(f"{name} lacks balanced test support")
+        labels = np.array([int(row.is_fraud) for row in selected], dtype=int)
         matrix = rng.normal(0.0, 0.05, (size, len(catalog.feature_names)))
         matrix[:, graph_index] = labels * 8.0
         matrix[:, integrity_index] = labels * 9.0
-        return matrix, labels
+        return matrix, labels, tuple(selected)
 
-    x_train, y_train = partition(32)
-    x_cal, y_cal = partition(16)
-    x_threshold, y_threshold = partition(16)
-    x_test, y_test = partition(8)
+    x_train, y_train, train_rows = partition("train", 32)
+    x_cal, y_cal, calibration_rows = partition("calibration", 16)
+    x_threshold, y_threshold, threshold_rows_source = partition("threshold", 16)
+    x_test, y_test, test_rows = partition(
+        "development_test", 8, trust_failure_first=True
+    )
     x_test[1, catalog.feature_names.index("actor_count_1m")] = 5.0
 
     def independent_digest(document: object) -> str:
@@ -127,19 +159,14 @@ def test_four_arms_train_and_score_independent_component_paths() -> None:
             ).encode()
         ).hexdigest()
 
-    def provenance(name: str, matrix: np.ndarray, labels: np.ndarray, ordinal: int):
-        event_ids = tuple(f"{name}-event-{index}" for index in range(len(labels)))
-        evidence_support = tuple(
-            support_type(
-                event_id=event_id,
-                label=int(labels[index]),
-                campaign_id=f"{name}-campaign-{index // 2}",
-                amount=float(index + 1),
-                family="legitimate" if not labels[index] else "card_testing_cnp",
-                execution_evidence_sha256=f"{ordinal + index + 1:064x}",
-            )
-            for index, event_id in enumerate(event_ids)
-        )
+    def provenance(
+        name: str,
+        matrix: np.ndarray,
+        labels: np.ndarray,
+        rows: tuple[V5DecisionRow, ...],
+    ):
+        event_ids = tuple(row.event_id for row in rows)
+        evidence_support = build_v5_arm_support_rows(rows)
         return build_v5_training_partition_evidence(
             partition=name,
             event_ids=event_ids,
@@ -152,12 +179,18 @@ def test_four_arms_train_and_score_independent_component_paths() -> None:
                 ).encode()
             ).hexdigest(),
             feature_matrix=matrix,
+            feature_names=catalog.feature_names,
             catalog_sha256=catalog.catalog_sha256,
+            execution_manifests=corpus.partitions[name].executions,
         )
 
-    train_provenance = provenance("train", x_train, y_train, 100)
-    calibration_provenance = provenance("calibration", x_cal, y_cal, 200)
-    threshold_provenance = provenance("threshold", x_threshold, y_threshold, 300)
+    train_provenance = provenance("train", x_train, y_train, train_rows)
+    calibration_provenance = provenance(
+        "calibration", x_cal, y_cal, calibration_rows
+    )
+    threshold_provenance = provenance(
+        "threshold", x_threshold, y_threshold, threshold_rows_source
+    )
     tampered_catalog = catalog.model_copy(update={"catalog_sha256": "0" * 64})
     with pytest.raises(ValueError, match="catalog digest"):
         train(
@@ -218,23 +251,17 @@ def test_four_arms_train_and_score_independent_component_paths() -> None:
         calibration_evidence=calibration_provenance,
         threshold_evidence=threshold_provenance,
     )
-    support = tuple(
-        support_type(
-            event_id=f"event-{index}",
-            label=int(y_test[index]),
-            campaign_id=f"campaign-{index // 2}",
-            amount=float(index + 1),
-            family="legitimate" if not y_test[index] else "card_testing_cnp",
-            execution_evidence_sha256=f"{index + 1:064x}",
-        )
-        for index in range(len(x_test))
+    support = build_v5_arm_support_rows(test_rows)
+    execution_artifacts = build_v5_execution_artifacts(
+        corpus.partitions["development_test"].executions
     )
-    trust_failures = [True] + [False] * (len(x_test) - 1)
+    trust_failures = [row.integrity_status == "fail" for row in test_rows]
     scored = score(
         trained=trained,
         catalog=catalog,
         features_matrix=x_test,
         support=support,
+        execution_artifacts=execution_artifacts,
         trust_failures=trust_failures,
     )
 
@@ -391,16 +418,16 @@ def test_four_arms_train_and_score_independent_component_paths() -> None:
         catalog=catalog,
         features_matrix=graph_mutation,
         support=support,
-        trust_failures=[False] * len(x_test),
-        novelty_scores=[1.0] * len(x_test),
+        execution_artifacts=execution_artifacts,
+        trust_failures=trust_failures,
     )
-    original_no_trust = score(
+    baseline = score(
         trained=trained,
         catalog=catalog,
         features_matrix=x_test,
         support=support,
-        trust_failures=[False] * len(x_test),
-        novelty_scores=[0.0] * len(x_test),
+        execution_artifacts=execution_artifacts,
+        trust_failures=trust_failures,
     )
 
     def probabilities(result: V5ArmScore) -> tuple[float, ...]:
@@ -408,73 +435,35 @@ def test_four_arms_train_and_score_independent_component_paths() -> None:
 
     assert probabilities(
         mutated.by_arm[V5Arm.ENSEMBLE_NO_GRAPH]
-    ) == probabilities(original_no_trust.by_arm[V5Arm.ENSEMBLE_NO_GRAPH])
+    ) == probabilities(baseline.by_arm[V5Arm.ENSEMBLE_NO_GRAPH])
     assert probabilities(mutated.by_arm[V5Arm.RULES_ONLY]) == probabilities(
-        original_no_trust.by_arm[V5Arm.RULES_ONLY]
+        baseline.by_arm[V5Arm.RULES_ONLY]
     )
     assert tuple(row.action for row in mutated.by_arm[V5Arm.RULES_ONLY].rows) == tuple(
-        row.action for row in original_no_trust.by_arm[V5Arm.RULES_ONLY].rows
+        row.action for row in baseline.by_arm[V5Arm.RULES_ONLY].rows
     )
     assert probabilities(
         mutated.by_arm[V5Arm.ENSEMBLE_WITH_GRAPH]
-    ) != probabilities(original_no_trust.by_arm[V5Arm.ENSEMBLE_WITH_GRAPH])
+    ) != probabilities(baseline.by_arm[V5Arm.ENSEMBLE_WITH_GRAPH])
     assert tuple(
         row.action for row in scored.by_arm[V5Arm.ENSEMBLE_NO_GRAPH].rows
-    ) == tuple(row.action for row in original_no_trust.by_arm[V5Arm.ENSEMBLE_NO_GRAPH].rows)
-
-    novelty_mutated = score(
-        trained=trained,
-        catalog=catalog,
-        features_matrix=x_test,
-        support=support,
-        trust_failures=[False] * len(x_test),
-        novelty_scores=[1.0] * len(x_test),
-    )
-    for arm in (V5Arm.ENSEMBLE_NO_GRAPH, V5Arm.ENSEMBLE_WITH_GRAPH):
-        assert probabilities(novelty_mutated.by_arm[arm]) == probabilities(
-            original_no_trust.by_arm[arm]
-        )
-        assert tuple(row.action for row in novelty_mutated.by_arm[arm].rows) == tuple(
-            row.action for row in original_no_trust.by_arm[arm].rows
-        )
-    original_full_row = original_no_trust.by_arm[V5Arm.FULL_SENTINEL].rows[0]
-    novelty_full_row = novelty_mutated.by_arm[V5Arm.FULL_SENTINEL].rows[0]
-    assert original_full_row.novelty_routed is False
-    assert novelty_full_row.novelty_routed is True
-    assert novelty_full_row.action.severity > original_full_row.action.severity
+    ) == tuple(row.action for row in baseline.by_arm[V5Arm.ENSEMBLE_NO_GRAPH].rows)
 
     rule_mutation = x_test.copy()
-    rule_mutation[0, catalog.feature_names.index("actor_count_1m")] = 100.0
+    rule_mutation[1, catalog.feature_names.index("actor_count_1m")] = 100.0
     rule_mutated = score(
         trained=trained,
         catalog=catalog,
         features_matrix=rule_mutation,
         support=support,
-        trust_failures=[False] * len(x_test),
-        novelty_scores=[0.0] * len(x_test),
+        execution_artifacts=execution_artifacts,
+        trust_failures=trust_failures,
     )
-    full_rule_row = rule_mutated.by_arm[V5Arm.FULL_SENTINEL].rows[0]
+    full_rule_row = rule_mutated.by_arm[V5Arm.FULL_SENTINEL].rows[1]
     assert full_rule_row.rule_action == SentinelAction.DECLINE_HOLD
     assert full_rule_row.model_action is not None
     assert full_rule_row.action == SentinelAction.DECLINE_HOLD
     assert full_rule_row.action.severity > full_rule_row.model_action.severity
-
-    trust_mutation_matrix = x_test.copy()
-    trust_mutation_matrix[:, integrity_index] = 100.0 - trust_mutation_matrix[:, integrity_index]
-    trust_mutated = score(
-        trained=trained,
-        catalog=catalog,
-        features_matrix=trust_mutation_matrix,
-        support=support,
-        trust_failures=[True] * len(x_test),
-    )
-    for arm in (V5Arm.ENSEMBLE_NO_GRAPH, V5Arm.ENSEMBLE_WITH_GRAPH):
-        assert probabilities(trust_mutated.by_arm[arm]) == probabilities(
-            original_no_trust.by_arm[arm]
-        )
-        assert tuple(row.action for row in trust_mutated.by_arm[arm].rows) == tuple(
-            row.action for row in original_no_trust.by_arm[arm].rows
-        )
 
     invalid = scored.model_dump(mode="json")
     invalid["by_arm"][V5Arm.FULL_SENTINEL.value]["rows"] = list(
@@ -519,8 +508,61 @@ def test_four_arms_train_and_score_independent_component_paths() -> None:
     original_raw = raw_score_tamper["rows"][0]["model_raw_scores"][0]
     raw_score_tamper["rows"][0]["model_raw_scores"][0] = 1.0 - original_raw
     rebind_score(raw_score_tamper)
-    with pytest.raises(ValueError, match="calibrator|calibrated"):
+    with pytest.raises(ValueError, match="raw model|artifact replay|calibrator|calibrated"):
         V5ArmScore.model_validate(raw_score_tamper)
+
+    feature_score_forge = deepcopy(
+        scored.by_arm[V5Arm.ENSEMBLE_WITH_GRAPH].model_dump(mode="json")
+    )
+    graph_name = catalog.feature_names[graph_index]
+    subset_graph_index = feature_score_forge["spec"]["feature_names"].index(graph_name)
+    feature_score_forge["rows"][0]["catalog_feature_values"][graph_index] -= 100.0
+    feature_score_forge["rows"][0]["subset_feature_values"][subset_graph_index] -= 100.0
+    feature_score_forge["rows"][0]["catalog_feature_sha256"] = independent_digest(
+        feature_score_forge["rows"][0]["catalog_feature_values"]
+    )
+    feature_score_forge["rows"][0]["subset_feature_sha256"] = independent_digest(
+        feature_score_forge["rows"][0]["subset_feature_values"]
+    )
+    rebind_score(feature_score_forge)
+    with pytest.raises(ValueError, match="raw model|model artifact|replay"):
+        V5ArmScore.model_validate(feature_score_forge)
+
+    novelty_forge = deepcopy(scored.by_arm[V5Arm.FULL_SENTINEL].model_dump(mode="json"))
+    novelty_row = next(
+        row for row in novelty_forge["rows"] if not row["trust_routed"]
+    )
+    novelty_row["novelty_raw_score"] += 0.000001
+    novelty_row["novelty_score"] = max(
+        0.0, min(1.0, 0.5 - novelty_row["novelty_raw_score"])
+    )
+    rebind_score(novelty_forge)
+    with pytest.raises(ValueError, match="novelty artifact|novelty replay"):
+        V5ArmScore.model_validate(novelty_forge)
+
+    trust_forge = deepcopy(scored.by_arm[V5Arm.FULL_SENTINEL].model_dump(mode="json"))
+    trust_row = next(row for row in trust_forge["rows"] if not row["trust_routed"])
+    trust_row["trust_action"] = SentinelAction.DECLINE_HOLD.value
+    trust_row["trust_routed"] = True
+    trust_row["action"] = SentinelAction.DECLINE_HOLD.value
+    rebind_score(trust_forge)
+    with pytest.raises(ValueError, match="trust evidence|verifier"):
+        V5ArmScore.model_validate(trust_forge)
+
+    feature_stream_forge = scored.model_dump(mode="json")
+    rules_document = feature_stream_forge["by_arm"][V5Arm.RULES_ONLY.value]
+    non_rule_index = next(
+        index
+        for index, name in enumerate(rules_document["spec"]["catalog_feature_names"])
+        if name not in rules_document["spec"]["feature_names"]
+    )
+    rules_document["rows"][0]["catalog_feature_values"][non_rule_index] += 0.25
+    rules_document["rows"][0]["catalog_feature_sha256"] = independent_digest(
+        rules_document["rows"][0]["catalog_feature_values"]
+    )
+    rebind_score(rules_document)
+    with pytest.raises(ValueError, match="catalog feature|feature stream"):
+        type(scored).model_validate(feature_stream_forge)
 
     disabled_tamper = deepcopy(
         scored.by_arm[V5Arm.ENSEMBLE_NO_GRAPH].model_dump(mode="json")

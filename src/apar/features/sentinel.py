@@ -231,7 +231,9 @@ def build_sentinel_features(
             graph_nodes = max(len(actor_nodes_seen) * len(cp_nodes_seen), 1)
             _set_if_in_catalog(values, catalog, "graph_edge_density", all_edges_seen / graph_nodes)
 
-            vector = [values.get(name, 0.0) for name in catalog.feature_names]
+            # Canonicalize before hashing so the persisted numeric matrix can
+            # independently reproduce the feature-batch content address.
+            vector = [float(values.get(name, 0.0)) for name in catalog.feature_names]
             if not all(math.isfinite(v) for v in vector):
                 raise ValueError(f"non-finite feature value in event {row.event_id}")
             feature_rows.append(values)

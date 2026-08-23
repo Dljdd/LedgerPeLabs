@@ -42,9 +42,13 @@ def test_runner_scores_four_arms_over_identical_real_execution_support() -> None
     corpus = build_v5_corpus(protocol, profile=V5Profile.SMOKE)
     output = score_all(
         train_decisions=corpus.partitions["train"].decisions,
+        train_executions=corpus.partitions["train"].executions,
         calibration_decisions=corpus.partitions["calibration"].decisions,
+        calibration_executions=corpus.partitions["calibration"].executions,
         threshold_decisions=corpus.partitions["threshold"].decisions,
+        threshold_executions=corpus.partitions["threshold"].executions,
         dev_test_decisions=corpus.partitions["development_test"].decisions,
+        dev_test_executions=corpus.partitions["development_test"].executions,
         catalog=catalog,
         configuration=configuration,
         bootstrap_seed=protocol.seeds.bootstrap,
@@ -145,6 +149,7 @@ def test_runner_scores_four_arms_over_identical_real_execution_support() -> None
             "spec": mixed_arm["arm_spec"],
             "support_sha256": mixed_arm["support_sha256"],
             "rows": mixed_arm["row_evidence"],
+            "execution_artifacts": mixed_arm["execution_artifacts"],
         }
     )
     mixed_arm["result_sha256"] = independent_digest(
@@ -153,5 +158,45 @@ def test_runner_scores_four_arms_over_identical_real_execution_support() -> None
     mixed["result_sha256"] = independent_digest(
         {key: value for key, value in mixed.items() if key != "result_sha256"}
     )
-    with pytest.raises(ValueError, match="mixed|training provenance"):
+    with pytest.raises(
+        ValueError, match="mixed|training provenance|feature batch digest"
+    ):
         V5DevelopmentResult.model_validate(mixed)
+
+    divergent_features = development.model_dump(mode="json")
+    divergent_arm = divergent_features["arms"][V5Arm.RULES_ONLY.value]
+    non_rule_index = next(
+        index
+        for index, name in enumerate(
+            divergent_arm["arm_spec"]["catalog_feature_names"]
+        )
+        if name not in divergent_arm["arm_spec"]["feature_names"]
+    )
+    divergent_row = divergent_arm["row_evidence"][0]
+    divergent_row["catalog_feature_values"][non_rule_index] += 0.25
+    divergent_row["catalog_feature_sha256"] = independent_digest(
+        divergent_row["catalog_feature_values"]
+    )
+    divergent_row["row_output_sha256"] = independent_digest(
+        {key: value for key, value in divergent_row.items() if key != "row_output_sha256"}
+    )
+    divergent_arm["score_sha256"] = independent_digest(
+        {
+            "spec": divergent_arm["arm_spec"],
+            "support_sha256": divergent_arm["support_sha256"],
+            "rows": divergent_arm["row_evidence"],
+            "execution_artifacts": divergent_arm["execution_artifacts"],
+        }
+    )
+    divergent_arm["result_sha256"] = independent_digest(
+        {key: value for key, value in divergent_arm.items() if key != "result_sha256"}
+    )
+    divergent_features["result_sha256"] = independent_digest(
+        {
+            key: value
+            for key, value in divergent_features.items()
+            if key != "result_sha256"
+        }
+    )
+    with pytest.raises(ValueError, match="catalog feature|feature stream"):
+        V5DevelopmentResult.model_validate(divergent_features)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 from pathlib import Path
 
 import apar.evaluation.v5_evaluation as v5_evaluation
@@ -38,6 +39,20 @@ def test_arm_evidence_contracts_exist_before_training() -> None:
         "disagreement_routed",
     }
     assert required_row_fields <= set(v5_evaluation.V5ArmRowEvidence.model_fields)
+    assert {
+        "feature_names",
+        "feature_matrix",
+        "support_records",
+        "execution_artifacts",
+    } <= set(v5_evaluation.V5TrainingPartitionEvidence.model_fields)
+    assert {
+        "model_artifacts",
+        "novelty_manifest",
+    } <= set(v5_evaluation.V5ArmSpecification.model_fields)
+    assert "execution_artifacts" in v5_evaluation.V5ArmScore.model_fields
+    assert getattr(v5_evaluation, "V5SerializedModelArtifact", None) is not None
+    assert getattr(v5_evaluation, "V5IsolationForestManifest", None) is not None
+    assert getattr(v5_evaluation, "V5ExecutionArtifact", None) is not None
 
 
 def test_trainer_requires_exact_partition_evidence_arguments() -> None:
@@ -72,3 +87,22 @@ def test_safe_404_protocol_copy_has_its_own_verified_digest() -> None:
     safe = load_safe_v5_test_protocol(ROOT)
     assert safe.seeds.development_test == 404
     assert safe.protocol_sha256 == digest(safe)
+
+
+def test_arm_implementation_inventory_binds_execution_and_trust_dependencies() -> None:
+    document = json.loads(
+        (ROOT / "config/defense/defense-v5-arms.json").read_text()
+    )
+    required = {
+        "src/apar/evaluation/v5_execution.py",
+        "src/apar/evaluation/v5_population.py",
+        "src/apar/generators/campaigns.py",
+        "src/apar/generators/population.py",
+        "src/apar/simulator/engine.py",
+        "src/apar/simulator/ledger.py",
+        "src/apar/simulator/rails/agentic.py",
+        "src/apar/simulator/rails/a2a.py",
+        "src/apar/simulator/rails/card.py",
+        "src/apar/trust/verifier.py",
+    }
+    assert required <= set(document["implementation_paths"])

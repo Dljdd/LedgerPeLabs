@@ -70,6 +70,26 @@ class V5DevelopmentResult(BaseModel):
             raise ValueError("development result arm key and result name mismatch")
         if len({result.support_sha256 for result in self.arms.values()}) != 1:
             raise ValueError("development arms do not share common ordered support")
+        feature_streams = {
+            tuple(
+                (row.catalog_feature_sha256, row.catalog_feature_values)
+                for row in result.row_evidence
+            )
+            for result in self.arms.values()
+        }
+        if len(feature_streams) != 1:
+            raise ValueError(
+                "development arms do not share an identical full catalog feature stream"
+            )
+        execution_streams = {
+            tuple(
+                artifact.model_dump_json()
+                for artifact in result.execution_artifacts
+            )
+            for result in self.arms.values()
+        }
+        if len(execution_streams) != 1:
+            raise ValueError("development arms do not share identical execution artifacts")
         if any(
             result.arm_spec is None
             or result.arm_spec.protocol_sha256 != self.protocol_sha256
@@ -137,7 +157,10 @@ def build_v5_development_result(
     else:
         status = "development_not_ready"
 
-    from apar.evaluation.v5_evaluation import V5EvaluationResult
+    from apar.evaluation.v5_evaluation import (
+        V5EvaluationResult,
+        build_v5_execution_artifacts,
+    )
 
     if tuple((arms or {}).keys()) != _REQUIRED_ARMS:
         raise ValueError("development result requires the exact four ordered arms")
@@ -145,6 +168,14 @@ def build_v5_development_result(
         name: V5EvaluationResult.model_validate(data)
         for name, data in (arms or {}).items()
     }
+    expected_execution_artifacts = build_v5_execution_artifacts(
+        corpus.partitions["development_test"].executions
+    )
+    if any(
+        result.execution_artifacts != expected_execution_artifacts
+        for result in parsed_arms.values()
+    ):
+        raise ValueError("development arm execution artifacts disagree with corpus evidence")
 
     failed_gates: list[str] = []
     for arm_result in parsed_arms.values():
