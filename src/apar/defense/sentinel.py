@@ -238,5 +238,21 @@ class SentinelDefender(BaseModel):
             trust_failure=False,
         )
 
-    def decide_batch(self, features_matrix: np.ndarray) -> list[SentinelDecision]:
-        return [self.decide(row) for row in features_matrix]
+    def decide_batch(
+        self,
+        features_matrix: np.ndarray,
+        *,
+        trust_failures: list[bool] | None = None,
+    ) -> list[SentinelDecision]:
+        if trust_failures is not None and len(trust_failures) != len(features_matrix):
+            raise ValueError(
+                f"trust_failures length {len(trust_failures)} does not match "
+                f"features_matrix length {len(features_matrix)}"
+            )
+        return [
+            self.decide(
+                row,
+                trust_failure=trust_failures[i] if trust_failures else False,
+            )
+            for i, row in enumerate(features_matrix)
+        ]
