@@ -1,6 +1,6 @@
 {
   "protocol_id": "apar-sentinel-v5-development",
-  "schema_version": "2.0.0",
+  "schema_version": "3.0.0",
   "development_only": true,
   "sealed_evaluation_allowed": false,
   "readiness": {
@@ -16,7 +16,7 @@
     "train": 101,
     "calibration": 202,
     "threshold": 303,
-    "development_test": 1404,
+    "development_test": 2404,
     "hardening_train": 505,
     "adaptive_holdout": 606,
     "bootstrap": 707,

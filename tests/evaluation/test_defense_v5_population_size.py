@@ -14,7 +14,7 @@ PROTOCOL = load_v5_development_protocol(ROOT / "config/defense/defense-v5-develo
 
 class TestProductionPopulationSize:
     def test_development_test_seed_is_1404(self) -> None:
-        assert PROTOCOL.seeds.development_test == 1404
+        assert PROTOCOL.seeds.development_test == 2404
 
     def test_production_declares_partition_specific_sizes(self) -> None:
         assert hasattr(PROTOCOL, "production_dev_test_legitimate"), (
