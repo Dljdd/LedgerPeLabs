@@ -1,0 +1,808 @@
+{
+  "closed_run_mode": {
+    "authorization_required": true,
+    "development_test_seed": 2404,
+    "mode": "locked_development",
+    "profile": "production",
+    "repeatable": false
+  },
+  "exact_command": ".venv/bin/python scripts/run_defense_v5_locked_development.py --root . --safe-evidence /private/tmp/apar-v5-approved-safe-evidence.json --approved-commit HEAD --authorize-exactly-once",
+  "frozen_definitions": {
+    "bootstrap": {
+      "confidence_level": 0.95,
+      "fraud_unit": "campaign",
+      "interval_method": "percentile",
+      "legitimate_unit": "campaign",
+      "metrics": [
+        "recall",
+        "false_decline_rate",
+        "challenge_rate",
+        "review_rate",
+        "captured_value_fraction",
+        "campaign_detection_rate",
+        "expected_calibration_error"
+      ],
+      "replicates": 2000,
+      "seed": 707,
+      "stratification": "legitimate_and_each_fraud_family"
+    },
+    "calibration": {
+      "bin_boundaries": [
+        0.0,
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6,
+        0.7,
+        0.8,
+        0.9,
+        1.0
+      ],
+      "interval_closure": "left_closed_right_open_final_closed",
+      "rules_only": "not_applicable"
+    },
+    "controls": {
+      "benign_only": {
+        "challenge_rate_max": 0.02,
+        "false_decline_rate_max": 0.001,
+        "recall_semantics": "undefined",
+        "review_rate_max": 0.01
+      },
+      "equal_time": {
+        "peer_count": 2,
+        "require_exact_invariance": true
+      },
+      "feature_leakage": {
+        "forbidden_fields": [
+          "is_fraud",
+          "family",
+          "campaign_id",
+          "split",
+          "seed",
+          "generator",
+          "lifecycle_state",
+          "final_outcome"
+        ],
+        "require_exact_numeric_invariance": true
+      },
+      "fraud_only": {
+        "qualifies_for_readiness": false,
+        "workload_semantics": "undefined"
+      },
+      "future_causality": {
+        "offset_seconds": 86400,
+        "require_exact_invariance": true
+      },
+      "identity_rename": {
+        "namespace": "apar.sentinel-v5.control.identity-rename.v1",
+        "require_exact_numeric_invariance": true
+      },
+      "label_shuffle": {
+        "max_pr_auc_excess_over_prevalence": 0.2,
+        "max_roc_auc": 0.7,
+        "min_roc_auc_delta": 0.05,
+        "permutation_seed": 1707
+      }
+    },
+    "economics": {
+      "aggregate_value_fraction": "unweighted_mean_of_currency_fractions",
+      "authorization_events": [
+        "authorization",
+        "transfer_accepted"
+      ],
+      "capture_semantics": "first_intervention_at_or_before_value_movement_or_lifecycle_reversal",
+      "escape_semantics": "malicious_value_moved_without_prior_intervention_and_without_lifecycle_reversal",
+      "family_rails": {
+        "agentic_intent_abuse": "agentic",
+        "app_scam_mule": "a2a",
+        "card_testing_cnp": "card",
+        "synthetic_merchant_refund": "card"
+      },
+      "intervention_actions": [
+        "challenge",
+        "review_hold",
+        "decline_hold"
+      ],
+      "rail_movement_events": {
+        "a2a": [
+          "transfer_posted"
+        ],
+        "agentic": [
+          "authorization"
+        ],
+        "card": [
+          "settlement"
+        ]
+      },
+      "value_reversal_events": [
+        "transfer_returned",
+        "refund",
+        "recovery"
+      ]
+    },
+    "gates": [
+      {
+        "comparison": "lower_bound_gte",
+        "metric": "family_recall",
+        "target": 0.75
+      },
+      {
+        "comparison": "upper_bound_lte",
+        "metric": "false_decline_rate",
+        "target": 0.001
+      },
+      {
+        "comparison": "upper_bound_lte",
+        "metric": "manual_review_rate",
+        "target": 0.01
+      },
+      {
+        "comparison": "upper_bound_lte",
+        "metric": "challenge_rate",
+        "target": 0.02
+      },
+      {
+        "comparison": "lower_bound_gte",
+        "metric": "captured_value_fraction",
+        "target": 0.7
+      },
+      {
+        "comparison": "upper_bound_lte",
+        "metric": "expected_calibration_error",
+        "target": 0.1
+      },
+      {
+        "comparison": "point_lte",
+        "metric": "p95_decision_latency_ms",
+        "target": 50.0
+      },
+      {
+        "comparison": "defined_interval",
+        "metric": "campaign_detection_rate",
+        "target": null
+      }
+    ],
+    "metric_definitions": {
+      "brier": "sum((probability-label)^2)/all_rows",
+      "campaign_detection_rate": "detected_fraud_campaigns/fraud_campaigns",
+      "challenge_rate": "challenged_legitimate_rows/legitimate_rows",
+      "decline_rate": "declined_rows/all_rows",
+      "detection_actions": [
+        "challenge",
+        "review_hold",
+        "decline_hold"
+      ],
+      "expected_calibration_error": "sum(bin_count/all_rows*abs(bin_mean_probability-bin_empirical_rate))",
+      "f1": "2*true_positive/(2*true_positive+false_positive+false_negative)",
+      "false_decline_rate": "declined_legitimate_rows/legitimate_rows",
+      "family_precision": "detected_family_rows/(detected_family_rows+detected_legitimate_rows)",
+      "maximum_calibration_error": "max(abs(bin_mean_probability-bin_empirical_rate))",
+      "precision": "detected_fraud_rows/all_detected_rows",
+      "recall": "detected_fraud_rows/fraud_rows",
+      "review_rate": "reviewed_legitimate_rows/legitimate_rows",
+      "time_to_first_alert": "first_intervention_decision_at-first_campaign_decision_at"
+    }
+  },
+  "manifest_sha256": "b021b32dbe6c3bdd37ab458de7024d3f648c853d36b4c0f1695a52c2db664305",
+  "output_contract": {
+    "candidate_manifest_path": "docs/experiments/defense-v5-locked-development-candidate.manifest.json",
+    "candidate_must_be_absent": true,
+    "chunk_size_bytes": 67108864,
+    "expected_envelope_upper_bound_bytes": 805306368,
+    "historical_result_path": "docs/experiments/defense-v5-development-result.json",
+    "historical_result_sha256": "af326f3a0fcbbe12c9b8623fc7d82a1ba6d0f327ec9a80f462cacd4bea1dd185",
+    "judge_summary_path": "docs/experiments/defense-v5-locked-development-summary.json",
+    "legacy_summary_is_not_evidence": true,
+    "maximum_chunk_count": 16,
+    "maximum_envelope_bytes": 1073741824,
+    "normal_git_blob_limit_bytes": 104857600,
+    "one_time_no_resume_or_retry": true,
+    "publication": "content_chunks_then_atomic_exclusive_manifest",
+    "schema_version": "apar-sentinel-v5-chunked-evidence/1"
+  },
+  "preregistration_path": "config/defense/defense-v5-locked-development-preregistration.json",
+  "production_support_plan": {
+    "mode": "locked_development",
+    "partitions": [
+      {
+        "execution_artifacts": 533,
+        "execution_payload_estimate_bytes": 120692912,
+        "fraud_rows_by_family": [
+          [
+            "agentic_intent_abuse",
+            2500
+          ],
+          [
+            "app_scam_mule",
+            3600
+          ],
+          [
+            "card_testing_cnp",
+            2600
+          ],
+          [
+            "synthetic_merchant_refund",
+            4600
+          ]
+        ],
+        "legitimate_rows": 12500,
+        "partition": "train",
+        "total_rows": 25800
+      },
+      {
+        "execution_artifacts": 533,
+        "execution_payload_estimate_bytes": 120692912,
+        "fraud_rows_by_family": [
+          [
+            "agentic_intent_abuse",
+            2500
+          ],
+          [
+            "app_scam_mule",
+            3600
+          ],
+          [
+            "card_testing_cnp",
+            2600
+          ],
+          [
+            "synthetic_merchant_refund",
+            4600
+          ]
+        ],
+        "legitimate_rows": 12500,
+        "partition": "calibration",
+        "total_rows": 25800
+      },
+      {
+        "execution_artifacts": 533,
+        "execution_payload_estimate_bytes": 120692912,
+        "fraud_rows_by_family": [
+          [
+            "agentic_intent_abuse",
+            2500
+          ],
+          [
+            "app_scam_mule",
+            3600
+          ],
+          [
+            "card_testing_cnp",
+            2600
+          ],
+          [
+            "synthetic_merchant_refund",
+            4600
+          ]
+        ],
+        "legitimate_rows": 12500,
+        "partition": "threshold",
+        "total_rows": 25800
+      },
+      {
+        "execution_artifacts": 924,
+        "execution_payload_estimate_bytes": 246005200,
+        "fraud_rows_by_family": [
+          [
+            "agentic_intent_abuse",
+            2500
+          ],
+          [
+            "app_scam_mule",
+            3600
+          ],
+          [
+            "card_testing_cnp",
+            2600
+          ],
+          [
+            "synthetic_merchant_refund",
+            4600
+          ]
+        ],
+        "legitimate_rows": 50000,
+        "partition": "development_test",
+        "total_rows": 63300
+      }
+    ],
+    "profile": "production",
+    "retained_execution_artifacts": 2523,
+    "retained_execution_payload_estimate_bytes": 608083936,
+    "support_plan_sha256": "73e02f1c78ee97d64a9f89a7ea66268e8252bd74edddab6a38871a2d487301ba"
+  },
+  "safe_validation": {
+    "approved_deterministic_core_sha256": "c0dc4b9b44f2df6c9db6c4b346d6f7778a7b65b2441f9b5f622013aa2e6d7bdb",
+    "approved_observational_environment_sha256": "415902f1184ebe83deac0380e419a2eb6f11c3d7147c2c67fe38f76fe72ecc33",
+    "historical_deterministic_core_sha256": "784a762fd90a65219a233e87df35290ac87c8fe8e4b9024de46564568f633719"
+  },
+  "schema_version": "apar-sentinel-v5-locked-preregistration/1",
+  "source_bindings": {
+    "arm_protocol_sha256": "6014b3273b3ab5098c1da2a0ed3f8b58b51299625318d9d259283c5b6f635469",
+    "base_protocol_sha256": "751db3b095ebb162c5856284b9afee4ab9d934eee3e4f2a2aba401beeb46b799",
+    "catalog_sha256": "4a4e807d61654691811f91ac79e1f71c6bbb1e4d16e3c6f2a4c2ee988b0dd9e8",
+    "evidence_protocol_sha256": "b364682d5423c70770e87c7ec8207ba6c77aaf1ba46af768202a0da0ce9c7f16",
+    "implementation_sha256": "c068e1a97320b4ae85739581ee672c0b4ce842cce6d1bcb439d02afc5bb0728b",
+    "verifier_sha256": "0223850ca2513462ce4c5397ed3064d4276aee631d92c585d6cbe91adb26c01b"
+  },
+  "source_commit": "e0879b2d2eabee163e89b9ab7d1714aa3d9885bb",
+  "source_files": [
+    [
+      "config/defense/defense-v5-arms.json",
+      "100644",
+      "6014b3273b3ab5098c1da2a0ed3f8b58b51299625318d9d259283c5b6f635469"
+    ],
+    [
+      "config/defense/defense-v5-development.json",
+      "100644",
+      "751db3b095ebb162c5856284b9afee4ab9d934eee3e4f2a2aba401beeb46b799"
+    ],
+    [
+      "config/defense/defense-v5-evidence.json",
+      "100644",
+      "55213d617b3062c63c2d052c67871a3fdf9e73ebb43d18e819fcce4061e5d1ee"
+    ],
+    [
+      "config/defense/feature-catalog-v5.json",
+      "100644",
+      "4a4e807d61654691811f91ac79e1f71c6bbb1e4d16e3c6f2a4c2ee988b0dd9e8"
+    ],
+    [
+      "scripts/build_defense_v5_safe_evidence.py",
+      "100644",
+      "94f19f769e88416d94e496d490336f7722031cdc9d77f8ad6be37fbb23c4976e"
+    ],
+    [
+      "scripts/run_defense_v5_development.py",
+      "100644",
+      "75be68c4bf9a158f2dbfa09b64bf7e7afd10154dfc011c988b4d5885b2536b20"
+    ],
+    [
+      "scripts/run_defense_v5_locked_development.py",
+      "100644",
+      "2d90da2cd07475cdf72be0c55d88a8f04207932837b6ff38b2f5e61598c61d0f"
+    ],
+    [
+      "scripts/v5_complete_evidence_execution.py",
+      "100644",
+      "09233a10e1b5a76e030336979c046be4afa10b608205331b92a2a9a0d7a9d280"
+    ],
+    [
+      "scripts/verify_defense_v5_evidence.py",
+      "100644",
+      "8c1f4b164817fdadbe859854ea2c887834a0072e479f3e059c9237c40592423a"
+    ],
+    [
+      "scripts/verify_defense_v5_locked_evidence.py",
+      "100644",
+      "9be1d959f2b24f884635c571f4f648fe5fd9ee44190f9e53a56082c9dcbee294"
+    ],
+    [
+      "scripts/verify_defense_v5_locked_preexecution.py",
+      "100644",
+      "0a0c946e1b1e309de37e6aefe56dbabe67e7cee2ac41555b390564e5fc740930"
+    ],
+    [
+      "scripts/verify_defense_v5_preexecution.py",
+      "100644",
+      "1cf6e246ad8af1554bd56cd9272f260b6451747c49a9a9a1383a462899b3c2ae"
+    ],
+    [
+      "src/apar/__init__.py",
+      "100644",
+      "91447944015cec709e8aa7655f7e9d64e1e4508e7023a57fe3746911c0fc6fed"
+    ],
+    [
+      "src/apar/cases/__init__.py",
+      "100644",
+      "efbae4309707519ca9432a82a57796b6dd8eeb537840d6c5052e4daaef00a7ed"
+    ],
+    [
+      "src/apar/cases/grouping.py",
+      "100644",
+      "86338fa6aa90ceb8d830148e009332702dc4ee6d45a440547e4617dee9c83afe"
+    ],
+    [
+      "src/apar/cases/queue.py",
+      "100644",
+      "fac1250839d8a3b5c50d73a2138a357d87a1821fec4784116514b3ada14b41c9"
+    ],
+    [
+      "src/apar/contracts/__init__.py",
+      "100644",
+      "1fb8d299efe37e76d12ae1c6da66223d8976e4861c5f6e02e773b68ca5f565f1"
+    ],
+    [
+      "src/apar/contracts/_validation.py",
+      "100644",
+      "83d5234e59b3dd5b003562b12fd09850008ea3a5535c462d349b2b7874766a64"
+    ],
+    [
+      "src/apar/contracts/decisions.py",
+      "100644",
+      "62ae405e57f0235af60ba0376be7e2f4784843a1112aade8b00134ddd39241f8"
+    ],
+    [
+      "src/apar/contracts/events.py",
+      "100644",
+      "93ef74802a57e0af536f6393f7e5ab1c9bdc49e26e615cb7aa1889001d8da960"
+    ],
+    [
+      "src/apar/contracts/reports.py",
+      "100644",
+      "3c320c7f8d2001b04ba0d12220deedca52aefe329787eb79b2cbd6b274086ee0"
+    ],
+    [
+      "src/apar/contracts/scenarios.py",
+      "100644",
+      "e690e2bf14a4163e3a20dffba28b54abd96ec83de96bf576458dc35bce31ee28"
+    ],
+    [
+      "src/apar/defense/__init__.py",
+      "100644",
+      "8b9f9087080ae482d0a4eaebf2203b6d71ad3b3bae3438d31a33c0cc3293d6d6"
+    ],
+    [
+      "src/apar/defense/bundle.py",
+      "100644",
+      "a31a513f7754580ee25f19351c0ad08d54ba4d9641fcad3369f428335ea9a992"
+    ],
+    [
+      "src/apar/defense/calibration.py",
+      "100644",
+      "cfc37e5ecc00caa0250c5d64f5817c2102ca0a67dd06cdb117363a06b905ac8f"
+    ],
+    [
+      "src/apar/defense/contracts.py",
+      "100644",
+      "3dc2407f176c20b8afd3985859aabaf3818d74dac7c104e5f7e6c1c38cb44e53"
+    ],
+    [
+      "src/apar/defense/gbdt.py",
+      "100644",
+      "f715a3186106a6a53caf8fd8b4e40e7913f000aff1710b210481a9fa49db35aa"
+    ],
+    [
+      "src/apar/defense/policy.py",
+      "100644",
+      "003b16bb366fb43751c00f65faa18bbc4582d2f820eccdae1510c5ed2c731391"
+    ],
+    [
+      "src/apar/defense/rules.py",
+      "100644",
+      "d41f60168ea6d9a07a5705f377addcaaaa54465a8fc3baf59a19d93bd8585aaf"
+    ],
+    [
+      "src/apar/defense/sentinel.py",
+      "100644",
+      "0bd25e089446a949969aa2546fe013b62e08675550e1ea316a13e03a63f446ec"
+    ],
+    [
+      "src/apar/defense/thresholds.py",
+      "100644",
+      "761455996886d89acec1392a16c826bc74231b7d8bee1d128e6bddd8fdb2734c"
+    ],
+    [
+      "src/apar/evaluation/__init__.py",
+      "100644",
+      "a077efc2574c01413de421fb2a5165312b86ac4d575676b7e15a158c2f213a52"
+    ],
+    [
+      "src/apar/evaluation/contracts.py",
+      "100644",
+      "38fb7e373d454a7a0dac3d79a30dfe43b08a81c8f08e21a9d54dd1a8310c7933"
+    ],
+    [
+      "src/apar/evaluation/corpus.py",
+      "100644",
+      "d9c3cbedf9883f1d8d1044e325f726400dad4e03022fc62033114bb4ee90a2fd"
+    ],
+    [
+      "src/apar/evaluation/defender_attestation.py",
+      "100644",
+      "39a498b4600a58be3ce07824090561db00eb26d6fef28e985d1f97c60302502b"
+    ],
+    [
+      "src/apar/evaluation/gates.py",
+      "100644",
+      "4c4832feec2cbed6a2ebbba80bb22bc5fbbee5be33f2cdb297906ca839e93f9f"
+    ],
+    [
+      "src/apar/evaluation/hidden_source.py",
+      "100644",
+      "28b0be680ce9695d92340e2073fca2a070f999ce03e34f36952809ff601ead20"
+    ],
+    [
+      "src/apar/evaluation/metrics.py",
+      "100644",
+      "d112302a8d759d539ff8fc6430e86b3af16132e0565c27fb961cdef051c538da"
+    ],
+    [
+      "src/apar/evaluation/regimes.py",
+      "100644",
+      "b98e9e49e49a6b8b48bb33a5da4936459c7a7379191c4a968bf7f236186054bf"
+    ],
+    [
+      "src/apar/evaluation/replay.py",
+      "100644",
+      "aeb5b66281371c3bb950466c9f50dd6853fed548cb0a0a9fb8201319e830bc31"
+    ],
+    [
+      "src/apar/evaluation/splits.py",
+      "100644",
+      "973d75a89714533014e4a8f90e4ade59998c9500d61ce64d9d37e7ca818932fb"
+    ],
+    [
+      "src/apar/evaluation/v5_arms.py",
+      "100644",
+      "ff9f4f0233276fc75b36a26c396ea82e9beb3da57265b11004c081c03d0e5276"
+    ],
+    [
+      "src/apar/evaluation/v5_controls.py",
+      "100644",
+      "d59e83715e07de242fc380a2b35677e8d8ce66b129ca3a2be811178328ba24b5"
+    ],
+    [
+      "src/apar/evaluation/v5_evaluation.py",
+      "100644",
+      "0931f873c6ff08c091547a2fcc8f56de668ad07552d7dc20ff39985e26f06a1e"
+    ],
+    [
+      "src/apar/evaluation/v5_evidence_bundle.py",
+      "100644",
+      "f828b548bd7744ab25c2e818f8bb037b93f71f78b200cbd7fc9287bec6632f30"
+    ],
+    [
+      "src/apar/evaluation/v5_evidence_layers.py",
+      "100644",
+      "57cc86b952941e12ded40bcf7ab5e0cc040e14d12a9f1229451f5fd94673d6e7"
+    ],
+    [
+      "src/apar/evaluation/v5_evidence_protocol.py",
+      "100644",
+      "7293e60d72be577ba05d5c1b92896c6c63eb51952a96eb1799534d0e366118a8"
+    ],
+    [
+      "src/apar/evaluation/v5_evidence_storage.py",
+      "100644",
+      "a105c9f7c0e74e2d3d5977fbac3473146c54a29d35d3030ff5d1b655f33fe805"
+    ],
+    [
+      "src/apar/evaluation/v5_execution.py",
+      "100644",
+      "7bc011160052b967af49d1bff7ea85a11b1073e9d209cc546cbd7943e68b95a6"
+    ],
+    [
+      "src/apar/evaluation/v5_fidelity.py",
+      "100644",
+      "23a752b1adf7540cd9327b6ffb1c6ecbe0e5a71faa3289805d94be4ee9391252"
+    ],
+    [
+      "src/apar/evaluation/v5_hardening.py",
+      "100644",
+      "bb1514460ec61b7480fc69501ac6e50132cc47bc408340d0a13b162aa4dc6a76"
+    ],
+    [
+      "src/apar/evaluation/v5_locked_evidence.py",
+      "100644",
+      "fe3aa137abf48aeaa653b0eff9bc827e3df5e070f23a838a03b0e1c2396c8194"
+    ],
+    [
+      "src/apar/evaluation/v5_metrics.py",
+      "100644",
+      "586b6e54be57c6ab7576689aba6913db033a2822e04cf43c73d8e46decf9cd50"
+    ],
+    [
+      "src/apar/evaluation/v5_population.py",
+      "100644",
+      "eef2634ad05aa11c5c7191dc92f14430732536ae411729cc040555146efdaebc"
+    ],
+    [
+      "src/apar/evaluation/v5_protocol.py",
+      "100644",
+      "8cba81b3d8c619aebe1a890e572d6f8b311daf052a17d3fb051cb73577415dfa"
+    ],
+    [
+      "src/apar/evaluation/v5_reporting.py",
+      "100644",
+      "860a5f19f65108d92ed88092a887f68323c4bd040bca8762953db92e8ec6b51b"
+    ],
+    [
+      "src/apar/evaluation/v5_run_mode.py",
+      "100644",
+      "b30ae5663bbf2836b0ddd7e75917548afc80f33cc39cb0d7c6d485db5ac282ca"
+    ],
+    [
+      "src/apar/evaluation_hidden/__init__.py",
+      "100644",
+      "d3d800df8c37826995fddbe68a4da03b6a439999b37586bc54bf39d1fa5f0df3"
+    ],
+    [
+      "src/apar/evaluation_hidden/authority_core.py",
+      "100644",
+      "24a3a0bd660582c6a47e1a7ef202c66cde840ba935ddd5d4525ee81c5d49c2f2"
+    ],
+    [
+      "src/apar/evaluation_hidden/defense_authority.py",
+      "100644",
+      "ee3f20c9b1cf4d65e80e8d356cd67e928cdde70245cc425837cdb601b9869073"
+    ],
+    [
+      "src/apar/evaluation_hidden/generator.py",
+      "100644",
+      "5fac08355d745810608dd8a3bccd58e43b96091ede2adaf3b08a413ddefb9b75"
+    ],
+    [
+      "src/apar/evaluation_hidden/import_audit.py",
+      "100644",
+      "f7c8639f5d6b933cdc6e46579beaa1a9b703e9ec6376c10370186133cddc62a0"
+    ],
+    [
+      "src/apar/evaluation_hidden/validity.py",
+      "100644",
+      "12284fb5c61a4b3949f7d550761b8b6a933313937cdb89698ceaad481d2689bf"
+    ],
+    [
+      "src/apar/evaluation_hidden/worker_client.py",
+      "100644",
+      "75a50dd87def72e90e06e06b946a206f1173163f06174ba0166a2c2d1905743e"
+    ],
+    [
+      "src/apar/features/__init__.py",
+      "100644",
+      "e6e294bf20a5fabba6e8a8068e2ed9d81d62d96427714dbebdf53acf02aa2657"
+    ],
+    [
+      "src/apar/features/builders.py",
+      "100644",
+      "9d8b29bceb4bd752c402073db07724a5d8a8795fe0b6746448802cf84319a031"
+    ],
+    [
+      "src/apar/features/catalog.py",
+      "100644",
+      "b58382fa4530a12fad7c614fc9107f30be0495f1f18a42e8ca01f476b0bd2a6d"
+    ],
+    [
+      "src/apar/features/parity.py",
+      "100644",
+      "36ad87aae7dbbbb3238321a766135ab4230c1b88072d3ab41762638bfb42f029"
+    ],
+    [
+      "src/apar/features/sentinel.py",
+      "100644",
+      "fb6fb1abbe6ddb35bbf1a60089a2e38fc5de12db1bb3d8e72a2efb8e19264990"
+    ],
+    [
+      "src/apar/features/state.py",
+      "100644",
+      "ee189dd341fcfd1f9e758ab5889b37278178a9fedba50c474f5dca829970532e"
+    ],
+    [
+      "src/apar/generators/__init__.py",
+      "100644",
+      "c4b3cdb979f1ec154cd6d55b40317495f024be7e09f7d9b6f7a93101b99d2886"
+    ],
+    [
+      "src/apar/generators/campaigns.py",
+      "100644",
+      "c3e2d8a6392e8754d8ca9a946ad5a87230ce01c4e026eb5d1964fa51d9a92ffe"
+    ],
+    [
+      "src/apar/generators/population.py",
+      "100644",
+      "2e54862322980414098c17930ec95bd268372da8968a78384a5bd661bfdaa2e5"
+    ],
+    [
+      "src/apar/redteam/__init__.py",
+      "100644",
+      "4f70824745ae39c3d1d34123b5f49da19bb5ff15b120101696e6715dde8aa8e3"
+    ],
+    [
+      "src/apar/redteam/benchmark.py",
+      "100644",
+      "7996fcf20c85547a861afcfeb9da132dad534ad30f7fe1a07618e90e2faef519"
+    ],
+    [
+      "src/apar/redteam/llm_policy.py",
+      "100644",
+      "8105a6788041f7d73b1afa571482f4b0ff3b15980f6c28769b701ab350936622"
+    ],
+    [
+      "src/apar/redteam/policies.py",
+      "100644",
+      "c97ab7b263a493978cf901140a97f15874a34f8ff2ce54c84253e7baa998fb82"
+    ],
+    [
+      "src/apar/redteam/search.py",
+      "100644",
+      "ee05348ab07a9852a68a3f6a477eeec7ad6837d94f187e6fbb97767220f60e89"
+    ],
+    [
+      "src/apar/runs/__init__.py",
+      "100644",
+      "1ba0e5fa020dbc78d720ed7f6b52f1d2560ea8fab0c1e21b9b799ed24b9c5200"
+    ],
+    [
+      "src/apar/runs/agentic_replay.py",
+      "100644",
+      "f34a9e38428cc31bfaca5733d7198cf5e3cf3efb98661d26b8edc1898e4bd195"
+    ],
+    [
+      "src/apar/runs/runner.py",
+      "100644",
+      "471848f673e3660e1043ba26407497ec24e1836e7d4e72b8e62fce08d82e1e0d"
+    ],
+    [
+      "src/apar/runs/wire.py",
+      "100644",
+      "b0cca68bd69a58d4933e349523f00776029c90ee6c8628931a0b50b2fa23ec91"
+    ],
+    [
+      "src/apar/simulator/__init__.py",
+      "100644",
+      "7e44b3619e4b779ca9a4180c1c90d3c11cb91aa6a9086f229536d62a3767ffb2"
+    ],
+    [
+      "src/apar/simulator/clock.py",
+      "100644",
+      "db2e5ffc264c3ba31ba900a88fc765cd7b1c665d85760b29625e3ac51ae8cf4a"
+    ],
+    [
+      "src/apar/simulator/engine.py",
+      "100644",
+      "f25805e01801591ead78eed8318842de2f3bc3b4fc01eb00fca5fb4feb84884e"
+    ],
+    [
+      "src/apar/simulator/ledger.py",
+      "100644",
+      "5c28b1cc8677cf2e969f292a2f36def4d34ed607bab48530744db09776bf16b4"
+    ],
+    [
+      "src/apar/simulator/rails/__init__.py",
+      "100644",
+      "b1b4b5f7602b4289ffe4b6c75477cb04dc3132282496af79f69c33ce64235359"
+    ],
+    [
+      "src/apar/simulator/rails/a2a.py",
+      "100644",
+      "26a64ba43a1a5d3bbfff975422e98076a1221f0e83d8ee3c627f6d41b6b30f84"
+    ],
+    [
+      "src/apar/simulator/rails/agentic.py",
+      "100644",
+      "5ebac3a3220f761c4e3b76d0cdf80f0956764c57e5a1251a8778e9f2a168be16"
+    ],
+    [
+      "src/apar/simulator/rails/base.py",
+      "100644",
+      "89573c15ce371a27c3eeb1c50a38e5656990b9f0ee11d9283b2b9ff4dd7ccc61"
+    ],
+    [
+      "src/apar/simulator/rails/card.py",
+      "100644",
+      "1969e60c08cacd2848348529160c19b1a1ca30d6932e31a40dc3affdd31a5cb9"
+    ],
+    [
+      "src/apar/storage/artifacts.py",
+      "100644",
+      "50330334d6ee244d9a0ce8e597a695025f0ca33947a77a3db54804885065500a"
+    ],
+    [
+      "src/apar/trust/__init__.py",
+      "100644",
+      "8cfdc9cb0166959aa352886687773dc4cdd1ce6b0e6774beaa47c91cb77b77ee"
+    ],
+    [
+      "src/apar/trust/verifier.py",
+      "100644",
+      "4cee724a64907c5b94489cc025daa09372a87d42f697b2d923e4f87365d618b6"
+    ],
+    [
+      "src/apar/v5_independent_verifier.py",
+      "100644",
+      "0223850ca2513462ce4c5397ed3064d4276aee631d92c585d6cbe91adb26c01b"
+    ]
+  ],
+  "source_tree_oid": "248b38535d05ecc2e851bad650ac5237090684c6"
+}
