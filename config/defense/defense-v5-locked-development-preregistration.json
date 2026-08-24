@@ -185,8 +185,11 @@
       "time_to_first_alert": "first_intervention_decision_at-first_campaign_decision_at"
     }
   },
-  "manifest_sha256": "b021b32dbe6c3bdd37ab458de7024d3f648c853d36b4c0f1695a52c2db664305",
+  "manifest_sha256": "89bf011d5b6cd63f9b97d437dd1b05631c3c0ec20a54a04417ddbbc9e1229710",
   "output_contract": {
+    "attempt_publication": "canonical_temp_fsync_link_no_replace_parent_fsync",
+    "attempt_receipt_must_be_absent": true,
+    "attempt_receipt_path": "docs/experiments/defense-v5-locked-development-attempt.json",
     "candidate_manifest_path": "docs/experiments/defense-v5-locked-development-candidate.manifest.json",
     "candidate_must_be_absent": true,
     "chunk_size_bytes": 67108864,
@@ -200,7 +203,7 @@
     "normal_git_blob_limit_bytes": 104857600,
     "one_time_no_resume_or_retry": true,
     "publication": "content_chunks_then_atomic_exclusive_manifest",
-    "schema_version": "apar-sentinel-v5-chunked-evidence/1"
+    "schema_version": "apar-sentinel-v5-chunked-evidence/2"
   },
   "preregistration_path": "config/defense/defense-v5-locked-development-preregistration.json",
   "production_support_plan": {
@@ -313,20 +316,20 @@
     "support_plan_sha256": "73e02f1c78ee97d64a9f89a7ea66268e8252bd74edddab6a38871a2d487301ba"
   },
   "safe_validation": {
-    "approved_deterministic_core_sha256": "c0dc4b9b44f2df6c9db6c4b346d6f7778a7b65b2441f9b5f622013aa2e6d7bdb",
+    "approved_deterministic_core_sha256": "8cd3bba2cda47aa5b0d0a85fed4476eeeff787f3f0d2fcec973cc3e30a7b0435",
     "approved_observational_environment_sha256": "415902f1184ebe83deac0380e419a2eb6f11c3d7147c2c67fe38f76fe72ecc33",
     "historical_deterministic_core_sha256": "784a762fd90a65219a233e87df35290ac87c8fe8e4b9024de46564568f633719"
   },
-  "schema_version": "apar-sentinel-v5-locked-preregistration/1",
+  "schema_version": "apar-sentinel-v5-locked-preregistration/2",
   "source_bindings": {
     "arm_protocol_sha256": "6014b3273b3ab5098c1da2a0ed3f8b58b51299625318d9d259283c5b6f635469",
     "base_protocol_sha256": "751db3b095ebb162c5856284b9afee4ab9d934eee3e4f2a2aba401beeb46b799",
     "catalog_sha256": "4a4e807d61654691811f91ac79e1f71c6bbb1e4d16e3c6f2a4c2ee988b0dd9e8",
-    "evidence_protocol_sha256": "b364682d5423c70770e87c7ec8207ba6c77aaf1ba46af768202a0da0ce9c7f16",
-    "implementation_sha256": "c068e1a97320b4ae85739581ee672c0b4ce842cce6d1bcb439d02afc5bb0728b",
-    "verifier_sha256": "0223850ca2513462ce4c5397ed3064d4276aee631d92c585d6cbe91adb26c01b"
+    "evidence_protocol_sha256": "550b62fd43156288544278c9b318ba56ce6474d00bd1efa13bacec0d0d9ce159",
+    "implementation_sha256": "2c5c8a78d44d7938b9ca92f0d3f78bf4ce6c6519db5fb22c45ecd8903ccb7064",
+    "verifier_sha256": "c2c20860fc407d91b4a3beb1ea9aa0cc34857c9e5d15ea67a8427d111b18c0b4"
   },
-  "source_commit": "e0879b2d2eabee163e89b9ab7d1714aa3d9885bb",
+  "source_commit": "6c3f7bef7e66f32c9a7156e710ee2ac953d499db",
   "source_files": [
     [
       "config/defense/defense-v5-arms.json",
@@ -341,12 +344,22 @@
     [
       "config/defense/defense-v5-evidence.json",
       "100644",
-      "55213d617b3062c63c2d052c67871a3fdf9e73ebb43d18e819fcce4061e5d1ee"
+      "873e73bce9861b8ef2b3783f3398a1f937553fce892d4209dadaca2084b07828"
     ],
     [
       "config/defense/feature-catalog-v5.json",
       "100644",
       "4a4e807d61654691811f91ac79e1f71c6bbb1e4d16e3c6f2a4c2ee988b0dd9e8"
+    ],
+    [
+      "docs/superpowers/plans/2026-08-22-apar-sentinel-v5.md",
+      "100644",
+      "243cb3644a811d406eed208aa76336bf9b62a11c83b375f2e78c0cc362e21897"
+    ],
+    [
+      "docs/superpowers/specs/2026-08-22-apar-sentinel-v5-design.md",
+      "100644",
+      "5177e831a22250af7fd2fff123c62fab30f173489e08ed7071168d04ca2e9d1c"
     ],
     [
       "scripts/build_defense_v5_safe_evidence.py",
@@ -361,12 +374,12 @@
     [
       "scripts/run_defense_v5_locked_development.py",
       "100644",
-      "2d90da2cd07475cdf72be0c55d88a8f04207932837b6ff38b2f5e61598c61d0f"
+      "61e09bf1e035d2da523424098d68431d89ba11bee9f221bc791e8e73534e21b1"
     ],
     [
       "scripts/v5_complete_evidence_execution.py",
       "100644",
-      "09233a10e1b5a76e030336979c046be4afa10b608205331b92a2a9a0d7a9d280"
+      "ae07f1e5d9b54318fe7ce7347013222ac21527b710976017c31d7d69200beaa6"
     ],
     [
       "scripts/verify_defense_v5_evidence.py",
@@ -376,12 +389,12 @@
     [
       "scripts/verify_defense_v5_locked_evidence.py",
       "100644",
-      "9be1d959f2b24f884635c571f4f648fe5fd9ee44190f9e53a56082c9dcbee294"
+      "bfd913f5c4874b216429d52dfb52eae8193e4ee5922b7a618a5cd9490526866b"
     ],
     [
       "scripts/verify_defense_v5_locked_preexecution.py",
       "100644",
-      "0a0c946e1b1e309de37e6aefe56dbabe67e7cee2ac41555b390564e5fc740930"
+      "440701d20108c19d504141e4893d7ae60aa54f0542eb270b6664a392c0b32804"
     ],
     [
       "scripts/verify_defense_v5_preexecution.py",
@@ -556,17 +569,17 @@
     [
       "src/apar/evaluation/v5_evidence_layers.py",
       "100644",
-      "57cc86b952941e12ded40bcf7ab5e0cc040e14d12a9f1229451f5fd94673d6e7"
+      "075eb57b173835116cc4e977934e7f0a3fa266098c73a3e3b10ca511ac2d3b4e"
     ],
     [
       "src/apar/evaluation/v5_evidence_protocol.py",
       "100644",
-      "7293e60d72be577ba05d5c1b92896c6c63eb51952a96eb1799534d0e366118a8"
+      "55f16b3772f55d9fc3dfa179c7b2a2e0f02ae32771af55f722a6fe662aa77f02"
     ],
     [
       "src/apar/evaluation/v5_evidence_storage.py",
       "100644",
-      "a105c9f7c0e74e2d3d5977fbac3473146c54a29d35d3030ff5d1b655f33fe805"
+      "f03bcbcd6f3a88bc2eb9c56fe697c07066b3a5a5ba7bcb7873a1c476f32b40b4"
     ],
     [
       "src/apar/evaluation/v5_execution.py",
@@ -586,7 +599,7 @@
     [
       "src/apar/evaluation/v5_locked_evidence.py",
       "100644",
-      "fe3aa137abf48aeaa653b0eff9bc827e3df5e070f23a838a03b0e1c2396c8194"
+      "b6c0ac2383a8496aa32f151d7a6ff0a6ff72e388197e9a64656f2afbe4cd1046"
     ],
     [
       "src/apar/evaluation/v5_metrics.py",
@@ -611,7 +624,7 @@
     [
       "src/apar/evaluation/v5_run_mode.py",
       "100644",
-      "b30ae5663bbf2836b0ddd7e75917548afc80f33cc39cb0d7c6d485db5ac282ca"
+      "5404e1757e21113f2aae27f07b3cdf29c535803cd65b679875540e782b6a13ad"
     ],
     [
       "src/apar/evaluation_hidden/__init__.py",
@@ -801,8 +814,8 @@
     [
       "src/apar/v5_independent_verifier.py",
       "100644",
-      "0223850ca2513462ce4c5397ed3064d4276aee631d92c585d6cbe91adb26c01b"
+      "c2c20860fc407d91b4a3beb1ea9aa0cc34857c9e5d15ea67a8427d111b18c0b4"
     ]
   ],
-  "source_tree_oid": "248b38535d05ecc2e851bad650ac5237090684c6"
+  "source_tree_oid": "b04dfd0c28de3daf1ea2d469f63bb6352c56bce1"
 }
