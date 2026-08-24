@@ -1,0 +1,147 @@
+{
+  "schema_version": "1.0.0",
+  "protocol_id": "apar-sentinel-v5-development-evidence",
+  "base_protocol_path": "config/defense/defense-v5-development.json",
+  "arm_protocol_path": "config/defense/defense-v5-arms.json",
+  "safe_development_test_seed": 404,
+  "locked_development_test_seed": 2404,
+  "existing_development_result_path": "docs/experiments/defense-v5-development-result.json",
+  "existing_development_result_sha256": "af326f3a0fcbbe12c9b8623fc7d82a1ba6d0f327ec9a80f462cacd4bea1dd185",
+  "controls": {
+    "label_shuffle": {
+      "permutation_seed": 1707,
+      "max_roc_auc": 0.70,
+      "max_pr_auc_excess_over_prevalence": 0.20,
+      "min_roc_auc_delta": 0.05
+    },
+    "identity_rename": {
+      "namespace": "apar.sentinel-v5.control.identity-rename.v1",
+      "require_exact_numeric_invariance": true
+    },
+    "future_causality": {
+      "offset_seconds": 86400,
+      "require_exact_invariance": true
+    },
+    "equal_time": {
+      "peer_count": 2,
+      "require_exact_invariance": true
+    },
+    "benign_only": {
+      "false_decline_rate_max": 0.001,
+      "challenge_rate_max": 0.02,
+      "review_rate_max": 0.01,
+      "recall_semantics": "undefined"
+    },
+    "fraud_only": {
+      "qualifies_for_readiness": false,
+      "workload_semantics": "undefined"
+    },
+    "feature_leakage": {
+      "forbidden_fields": [
+        "is_fraud",
+        "family",
+        "campaign_id",
+        "split",
+        "seed",
+        "generator",
+        "lifecycle_state",
+        "final_outcome"
+      ],
+      "require_exact_numeric_invariance": true
+    }
+  },
+  "calibration": {
+    "bin_boundaries": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+    "interval_closure": "left_closed_right_open_final_closed",
+    "rules_only": "not_applicable"
+  },
+  "bootstrap": {
+    "replicates": 2000,
+    "seed": 707,
+    "confidence_level": 0.95,
+    "interval_method": "percentile",
+    "fraud_unit": "campaign",
+    "legitimate_unit": "campaign",
+    "stratification": "legitimate_and_each_fraud_family",
+    "metrics": [
+      "recall",
+      "false_decline_rate",
+      "challenge_rate",
+      "review_rate",
+      "captured_value_fraction",
+      "campaign_detection_rate",
+      "expected_calibration_error"
+    ]
+  },
+  "economics": {
+    "intervention_actions": ["challenge", "review_hold", "decline_hold"],
+    "rail_movement_events": {
+      "a2a": ["transfer_posted"],
+      "agentic": ["authorization"],
+      "card": ["settlement"]
+    },
+    "authorization_events": [
+      "authorization",
+      "transfer_accepted"
+    ],
+    "value_reversal_events": [
+      "transfer_returned",
+      "refund",
+      "recovery"
+    ],
+    "family_rails": {
+      "agentic_intent_abuse": "agentic",
+      "app_scam_mule": "a2a",
+      "card_testing_cnp": "card",
+      "synthetic_merchant_refund": "card"
+    },
+    "aggregate_value_fraction": "unweighted_mean_of_currency_fractions",
+    "capture_semantics": "first_intervention_at_or_before_value_movement_or_lifecycle_reversal",
+    "escape_semantics": "malicious_value_moved_without_prior_intervention_and_without_lifecycle_reversal"
+  },
+  "metric_definitions": {
+    "detection_actions": ["challenge", "review_hold", "decline_hold"],
+    "recall": "detected_fraud_rows/fraud_rows",
+    "precision": "detected_fraud_rows/all_detected_rows",
+    "f1": "2*true_positive/(2*true_positive+false_positive+false_negative)",
+    "false_decline_rate": "declined_legitimate_rows/legitimate_rows",
+    "challenge_rate": "challenged_legitimate_rows/legitimate_rows",
+    "review_rate": "reviewed_legitimate_rows/legitimate_rows",
+    "decline_rate": "declined_rows/all_rows",
+    "brier": "sum((probability-label)^2)/all_rows",
+    "expected_calibration_error": "sum(bin_count/all_rows*abs(bin_mean_probability-bin_empirical_rate))",
+    "maximum_calibration_error": "max(abs(bin_mean_probability-bin_empirical_rate))",
+    "family_precision": "detected_family_rows/(detected_family_rows+detected_legitimate_rows)",
+    "campaign_detection_rate": "detected_fraud_campaigns/fraud_campaigns",
+    "time_to_first_alert": "first_intervention_decision_at-first_campaign_decision_at"
+  },
+  "gates": [
+    {"metric": "family_recall", "comparison": "lower_bound_gte", "target": 0.75},
+    {"metric": "false_decline_rate", "comparison": "upper_bound_lte", "target": 0.001},
+    {"metric": "manual_review_rate", "comparison": "upper_bound_lte", "target": 0.01},
+    {"metric": "challenge_rate", "comparison": "upper_bound_lte", "target": 0.02},
+    {"metric": "captured_value_fraction", "comparison": "lower_bound_gte", "target": 0.70},
+    {"metric": "expected_calibration_error", "comparison": "upper_bound_lte", "target": 0.10},
+    {"metric": "p95_decision_latency_ms", "comparison": "point_lte", "target": 50.0},
+    {"metric": "campaign_detection_rate", "comparison": "defined_interval", "target": null}
+  ],
+  "bounds": {
+    "max_rows": 100000,
+    "max_execution_artifacts": 4096,
+    "max_single_execution_bytes": 16777216,
+    "max_aggregate_execution_bytes": 536870912,
+    "max_control_rows": 100000,
+    "max_bootstrap_replicates": 10000,
+    "max_serialized_evidence_bytes": 536870912
+  },
+  "implementation_paths": [
+    "scripts/build_defense_v5_safe_evidence.py",
+    "scripts/verify_defense_v5_evidence.py",
+    "scripts/verify_defense_v5_preexecution.py",
+    "src/apar/evaluation/v5_controls.py",
+    "src/apar/evaluation/v5_evidence_bundle.py",
+    "src/apar/evaluation/v5_evidence_protocol.py",
+    "src/apar/evaluation/v5_metrics.py",
+    "src/apar/v5_independent_verifier.py"
+  ]
+}

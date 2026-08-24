@@ -2215,14 +2215,6 @@ def load_v5_arm_configuration(
     )
 
 
-class V5ControlResult(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    name: str
-    passed: bool
-    detail: str = ""
-
-
 class V5EvaluationResult(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -2511,49 +2503,6 @@ def evaluate_v5_arm(
     )
 
 
-def run_v5_controls() -> tuple[V5ControlResult, ...]:
-    """Run all mandatory baseline controls."""
-    return (
-        V5ControlResult(
-            name="label_shuffle",
-            passed=False,
-            detail="label shuffling collapses discrimination to chance; "
-                   "verified by PR-AUC near 0.5 on shuffled labels",
-        ),
-        V5ControlResult(
-            name="identity_rename",
-            passed=True,
-            detail="predictions invariant under synthetic identity renaming; "
-                   "verified by byte-identical numeric features",
-        ),
-        V5ControlResult(
-            name="future_causality",
-            passed=True,
-            detail="future insertion/permutation cannot change earlier vectors",
-        ),
-        V5ControlResult(
-            name="equal_time_isolation",
-            passed=True,
-            detail="equal-timestamp peers do not observe one another",
-        ),
-        V5ControlResult(
-            name="benign_only",
-            passed=True,
-            detail="benign-only control measures workload; recall is undefined by design",
-        ),
-        V5ControlResult(
-            name="fraud_only_diagnostic",
-            passed=False,
-            detail="fraud-only data is non-operational and cannot qualify for readiness",
-        ),
-        V5ControlResult(
-            name="feature_leakage",
-            passed=True,
-            detail="family/campaign/seed/split/generator/label fields absent from model features",
-        ),
-    )
-
-
 __all__ = [
     "V5Arm",
     "V5ArmConfiguration",
@@ -2568,7 +2517,6 @@ __all__ = [
     "V5IsolationTreeManifest",
     "V5SerializedModelArtifact",
     "V5TrainingPartitionEvidence",
-    "V5ControlResult",
     "V5EvaluationResult",
     "bind_v5_evaluation_result",
     "build_v5_arm_support_rows",
@@ -2579,6 +2527,5 @@ __all__ = [
     "evaluate_v5_arm",
     "load_v5_arm_configuration",
     "replay_v5_rule_result",
-    "run_v5_controls",
     "validate_v5_rule_feature_provenance",
 ]
