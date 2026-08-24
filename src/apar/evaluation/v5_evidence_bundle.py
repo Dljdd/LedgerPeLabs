@@ -13,6 +13,12 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from apar.evaluation.v5_controls import V5ExecutedControlSuite
 from apar.evaluation.v5_evaluation import V5Arm, V5EvaluationResult, V5ExecutionArtifact
+from apar.evaluation.v5_evidence_layers import (
+    DETERMINISTIC_CORE_EXCLUSION_SCHEMA,
+    DETERMINISTIC_CORE_SCHEMA,
+    build_deterministic_core_document,
+    build_observational_latency_document,
+)
 from apar.evaluation.v5_evidence_protocol import (
     V5EvidenceProtocol,
     V5MetricApplicability,
@@ -60,6 +66,7 @@ class V5PackedDocument(BaseModel):
         "arm_result",
         "complete_metrics",
         "executed_controls",
+        "observational_latency",
     ]
     compression: Literal["zlib-9"]
     content_base64: str
@@ -79,6 +86,7 @@ class V5PackedDocument(BaseModel):
             "arm_result",
             "complete_metrics",
             "executed_controls",
+            "observational_latency",
         ],
         document: object,
         max_uncompressed_bytes: int = _PACKED_DOCUMENT_LIMIT,
@@ -289,12 +297,30 @@ class V5ReadinessEvidence(BaseModel):
         return self
 
 
+class V5DeterministicCoreBinding(BaseModel):
+    """Frozen exact exclusion schema and its canonical deterministic address."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["apar-sentinel-v5-deterministic-core/1"]
+    exclusion_schema: tuple[tuple[str, tuple[str, ...], str], ...]
+    core_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def exclusion_contract_is_exact(self) -> Self:
+        if self.schema_version != DETERMINISTIC_CORE_SCHEMA:
+            raise ValueError("unknown deterministic core schema")
+        if self.exclusion_schema != DETERMINISTIC_CORE_EXCLUSION_SCHEMA:
+            raise ValueError("deterministic core exclusion schema differs")
+        return self
+
+
 class V5EvidencePayload(BaseModel):
     """Canonical uncompressed evidence document consumed by the verifier."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal["1.0.0"]
+    schema_version: Literal["1.1.0"]
     safe_seed: Literal[404]
     evidence_protocol: V5EvidenceProtocol
     catalog_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -303,6 +329,8 @@ class V5EvidencePayload(BaseModel):
     complete_metrics: tuple[V5PackedDocument, ...]
     controls: V5PackedDocument
     readiness: V5ReadinessEvidence
+    deterministic_core: V5DeterministicCoreBinding
+    observational_latency: V5PackedDocument
     payload_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
@@ -334,6 +362,8 @@ class V5EvidencePayload(BaseModel):
         if self.controls.kind != "executed_controls":
             raise ValueError("executed controls packed-document kind differs")
         control_suite = V5ExecutedControlSuite.model_validate(self.controls.document())
+        if self.observational_latency.kind != "observational_latency":
+            raise ValueError("observational latency packed-document kind differs")
         expected_arms = tuple(arm.value for arm in _ARM_ORDER)
         if tuple(item.arm for item in results) != expected_arms:
             raise ValueError("evidence payload requires exact ordered four arms")
@@ -357,6 +387,32 @@ class V5EvidencePayload(BaseModel):
             or control_suite.implementation_sha256 != self.evidence_protocol.implementation_sha256
         ):
             raise ValueError("control suite protocol binding mismatch")
+        execution_documents = [item.document() for item in self.execution_artifact_pool]
+        result_documents = [item.document() for item in self.arm_results]
+        complete_documents = [item.document() for item in self.complete_metrics]
+        controls_document = self.controls.document()
+        readiness_document = self.readiness.model_dump(mode="json")
+        core_document = build_deterministic_core_document(
+            safe_seed=self.safe_seed,
+            evidence_protocol=self.evidence_protocol.model_dump(mode="json"),
+            catalog_sha256=self.catalog_sha256,
+            execution_artifacts=execution_documents,
+            arm_results=result_documents,
+            complete_metrics=complete_documents,
+            controls=controls_document,
+            readiness=readiness_document,
+        )
+        if self.deterministic_core.core_sha256 != _digest(core_document):
+            raise ValueError("deterministic core digest mismatch")
+        expected_observational = build_observational_latency_document(
+            deterministic_core_sha256_value=self.deterministic_core.core_sha256,
+            arm_results=result_documents,
+            complete_metrics=complete_documents,
+            controls=controls_document,
+            readiness=readiness_document,
+        )
+        if self.observational_latency.document() != expected_observational:
+            raise ValueError("observational latency evidence mismatch")
         if self.payload_sha256 != _digest(self.model_dump(mode="json", exclude={"payload_sha256"})):
             raise ValueError("complete evidence payload digest mismatch")
         return self
@@ -367,7 +423,7 @@ class V5EvidenceEnvelope(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal["apar-sentinel-v5-evidence-envelope/1"]
+    schema_version: Literal["apar-sentinel-v5-evidence-envelope/2"]
     compression: Literal["zlib-9"]
     payload_base64: str
     payload_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -589,19 +645,48 @@ def build_v5_evidence_envelope(
     aggregate_execution_bytes = sum(item.uncompressed_bytes for item in packed_artifacts)
     if aggregate_execution_bytes > evidence_protocol.bounds.max_aggregate_execution_bytes:
         raise ValueError("execution artifact pool exceeds frozen aggregate bound")
+    compact_results = tuple(_compact_result(result) for result in results)
+    complete_documents = tuple(metrics.model_dump(mode="json") for metrics in complete)
+    controls_document = controls.model_dump(mode="json")
+    readiness_document = readiness.model_dump(mode="json")
     packed_results = tuple(
-        V5PackedDocument.pack(kind="arm_result", document=_compact_result(result))
-        for result in results
+        V5PackedDocument.pack(kind="arm_result", document=document)
+        for document in compact_results
     )
     packed_complete = tuple(
-        V5PackedDocument.pack(kind="complete_metrics", document=metrics.model_dump(mode="json"))
-        for metrics in complete
+        V5PackedDocument.pack(kind="complete_metrics", document=document)
+        for document in complete_documents
     )
     packed_controls = V5PackedDocument.pack(
-        kind="executed_controls", document=controls.model_dump(mode="json")
+        kind="executed_controls", document=controls_document
+    )
+    core_document = build_deterministic_core_document(
+        safe_seed=seed,
+        evidence_protocol=evidence_protocol.model_dump(mode="json"),
+        catalog_sha256=catalog_sha256,
+        execution_artifacts=[artifact.model_dump(mode="json") for artifact in artifacts],
+        arm_results=list(compact_results),
+        complete_metrics=list(complete_documents),
+        controls=controls_document,
+        readiness=readiness_document,
+    )
+    deterministic_core = V5DeterministicCoreBinding(
+        schema_version=DETERMINISTIC_CORE_SCHEMA,
+        exclusion_schema=DETERMINISTIC_CORE_EXCLUSION_SCHEMA,
+        core_sha256=_digest(core_document),
+    )
+    observational_document = build_observational_latency_document(
+        deterministic_core_sha256_value=deterministic_core.core_sha256,
+        arm_results=list(compact_results),
+        complete_metrics=list(complete_documents),
+        controls=controls_document,
+        readiness=readiness_document,
+    )
+    packed_observational = V5PackedDocument.pack(
+        kind="observational_latency", document=observational_document
     )
     values = {
-        "schema_version": "1.0.0",
+        "schema_version": "1.1.0",
         "safe_seed": seed,
         "evidence_protocol": evidence_protocol,
         "catalog_sha256": catalog_sha256,
@@ -610,6 +695,8 @@ def build_v5_evidence_envelope(
         "complete_metrics": packed_complete,
         "controls": packed_controls,
         "readiness": readiness,
+        "deterministic_core": deterministic_core,
+        "observational_latency": packed_observational,
     }
     values["payload_sha256"] = _digest(
         {
@@ -631,7 +718,7 @@ def build_v5_evidence_envelope(
     if len(compressed) > evidence_protocol.bounds.max_serialized_evidence_bytes:
         raise ValueError("compressed evidence exceeds frozen serialized bound")
     envelope_values = {
-        "schema_version": "apar-sentinel-v5-evidence-envelope/1",
+        "schema_version": "apar-sentinel-v5-evidence-envelope/2",
         "compression": "zlib-9",
         "payload_base64": base64.b64encode(compressed).decode("ascii"),
         "payload_sha256": hashlib.sha256(raw).hexdigest(),
@@ -644,6 +731,7 @@ def build_v5_evidence_envelope(
 
 
 __all__ = [
+    "V5DeterministicCoreBinding",
     "V5EvidenceEnvelope",
     "V5PackedDocument",
     "V5EvidencePayload",

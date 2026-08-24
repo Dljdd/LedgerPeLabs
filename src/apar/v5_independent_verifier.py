@@ -10,11 +10,15 @@ import base64
 import hashlib
 import json
 import math
+import platform
+import sys
+import time
 import zlib
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from decimal import Decimal
+from importlib.metadata import version
 from pathlib import Path
 from typing import Any, NoReturn, cast
 
@@ -217,6 +221,83 @@ _RESULT_FIELDS = {
     "score_sha256",
     "result_sha256",
 }
+_DETERMINISTIC_CORE_SCHEMA = "apar-sentinel-v5-deterministic-core/1"
+_OBSERVATIONAL_LATENCY_SCHEMA = "apar-sentinel-v5-observational-latency/1"
+_OBSERVATIONAL_MEASUREMENT_METHOD = "time.perf_counter_ns-elapsed-v1"
+_DETERMINISTIC_CORE_EXCLUSION_SCHEMA = (
+    (
+        "arm_results[*].row_evidence[*]",
+        ("latency_ms", "row_output_sha256"),
+        "deterministic_row_sha256",
+    ),
+    (
+        "arm_results[*]",
+        (
+            "p50_latency_ms",
+            "p95_latency_ms",
+            "p99_latency_ms",
+            "score_sha256",
+            "result_sha256",
+        ),
+        "deterministic_result_sha256",
+    ),
+    (
+        "complete_metrics[*].aggregate",
+        ("p50_latency_ms", "p95_latency_ms", "p99_latency_ms"),
+        "observational_latency.arm_observations",
+    ),
+    (
+        "complete_metrics[*]",
+        ("arm_result_sha256", "complete_metrics_sha256"),
+        "deterministic_complete_metrics_sha256",
+    ),
+    (
+        "controls.controls[*]",
+        ("control_sha256", "row_evidence_sha256"),
+        "deterministic_control_sha256",
+    ),
+    (
+        "controls.invariance.row_evidence",
+        ("before_score_sha256", "after_score_sha256"),
+        "before_score_signature+after_score_signature",
+    ),
+    (
+        "controls.workload.row_evidence",
+        ("full_score_sha256", "arms[*].score_sha256", "arms[*].rows[*].latency_ms"),
+        "deterministic_control_row_evidence_sha256",
+    ),
+    (
+        "controls.workload.measurements",
+        ("*p95_latency_ms",),
+        "observational_latency.control_observations",
+    ),
+    (
+        "controls",
+        ("suite_sha256",),
+        "deterministic_control_suite_sha256",
+    ),
+    (
+        "readiness",
+        (
+            "gates[p95_latency_ms]",
+            "qualifying_controls[*].control_sha256",
+            "readiness_sha256",
+        ),
+        "deterministic_readiness_sha256+observational_latency.latency_gate",
+    ),
+    (
+        "payload",
+        ("observational_latency", "payload_sha256"),
+        "deterministic_core.core_sha256",
+    ),
+)
+_WORKLOAD_CONTROLS = ("benign_only", "fraud_only_diagnostic")
+_INVARIANCE_CONTROLS = (
+    "identity_rename",
+    "future_causality",
+    "equal_time_isolation",
+    "feature_leakage",
+)
 
 
 class IndependentVerificationError(ValueError):
@@ -279,6 +360,395 @@ def _close(left: object, right: object, label: str) -> None:
         _fail(f"{label} failed independent recomputation")
 
 
+def _stable_core_row(value: object) -> dict[str, Any]:
+    row = _mapping(value, "core arm row")
+    _exact_fields(row, _ROW_FIELDS, "core arm row")
+    stable = {
+        key: row[key]
+        for key in _ROW_FIELDS
+        if key not in {"latency_ms", "row_output_sha256"}
+    }
+    stable["deterministic_row_sha256"] = _digest(stable)
+    return stable
+
+
+def _stable_core_result(value: object) -> dict[str, Any]:
+    result = _mapping(value, "retained core arm result")
+    fields = (_RESULT_FIELDS - {"execution_artifacts"}) | {"execution_artifact_refs"}
+    _exact_fields(result, fields, "retained core arm result")
+    excluded = {
+        "arm_spec",
+        "row_evidence",
+        "p50_latency_ms",
+        "p95_latency_ms",
+        "p99_latency_ms",
+        "score_sha256",
+        "result_sha256",
+    }
+    stable = {key: result[key] for key in fields if key not in excluded}
+    stable_rows = [_stable_core_row(row) for row in result["row_evidence"]]
+    stable["row_evidence_addresses"] = [
+        {
+            "event_id": row["support"]["event_id"],
+            "deterministic_row_sha256": row["deterministic_row_sha256"],
+        }
+        for row in stable_rows
+    ]
+    stable["deterministic_row_stream_sha256"] = _digest(stable_rows)
+    stable["deterministic_result_sha256"] = _digest(stable)
+    return stable
+
+
+def _stable_core_complete(
+    value: object, *, deterministic_result_sha256: str
+) -> dict[str, Any]:
+    metrics = _mapping(value, "core complete metrics")
+    fields = {
+        "arm",
+        "arm_result_sha256",
+        "support_sha256",
+        "aggregate",
+        "calibration",
+        "economics",
+        "by_family",
+        "bootstrap",
+        "complete_metrics_sha256",
+    }
+    _exact_fields(metrics, fields, "core complete metrics")
+    aggregate = _mapping(metrics["aggregate"], "core aggregate metrics")
+    latency = {"p50_latency_ms", "p95_latency_ms", "p99_latency_ms"}
+    if not latency <= set(aggregate):
+        _fail("core complete metrics lack exact latency fields")
+    stable = {
+        "arm": metrics["arm"],
+        "deterministic_result_sha256": deterministic_result_sha256,
+        "support_sha256": metrics["support_sha256"],
+        "aggregate": {
+            name: metric for name, metric in aggregate.items() if name not in latency
+        },
+        "calibration_sha256": metrics["calibration"]["calibration_sha256"],
+        "economics_sha256": metrics["economics"]["economics_sha256"],
+        "family_sha256": [item["family_sha256"] for item in metrics["by_family"]],
+        "bootstrap_sha256": metrics["bootstrap"]["bootstrap_sha256"],
+    }
+    stable["deterministic_complete_metrics_sha256"] = _digest(stable)
+    return stable
+
+
+def _stable_core_control_rows(name: str, raw_json: object) -> dict[str, Any]:
+    if type(raw_json) is not str:
+        _fail("core control row evidence must be JSON")
+    try:
+        rows = _mapping(json.loads(raw_json), "core control row evidence")
+    except json.JSONDecodeError as error:
+        raise IndependentVerificationError("core control row evidence is invalid") from error
+    if raw_json != json.dumps(rows, sort_keys=True):
+        _fail("core control row evidence is not canonical")
+    if name in _INVARIANCE_CONTROLS:
+        excluded = {"before_score_sha256", "after_score_sha256"}
+        if not excluded <= set(rows):
+            _fail("core invariance score bindings are incomplete")
+        return {key: value for key, value in rows.items() if key not in excluded}
+    if name in _WORKLOAD_CONTROLS:
+        if set(rows) != {"arms", "full_score_sha256"}:
+            _fail("core workload row evidence schema differs")
+        arms = _mapping(rows["arms"], "core workload arms")
+        if set(arms) != set(_ARMS):
+            _fail("core workload arm set differs")
+        stable_arms: dict[str, Any] = {}
+        for arm in _ARMS:
+            arm_rows = _mapping(arms[arm], "core workload arm")
+            if "score_sha256" not in arm_rows or "rows" not in arm_rows:
+                _fail("core workload arm evidence is incomplete")
+            stable_rows = []
+            for raw_row in arm_rows["rows"]:
+                row = _mapping(raw_row, "core workload row")
+                if set(row) != {"event_id", "action", "probability", "latency_ms"}:
+                    _fail("core workload row schema differs")
+                stable_rows.append(
+                    {
+                        "event_id": row["event_id"],
+                        "action": row["action"],
+                        "probability": row["probability"],
+                    }
+                )
+            stable_arms[arm] = {
+                key: item
+                for key, item in arm_rows.items()
+                if key not in {"score_sha256", "rows"}
+            }
+            stable_arms[arm]["rows"] = stable_rows
+        return {"arms": stable_arms}
+    if name == "label_shuffle":
+        return rows
+    _fail("core executed control name differs")
+
+
+def _stable_core_controls(value: object) -> tuple[dict[str, Any], dict[str, str]]:
+    suite = _mapping(value, "core controls")
+    suite_fields = {
+        "controls",
+        "evidence_protocol_sha256",
+        "support_sha256",
+        "implementation_sha256",
+        "suite_sha256",
+    }
+    _exact_fields(suite, suite_fields, "core controls")
+    control_fields = {
+        "name",
+        "executed",
+        "qualifies_for_readiness",
+        "spec_json",
+        "spec_sha256",
+        "input_support_ids",
+        "input_support_sha256",
+        "input_artifact_ids",
+        "input_artifact_sha256",
+        "permutation_seed",
+        "executed_arm_spec_sha256",
+        "measurements",
+        "criterion",
+        "passed",
+        "row_evidence_json",
+        "row_evidence_sha256",
+        "implementation_sha256",
+        "control_sha256",
+    }
+    stable_controls = []
+    digests: dict[str, str] = {}
+    for raw in suite["controls"]:
+        control = _mapping(raw, "core control")
+        _exact_fields(control, control_fields, "core control")
+        name = str(control["name"])
+        excluded = {
+            "control_sha256",
+            "row_evidence_json",
+            "row_evidence_sha256",
+            "measurements",
+        }
+        stable = {key: control[key] for key in control_fields if key not in excluded}
+        stable["measurements"] = [
+            measurement
+            for measurement in control["measurements"]
+            if not str(measurement["name"]).endswith("p95_latency_ms")
+        ]
+        stable_rows = _stable_core_control_rows(name, control["row_evidence_json"])
+        stable["deterministic_row_evidence_sha256"] = _digest(stable_rows)
+        stable["deterministic_control_sha256"] = _digest(stable)
+        digests[name] = stable["deterministic_control_sha256"]
+        stable_controls.append(stable)
+    stable_suite = {
+        "controls": stable_controls,
+        "evidence_protocol_sha256": suite["evidence_protocol_sha256"],
+        "support_sha256": suite["support_sha256"],
+        "implementation_sha256": suite["implementation_sha256"],
+    }
+    stable_suite["deterministic_control_suite_sha256"] = _digest(stable_suite)
+    return stable_suite, digests
+
+
+def _stable_core_readiness(
+    value: object, *, deterministic_control_digests: Mapping[str, str]
+) -> dict[str, Any]:
+    readiness = _mapping(value, "core readiness")
+    fields = {
+        "evaluated_arm",
+        "gates",
+        "qualifying_controls",
+        "status",
+        "readiness_sha256",
+    }
+    _exact_fields(readiness, fields, "core readiness")
+    gates = [gate for gate in readiness["gates"] if gate["metric"] != "p95_latency_ms"]
+    if len(gates) + 1 != len(readiness["gates"]):
+        _fail("core readiness latency gate is missing or duplicated")
+    controls = []
+    for name, passed, _digest_value in readiness["qualifying_controls"]:
+        if name not in deterministic_control_digests:
+            _fail("core readiness qualifying control is unknown")
+        controls.append([name, passed, deterministic_control_digests[name]])
+    status = (
+        "ready"
+        if all(gate["passed"] for gate in gates) and all(item[1] for item in controls)
+        else "not_ready"
+    )
+    stable = {
+        "evaluated_arm": readiness["evaluated_arm"],
+        "gates": gates,
+        "qualifying_controls": controls,
+        "deterministic_status": status,
+    }
+    stable["deterministic_readiness_sha256"] = _digest(stable)
+    return stable
+
+
+def _independent_core_document(
+    *,
+    payload: Mapping[str, Any],
+    artifacts: Sequence[Mapping[str, Any]],
+    retained_results: Sequence[Mapping[str, Any]],
+    complete: Sequence[Mapping[str, Any]],
+    controls: Mapping[str, Any],
+    readiness: Mapping[str, Any],
+) -> dict[str, Any]:
+    results = [_stable_core_result(result) for result in retained_results]
+    if [result["arm"] for result in results] != list(_ARMS):
+        _fail("deterministic core arm order differs")
+    metrics = [
+        _stable_core_complete(
+            item, deterministic_result_sha256=result["deterministic_result_sha256"]
+        )
+        for item, result in zip(complete, results, strict=True)
+    ]
+    stable_controls, control_digests = _stable_core_controls(controls)
+    stable_readiness = _stable_core_readiness(
+        readiness, deterministic_control_digests=control_digests
+    )
+    addresses = []
+    for artifact in artifacts:
+        _exact_fields(artifact, _EXECUTION_ARTIFACT_FIELDS, "core execution artifact")
+        addresses.append(
+            {
+                "evidence_sha256": artifact["evidence_sha256"],
+                "artifact_sha256": artifact["artifact_sha256"],
+                "payload_sha256": artifact["payload_sha256"],
+            }
+        )
+    return {
+        "schema_version": _DETERMINISTIC_CORE_SCHEMA,
+        "exclusion_schema": _DETERMINISTIC_CORE_EXCLUSION_SCHEMA,
+        "safe_seed": payload["safe_seed"],
+        "evidence_protocol": payload["evidence_protocol"],
+        "catalog_sha256": payload["catalog_sha256"],
+        "execution_artifact_addresses": addresses,
+        "arm_results": results,
+        "complete_metrics": metrics,
+        "controls": stable_controls,
+        "readiness": stable_readiness,
+    }
+
+
+def _current_latency_environment() -> dict[str, Any]:
+    clock = time.get_clock_info("perf_counter")
+    return {
+        "python_implementation": platform.python_implementation(),
+        "python_version": platform.python_version(),
+        "platform_system": platform.system(),
+        "platform_release": platform.release(),
+        "platform_machine": platform.machine(),
+        "executable_abi": sys.implementation.cache_tag,
+        "catboost_version": version("catboost"),
+        "numpy_version": version("numpy"),
+        "scikit_learn_version": version("scikit-learn"),
+        "clock": {
+            "implementation": clock.implementation,
+            "monotonic": clock.monotonic,
+            "adjustable": clock.adjustable,
+            "resolution_seconds": clock.resolution,
+        },
+    }
+
+
+def _independent_observational_document(
+    *,
+    core_sha256: str,
+    retained_results: Sequence[Mapping[str, Any]],
+    complete: Sequence[Mapping[str, Any]],
+    controls: Mapping[str, Any],
+    readiness: Mapping[str, Any],
+) -> dict[str, Any]:
+    arm_observations = []
+    for result, metrics in zip(retained_results, complete, strict=True):
+        samples = [
+            {
+                "row_index": index,
+                "event_id": row["support"]["event_id"],
+                "latency_ms": row["latency_ms"],
+            }
+            for index, row in enumerate(result["row_evidence"])
+        ]
+        values = [_finite(item["latency_ms"], "arm latency sample") for item in samples]
+        if len(values) < 2 or any(value <= 0.0 for value in values):
+            _fail("observational arm latency samples are invalid")
+        if len(set(values)) == 1:
+            _fail("constant arm latency samples are not observational evidence")
+        aggregate = metrics["aggregate"]
+        arm_observations.append(
+            {
+                "arm": result["arm"],
+                "support_sha256": result["support_sha256"],
+                "samples": samples,
+                "p50_latency_ms": float(np.percentile(values, 50)),
+                "p95_latency_ms": float(np.percentile(values, 95)),
+                "p99_latency_ms": float(np.percentile(values, 99)),
+                "reported_metric_sha256": [
+                    aggregate[name]["metric_sha256"]
+                    for name in (
+                        "p50_latency_ms",
+                        "p95_latency_ms",
+                        "p99_latency_ms",
+                    )
+                ],
+            }
+        )
+    if [item["arm"] for item in arm_observations] != list(_ARMS):
+        _fail("observational arm order differs")
+    controls_by_name = {str(item["name"]): item for item in controls["controls"]}
+    control_observations = []
+    for control_name in _WORKLOAD_CONTROLS:
+        control = controls_by_name.get(control_name)
+        if control is None:
+            _fail("observational workload control is missing")
+        evidence = _mapping(
+            json.loads(str(control["row_evidence_json"])),
+            "observational control rows",
+        )
+        for arm in _ARMS:
+            rows = evidence["arms"][arm]["rows"]
+            samples = [
+                {
+                    "row_index": index,
+                    "event_id": row["event_id"],
+                    "latency_ms": row["latency_ms"],
+                }
+                for index, row in enumerate(rows)
+            ]
+            values = [
+                _finite(item["latency_ms"], "control latency sample") for item in samples
+            ]
+            if len(values) < 2 or any(value <= 0.0 for value in values):
+                _fail("observational control latency samples are invalid")
+            if len(set(values)) == 1:
+                _fail("constant control latency samples are not observational evidence")
+            control_observations.append(
+                {
+                    "control": control_name,
+                    "arm": arm,
+                    "samples": samples,
+                    "p95_latency_ms": float(np.percentile(values, 95)),
+                }
+            )
+    latency_gates = [
+        gate for gate in readiness["gates"] if gate["metric"] == "p95_latency_ms"
+    ]
+    if len(latency_gates) != 1:
+        _fail("observational latency gate is missing or duplicated")
+    environment = _current_latency_environment()
+    document = {
+        "schema_version": _OBSERVATIONAL_LATENCY_SCHEMA,
+        "measurement_method": _OBSERVATIONAL_MEASUREMENT_METHOD,
+        "synthetic_values": False,
+        "deterministic_core_sha256": core_sha256,
+        "environment": environment,
+        "environment_sha256": _digest(environment),
+        "arm_observations": arm_observations,
+        "control_observations": control_observations,
+        "latency_gate": latency_gates[0],
+    }
+    document["observational_latency_sha256"] = _digest(document)
+    return document
+
+
 def _parse_envelope(serialized: bytes) -> tuple[dict[str, Any], dict[str, Any]]:
     if len(serialized) > 750_000_000:
         _fail("serialized envelope exceeds the frozen bound")
@@ -300,7 +770,7 @@ def _parse_envelope(serialized: bytes) -> tuple[dict[str, Any], dict[str, Any]]:
         },
         "envelope",
     )
-    if envelope["schema_version"] != "apar-sentinel-v5-evidence-envelope/1":
+    if envelope["schema_version"] != "apar-sentinel-v5-evidence-envelope/2":
         _fail("unknown envelope schema")
     if envelope["compression"] != "zlib-9":
         _fail("unknown envelope compression")
@@ -1659,12 +2129,31 @@ def _verify_spec(spec: Mapping[str, Any], catalog_sha256: str, bindings: Mapping
         ):
             _fail("model member evidence count mismatch")
         for artifact, expected in zip(artifacts, spec["model_artifact_sha256"], strict=True):
+            artifact = _mapping(artifact, "model artifact")
+            _exact_fields(
+                artifact,
+                {"serialization", "payload_base64", "artifact_sha256"},
+                "model artifact",
+            )
+            if artifact["serialization"] != "catboost-json-canonical-v1":
+                _fail("model artifact serialization differs")
             raw = base64.b64decode(artifact["payload_base64"], validate=True)
             if (
                 hashlib.sha256(raw).hexdigest() != artifact["artifact_sha256"]
                 or expected != artifact["artifact_sha256"]
             ):
                 _fail("model artifact digest mismatch")
+            try:
+                model_document = _mapping(json.loads(raw), "canonical CatBoost model")
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise IndependentVerificationError(
+                    "model artifact is not canonical JSON"
+                ) from error
+            if raw != _canonical_bytes(model_document):
+                _fail("model artifact JSON is not canonical")
+            model_info = _mapping(model_document.get("model_info"), "CatBoost model_info")
+            if {"model_guid", "train_finish_time"} & set(model_info):
+                _fail("model artifact retains volatile metadata")
         for manifest, expected in zip(calibrators, spec["calibrator_artifact_sha256"], strict=True):
             if (
                 manifest["artifact_sha256"]
@@ -3796,11 +4285,13 @@ def _verify_evidence_bytes(serialized: bytes, *, root: Path) -> dict[str, object
             "complete_metrics",
             "controls",
             "readiness",
+            "deterministic_core",
+            "observational_latency",
             "payload_sha256",
         },
         "payload",
     )
-    if payload["schema_version"] != "1.0.0":
+    if payload["schema_version"] != "1.1.0":
         _fail("unknown evidence payload schema")
     if payload["payload_sha256"] != _digest(
         {key: value for key, value in payload.items() if key != "payload_sha256"}
@@ -3828,9 +4319,11 @@ def _verify_evidence_bytes(serialized: bytes, *, root: Path) -> dict[str, object
         _fail("execution artifact pool exceeds the frozen aggregate bound")
     packed_results = _sequence(payload["arm_results"], "packed arm results")
     results: list[dict[str, Any]] = []
+    retained_results: list[dict[str, Any]] = []
     used_artifact_ids: set[str] = set()
     for item in packed_results:
         retained = _unpack_document(item, expected_kind="arm_result")
+        retained_results.append(retained)
         expanded, used = _expand_retained_result(retained, artifact_pool)
         results.append(expanded)
         used_artifact_ids.update(used)
@@ -3875,6 +4368,40 @@ def _verify_evidence_bytes(serialized: bytes, *, root: Path) -> dict[str, object
     )
     readiness = _mapping(payload["readiness"], "readiness")
     _verify_readiness(readiness, complete_metrics=complete[-1], controls=controls)
+    core_binding = _mapping(payload["deterministic_core"], "deterministic core binding")
+    _exact_fields(
+        core_binding,
+        {"schema_version", "exclusion_schema", "core_sha256"},
+        "deterministic core binding",
+    )
+    if core_binding["schema_version"] != _DETERMINISTIC_CORE_SCHEMA:
+        _fail("unknown deterministic core schema")
+    expected_exclusions = json.loads(_canonical_bytes(_DETERMINISTIC_CORE_EXCLUSION_SCHEMA))
+    if core_binding["exclusion_schema"] != expected_exclusions:
+        _fail("deterministic core exclusion schema differs")
+    core_document = _independent_core_document(
+        payload=payload,
+        artifacts=list(artifact_pool.values()),
+        retained_results=retained_results,
+        complete=complete,
+        controls=controls,
+        readiness=readiness,
+    )
+    expected_core_sha256 = _digest(core_document)
+    if core_binding["core_sha256"] != expected_core_sha256:
+        _fail("deterministic core digest mismatch")
+    observational = _unpack_document(
+        payload["observational_latency"], expected_kind="observational_latency"
+    )
+    expected_observational = _independent_observational_document(
+        core_sha256=expected_core_sha256,
+        retained_results=retained_results,
+        complete=complete,
+        controls=controls,
+        readiness=readiness,
+    )
+    if observational != expected_observational:
+        _fail("observational latency evidence differs from retained samples")
     return {
         "verified": True,
         "status": readiness["status"],
@@ -3883,6 +4410,16 @@ def _verify_evidence_bytes(serialized: bytes, *, root: Path) -> dict[str, object
         "support_count": len(reference_support),
         "payload_sha256": payload["payload_sha256"],
         "envelope_sha256": envelope["envelope_sha256"],
+        "deterministic_core_sha256": expected_core_sha256,
+        "observational_latency_sha256": observational[
+            "observational_latency_sha256"
+        ],
+        "observational_environment_sha256": observational["environment_sha256"],
+        "evidence_protocol_sha256": protocol["evidence_protocol_sha256"],
+        "base_protocol_sha256": protocol["base_protocol_sha256"],
+        "arm_protocol_sha256": protocol["arm_protocol_sha256"],
+        "implementation_sha256": protocol["implementation_sha256"],
+        "catalog_sha256": payload["catalog_sha256"],
     }
 
 

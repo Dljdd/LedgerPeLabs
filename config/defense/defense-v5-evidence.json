@@ -140,6 +140,7 @@
     "scripts/verify_defense_v5_preexecution.py",
     "src/apar/evaluation/v5_controls.py",
     "src/apar/evaluation/v5_evidence_bundle.py",
+    "src/apar/evaluation/v5_evidence_layers.py",
     "src/apar/evaluation/v5_evidence_protocol.py",
     "src/apar/evaluation/v5_metrics.py",
     "src/apar/v5_independent_verifier.py"

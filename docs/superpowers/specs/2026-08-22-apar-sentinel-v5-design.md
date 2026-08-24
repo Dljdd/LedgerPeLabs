@@ -430,6 +430,31 @@ At minimum report:
 - full Sentinel policy with novelty/uncertainty routing;
 - hardened Sentinel after the single adaptive-training round.
 
+### 11.5 Deterministic and observational evidence addresses
+
+The safe pre-execution fixture has two separately authenticated layers:
+
+- `apar-sentinel-v5-deterministic-core/1` binds source/config/protocol,
+  canonical model semantics, execution lineage, ordered features, actions,
+  probabilities, non-latency metrics, controls, economics, bootstrap evidence,
+  and deterministic readiness gates;
+- `apar-sentinel-v5-observational-latency/1` binds the deterministic core,
+  ordered per-row `time.perf_counter_ns` elapsed samples, workload-control
+  samples, runtime/timer environment, recomputed percentiles, and the latency
+  gate.
+
+The deterministic-core exclusion schema is an exact versioned list of paths.
+It excludes only real latency samples and hashes or aggregate fields derived
+from those samples; deterministic replacements are content-addressed. It must
+never implement a recursive rule such as ignoring every key named `latency`.
+CatBoost evidence uses canonical JSON with only the volatile `model_guid` and
+`train_finish_time` metadata removed; tree/model semantics remain retained and
+reloadable.
+
+Safe builds from identical source and seed must share the deterministic-core
+digest. Real timing, observational, payload, and envelope hashes may vary, so
+the complete serialized artifact is not described as byte-reproducible.
+
 ## 12. Mandatory controls and ablations
 
 The development report is invalid without these controls:
@@ -538,4 +563,3 @@ The design is informed by the following sources:
 8. [Visa Trusted Agent Protocol](https://developer.visa.com/capabilities/trusted-agent-protocol/docs) — identity, intent, authentication, and signed request binding for agentic commerce.
 
 Private datasets, different base rates, vendor claims, and research prototypes are not directly comparable to APAR metrics. The purpose of these sources is to justify architectural choices, not to borrow performance claims.
-

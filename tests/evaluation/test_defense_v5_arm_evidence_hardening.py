@@ -9,6 +9,7 @@ from copy import deepcopy
 from pathlib import Path
 
 import pytest
+from catboost import CatBoostClassifier
 
 import apar.evaluation.v5_evaluation as v5_evaluation
 from apar.evaluation.v5_evaluation import (
@@ -78,6 +79,31 @@ def test_arm_evidence_contracts_exist_before_training() -> None:
     assert getattr(v5_evaluation, "V5SerializedModelArtifact", None) is not None
     assert getattr(v5_evaluation, "V5IsolationForestManifest", None) is not None
     assert getattr(v5_evaluation, "V5ExecutionArtifact", None) is not None
+
+
+def test_catboost_evidence_serialization_excludes_only_volatile_metadata() -> None:
+    """Restoring CBM bytes must make equal seeded models receive different identities."""
+    from apar.evaluation.v5_arms import _model_artifact
+
+    features = [[0.0, 1.0], [1.0, 0.0], [0.1, 0.9], [0.9, 0.1]]
+    labels = [0, 1, 0, 1]
+    models = []
+    for _index in range(2):
+        model = CatBoostClassifier(
+            iterations=2,
+            depth=2,
+            random_seed=123,
+            allow_writing_files=False,
+            verbose=False,
+        )
+        model.fit(features, labels)
+        models.append(model)
+    left, right = (_model_artifact(model) for model in models)
+    assert left.serialization == "catboost-json-canonical-v1"
+    assert left == right
+    assert left.load_model().predict_proba(features).tolist() == models[0].predict_proba(
+        features
+    ).tolist()
 
 
 def test_trainer_requires_exact_partition_evidence_arguments() -> None:

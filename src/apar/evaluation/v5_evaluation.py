@@ -14,6 +14,7 @@ from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import MappingProxyType
 from typing import Literal, Self, cast
 
@@ -860,11 +861,13 @@ class V5CalibratorManifest(BaseModel):
 
 
 class V5SerializedModelArtifact(BaseModel):
-    """Bounded content-addressed CatBoost bytes for independent raw-score replay."""
+    """Canonical CatBoost semantics with volatile training metadata removed."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    serialization: Literal["catboost-cbm"] = "catboost-cbm"
+    serialization: Literal["catboost-json-canonical-v1"] = (
+        "catboost-json-canonical-v1"
+    )
     payload_base64: str = Field(max_length=24_000_000)
     artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
@@ -878,14 +881,37 @@ class V5SerializedModelArtifact(BaseModel):
         return payload
 
     def load_model(self) -> CatBoostClassifier:
-        model = CatBoostClassifier()
-        model.load_model(blob=self.payload())
+        with TemporaryDirectory(prefix="apar-v5-catboost-load-") as directory:
+            path = Path(directory) / "model.json"
+            path.write_bytes(self.payload())
+            model = CatBoostClassifier()
+            model.load_model(str(path), format="json")
         return model
 
     @model_validator(mode="after")
     def payload_digest_matches(self) -> Self:
-        if hashlib.sha256(self.payload()).hexdigest() != self.artifact_sha256:
+        payload = self.payload()
+        if hashlib.sha256(payload).hexdigest() != self.artifact_sha256:
             raise ValueError("CatBoost artifact payload digest mismatch")
+        try:
+            document = json.loads(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("CatBoost artifact is not canonical JSON") from error
+        canonical = json.dumps(
+            document,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode()
+        if payload != canonical:
+            raise ValueError("CatBoost artifact JSON is not canonical")
+        model_info = document.get("model_info") if isinstance(document, dict) else None
+        if not isinstance(model_info, dict) or {
+            "model_guid",
+            "train_finish_time",
+        } & set(model_info):
+            raise ValueError("CatBoost artifact retains volatile metadata")
         return self
 
 

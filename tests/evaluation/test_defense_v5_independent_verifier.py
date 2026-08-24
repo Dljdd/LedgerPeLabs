@@ -85,7 +85,7 @@ def _mutated_envelope(mutator: Callable[[dict[str, object]], None]) -> bytes:
     raw = _canonical(payload)
     compressed = zlib.compress(raw, level=9)
     rebound = {
-        "schema_version": "apar-sentinel-v5-evidence-envelope/1",
+        "schema_version": envelope["schema_version"],
         "compression": "zlib-9",
         "payload_base64": base64.b64encode(compressed).decode("ascii"),
         "payload_sha256": hashlib.sha256(raw).hexdigest(),
@@ -95,6 +95,22 @@ def _mutated_envelope(mutator: Callable[[dict[str, object]], None]) -> bytes:
     }
     rebound["envelope_sha256"] = _digest(rebound)
     return _canonical(rebound)
+
+
+def _mutate_observational(
+    payload: dict[str, object], mutator: Callable[[dict[str, object]], None]
+) -> None:
+    packed = payload["observational_latency"]
+    document = _unpack(packed)
+    mutator(document)
+    document["observational_latency_sha256"] = _digest(
+        {
+            key: value
+            for key, value in document.items()
+            if key != "observational_latency_sha256"
+        }
+    )
+    payload["observational_latency"] = _repack("observational_latency", document)
 
 
 def _mutate_event(payload: dict[str, object]) -> None:
@@ -252,6 +268,112 @@ def test_independent_verifier_rejects_rebound_layer_mutation(
         verify_evidence_bytes(_mutated_envelope(mutator), root=ROOT)
 
 
+def test_independent_verifier_rejects_rebound_deterministic_core_mutation() -> None:
+    """Trusting the claimed core address must accept a readdressed semantic core."""
+
+    def mutate(payload: dict[str, object]) -> None:
+        forged = "f" * 64
+        payload["deterministic_core"]["core_sha256"] = forged
+        _mutate_observational(
+            payload,
+            lambda document: document.__setitem__(
+                "deterministic_core_sha256", forged
+            ),
+        )
+
+    with pytest.raises(IndependentVerificationError, match="deterministic core"):
+        verify_evidence_bytes(_mutated_envelope(mutate), root=ROOT)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda document: document["arm_observations"][0]["samples"][0].__setitem__(
+            "latency_ms", 999.0
+        ),
+        lambda document: document["arm_observations"][0]["samples"].pop(),
+        lambda document: document["arm_observations"][0]["samples"].__setitem__(
+            slice(0, 2),
+            list(reversed(document["arm_observations"][0]["samples"][:2])),
+        ),
+        lambda document: document["arm_observations"][0].__setitem__(
+            "p95_latency_ms", 999.0
+        ),
+    ),
+    ids=("sample_mutation", "sample_deletion", "sample_reorder", "metric_mutation"),
+)
+def test_independent_verifier_rejects_rebound_observational_latency_mutation(
+    mutation: Callable[[dict[str, object]], None],
+) -> None:
+    """Dropping sample alignment/recomputation must accept rebound latency evidence."""
+    with pytest.raises(IndependentVerificationError, match="observational latency"):
+        verify_evidence_bytes(
+            _mutated_envelope(
+                lambda payload: _mutate_observational(payload, mutation)
+            ),
+            root=ROOT,
+        )
+
+
+def test_independent_verifier_rejects_rebound_latency_environment_mutation() -> None:
+    """Treating the declared environment as caller truth must accept this forgery."""
+
+    def mutate(document: dict[str, object]) -> None:
+        document["environment"]["python_version"] = "0.0-forged"
+        document["environment_sha256"] = _digest(document["environment"])
+
+    with pytest.raises(IndependentVerificationError, match="observational latency"):
+        verify_evidence_bytes(
+            _mutated_envelope(
+                lambda payload: _mutate_observational(payload, mutate)
+            ),
+            root=ROOT,
+        )
+
+
+@pytest.mark.parametrize("kind", ["fake_marker", "constant_samples"])
+def test_independent_verifier_rejects_fake_or_constant_timing_evidence(
+    kind: str,
+) -> None:
+    """Trusting timing markers or distributions must accept synthetic observations."""
+
+    def mutate(document: dict[str, object]) -> None:
+        if kind == "fake_marker":
+            document["measurement_method"] = "synthetic-constant-v1"
+            document["synthetic_values"] = True
+            return
+        observation = document["arm_observations"][0]
+        for sample in observation["samples"]:
+            sample["latency_ms"] = 1.0
+        observation["p50_latency_ms"] = 1.0
+        observation["p95_latency_ms"] = 1.0
+        observation["p99_latency_ms"] = 1.0
+
+    with pytest.raises(IndependentVerificationError, match="observational latency"):
+        verify_evidence_bytes(
+            _mutated_envelope(
+                lambda payload: _mutate_observational(payload, mutate)
+            ),
+            root=ROOT,
+        )
+
+
+def test_independent_verifier_rejects_latency_layer_bound_to_another_core() -> None:
+    """Omitting the core binding must allow a validly rehashed foreign timing layer."""
+    with pytest.raises(IndependentVerificationError, match="observational latency"):
+        verify_evidence_bytes(
+            _mutated_envelope(
+                lambda payload: _mutate_observational(
+                    payload,
+                    lambda document: document.__setitem__(
+                        "deterministic_core_sha256", "e" * 64
+                    ),
+                )
+            ),
+            root=ROOT,
+        )
+
+
 def test_independent_verifier_has_a_static_production_import_boundary() -> None:
     source_path = ROOT / "src/apar/v5_independent_verifier.py"
     tree = ast.parse(source_path.read_text())
@@ -266,6 +388,7 @@ def test_independent_verifier_has_a_static_production_import_boundary() -> None:
         "apar.evaluation.v5_controls",
         "apar.evaluation.v5_evaluation",
         "apar.evaluation.v5_evidence_bundle",
+        "apar.evaluation.v5_evidence_layers",
         "apar.evaluation.v5_metrics",
         "apar.evaluation.v5_population",
         "apar.simulator",

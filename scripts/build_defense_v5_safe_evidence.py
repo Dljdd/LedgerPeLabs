@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+from importlib import import_module
 from pathlib import Path
+from typing import Any
 
 from apar.evaluation.v5_controls import execute_v5_controls
 from apar.evaluation.v5_evaluation import (
@@ -21,7 +23,13 @@ from apar.evaluation.v5_protocol import (
     v5_protocol_digest,
 )
 from apar.features.sentinel import SentinelFeatureCatalog
-from scripts.run_defense_v5_development import _score_all_arms_and_evaluate
+
+_runner_module: Any = import_module(
+    f"{__package__}.run_defense_v5_development"
+    if __package__
+    else "run_defense_v5_development"
+)
+_score_all_arms_and_evaluate: Any = _runner_module._score_all_arms_and_evaluate
 
 
 def _safe_protocol(root: Path) -> V5DevelopmentProtocol:
@@ -97,6 +105,10 @@ def main() -> int:
     args = parser.parse_args()
     root = args.root.resolve()
     output = args.output.resolve()
+    if not (root / "config/defense/defense-v5-evidence.json").is_file():
+        raise SystemExit(
+            "repository root is missing the Sentinel v5 evidence configuration"
+        )
     if output.exists():
         raise SystemExit("refusing to overwrite an existing safe evidence fixture")
     output.write_bytes(build_safe_evidence(root))

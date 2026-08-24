@@ -784,20 +784,26 @@ uv run --python 3.12.5 --with-editable . --extra dev \
 
 ### Step 2: Execute and verify smoke evidence
 
-Write smoke output to a temporary directory, not `docs/experiments`:
+Write the complete seed-404 evidence envelope to an absent temporary path, not
+`docs/experiments`. The direct-file command is canonical; module invocation is
+an equivalent tested entrypoint and neither mode requires `PYTHONPATH` mutation:
 
 ```bash
-tmp_dir="$(mktemp -d)"
-uv run --python 3.12.5 --with-editable . --extra dev \
-  python scripts/run_defense_v5_development.py \
-  --profile smoke \
-  --output "$tmp_dir/defense-v5-smoke.json"
-uv run --python 3.12.5 --with-editable . --extra dev \
-  python scripts/verify_defense_v5_readiness.py \
-  "$tmp_dir/defense-v5-smoke.json"
+.venv/bin/python scripts/build_defense_v5_safe_evidence.py \
+  --root . \
+  --output /private/tmp/apar-v5-safe-404.json
+.venv/bin/python scripts/verify_defense_v5_evidence.py \
+  --root . \
+  /private/tmp/apar-v5-safe-404.json
+.venv/bin/python -m scripts.build_defense_v5_safe_evidence \
+  --root . \
+  --output /private/tmp/apar-v5-safe-404-module.json
 ```
 
-Expected behavior: the pipeline completes deterministically, and the verifier identifies the result as smoke/non-readiness evidence without presenting it as production.
+Expected behavior: independently repeated builds have the same
+`deterministic_core_sha256`. Real latency samples, their authenticated
+`observational_latency_sha256`, the payload SHA, and the envelope SHA may differ.
+The complete serialized artifact is not claimed to be byte-reproducible.
 
 ### Step 3: Freeze the development code state
 
@@ -808,6 +814,23 @@ Record:
 - all v5 production and script file SHA-256 values;
 - Python and dependency versions;
 - a clean tracked worktree.
+
+Commit behavior, source, tests, and documentation as the SOURCE commit. Build
+and independently verify two safe artifacts at that clean commit. Then add only
+`config/defense/defense-v5-safe-core-freeze.json` in its direct child FREEZE
+commit. The one-time pre-execution audit command is:
+
+```bash
+.venv/bin/python scripts/verify_defense_v5_preexecution.py \
+  --root . \
+  --safe-evidence /private/tmp/apar-v5-safe-404.json \
+  --approved-commit <exact-40-character-FREEZE-commit>
+```
+
+The audit must reject any other deterministic core or any non-manifest change
+in the FREEZE commit. It may accept fresh, independently verified latency
+observations from the pinned environment because latency is not the safe-core
+commitment.
 
 Do not edit model, thresholds, targets, or population parameters after reading the production development-test result. If a genuine execution bug occurs, preserve the failed result outside the canonical path, add a failing regression test, fix the bug, and rerun the entire development experiment with a new explicitly recorded attempt ID.
 
@@ -915,4 +938,3 @@ Report:
 - any remaining limitations and the next recommended task.
 
 Do not call the system competition-winning, production-ready, or validated. The next task after a successful v5 development run is an independent review and a separately preregistered confirmatory protocol; the walkthrough/web prototype consumes only the redacted view.
-

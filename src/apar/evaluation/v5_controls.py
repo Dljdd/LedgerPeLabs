@@ -18,6 +18,7 @@ from sklearn.metrics import average_precision_score, roc_auc_score  # type: igno
 from apar.defense.sentinel import SentinelAction, train_sentinel_defender
 from apar.evaluation.v5_arms import (
     V5TrainedArmSet,
+    _model_artifact,
     score_v5_arm_set,
     train_v5_arm_set,
 )
@@ -489,7 +490,7 @@ def _label_shuffle_control(
         after_roc.append(shuffled_metrics[0])
         after_pr.append(shuffled_metrics[1])
         model_hashes = tuple(
-            hashlib.sha256(model._serialize_model()).hexdigest() for model in defender.model_members
+            _model_artifact(model).artifact_sha256 for model in defender.model_members
         )
         arm_digest = _canonical_digest(
             {

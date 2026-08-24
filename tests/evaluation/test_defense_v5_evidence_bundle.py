@@ -54,3 +54,24 @@ def test_real_safe_evidence_bundle_binds_controls_metrics_intervals_and_readines
     report = verify_evidence_bytes(serialized, root=ROOT)
     assert report["verified"] is True
     assert report["status"] == payload.readiness.status
+
+
+def test_safe_evidence_separates_deterministic_core_from_observed_latency() -> None:
+    """Removing either authenticated layer must collapse the two-layer commitment."""
+    envelope = V5EvidenceEnvelope.model_validate_json(safe_v5_evidence_bytes())
+    payload = envelope.payload()
+    document = payload.model_dump(mode="json")
+    assert "deterministic_core" in document
+    assert "observational_latency" in document
+    assert document["deterministic_core"]["schema_version"] == (
+        "apar-sentinel-v5-deterministic-core/1"
+    )
+    assert document["deterministic_core"]["core_sha256"]
+    assert document["observational_latency"]["kind"] == "observational_latency"
+    latency = document["observational_latency"]
+    assert latency["content_sha256"] != document["deterministic_core"]["core_sha256"]
+    report = verify_evidence_bytes(envelope.serialized_bytes(), root=ROOT)
+    assert report["deterministic_core_sha256"] == document["deterministic_core"][
+        "core_sha256"
+    ]
+    assert report["observational_latency_sha256"]

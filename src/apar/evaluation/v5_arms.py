@@ -7,6 +7,8 @@ import json
 import time
 from base64 import b64encode
 from dataclasses import dataclass
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 from numpy.typing import NDArray
@@ -151,10 +153,27 @@ def _bound_spec(
 
 
 def _model_artifact(model: object) -> V5SerializedModelArtifact:
-    serialized = model._serialize_model()  # type: ignore[attr-defined]
-    if type(serialized) is not bytes:
-        raise TypeError("CatBoost artifact serialization must return bytes")
+    with TemporaryDirectory(prefix="apar-v5-catboost-") as directory:
+        path = Path(directory) / "model.json"
+        model.save_model(str(path), format="json")  # type: ignore[attr-defined]
+        document = json.loads(path.read_bytes())
+    if type(document) is not dict or type(document.get("model_info")) is not dict:
+        raise TypeError("CatBoost JSON artifact must contain model_info")
+    model_info = document["model_info"]
+    volatile_fields = ("model_guid", "train_finish_time")
+    if any(type(model_info.get(field)) is not str for field in volatile_fields):
+        raise ValueError("CatBoost volatile metadata schema differs")
+    for field in volatile_fields:
+        model_info.pop(field)
+    serialized = json.dumps(
+        document,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode()
     return V5SerializedModelArtifact(
+        serialization="catboost-json-canonical-v1",
         payload_base64=b64encode(serialized).decode("ascii"),
         artifact_sha256=hashlib.sha256(serialized).hexdigest(),
     )
