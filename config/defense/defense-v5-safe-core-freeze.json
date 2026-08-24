@@ -1,0 +1,34 @@
+{
+  "approved_deterministic_core_sha256": "784a762fd90a65219a233e87df35290ac87c8fe8e4b9024de46564568f633719",
+  "approved_observational_environment_sha256": "415902f1184ebe83deac0380e419a2eb6f11c3d7147c2c67fe38f76fe72ecc33",
+  "freeze_path": "config/defense/defense-v5-safe-core-freeze.json",
+  "manifest_sha256": "48e458c62c2f036f3ceaca9afa5e27ddff4eff33e7b9fe66be432377ec047b43",
+  "schema_version": "apar-sentinel-v5-safe-core-freeze/1",
+  "source_bindings": {
+    "arm_protocol_sha256": "367b423e2646fe449496102e7651811db95be4f49079663a05e61f05df480838",
+    "base_protocol_sha256": "751db3b095ebb162c5856284b9afee4ab9d934eee3e4f2a2aba401beeb46b799",
+    "catalog_sha256": "4a4e807d61654691811f91ac79e1f71c6bbb1e4d16e3c6f2a4c2ee988b0dd9e8",
+    "evidence_protocol_sha256": "8f817114c5156e6fff475031db367885a6496e9a6534372989c5a4329115ea40",
+    "implementation_sha256": "a912836041221f9446b9114f6d5f74472d9e4f3a3c1c84cbbb4387617184e81b"
+  },
+  "source_commit": "98e97d92620accc4850d4231eae0e566022b0ced",
+  "source_files": [
+    [
+      "config/defense/defense-v5-arms.json",
+      "367b423e2646fe449496102e7651811db95be4f49079663a05e61f05df480838"
+    ],
+    [
+      "config/defense/defense-v5-development.json",
+      "751db3b095ebb162c5856284b9afee4ab9d934eee3e4f2a2aba401beeb46b799"
+    ],
+    [
+      "config/defense/defense-v5-evidence.json",
+      "078ec857b16abfc8dac81c4d7fd7244dfd18a6e29c4ec78704bc5e649e239464"
+    ],
+    [
+      "config/defense/feature-catalog-v5.json",
+      "4a4e807d61654691811f91ac79e1f71c6bbb1e4d16e3c6f2a4c2ee988b0dd9e8"
+    ]
+  ],
+  "source_tree_oid": "340b09f54f8e900fb93dfe372a831cdc530a317b"
+}
