@@ -17,6 +17,10 @@ from apar.evaluation.v5_evaluation import (
     load_v5_arm_configuration,
 )
 from apar.evaluation.v5_evidence_protocol import V5EvidenceProtocol, load_v5_evidence_protocol
+from apar.evaluation.v5_evidence_storage import (
+    V5LockedAttemptReceipt,
+    read_v5_locked_attempt_receipt,
+)
 from apar.evaluation.v5_population import V5Corpus, build_v5_corpus
 from apar.evaluation.v5_protocol import (
     V5DevelopmentProtocol,
@@ -49,15 +53,29 @@ _LOCKED_CAPABILITY_SEAL = object()
 @dataclass(frozen=True)
 class _LockedExecutionCapability:
     run_binding_sha256: str
+    attempt_receipt_sha256: str
     seal: object
 
 
 def _issue_locked_execution_capability(
     binding: V5LockedEvidenceRunBinding,
+    attempt_receipt: V5LockedAttemptReceipt,
+    *,
+    root: Path,
 ) -> _LockedExecutionCapability:
-    """Issue the in-process capability only after the runner's preflight."""
+    """Issue a capability only for a durable, validated attempt receipt."""
+    evidence = load_v5_evidence_protocol(
+        root / "config/defense/defense-v5-evidence.json", root=root
+    )
+    durable = read_v5_locked_attempt_receipt(
+        target=root / evidence.locked_artifact_storage.attempt_receipt_path,
+        expected_run_binding_sha256=binding.run_binding_sha256,
+    )
+    if durable != attempt_receipt:
+        raise PermissionError("locked capability attempt receipt differs")
     return _LockedExecutionCapability(
         run_binding_sha256=binding.run_binding_sha256,
+        attempt_receipt_sha256=durable.receipt_sha256,
         seal=_LOCKED_CAPABILITY_SEAL,
     )
 
@@ -110,6 +128,7 @@ def execute_v5_complete_evidence(
         locked_capability is None
         or locked_capability.seal is not _LOCKED_CAPABILITY_SEAL
         or len(locked_capability.run_binding_sha256) != 64
+        or len(locked_capability.attempt_receipt_sha256) != 64
     ):
         raise PermissionError("locked execution requires verified preflight capability")
     if mode is V5RunMode.SAFE_VALIDATION and locked_capability is not None:

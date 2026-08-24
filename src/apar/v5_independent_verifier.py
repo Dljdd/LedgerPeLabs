@@ -18,7 +18,7 @@ import time
 import zlib
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from importlib.metadata import version
 from pathlib import Path
@@ -291,6 +291,14 @@ _DETERMINISTIC_CORE_EXCLUSION_SCHEMA = (
         "payload",
         ("observational_latency", "payload_sha256"),
         "deterministic_core.core_sha256",
+    ),
+)
+_LOCKED_DETERMINISTIC_CORE_EXCLUSION_SCHEMA = (
+    *_DETERMINISTIC_CORE_EXCLUSION_SCHEMA,
+    (
+        "locked_payload",
+        ("attempt_receipt_sha256",),
+        "durable_attempt_receipt.receipt_sha256",
     ),
 )
 _WORKLOAD_CONTROLS = ("benign_only", "fraud_only_diagnostic")
@@ -907,7 +915,7 @@ def _expand_retained_result(
 
 def _verify_protocol(payload: Mapping[str, Any], root: Path) -> dict[str, Any]:
     protocol = _mapping(payload.get("evidence_protocol"), "evidence protocol")
-    if protocol.get("schema_version") != "1.1.0":
+    if protocol.get("schema_version") != "1.2.0":
         _fail("evidence protocol schema differs")
     if payload.get("safe_seed") != 404 or protocol.get("safe_development_test_seed") != 404:
         _fail("safe evidence seed must equal 404")
@@ -1048,7 +1056,10 @@ def _verify_protocol(payload: Mapping[str, Any], root: Path) -> dict[str, Any]:
     }:
         _fail("closed evidence run-mode protocol differs")
     if protocol.get("locked_artifact_storage") != {
-        "schema_version": "apar-sentinel-v5-chunked-evidence/1",
+        "schema_version": "apar-sentinel-v5-chunked-evidence/2",
+        "attempt_receipt_path": (
+            "docs/experiments/defense-v5-locked-development-attempt.json"
+        ),
         "candidate_manifest_path": (
             "docs/experiments/defense-v5-locked-development-candidate.manifest.json"
         ),
@@ -1061,6 +1072,9 @@ def _verify_protocol(payload: Mapping[str, Any], root: Path) -> dict[str, Any]:
         "maximum_chunk_count": 16,
         "normal_git_blob_limit_bytes": 104_857_600,
         "publication": "content_chunks_then_atomic_exclusive_manifest",
+        "attempt_publication": (
+            "canonical_temp_fsync_link_no_replace_parent_fsync"
+        ),
     }:
         _fail("locked artifact storage protocol differs")
     prior_result = root / str(protocol.get("existing_development_result_path"))
@@ -4486,7 +4500,7 @@ def verify_locked_evidence_payload_bytes(
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise IndependentVerificationError("locked payload schema is invalid") from error
     if payload.get("schema_version") != (
-        "apar-sentinel-v5-locked-development-payload/1"
+        "apar-sentinel-v5-locked-development-payload/2"
     ):
         _fail("locked payload schema differs")
     _exact_fields(
@@ -4494,6 +4508,7 @@ def verify_locked_evidence_payload_bytes(
         {
             "schema_version",
             "run_binding",
+            "attempt_receipt_sha256",
             "evidence_protocol",
             "catalog_sha256",
             "execution_artifact_pool",
@@ -4621,8 +4636,9 @@ def _independent_locked_core_document(
         readiness=readiness,
     )
     document["schema_version"] = (
-        "apar-sentinel-v5-locked-deterministic-core/1"
+        "apar-sentinel-v5-locked-deterministic-core/2"
     )
+    document["exclusion_schema"] = _LOCKED_DETERMINISTIC_CORE_EXCLUSION_SCHEMA
     document.pop("safe_seed")
     document["run_binding"] = payload["run_binding"]
     return document
@@ -4657,6 +4673,8 @@ def _locked_preregistration_source_paths(root: Path) -> tuple[str, ...]:
         "config/defense/defense-v5-development.json",
         "config/defense/defense-v5-evidence.json",
         "config/defense/feature-catalog-v5.json",
+        "docs/superpowers/plans/2026-08-22-apar-sentinel-v5.md",
+        "docs/superpowers/specs/2026-08-22-apar-sentinel-v5-design.md",
         *[str(item) for item in _sequence(arms["implementation_paths"], "arm paths")],
         *[
             str(item)
@@ -4713,7 +4731,7 @@ def _verify_locked_preregistration_document(
         "locked preregistration fields",
     )
     if preregistration["schema_version"] != (
-        "apar-sentinel-v5-locked-preregistration/1"
+        "apar-sentinel-v5-locked-preregistration/2"
     ):
         _fail("locked preregistration schema differs")
     if preregistration["manifest_sha256"] != _digest(
@@ -4796,6 +4814,7 @@ def _verify_locked_preregistration_document(
     storage = _mapping(protocol["locked_artifact_storage"], "locked storage")
     if preregistration["output_contract"] != {
         **storage,
+        "attempt_receipt_must_be_absent": True,
         "candidate_must_be_absent": True,
         "historical_result_path": protocol["existing_development_result_path"],
         "historical_result_sha256": protocol[
@@ -4871,7 +4890,7 @@ def _verify_locked_run_binding(
         binding["candidate_manifest_path"] != storage["candidate_manifest_path"]
         or binding["storage_schema_version"] != storage["schema_version"]
         or binding["payload_schema_version"]
-        != "apar-sentinel-v5-locked-development-payload/1"
+        != "apar-sentinel-v5-locked-development-payload/2"
     ):
         _fail("locked output/storage schema binding differs")
     base_path = root / str(protocol["base_protocol_path"])
@@ -5012,6 +5031,124 @@ def _verify_locked_protocol(
     return protocol
 
 
+def _read_locked_attempt_receipt_document(path: Path) -> dict[str, Any]:
+    """Read the attempt receipt independently of production storage code."""
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise IndependentVerificationError(
+            "locked attempt receipt is missing"
+        ) from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_size > 65_536
+    ):
+        _fail("locked attempt receipt topology/size differs")
+    raw = path.read_bytes()
+    try:
+        receipt = _mapping(json.loads(raw), "locked attempt receipt")
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise IndependentVerificationError(
+            "locked attempt receipt is not JSON"
+        ) from error
+    if raw != _canonical_bytes(receipt):
+        _fail("locked attempt receipt is not canonical JSON")
+    _exact_fields(
+        receipt,
+        {
+            "schema_version",
+            "run_binding_sha256",
+            "preregistration_commit",
+            "preregistration_sha256",
+            "source_commit",
+            "source_tree_oid",
+            "approved_safe_deterministic_core_sha256",
+            "approved_safe_observational_environment_sha256",
+            "authorization_sha256",
+            "exact_command",
+            "started_at_utc",
+            "receipt_sha256",
+        },
+        "locked attempt receipt",
+    )
+    if receipt["schema_version"] != (
+        "apar-sentinel-v5-locked-attempt-receipt/1"
+    ):
+        _fail("locked attempt receipt schema differs")
+    if receipt["receipt_sha256"] != _digest(
+        {
+            key: value
+            for key, value in receipt.items()
+            if key != "receipt_sha256"
+        }
+    ):
+        _fail("locked attempt receipt digest differs")
+    timestamp = receipt["started_at_utc"]
+    if type(timestamp) is not str or not timestamp.endswith("Z"):
+        _fail("locked attempt receipt timestamp differs")
+    try:
+        started = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise IndependentVerificationError(
+            "locked attempt receipt timestamp is invalid"
+        ) from error
+    if started.tzinfo != UTC:
+        _fail("locked attempt receipt timestamp is not UTC")
+    return receipt
+
+
+def _verify_locked_attempt_receipt(
+    *,
+    payload: Mapping[str, Any],
+    protocol: Mapping[str, Any],
+    binding: Mapping[str, Any],
+    root: Path,
+) -> dict[str, Any]:
+    storage = _mapping(protocol["locked_artifact_storage"], "locked storage")
+    attempt_path = str(storage["attempt_receipt_path"])
+    if attempt_path != (
+        "docs/experiments/defense-v5-locked-development-attempt.json"
+    ):
+        _fail("locked attempt receipt path differs")
+    receipt = _read_locked_attempt_receipt_document(root / attempt_path)
+    preregistration = _mapping(
+        json.loads(
+            (root / str(binding["preregistration_path"])).read_bytes()
+        ),
+        "locked preregistration",
+    )
+    safe = _mapping(preregistration["safe_validation"], "locked safe validation")
+    expected_authorization_sha256 = _digest(
+        {
+            "authorization": "execute-exactly-once-locked-development",
+            "preregistration_commit": binding["preregistration_commit"],
+            "run_binding_sha256": binding["run_binding_sha256"],
+            "exact_command": preregistration["exact_command"],
+        }
+    )
+    expected = {
+        "run_binding_sha256": binding["run_binding_sha256"],
+        "preregistration_commit": binding["preregistration_commit"],
+        "preregistration_sha256": binding["preregistration_sha256"],
+        "source_commit": binding["source_commit"],
+        "source_tree_oid": binding["source_tree_oid"],
+        "approved_safe_deterministic_core_sha256": safe[
+            "approved_deterministic_core_sha256"
+        ],
+        "approved_safe_observational_environment_sha256": safe[
+            "approved_observational_environment_sha256"
+        ],
+        "authorization_sha256": expected_authorization_sha256,
+        "exact_command": preregistration["exact_command"],
+    }
+    if any(receipt[field] != value for field, value in expected.items()):
+        _fail("locked attempt receipt binding differs")
+    if payload["attempt_receipt_sha256"] != receipt["receipt_sha256"]:
+        _fail("locked payload attempt receipt binding differs")
+    return receipt
+
+
 def _verify_locked_payload_document(
     payload: Mapping[str, Any], *, root: Path
 ) -> dict[str, object]:
@@ -5021,6 +5158,12 @@ def _verify_locked_payload_document(
         binding=binding,
         protocol=protocol,
         payload=payload,
+        root=root,
+    )
+    attempt_receipt = _verify_locked_attempt_receipt(
+        payload=payload,
+        protocol=protocol,
+        binding=binding,
         root=root,
     )
     packed_artifacts = _sequence(
@@ -5114,11 +5257,11 @@ def _verify_locked_payload_document(
         "locked deterministic core binding",
     )
     if core_binding["schema_version"] != (
-        "apar-sentinel-v5-locked-deterministic-core/1"
+        "apar-sentinel-v5-locked-deterministic-core/2"
     ):
         _fail("locked deterministic core schema differs")
     if core_binding["exclusion_schema"] != json.loads(
-        _canonical_bytes(_DETERMINISTIC_CORE_EXCLUSION_SCHEMA)
+        _canonical_bytes(_LOCKED_DETERMINISTIC_CORE_EXCLUSION_SCHEMA)
     ):
         _fail("locked deterministic core exclusion schema differs")
     core_document = _independent_locked_core_document(
@@ -5159,6 +5302,7 @@ def _verify_locked_payload_document(
         ],
         "observational_environment_sha256": observational["environment_sha256"],
         "run_binding_sha256": binding["run_binding_sha256"],
+        "attempt_receipt_sha256": attempt_receipt["receipt_sha256"],
         "support_plan_sha256": expected_plan["support_plan_sha256"],
         "evidence_protocol_sha256": protocol["evidence_protocol_sha256"],
         "base_protocol_sha256": protocol["base_protocol_sha256"],
@@ -5171,6 +5315,7 @@ def _verify_locked_payload_document(
 def read_locked_evidence_storage_bytes(
     *,
     target_manifest: Path,
+    attempt_receipt_path: Path,
     chunk_size_bytes: int,
     maximum_envelope_bytes: int,
     maximum_chunk_count: int,
@@ -5209,7 +5354,8 @@ def read_locked_evidence_storage_bytes(
             "payload_sha256",
             "payload_bytes",
             "run_binding_sha256",
-            "start_receipt",
+            "attempt_receipt_path",
+            "attempt_receipt_sha256",
             "completion_receipt",
             "chunks",
             "manifest_sha256",
@@ -5217,7 +5363,7 @@ def read_locked_evidence_storage_bytes(
         "locked storage manifest",
     )
     if (
-        manifest["schema_version"] != "apar-sentinel-v5-chunked-evidence/1"
+        manifest["schema_version"] != "apar-sentinel-v5-chunked-evidence/2"
         or manifest["content_encoding"] != "opaque-locked-evidence-bytes"
         or manifest["publication"]
         != "content_chunks_then_atomic_exclusive_manifest"
@@ -5288,21 +5434,47 @@ def read_locked_evidence_storage_bytes(
         or manifest["payload_sha256"] != hashlib.sha256(payload).hexdigest()
     ):
         _fail("locked storage payload digest/size differs")
-    start = _mapping(manifest["start_receipt"], "locked start receipt")
+    declared_attempt_path = Path(str(manifest["attempt_receipt_path"]))
+    if (
+        declared_attempt_path.is_absolute()
+        or ".." in declared_attempt_path.parts
+        or tuple(attempt_receipt_path.absolute().parts[-len(declared_attempt_path.parts) :])
+        != declared_attempt_path.parts
+    ):
+        _fail("locked attempt receipt path differs")
+    attempt = _read_locked_attempt_receipt_document(
+        attempt_receipt_path.absolute()
+    )
     completion = _mapping(
         manifest["completion_receipt"], "locked completion receipt"
     )
-    if start.get("receipt_sha256") != _digest(
-        {key: value for key, value in start.items() if key != "receipt_sha256"}
+    _exact_fields(
+        completion,
+        {
+            "schema_version",
+            "attempt_receipt_sha256",
+            "completed_at_utc",
+            "elapsed_ms",
+            "payload_sha256",
+            "payload_bytes",
+            "receipt_sha256",
+        },
+        "locked completion receipt",
+    )
+    if completion.get("schema_version") != (
+        "apar-sentinel-v5-locked-completion-receipt/2"
     ):
-        _fail("locked start receipt digest differs")
+        _fail("locked completion receipt schema differs")
     if completion.get("receipt_sha256") != _digest(
         {key: value for key, value in completion.items() if key != "receipt_sha256"}
     ):
         _fail("locked completion receipt digest differs")
     if (
-        start.get("run_binding_sha256") != manifest["run_binding_sha256"]
-        or completion.get("start_receipt_sha256") != start.get("receipt_sha256")
+        attempt.get("run_binding_sha256") != manifest["run_binding_sha256"]
+        or manifest.get("attempt_receipt_sha256")
+        != attempt.get("receipt_sha256")
+        or completion.get("attempt_receipt_sha256")
+        != attempt.get("receipt_sha256")
         or completion.get("payload_sha256") != manifest["payload_sha256"]
         or completion.get("payload_bytes") != manifest["payload_bytes"]
     ):
@@ -5310,9 +5482,84 @@ def read_locked_evidence_storage_bytes(
     return payload
 
 
+def verify_locked_judge_summary(
+    *,
+    summary_path: Path,
+    target_manifest: Path,
+    attempt_receipt_path: Path,
+    verification: Mapping[str, object],
+    candidate_manifest_path: str,
+    declared_attempt_receipt_path: str,
+) -> dict[str, Any]:
+    """Independently bind the compact summary to verified durable evidence."""
+    try:
+        metadata = summary_path.lstat()
+    except OSError as error:
+        raise IndependentVerificationError("locked judge summary is missing") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_size > 1_048_576
+    ):
+        _fail("locked judge summary topology/size differs")
+    raw = summary_path.read_bytes()
+    try:
+        summary = _mapping(json.loads(raw), "locked judge summary")
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise IndependentVerificationError(
+            "locked judge summary is not JSON"
+        ) from error
+    if raw != _canonical_bytes(summary):
+        _fail("locked judge summary is not canonical JSON")
+    _exact_fields(
+        summary,
+        {
+            "schema_version",
+            "candidate_manifest_path",
+            "manifest_sha256",
+            "payload_sha256",
+            "run_binding_sha256",
+            "attempt_receipt_path",
+            "attempt_receipt_sha256",
+            "verification",
+            "summary_sha256",
+        },
+        "locked judge summary",
+    )
+    if summary["schema_version"] != (
+        "apar-sentinel-v5-locked-judge-summary/2"
+    ):
+        _fail("locked judge summary schema differs")
+    if summary["summary_sha256"] != _digest(
+        {
+            key: value
+            for key, value in summary.items()
+            if key != "summary_sha256"
+        }
+    ):
+        _fail("locked judge summary digest differs")
+    manifest = _mapping(
+        json.loads(target_manifest.read_bytes()), "locked storage manifest"
+    )
+    attempt = _read_locked_attempt_receipt_document(attempt_receipt_path)
+    expected = {
+        "candidate_manifest_path": candidate_manifest_path,
+        "manifest_sha256": manifest["manifest_sha256"],
+        "payload_sha256": manifest["payload_sha256"],
+        "run_binding_sha256": manifest["run_binding_sha256"],
+        "attempt_receipt_path": declared_attempt_receipt_path,
+        "attempt_receipt_sha256": attempt["receipt_sha256"],
+        "verification": dict(verification),
+    }
+    if any(summary[field] != value for field, value in expected.items()):
+        _fail("locked judge summary evidence binding differs")
+    return summary
+
+
 __all__ = [
     "IndependentVerificationError",
     "read_locked_evidence_storage_bytes",
+    "verify_locked_judge_summary",
     "verify_evidence_bytes",
     "verify_locked_evidence_payload_bytes",
 ]

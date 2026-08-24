@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.1.0",
+  "schema_version": "1.2.0",
   "protocol_id": "apar-sentinel-v5-development-evidence",
   "base_protocol_path": "config/defense/defense-v5-development.json",
   "arm_protocol_path": "config/defense/defense-v5-arms.json",
@@ -149,7 +149,8 @@
     }
   },
   "locked_artifact_storage": {
-    "schema_version": "apar-sentinel-v5-chunked-evidence/1",
+    "schema_version": "apar-sentinel-v5-chunked-evidence/2",
+    "attempt_receipt_path": "docs/experiments/defense-v5-locked-development-attempt.json",
     "candidate_manifest_path": "docs/experiments/defense-v5-locked-development-candidate.manifest.json",
     "judge_summary_path": "docs/experiments/defense-v5-locked-development-summary.json",
     "chunk_size_bytes": 67108864,
@@ -157,7 +158,8 @@
     "maximum_envelope_bytes": 1073741824,
     "maximum_chunk_count": 16,
     "normal_git_blob_limit_bytes": 104857600,
-    "publication": "content_chunks_then_atomic_exclusive_manifest"
+    "publication": "content_chunks_then_atomic_exclusive_manifest",
+    "attempt_publication": "canonical_temp_fsync_link_no_replace_parent_fsync"
   },
   "implementation_paths": [
     "scripts/build_defense_v5_safe_evidence.py",

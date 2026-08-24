@@ -304,7 +304,10 @@ class V5RunModeProtocol(_FrozenModel):
 
 
 class V5LockedArtifactStorage(_FrozenModel):
-    schema_version: Literal["apar-sentinel-v5-chunked-evidence/1"]
+    schema_version: Literal["apar-sentinel-v5-chunked-evidence/2"]
+    attempt_receipt_path: Literal[
+        "docs/experiments/defense-v5-locked-development-attempt.json"
+    ]
     candidate_manifest_path: Literal[
         "docs/experiments/defense-v5-locked-development-candidate.manifest.json"
     ]
@@ -317,6 +320,9 @@ class V5LockedArtifactStorage(_FrozenModel):
     maximum_chunk_count: Literal[16]
     normal_git_blob_limit_bytes: Literal[104857600]
     publication: Literal["content_chunks_then_atomic_exclusive_manifest"]
+    attempt_publication: Literal[
+        "canonical_temp_fsync_link_no_replace_parent_fsync"
+    ]
 
     @model_validator(mode="after")
     def storage_is_bounded(self) -> Self:
@@ -330,7 +336,7 @@ class V5LockedArtifactStorage(_FrozenModel):
 
 
 class V5EvidenceProtocol(_FrozenModel):
-    schema_version: Literal["1.1.0"]
+    schema_version: Literal["1.2.0"]
     protocol_id: Literal["apar-sentinel-v5-development-evidence"]
     base_protocol_path: Literal["config/defense/defense-v5-development.json"]
     arm_protocol_path: Literal["config/defense/defense-v5-arms.json"]

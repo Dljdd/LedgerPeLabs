@@ -21,7 +21,7 @@ def test_evidence_protocol_freezes_controls_metrics_economics_and_bootstrap() ->
         root=ROOT,
     )
 
-    assert protocol.schema_version == "1.1.0"
+    assert protocol.schema_version == "1.2.0"
     assert protocol.protocol_id == "apar-sentinel-v5-development-evidence"
     assert protocol.base_protocol_path == "config/defense/defense-v5-development.json"
     assert protocol.arm_protocol_path == "config/defense/defense-v5-arms.json"

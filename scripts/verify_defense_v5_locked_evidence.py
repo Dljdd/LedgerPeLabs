@@ -11,6 +11,7 @@ from apar.v5_independent_verifier import (
     IndependentVerificationError,
     read_locked_evidence_storage_bytes,
     verify_locked_evidence_payload_bytes,
+    verify_locked_judge_summary,
 )
 
 
@@ -30,6 +31,7 @@ def main() -> int:
             raise ValueError("locked evidence is not at the frozen candidate path")
         payload = read_locked_evidence_storage_bytes(
             target_manifest=args.candidate_manifest.resolve(),
+            attempt_receipt_path=root / storage["attempt_receipt_path"],
             chunk_size_bytes=int(storage["chunk_size_bytes"]),
             maximum_envelope_bytes=int(storage["maximum_envelope_bytes"]),
             maximum_chunk_count=int(storage["maximum_chunk_count"]),
@@ -38,6 +40,14 @@ def main() -> int:
             ),
         )
         report = verify_locked_evidence_payload_bytes(payload, root=root)
+        verify_locked_judge_summary(
+            summary_path=root / storage["judge_summary_path"],
+            target_manifest=args.candidate_manifest.resolve(),
+            attempt_receipt_path=root / storage["attempt_receipt_path"],
+            verification=report,
+            candidate_manifest_path=storage["candidate_manifest_path"],
+            declared_attempt_receipt_path=storage["attempt_receipt_path"],
+        )
     except (
         IndependentVerificationError,
         json.JSONDecodeError,

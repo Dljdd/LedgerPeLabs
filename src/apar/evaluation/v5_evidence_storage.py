@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import stat
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Self
 
@@ -35,12 +36,23 @@ class V5EvidenceChunk(BaseModel):
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
-class V5LockedStartReceipt(BaseModel):
+class V5LockedAttemptReceipt(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal["apar-sentinel-v5-locked-start-receipt/1"]
+    schema_version: Literal["apar-sentinel-v5-locked-attempt-receipt/1"]
     run_binding_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    preregistration_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
+    preregistration_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
+    source_tree_oid: str = Field(pattern=r"^[0-9a-f]{40}$")
+    approved_safe_deterministic_core_sha256: str = Field(
+        pattern=r"^[0-9a-f]{64}$"
+    )
+    approved_safe_observational_environment_sha256: str = Field(
+        pattern=r"^[0-9a-f]{64}$"
+    )
     authorization_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    exact_command: str = Field(min_length=1)
     started_at_utc: str
     receipt_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
@@ -49,15 +61,23 @@ class V5LockedStartReceipt(BaseModel):
         if self.receipt_sha256 != _digest(
             self.model_dump(mode="json", exclude={"receipt_sha256"})
         ):
-            raise ValueError("locked start receipt digest mismatch")
+            raise ValueError("locked attempt receipt digest mismatch")
+        try:
+            started = datetime.fromisoformat(
+                self.started_at_utc.replace("Z", "+00:00")
+            )
+        except ValueError as error:
+            raise ValueError("locked attempt receipt timestamp is invalid") from error
+        if not self.started_at_utc.endswith("Z") or started.tzinfo != UTC:
+            raise ValueError("locked attempt receipt timestamp is not UTC")
         return self
 
 
 class V5LockedCompletionReceipt(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal["apar-sentinel-v5-locked-completion-receipt/1"]
-    start_receipt_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    schema_version: Literal["apar-sentinel-v5-locked-completion-receipt/2"]
+    attempt_receipt_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     completed_at_utc: str
     elapsed_ms: float = Field(gt=0.0)
     payload_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -76,7 +96,7 @@ class V5LockedCompletionReceipt(BaseModel):
 class V5ChunkedEvidenceManifest(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal["apar-sentinel-v5-chunked-evidence/1"]
+    schema_version: Literal["apar-sentinel-v5-chunked-evidence/2"]
     content_encoding: Literal["opaque-locked-evidence-bytes"]
     publication: Literal["content_chunks_then_atomic_exclusive_manifest"]
     chunks_directory: str
@@ -87,7 +107,8 @@ class V5ChunkedEvidenceManifest(BaseModel):
     payload_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     payload_bytes: int = Field(gt=0)
     run_binding_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    start_receipt: V5LockedStartReceipt
+    attempt_receipt_path: str
+    attempt_receipt_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     completion_receipt: V5LockedCompletionReceipt
     chunks: tuple[V5EvidenceChunk, ...]
     manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -114,11 +135,10 @@ class V5ChunkedEvidenceManifest(BaseModel):
         ) or self.chunks[-1].bytes > self.chunk_size_bytes:
             raise ValueError("locked evidence chunk size differs")
         if (
-            self.completion_receipt.start_receipt_sha256
-            != self.start_receipt.receipt_sha256
+            self.completion_receipt.attempt_receipt_sha256
+            != self.attempt_receipt_sha256
             or self.completion_receipt.payload_sha256 != self.payload_sha256
             or self.completion_receipt.payload_bytes != self.payload_bytes
-            or self.start_receipt.run_binding_sha256 != self.run_binding_sha256
         ):
             raise ValueError("locked evidence receipt lineage differs")
         if self.manifest_sha256 != _digest(
@@ -150,13 +170,114 @@ def _ensure_absent(path: Path, label: str) -> None:
         raise FileExistsError(f"{label} already exists")
 
 
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def build_v5_locked_attempt_receipt(
+    *,
+    run_binding_sha256: str,
+    preregistration_commit: str,
+    preregistration_sha256: str,
+    source_commit: str,
+    source_tree_oid: str,
+    approved_safe_deterministic_core_sha256: str,
+    approved_safe_observational_environment_sha256: str,
+    authorization_sha256: str,
+    exact_command: str,
+    started_at_utc: str,
+) -> V5LockedAttemptReceipt:
+    """Build the canonical receipt that permanently consumes the one-time run."""
+    values = {
+        "schema_version": "apar-sentinel-v5-locked-attempt-receipt/1",
+        "run_binding_sha256": run_binding_sha256,
+        "preregistration_commit": preregistration_commit,
+        "preregistration_sha256": preregistration_sha256,
+        "source_commit": source_commit,
+        "source_tree_oid": source_tree_oid,
+        "approved_safe_deterministic_core_sha256": (
+            approved_safe_deterministic_core_sha256
+        ),
+        "approved_safe_observational_environment_sha256": (
+            approved_safe_observational_environment_sha256
+        ),
+        "authorization_sha256": authorization_sha256,
+        "exact_command": exact_command,
+        "started_at_utc": started_at_utc,
+    }
+    values["receipt_sha256"] = _digest(values)
+    return V5LockedAttemptReceipt.model_validate(values)
+
+
+def publish_v5_locked_attempt_receipt(
+    *, target: Path, receipt: V5LockedAttemptReceipt
+) -> V5LockedAttemptReceipt:
+    """Atomically publish and directory-fsync a no-replace attempt receipt."""
+    target = target.absolute()
+    if os.path.lexists(target):
+        raise FileExistsError("locked attempt receipt already exists")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    serialized = _canonical_bytes(receipt.model_dump(mode="json"))
+    temporary = target.with_name(
+        f".{target.name}.{os.getpid()}.{receipt.receipt_sha256[:12]}.tmp"
+    )
+    _ensure_absent(temporary, "temporary locked attempt receipt")
+    _write_exclusive(temporary, serialized)
+    linked = False
+    try:
+        os.link(temporary, target, follow_symlinks=False)
+        linked = True
+        temporary.unlink()
+        _fsync_directory(target.parent)
+    except FileExistsError as error:
+        raise FileExistsError("locked attempt receipt already exists") from error
+    finally:
+        if not linked:
+            temporary.unlink(missing_ok=True)
+    return receipt
+
+
+def read_v5_locked_attempt_receipt(
+    *, target: Path, expected_run_binding_sha256: str | None = None
+) -> V5LockedAttemptReceipt:
+    """Validate a durable attempt receipt without permitting aliases or rebinding."""
+    target = target.absolute()
+    metadata = _regular_single_link(target, "locked attempt receipt")
+    if metadata.st_size > 65_536:
+        raise ValueError("locked attempt receipt exceeds its byte bound")
+    raw = target.read_bytes()
+    try:
+        document = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("locked attempt receipt is not JSON") from error
+    if raw != _canonical_bytes(document):
+        raise ValueError("locked attempt receipt is not canonical JSON")
+    receipt = V5LockedAttemptReceipt.model_validate(document)
+    if (
+        expected_run_binding_sha256 is not None
+        and receipt.run_binding_sha256 != expected_run_binding_sha256
+    ):
+        raise ValueError("locked attempt receipt run binding differs")
+    return receipt
+
+
 def publish_v5_chunked_evidence(
     *,
     payload_bytes: bytes,
     target_manifest: Path,
     run_binding_sha256: str,
-    authorization_sha256: str,
-    started_at_utc: str,
+    attempt_receipt: V5LockedAttemptReceipt,
+    attempt_receipt_path: str,
+    attempt_receipt_target: Path,
     completed_at_utc: str,
     elapsed_ms: float,
     chunk_size_bytes: int,
@@ -174,6 +295,14 @@ def publish_v5_chunked_evidence(
     chunk_count = (len(payload_bytes) + chunk_size_bytes - 1) // chunk_size_bytes
     if not 0 < chunk_count <= maximum_chunk_count:
         raise ValueError("locked evidence exceeds the maximum chunk count")
+    durable_attempt = read_v5_locked_attempt_receipt(
+        target=attempt_receipt_target,
+        expected_run_binding_sha256=run_binding_sha256,
+    )
+    if durable_attempt != attempt_receipt:
+        raise ValueError("locked durable attempt receipt differs")
+    if attempt_receipt.run_binding_sha256 != run_binding_sha256:
+        raise ValueError("locked attempt receipt run binding differs")
     target_manifest = target_manifest.absolute()
     chunks_directory = target_manifest.with_name(f"{target_manifest.name}.chunks")
     _ensure_absent(target_manifest, "candidate manifest target")
@@ -198,18 +327,10 @@ def publish_v5_chunked_evidence(
             )
         )
 
-    start_values = {
-        "schema_version": "apar-sentinel-v5-locked-start-receipt/1",
-        "run_binding_sha256": run_binding_sha256,
-        "authorization_sha256": authorization_sha256,
-        "started_at_utc": started_at_utc,
-    }
-    start_values["receipt_sha256"] = _digest(start_values)
-    start = V5LockedStartReceipt.model_validate(start_values)
     payload_sha256 = hashlib.sha256(payload_bytes).hexdigest()
     completion_values = {
-        "schema_version": "apar-sentinel-v5-locked-completion-receipt/1",
-        "start_receipt_sha256": start.receipt_sha256,
+        "schema_version": "apar-sentinel-v5-locked-completion-receipt/2",
+        "attempt_receipt_sha256": attempt_receipt.receipt_sha256,
         "completed_at_utc": completed_at_utc,
         "elapsed_ms": elapsed_ms,
         "payload_sha256": payload_sha256,
@@ -218,7 +339,7 @@ def publish_v5_chunked_evidence(
     completion_values["receipt_sha256"] = _digest(completion_values)
     completion = V5LockedCompletionReceipt.model_validate(completion_values)
     manifest_values = {
-        "schema_version": "apar-sentinel-v5-chunked-evidence/1",
+        "schema_version": "apar-sentinel-v5-chunked-evidence/2",
         "content_encoding": "opaque-locked-evidence-bytes",
         "publication": "content_chunks_then_atomic_exclusive_manifest",
         "chunks_directory": chunks_directory.name,
@@ -229,7 +350,8 @@ def publish_v5_chunked_evidence(
         "payload_sha256": payload_sha256,
         "payload_bytes": len(payload_bytes),
         "run_binding_sha256": run_binding_sha256,
-        "start_receipt": start,
+        "attempt_receipt_path": attempt_receipt_path,
+        "attempt_receipt_sha256": attempt_receipt.receipt_sha256,
         "completion_receipt": completion,
         "chunks": tuple(chunks),
     }
@@ -259,11 +381,7 @@ def publish_v5_chunked_evidence(
         raise FileExistsError("candidate manifest target already exists") from error
     finally:
         temporary.unlink(missing_ok=True)
-    directory_descriptor = os.open(target_manifest.parent, os.O_RDONLY)
-    try:
-        os.fsync(directory_descriptor)
-    finally:
-        os.close(directory_descriptor)
+    _fsync_directory(target_manifest.parent)
     return manifest
 
 
@@ -334,8 +452,11 @@ def reconstruct_v5_chunked_evidence(
 __all__ = [
     "V5ChunkedEvidenceManifest",
     "V5EvidenceChunk",
+    "V5LockedAttemptReceipt",
     "V5LockedCompletionReceipt",
-    "V5LockedStartReceipt",
+    "build_v5_locked_attempt_receipt",
     "publish_v5_chunked_evidence",
+    "publish_v5_locked_attempt_receipt",
+    "read_v5_locked_attempt_receipt",
     "reconstruct_v5_chunked_evidence",
 ]

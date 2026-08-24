@@ -475,6 +475,19 @@ output target. An offline independent verifier authenticates the manifest,
 chunk topology and order, receipts, complete payload, production support plan,
 all evidence semantics, and both deterministic and observational layers.
 
+Before any locked execution capability can reach population construction,
+training, scoring, or controls, the runner exclusively publishes
+`docs/experiments/defense-v5-locked-development-attempt.json`. The canonical
+receipt is file-fsynced, atomically linked without replacement, and its parent
+directory is fsynced before execution begins. It binds the run, SOURCE and
+PREREGISTRATION commits, approved safe core and environment, authorization,
+exact command, and UTC start time through a self-digest. Any visible receipt,
+including malformed, partial, tampered, symlinked, or hard-linked state,
+permanently consumes the current protocol attempt. A failure after visibility
+has no cleanup, resume, overwrite, or retry path. The final chunk manifest,
+completion receipt, payload wrapper, and judge summary bind the durable
+attempt-receipt digest, which the offline verifier reads independently.
+
 Execution is permitted only from a clean PREREGISTRATION commit whose sole
 parent is the reviewed SOURCE commit and whose only changed path is the locked
 preregistration manifest. That manifest binds the SOURCE tree and exact file

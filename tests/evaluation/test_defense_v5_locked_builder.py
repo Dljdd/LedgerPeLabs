@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from apar.evaluation.v5_evidence_protocol import load_v5_evidence_protocol
+from apar.evaluation.v5_evidence_storage import V5LockedAttemptReceipt
 from apar.evaluation.v5_protocol import load_v5_development_protocol
 from apar.evaluation.v5_run_mode import (
     V5LockedEvidenceRunBinding,
@@ -55,7 +56,7 @@ def _binding() -> V5LockedEvidenceRunBinding:
         ),
         "storage_schema_version": evidence.locked_artifact_storage.schema_version,
         "payload_schema_version": (
-            "apar-sentinel-v5-locked-development-payload/1"
+            "apar-sentinel-v5-locked-development-payload/2"
         ),
     }
     values["run_binding_sha256"] = V5LockedEvidenceRunBinding.compute_digest(values)
@@ -71,13 +72,31 @@ class _SyntheticAuthority:
 
     def preflight(
         self, *, root: Path, safe_evidence: Path, approved_commit: str
-    ) -> V5LockedEvidenceRunBinding:
+    ) -> object:
+        from scripts.run_defense_v5_locked_development import (
+            _LockedPreexecutionAuthorization,
+        )
+
         self.calls.append(("preflight", (root, safe_evidence, approved_commit)))
-        return self.binding
+        return _LockedPreexecutionAuthorization(
+            binding=self.binding,
+            approved_safe_deterministic_core_sha256="7" * 64,
+            approved_safe_observational_environment_sha256="8" * 64,
+            exact_command="locked-test-command",
+        )
 
     def build_payload(
-        self, *, root: Path, binding: V5LockedEvidenceRunBinding
+        self,
+        *,
+        root: Path,
+        binding: V5LockedEvidenceRunBinding,
+        attempt_receipt: V5LockedAttemptReceipt,
     ) -> bytes:
+        storage = load_v5_evidence_protocol(
+            ROOT / "config/defense/defense-v5-evidence.json", root=ROOT
+        ).locked_artifact_storage
+        assert (root / storage.attempt_receipt_path).is_file()
+        assert attempt_receipt.run_binding_sha256 == binding.run_binding_sha256
         self.calls.append(("build_payload", binding.mode))
         return json.dumps(
             {
@@ -103,6 +122,38 @@ class _SyntheticAuthority:
     ) -> dict[str, object]:
         self.calls.append(("verify_published", target))
         return {"verified": True, "status": "test_only_published"}
+
+    def verify_summary(
+        self,
+        *,
+        root: Path,
+        summary_target: Path,
+        target: Path,
+        storage: object,
+        published: dict[str, object],
+    ) -> dict[str, object]:
+        assert summary_target.is_file()
+        self.calls.append(("verify_summary", target))
+        return {"verified": True, "status": "test_only_summary"}
+
+
+class _CrashingAuthority(_SyntheticAuthority):
+    """A test authority that fails only after the workload boundary is entered."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.build_calls = 0
+
+    def build_payload(
+        self,
+        *,
+        root: Path,
+        binding: V5LockedEvidenceRunBinding,
+        attempt_receipt: V5LockedAttemptReceipt,
+    ) -> bytes:
+        self.build_calls += 1
+        self.calls.append(("build_payload", binding.mode))
+        raise RuntimeError("simulated production crash")
 
 
 def test_complete_evidence_engine_exists_for_both_closed_modes() -> None:
@@ -169,6 +220,12 @@ def test_test_only_authority_proves_fixed_locked_publication_wiring(
         tmp_path
         / load_v5_evidence_protocol(
             ROOT / "config/defense/defense-v5-evidence.json", root=ROOT
+        ).locked_artifact_storage.attempt_receipt_path
+    ).is_file()
+    assert (
+        tmp_path
+        / load_v5_evidence_protocol(
+            ROOT / "config/defense/defense-v5-evidence.json", root=ROOT
         ).locked_artifact_storage.judge_summary_path
     ).is_file()
     assert manifest.run_binding_sha256 == authority.binding.run_binding_sha256
@@ -178,6 +235,7 @@ def test_test_only_authority_proves_fixed_locked_publication_wiring(
         "build_payload",
         "verify_payload",
         "verify_published",
+        "verify_summary",
     ]
     assert authority.calls[2] == ("build_payload", V5RunMode.LOCKED_DEVELOPMENT)
 
@@ -222,5 +280,78 @@ def test_locked_builder_refuses_existing_candidate_before_execution(
             authorization_granted=True,
             authority=authority,
         )
-    assert [name for name, _value in authority.calls] == ["preflight"]
+    assert [name for name, _value in authority.calls] == [
+        "preflight",
+        "storage",
+    ]
     assert target.read_bytes() == b"historical-candidate"
+
+
+def test_locked_builder_crash_consumes_attempt_before_workload(
+    tmp_path: Path,
+) -> None:
+    """A crash after entry must leave a marker that blocks every later attempt."""
+    from scripts.run_defense_v5_locked_development import (
+        _execute_locked_development_once,
+    )
+
+    authority = _CrashingAuthority()
+    safe_evidence = tmp_path / "safe.json"
+    safe_evidence.write_bytes(b"not-read-by-test-authority")
+    attempt = (
+        tmp_path
+        / "docs/experiments/defense-v5-locked-development-attempt.json"
+    )
+    with pytest.raises(RuntimeError, match="simulated production crash"):
+        _execute_locked_development_once(
+            root=tmp_path,
+            safe_evidence=safe_evidence,
+            approved_commit="6" * 40,
+            authorization_granted=True,
+            authority=authority,
+        )
+    first_marker_visible = attempt.is_file()
+    with pytest.raises((FileExistsError, RuntimeError)):
+        _execute_locked_development_once(
+            root=tmp_path,
+            safe_evidence=safe_evidence,
+            approved_commit="6" * 40,
+            authorization_granted=True,
+            authority=authority,
+        )
+    assert (first_marker_visible, authority.build_calls) == (True, 1)
+
+
+def test_locked_builder_does_not_enter_workload_when_directory_fsync_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The execution authority must remain unreachable until directory fsync."""
+    from apar.evaluation import v5_evidence_storage as storage_module
+    from scripts.run_defense_v5_locked_development import (
+        _execute_locked_development_once,
+    )
+
+    authority = _SyntheticAuthority()
+
+    def fail_directory_fsync(_path: Path) -> None:
+        raise OSError("simulated directory fsync failure")
+
+    monkeypatch.setattr(
+        storage_module, "_fsync_directory", fail_directory_fsync
+    )
+    with pytest.raises(OSError, match="directory fsync failure"):
+        _execute_locked_development_once(
+            root=tmp_path,
+            safe_evidence=tmp_path / "safe.json",
+            approved_commit="6" * 40,
+            authorization_granted=True,
+            authority=authority,
+        )
+    assert [name for name, _value in authority.calls] == [
+        "preflight",
+        "storage",
+    ]
+    configured = load_v5_evidence_protocol(
+        ROOT / "config/defense/defense-v5-evidence.json", root=ROOT
+    ).locked_artifact_storage
+    assert (tmp_path / configured.attempt_receipt_path).is_file()

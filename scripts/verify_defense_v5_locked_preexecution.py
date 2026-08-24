@@ -88,6 +88,8 @@ def _source_paths(root: Path) -> tuple[str, ...]:
         "config/defense/defense-v5-development.json",
         "config/defense/defense-v5-evidence.json",
         "config/defense/feature-catalog-v5.json",
+        "docs/superpowers/plans/2026-08-22-apar-sentinel-v5.md",
+        "docs/superpowers/specs/2026-08-22-apar-sentinel-v5-design.md",
         *arms["implementation_paths"],
         *evidence["implementation_paths"],
     }
@@ -157,7 +159,7 @@ def _manifest_without_digest(
     )
     storage = evidence.locked_artifact_storage
     return {
-        "schema_version": "apar-sentinel-v5-locked-preregistration/1",
+        "schema_version": "apar-sentinel-v5-locked-preregistration/2",
         "source_commit": source_commit,
         "source_tree_oid": _git(root, "rev-parse", f"{source_commit}^{{tree}}"),
         "preregistration_path": _PREREGISTRATION_PATH,
@@ -186,6 +188,7 @@ def _manifest_without_digest(
         "frozen_definitions": _frozen_definitions(evidence),
         "output_contract": {
             **storage.model_dump(mode="json"),
+            "attempt_receipt_must_be_absent": True,
             "candidate_must_be_absent": True,
             "historical_result_path": evidence.existing_development_result_path,
             "historical_result_sha256": (
@@ -260,7 +263,7 @@ def _validate_manifest(
     }
     if set(document) != expected_fields:
         raise ValueError("locked preregistration schema differs")
-    if document["schema_version"] != "apar-sentinel-v5-locked-preregistration/1":
+    if document["schema_version"] != "apar-sentinel-v5-locked-preregistration/2":
         raise ValueError("locked preregistration version differs")
     if document["preregistration_path"] != _PREREGISTRATION_PATH:
         raise ValueError("locked preregistration path differs")
@@ -317,6 +320,7 @@ def _validate_manifest(
     output = document["output_contract"]
     expected_output = {
         **evidence.locked_artifact_storage.model_dump(mode="json"),
+        "attempt_receipt_must_be_absent": True,
         "candidate_must_be_absent": True,
         "historical_result_path": evidence.existing_development_result_path,
         "historical_result_sha256": evidence.existing_development_result_sha256,
@@ -384,6 +388,9 @@ def verify_locked_preexecution(
     ):
         raise ValueError("historical development result bytes changed")
     storage = evidence.locked_artifact_storage
+    _assert_absent(
+        root / storage.attempt_receipt_path, "locked attempt receipt"
+    )
     candidate = root / storage.candidate_manifest_path
     _assert_absent(candidate, "locked candidate manifest")
     _assert_absent(candidate.with_name(f"{candidate.name}.chunks"), "locked chunks")
@@ -411,7 +418,7 @@ def verify_locked_preexecution(
         "candidate_manifest_path": storage.candidate_manifest_path,
         "storage_schema_version": storage.schema_version,
         "payload_schema_version": (
-            "apar-sentinel-v5-locked-development-payload/1"
+            "apar-sentinel-v5-locked-development-payload/2"
         ),
     }
     binding_values["run_binding_sha256"] = (
@@ -428,9 +435,13 @@ def verify_locked_preexecution(
         "safe_deterministic_core_sha256": safe_verification[
             "deterministic_core_sha256"
         ],
+        "safe_observational_environment_sha256": safe_verification[
+            "observational_environment_sha256"
+        ],
         "historical_safe_core_sha256": _HISTORICAL_SAFE_CORE_SHA256,
         "historical_result_sha256": evidence.existing_development_result_sha256,
         "candidate_result_absent": True,
+        "attempt_receipt_absent": True,
         "production_support_plan_sha256": plan.support_plan_sha256,
         "preregistration_sha256": preregistration_sha256,
         "run_binding": binding.model_dump(mode="json"),

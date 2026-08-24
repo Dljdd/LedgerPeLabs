@@ -70,7 +70,7 @@ def _locked_binding_values() -> dict[str, object]:
             evidence.locked_artifact_storage.schema_version
         ),
         "payload_schema_version": (
-            "apar-sentinel-v5-locked-development-payload/1"
+            "apar-sentinel-v5-locked-development-payload/2"
         ),
     }
     values["run_binding_sha256"] = V5LockedEvidenceRunBinding.compute_digest(values)
@@ -115,7 +115,7 @@ def test_locked_payload_rejects_legacy_or_partial_documents() -> None:
     with pytest.raises(ValidationError):
         V5LockedEvidencePayload.model_validate(
             {
-                "schema_version": "apar-sentinel-v5-locked-development-payload/1",
+                "schema_version": "apar-sentinel-v5-locked-development-payload/2",
                 "run_binding": _locked_binding_values(),
                 "arm_results": [],
             }
@@ -141,6 +141,7 @@ def test_locked_payload_builder_requires_exact_ordered_four_arms() -> None:
     with pytest.raises(ValueError, match="exact ordered four arm"):
         build_v5_locked_evidence_payload(
             run_binding=_locked_binding_values(),
+            attempt_receipt_sha256="6" * 64,
             evidence_protocol=evidence,
             catalog_sha256="4" * 64,
             arm_results=(),
@@ -240,7 +241,7 @@ def test_safe_verifier_rejects_a_locked_payload_schema() -> None:
     )
 
     locked = _canonical_bytes(
-        {"schema_version": "apar-sentinel-v5-locked-development-payload/1"}
+        {"schema_version": "apar-sentinel-v5-locked-development-payload/2"}
     )
     with pytest.raises(IndependentVerificationError, match="envelope"):
         verify_evidence_bytes(locked, root=ROOT)
@@ -254,7 +255,7 @@ def test_locked_verifier_rejects_partial_payload_before_evidence_replay() -> Non
     )
 
     partial = _canonical_bytes(
-        {"schema_version": "apar-sentinel-v5-locked-development-payload/1"}
+        {"schema_version": "apar-sentinel-v5-locked-development-payload/2"}
     )
     with pytest.raises(IndependentVerificationError, match="locked payload fields"):
         verify_locked_evidence_payload_bytes(partial, root=ROOT)
@@ -280,8 +281,9 @@ def test_locked_verifier_rejects_raw_run_relabeling(
     run_binding = _locked_binding_values()
     run_binding[field] = replacement
     payload: dict[str, object] = {
-        "schema_version": "apar-sentinel-v5-locked-development-payload/1",
+        "schema_version": "apar-sentinel-v5-locked-development-payload/2",
         "run_binding": run_binding,
+        "attempt_receipt_sha256": "6" * 64,
         "evidence_protocol": {},
         "catalog_sha256": "4" * 64,
         "execution_artifact_pool": [],

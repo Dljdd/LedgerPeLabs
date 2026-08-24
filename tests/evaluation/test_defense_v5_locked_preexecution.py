@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -179,3 +180,36 @@ def test_historical_safe_core_and_rejected_result_remain_frozen() -> None:
     assert hashlib.sha256(result.read_bytes()).hexdigest() == (
         "af326f3a0fcbbe12c9b8623fc7d82a1ba6d0f327ec9a80f462cacd4bea1dd185"
     )
+
+
+@pytest.mark.parametrize(
+    "existing_kind", ["file", "malformed", "symlink", "hardlink", "directory"]
+)
+def test_preexecution_treats_any_attempt_receipt_as_consumed(
+    tmp_path: Path, existing_kind: str
+) -> None:
+    """Preexecution must never inspect-and-repair or replace an attempt marker."""
+    target = tmp_path / "attempt.json"
+    if existing_kind in {"file", "malformed"}:
+        target.write_bytes(b"{}" if existing_kind == "file" else b"partial")
+    elif existing_kind == "directory":
+        target.mkdir()
+    elif existing_kind == "symlink":
+        source = tmp_path / "source"
+        source.write_text("receipt")
+        target.symlink_to(source)
+    else:
+        source = tmp_path / "source"
+        source.write_text("receipt")
+        os.link(source, target)
+    with pytest.raises(ValueError, match="must be absent"):
+        preexecution._assert_absent(target, "locked attempt receipt")
+
+
+def test_preexecution_absence_check_does_not_create_attempt_receipt(
+    tmp_path: Path,
+) -> None:
+    """Auditing readiness must not itself consume the one-time run."""
+    target = tmp_path / "attempt.json"
+    preexecution._assert_absent(target, "locked attempt receipt")
+    assert not os.path.lexists(target)

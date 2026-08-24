@@ -20,7 +20,7 @@ from apar.evaluation.v5_evidence_bundle import (
     build_v5_readiness_evidence,
 )
 from apar.evaluation.v5_evidence_layers import (
-    DETERMINISTIC_CORE_EXCLUSION_SCHEMA,
+    LOCKED_DETERMINISTIC_CORE_EXCLUSION_SCHEMA,
     LOCKED_DETERMINISTIC_CORE_SCHEMA,
     build_locked_deterministic_core_document,
     build_observational_latency_document,
@@ -45,7 +45,7 @@ def _digest(document: object) -> str:
 class V5LockedDeterministicCoreBinding(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal["apar-sentinel-v5-locked-deterministic-core/1"]
+    schema_version: Literal["apar-sentinel-v5-locked-deterministic-core/2"]
     exclusion_schema: tuple[tuple[str, tuple[str, ...], str], ...]
     core_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
@@ -53,7 +53,7 @@ class V5LockedDeterministicCoreBinding(BaseModel):
     def exclusions_are_exact(self) -> Self:
         if self.schema_version != LOCKED_DETERMINISTIC_CORE_SCHEMA:
             raise ValueError("locked deterministic-core schema differs")
-        if self.exclusion_schema != DETERMINISTIC_CORE_EXCLUSION_SCHEMA:
+        if self.exclusion_schema != LOCKED_DETERMINISTIC_CORE_EXCLUSION_SCHEMA:
             raise ValueError("locked deterministic-core exclusion schema differs")
         return self
 
@@ -63,8 +63,9 @@ class V5LockedEvidencePayload(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal["apar-sentinel-v5-locked-development-payload/1"]
+    schema_version: Literal["apar-sentinel-v5-locked-development-payload/2"]
     run_binding: V5LockedEvidenceRunBinding
+    attempt_receipt_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     evidence_protocol: V5EvidenceProtocol
     catalog_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     execution_artifact_pool: tuple[V5PackedDocument, ...]
@@ -157,6 +158,7 @@ def _validate_locked_support(
 def build_v5_locked_evidence_payload(
     *,
     run_binding: V5LockedEvidenceRunBinding | dict[str, object],
+    attempt_receipt_sha256: str,
     evidence_protocol: V5EvidenceProtocol,
     catalog_sha256: str,
     arm_results: Sequence[V5EvaluationResult],
@@ -169,6 +171,11 @@ def build_v5_locked_evidence_payload(
     ):
         raise ValueError("locked evidence requires exact ordered four arm results")
     binding = V5LockedEvidenceRunBinding.model_validate(run_binding)
+    if len(attempt_receipt_sha256) != 64 or any(
+        character not in "0123456789abcdef"
+        for character in attempt_receipt_sha256
+    ):
+        raise ValueError("locked attempt receipt digest is invalid")
     if controls is None:
         raise ValueError("locked evidence requires all seven executed controls")
     if (
@@ -230,7 +237,7 @@ def build_v5_locked_evidence_payload(
     )
     deterministic_core = V5LockedDeterministicCoreBinding(
         schema_version=LOCKED_DETERMINISTIC_CORE_SCHEMA,
-        exclusion_schema=DETERMINISTIC_CORE_EXCLUSION_SCHEMA,
+        exclusion_schema=LOCKED_DETERMINISTIC_CORE_EXCLUSION_SCHEMA,
         core_sha256=_digest(core_document),
     )
     observational = build_observational_latency_document(
@@ -244,8 +251,9 @@ def build_v5_locked_evidence_payload(
         kind="observational_latency", document=observational
     )
     values = {
-        "schema_version": "apar-sentinel-v5-locked-development-payload/1",
+        "schema_version": "apar-sentinel-v5-locked-development-payload/2",
         "run_binding": binding,
+        "attempt_receipt_sha256": attempt_receipt_sha256,
         "evidence_protocol": evidence_protocol,
         "catalog_sha256": catalog_sha256,
         "execution_artifact_pool": packed_artifacts,

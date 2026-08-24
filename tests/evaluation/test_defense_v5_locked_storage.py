@@ -23,14 +23,36 @@ def _limits() -> dict[str, int]:
 
 
 def _publish(target: Path, payload: bytes = b"0123456789abcdef") -> object:
-    from apar.evaluation.v5_evidence_storage import publish_v5_chunked_evidence
+    from apar.evaluation.v5_evidence_storage import (
+        build_v5_locked_attempt_receipt,
+        publish_v5_chunked_evidence,
+        publish_v5_locked_attempt_receipt,
+    )
+
+    attempt = build_v5_locked_attempt_receipt(
+        run_binding_sha256="1" * 64,
+        preregistration_commit="2" * 40,
+        preregistration_sha256="3" * 64,
+        source_commit="4" * 40,
+        source_tree_oid="5" * 40,
+        approved_safe_deterministic_core_sha256="6" * 64,
+        approved_safe_observational_environment_sha256="7" * 64,
+        authorization_sha256="8" * 64,
+        exact_command="locked-test-command",
+        started_at_utc="2026-08-24T00:00:00Z",
+    )
+    attempt_path = target.with_name("attempt.json")
+    publish_v5_locked_attempt_receipt(
+        target=attempt_path, receipt=attempt
+    )
 
     return publish_v5_chunked_evidence(
         payload_bytes=payload,
         target_manifest=target,
         run_binding_sha256="1" * 64,
-        authorization_sha256="2" * 64,
-        started_at_utc="2026-08-24T00:00:00Z",
+        attempt_receipt=attempt,
+        attempt_receipt_path=attempt_path.name,
+        attempt_receipt_target=attempt_path,
         completed_at_utc="2026-08-24T00:00:01Z",
         elapsed_ms=1000.0,
         **_limits(),
@@ -119,6 +141,44 @@ def test_chunked_publication_rejects_oversized_artifact(tmp_path: Path) -> None:
     assert not target.exists()
 
 
+def test_chunked_publication_requires_visible_durable_attempt(
+    tmp_path: Path,
+) -> None:
+    """A valid in-memory receipt cannot substitute for its durable target."""
+    from apar.evaluation.v5_evidence_storage import (
+        build_v5_locked_attempt_receipt,
+        publish_v5_chunked_evidence,
+    )
+
+    attempt = build_v5_locked_attempt_receipt(
+        run_binding_sha256="1" * 64,
+        preregistration_commit="2" * 40,
+        preregistration_sha256="3" * 64,
+        source_commit="4" * 40,
+        source_tree_oid="5" * 40,
+        approved_safe_deterministic_core_sha256="6" * 64,
+        approved_safe_observational_environment_sha256="7" * 64,
+        authorization_sha256="8" * 64,
+        exact_command="locked-test-command",
+        started_at_utc="2026-08-24T00:00:00Z",
+    )
+    target = tmp_path / "candidate.manifest.json"
+    with pytest.raises(FileNotFoundError):
+        publish_v5_chunked_evidence(
+            payload_bytes=b"payload",
+            target_manifest=target,
+            run_binding_sha256="1" * 64,
+            attempt_receipt=attempt,
+            attempt_receipt_path="attempt.json",
+            attempt_receipt_target=tmp_path / "attempt.json",
+            completed_at_utc="2026-08-24T00:00:01Z",
+            elapsed_ms=1000.0,
+            **_limits(),
+        )
+    assert not target.exists()
+    assert not target.with_name(f"{target.name}.chunks").exists()
+
+
 @pytest.mark.parametrize("mutation", ["missing", "reordered", "content", "manifest"])
 def test_chunked_reconstruction_rejects_missing_reordered_or_tampered_data(
     tmp_path: Path, mutation: str
@@ -166,7 +226,9 @@ def test_independent_verifier_reconstructs_without_production_storage_import(
     target = tmp_path / "candidate.manifest.json"
     _publish(target)
     assert read_locked_evidence_storage_bytes(
-        target_manifest=target, **_limits()
+        target_manifest=target,
+        attempt_receipt_path=tmp_path / "attempt.json",
+        **_limits(),
     ) == b"0123456789abcdef"
 
     tree = ast.parse((ROOT / "src/apar/v5_independent_verifier.py").read_text())
@@ -198,4 +260,133 @@ def test_independent_storage_reconstruction_rejects_tampered_chunk(
         b"tampered"
     )
     with pytest.raises(IndependentVerificationError, match="chunk"):
-        read_locked_evidence_storage_bytes(target_manifest=target, **_limits())
+        read_locked_evidence_storage_bytes(
+            target_manifest=target,
+            attempt_receipt_path=tmp_path / "attempt.json",
+            **_limits(),
+        )
+
+
+@pytest.mark.parametrize("mutation", ["missing", "different_valid_receipt"])
+def test_independent_storage_rejects_missing_or_substituted_attempt(
+    tmp_path: Path, mutation: str
+) -> None:
+    from apar.evaluation.v5_evidence_storage import (
+        build_v5_locked_attempt_receipt,
+        publish_v5_locked_attempt_receipt,
+    )
+    from apar.v5_independent_verifier import (
+        IndependentVerificationError,
+        read_locked_evidence_storage_bytes,
+    )
+
+    target = tmp_path / "candidate.manifest.json"
+    _publish(target)
+    attempt_path = tmp_path / "attempt.json"
+    attempt_path.unlink()
+    if mutation == "different_valid_receipt":
+        replacement = build_v5_locked_attempt_receipt(
+            run_binding_sha256="1" * 64,
+            preregistration_commit="2" * 40,
+            preregistration_sha256="3" * 64,
+            source_commit="4" * 40,
+            source_tree_oid="5" * 40,
+            approved_safe_deterministic_core_sha256="6" * 64,
+            approved_safe_observational_environment_sha256="7" * 64,
+            authorization_sha256="8" * 64,
+            exact_command="locked-test-command",
+            started_at_utc="2026-08-24T00:00:02Z",
+        )
+        publish_v5_locked_attempt_receipt(
+            target=attempt_path, receipt=replacement
+        )
+    with pytest.raises(
+        IndependentVerificationError, match="attempt receipt|receipt lineage"
+    ):
+        read_locked_evidence_storage_bytes(
+            target_manifest=target,
+            attempt_receipt_path=attempt_path,
+            **_limits(),
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation", ["attempt", "manifest", "payload", "verification"]
+)
+def test_independent_verifier_rejects_rebound_judge_summary(
+    tmp_path: Path, mutation: str
+) -> None:
+    from apar.v5_independent_verifier import (
+        IndependentVerificationError,
+        verify_locked_judge_summary,
+    )
+    from scripts.run_defense_v5_locked_development import (
+        _write_summary_exclusive,
+    )
+
+    target = tmp_path / "candidate.manifest.json"
+    manifest = _publish(target)
+    verification = {"verified": True, "status": "test_only"}
+    values: dict[str, object] = {
+        "schema_version": "apar-sentinel-v5-locked-judge-summary/2",
+        "candidate_manifest_path": target.name,
+        "manifest_sha256": manifest.manifest_sha256,
+        "payload_sha256": manifest.payload_sha256,
+        "run_binding_sha256": manifest.run_binding_sha256,
+        "attempt_receipt_path": "attempt.json",
+        "attempt_receipt_sha256": manifest.attempt_receipt_sha256,
+        "verification": verification,
+    }
+    values["summary_sha256"] = hashlib.sha256(
+        json.dumps(
+            values, sort_keys=True, separators=(",", ":")
+        ).encode()
+    ).hexdigest()
+    summary = tmp_path / "summary.json"
+    _write_summary_exclusive(summary, values)
+    verify_locked_judge_summary(
+        summary_path=summary,
+        target_manifest=target,
+        attempt_receipt_path=tmp_path / "attempt.json",
+        verification=verification,
+        candidate_manifest_path=target.name,
+        declared_attempt_receipt_path="attempt.json",
+    )
+
+    document = json.loads(summary.read_bytes())
+    field = {
+        "attempt": "attempt_receipt_sha256",
+        "manifest": "manifest_sha256",
+        "payload": "payload_sha256",
+        "verification": "verification",
+    }[mutation]
+    document[field] = (
+        {"verified": False, "status": "rebound"}
+        if mutation == "verification"
+        else "9" * 64
+    )
+    document["summary_sha256"] = hashlib.sha256(
+        json.dumps(
+            {
+                key: value
+                for key, value in document.items()
+                if key != "summary_sha256"
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    summary.write_text(
+        json.dumps(document, sort_keys=True, separators=(",", ":"))
+    )
+    with pytest.raises(
+        IndependentVerificationError, match="summary evidence binding"
+    ):
+        verify_locked_judge_summary(
+            summary_path=summary,
+            target_manifest=target,
+            attempt_receipt_path=tmp_path / "attempt.json",
+            verification=verification,
+            candidate_manifest_path=target.name,
+            declared_attempt_receipt_path="attempt.json",
+        )

@@ -14,7 +14,7 @@ import numpy as np
 
 DETERMINISTIC_CORE_SCHEMA: Final = "apar-sentinel-v5-deterministic-core/1"
 LOCKED_DETERMINISTIC_CORE_SCHEMA: Final = (
-    "apar-sentinel-v5-locked-deterministic-core/1"
+    "apar-sentinel-v5-locked-deterministic-core/2"
 )
 OBSERVATIONAL_LATENCY_SCHEMA: Final = "apar-sentinel-v5-observational-latency/1"
 OBSERVATIONAL_MEASUREMENT_METHOD: Final = "time.perf_counter_ns-elapsed-v1"
@@ -84,6 +84,14 @@ DETERMINISTIC_CORE_EXCLUSION_SCHEMA: Final = (
         "payload",
         ("observational_latency", "payload_sha256"),
         "deterministic_core.core_sha256",
+    ),
+)
+LOCKED_DETERMINISTIC_CORE_EXCLUSION_SCHEMA: Final = (
+    *DETERMINISTIC_CORE_EXCLUSION_SCHEMA,
+    (
+        "locked_payload",
+        ("attempt_receipt_sha256",),
+        "durable_attempt_receipt.receipt_sha256",
     ),
 )
 
@@ -541,7 +549,7 @@ def build_locked_deterministic_core_document(
         )
     return {
         "schema_version": LOCKED_DETERMINISTIC_CORE_SCHEMA,
-        "exclusion_schema": DETERMINISTIC_CORE_EXCLUSION_SCHEMA,
+        "exclusion_schema": LOCKED_DETERMINISTIC_CORE_EXCLUSION_SCHEMA,
         "run_binding": run_binding,
         "evidence_protocol": evidence_protocol,
         "catalog_sha256": catalog_sha256,
@@ -692,6 +700,7 @@ __all__ = [
     "DETERMINISTIC_CORE_EXCLUSION_SCHEMA",
     "DETERMINISTIC_CORE_SCHEMA",
     "LOCKED_DETERMINISTIC_CORE_SCHEMA",
+    "LOCKED_DETERMINISTIC_CORE_EXCLUSION_SCHEMA",
     "OBSERVATIONAL_LATENCY_SCHEMA",
     "build_deterministic_core_document",
     "build_locked_deterministic_core_document",

@@ -174,10 +174,10 @@ class V5LockedEvidenceRunBinding(BaseModel):
             "docs/experiments/defense-v5-locked-development-candidate.manifest.json"
         ):
             raise ValueError("locked candidate manifest path differs")
-        if self.storage_schema_version != "apar-sentinel-v5-chunked-evidence/1":
+        if self.storage_schema_version != "apar-sentinel-v5-chunked-evidence/2":
             raise ValueError("locked storage schema differs")
         if self.payload_schema_version != (
-            "apar-sentinel-v5-locked-development-payload/1"
+            "apar-sentinel-v5-locked-development-payload/2"
         ):
             raise ValueError("locked payload schema differs")
         if self.run_binding_sha256 != self.compute_digest(self):

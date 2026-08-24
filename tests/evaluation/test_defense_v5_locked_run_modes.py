@@ -101,7 +101,7 @@ def test_evidence_protocol_freezes_modes_and_chunked_storage() -> None:
     evidence = load_v5_evidence_protocol(
         ROOT / "config/defense/defense-v5-evidence.json", root=ROOT
     )
-    assert evidence.schema_version == "1.1.0"
+    assert evidence.schema_version == "1.2.0"
     assert evidence.run_modes.safe_validation.model_dump(mode="json") == {
         "profile": "smoke",
         "development_test_seed": 404,
@@ -115,7 +115,10 @@ def test_evidence_protocol_freezes_modes_and_chunked_storage() -> None:
         "authorization_required": True,
     }
     storage = evidence.locked_artifact_storage
-    assert storage.schema_version == "apar-sentinel-v5-chunked-evidence/1"
+    assert storage.schema_version == "apar-sentinel-v5-chunked-evidence/2"
+    assert storage.attempt_receipt_path == (
+        "docs/experiments/defense-v5-locked-development-attempt.json"
+    )
     assert storage.candidate_manifest_path == (
         "docs/experiments/defense-v5-locked-development-candidate.manifest.json"
     )

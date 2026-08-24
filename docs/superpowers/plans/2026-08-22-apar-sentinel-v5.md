@@ -838,7 +838,16 @@ verified latency observations from the pinned environment because latency is
 not the safe-core commitment. It must report seed `404` as the only executed
 seed and seed `2404` as asserted only.
 
-Do not edit model, thresholds, targets, or population parameters after reading the production development-test result. If a genuine execution bug occurs, preserve the failed result outside the canonical path, add a failing regression test, fix the bug, and rerun the entire development experiment with a new explicitly recorded attempt ID.
+The audit must also require the frozen attempt-receipt path to be absent and
+must never create it. The locked runner publishes and directory-fsyncs that
+receipt after preexecution succeeds but before issuing the in-process locked
+capability. Once the target is visible, any crash or verification failure is
+terminal evidence and the current frozen command can never be retried.
+
+Do not edit model, thresholds, targets, or population parameters after reading
+the production development-test result. If a genuine execution bug occurs,
+preserve the attempt receipt and every partial artifact as rejected evidence;
+the current protocol provides no rerun, resume, cleanup, or replacement path.
 
 ### Step 4: Execute the production development run
 
