@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import subprocess
 from copy import deepcopy
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from apar.evaluation.v5_evaluation import (
     V5IsolationForestManifest,
     V5IsolationTreeManifest,
     V5TrainingPartitionEvidence,
+    discover_v5_implementation_paths,
     load_v5_arm_configuration,
 )
 from apar.features import sentinel as sentinel_features
@@ -26,6 +28,22 @@ from apar.features.sentinel import SentinelFeatureCatalog
 from tests.evaluation.v5_safe_protocol import load_safe_v5_test_protocol
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_v5_implementation_paths_use_tracked_canonical_case() -> None:
+    """Case aliases cannot be bound reproducibly on a case-sensitive verifier."""
+    discovered = discover_v5_implementation_paths(ROOT)
+    tracked = set(
+        subprocess.run(
+            ["git", "ls-files"],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+    )
+    assert "src/apar/generators/Population.py" not in discovered
+    assert set(discovered) <= tracked
 
 
 def _independent_digest(document: object) -> str:

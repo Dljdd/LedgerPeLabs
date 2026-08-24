@@ -455,6 +455,35 @@ Safe builds from identical source and seed must share the deterministic-core
 digest. Real timing, observational, payload, and envelope hashes may vary, so
 the complete serialized artifact is not described as byte-reproducible.
 
+### 11.6 Closed execution modes and one-time evidence publication
+
+Complete evidence execution has exactly two modes. `safe_validation` always
+uses the smoke profile and seed `404` and is repeatable. `locked_development`
+always uses the production profile and seed `2404`, requires explicit one-time
+authorization, and has no public seed, profile, output, retry, or resume
+parameter. Both modes run the same corpus, four-arm, seven-control, complete
+metric, ledger-economics, calibration, bootstrap, deterministic-core, and
+observational-latency architecture. The legacy development-summary runner is
+smoke-only and cannot represent locked evidence.
+
+The locked artifact is an opaque canonical payload published as deterministic
+64 MiB chunks followed by one atomically linked, exclusively created manifest.
+The planned envelope upper bound is 768 MiB, the hard bound is 1 GiB, at most
+16 chunks are permitted, and every chunk remains below the practical 100 MiB
+normal Git-blob limit. The existing historical development result is never an
+output target. An offline independent verifier authenticates the manifest,
+chunk topology and order, receipts, complete payload, production support plan,
+all evidence semantics, and both deterministic and observational layers.
+
+Execution is permitted only from a clean PREREGISTRATION commit whose sole
+parent is the reviewed SOURCE commit and whose only changed path is the locked
+preregistration manifest. That manifest binds the SOURCE tree and exact file
+modes/content hashes, all protocol/config/catalog/verifier digests, the
+historical and newly reviewed safe cores, exact production support, frozen
+definitions, storage limits, historical result hash, and the sole command.
+The preregistration task never executes seed `2404` and creates no candidate
+artifact.
+
 ## 12. Mandatory controls and ablations
 
 The development report is invalid without these controls:

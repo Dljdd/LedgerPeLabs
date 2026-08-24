@@ -13,6 +13,9 @@ from typing import Any, Final, cast
 import numpy as np
 
 DETERMINISTIC_CORE_SCHEMA: Final = "apar-sentinel-v5-deterministic-core/1"
+LOCKED_DETERMINISTIC_CORE_SCHEMA: Final = (
+    "apar-sentinel-v5-locked-deterministic-core/1"
+)
 OBSERVATIONAL_LATENCY_SCHEMA: Final = "apar-sentinel-v5-observational-latency/1"
 OBSERVATIONAL_MEASUREMENT_METHOD: Final = "time.perf_counter_ns-elapsed-v1"
 
@@ -486,6 +489,70 @@ def deterministic_core_sha256(**kwargs: object) -> str:
     return _digest(build_deterministic_core_document(**kwargs))  # type: ignore[arg-type]
 
 
+def build_locked_deterministic_core_document(
+    *,
+    run_binding: dict[str, Any],
+    evidence_protocol: object,
+    catalog_sha256: str,
+    execution_artifacts: list[dict[str, Any]],
+    arm_results: list[dict[str, Any]],
+    complete_metrics: list[dict[str, Any]],
+    controls: dict[str, Any],
+    readiness: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the versioned locked core with the full immutable run contract."""
+    if (
+        run_binding.get("mode") != "locked_development"
+        or run_binding.get("profile") != "production"
+        or run_binding.get("development_test_seed") != 2404
+    ):
+        raise ValueError("locked deterministic core requires production seed 2404")
+    if len(arm_results) != len(_ARMS) or len(complete_metrics) != len(_ARMS):
+        raise ValueError("locked deterministic core requires exact four arms")
+    stable_results = [_stable_result(result) for result in arm_results]
+    if [result["arm"] for result in stable_results] != list(_ARMS):
+        raise ValueError("locked deterministic core arm order differs")
+    stable_metrics = [
+        _stable_complete_metrics(
+            metrics,
+            deterministic_result_sha256=result["deterministic_result_sha256"],
+        )
+        for metrics, result in zip(complete_metrics, stable_results, strict=True)
+    ]
+    stable_controls, control_digests = _stable_controls(controls)
+    stable_readiness = _stable_readiness(
+        readiness, deterministic_control_digests=control_digests
+    )
+    artifact_addresses = []
+    for artifact in execution_artifacts:
+        if set(artifact) != {
+            "evidence_sha256",
+            "artifact_sha256",
+            "payload_sha256",
+            "payload_json",
+        }:
+            raise ValueError("locked execution artifact schema differs")
+        artifact_addresses.append(
+            {
+                "evidence_sha256": artifact["evidence_sha256"],
+                "artifact_sha256": artifact["artifact_sha256"],
+                "payload_sha256": artifact["payload_sha256"],
+            }
+        )
+    return {
+        "schema_version": LOCKED_DETERMINISTIC_CORE_SCHEMA,
+        "exclusion_schema": DETERMINISTIC_CORE_EXCLUSION_SCHEMA,
+        "run_binding": run_binding,
+        "evidence_protocol": evidence_protocol,
+        "catalog_sha256": catalog_sha256,
+        "execution_artifact_addresses": artifact_addresses,
+        "arm_results": stable_results,
+        "complete_metrics": stable_metrics,
+        "controls": stable_controls,
+        "readiness": stable_readiness,
+    }
+
+
 def current_latency_environment() -> dict[str, Any]:
     """Declare the exact runtime and monotonic timer used for observations."""
     clock = time.get_clock_info("perf_counter")
@@ -624,8 +691,10 @@ def build_observational_latency_document(
 __all__ = [
     "DETERMINISTIC_CORE_EXCLUSION_SCHEMA",
     "DETERMINISTIC_CORE_SCHEMA",
+    "LOCKED_DETERMINISTIC_CORE_SCHEMA",
     "OBSERVATIONAL_LATENCY_SCHEMA",
     "build_deterministic_core_document",
+    "build_locked_deterministic_core_document",
     "build_observational_latency_document",
     "current_latency_environment",
     "deterministic_core_sha256",

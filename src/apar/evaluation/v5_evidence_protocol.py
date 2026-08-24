@@ -267,8 +267,70 @@ class V5EvidenceBounds(_FrozenModel):
     max_serialized_evidence_bytes: Literal[536870912]
 
 
+class V5RunModeSpec(_FrozenModel):
+    profile: Literal["smoke", "production"]
+    development_test_seed: Literal[404, 2404]
+    repeatable: bool
+    authorization_required: bool
+
+
+class V5RunModeProtocol(_FrozenModel):
+    safe_validation: V5RunModeSpec
+    locked_development: V5RunModeSpec
+
+    @model_validator(mode="after")
+    def modes_are_exact(self) -> Self:
+        observed = {
+            "safe_validation": self.safe_validation.model_dump(mode="json"),
+            "locked_development": self.locked_development.model_dump(mode="json"),
+        }
+        expected = {
+            "safe_validation": {
+                "profile": "smoke",
+                "development_test_seed": 404,
+                "repeatable": True,
+                "authorization_required": False,
+            },
+            "locked_development": {
+                "profile": "production",
+                "development_test_seed": 2404,
+                "repeatable": False,
+                "authorization_required": True,
+            },
+        }
+        if observed != expected:
+            raise ValueError("closed run-mode contract differs")
+        return self
+
+
+class V5LockedArtifactStorage(_FrozenModel):
+    schema_version: Literal["apar-sentinel-v5-chunked-evidence/1"]
+    candidate_manifest_path: Literal[
+        "docs/experiments/defense-v5-locked-development-candidate.manifest.json"
+    ]
+    judge_summary_path: Literal[
+        "docs/experiments/defense-v5-locked-development-summary.json"
+    ]
+    chunk_size_bytes: Literal[67108864]
+    expected_envelope_upper_bound_bytes: Literal[805306368]
+    maximum_envelope_bytes: Literal[1073741824]
+    maximum_chunk_count: Literal[16]
+    normal_git_blob_limit_bytes: Literal[104857600]
+    publication: Literal["content_chunks_then_atomic_exclusive_manifest"]
+
+    @model_validator(mode="after")
+    def storage_is_bounded(self) -> Self:
+        if self.chunk_size_bytes >= self.normal_git_blob_limit_bytes:
+            raise ValueError("evidence chunk reaches the normal Git blob limit")
+        if self.expected_envelope_upper_bound_bytes > self.maximum_envelope_bytes:
+            raise ValueError("expected envelope estimate exceeds the hard bound")
+        if self.chunk_size_bytes * self.maximum_chunk_count < self.maximum_envelope_bytes:
+            raise ValueError("chunk count cannot contain the maximum envelope")
+        return self
+
+
 class V5EvidenceProtocol(_FrozenModel):
-    schema_version: Literal["1.0.0"]
+    schema_version: Literal["1.1.0"]
     protocol_id: Literal["apar-sentinel-v5-development-evidence"]
     base_protocol_path: Literal["config/defense/defense-v5-development.json"]
     arm_protocol_path: Literal["config/defense/defense-v5-arms.json"]
@@ -285,6 +347,8 @@ class V5EvidenceProtocol(_FrozenModel):
     metric_definitions: V5MetricDefinitions
     gates: tuple[V5GateProtocol, ...]
     bounds: V5EvidenceBounds
+    run_modes: V5RunModeProtocol
+    locked_artifact_storage: V5LockedArtifactStorage
     implementation_paths: tuple[str, ...]
     evidence_protocol_sha256: str = ""
     base_protocol_sha256: str = ""

@@ -11,6 +11,8 @@ import hashlib
 import json
 import math
 import platform
+import stat
+import subprocess
 import sys
 import time
 import zlib
@@ -905,6 +907,8 @@ def _expand_retained_result(
 
 def _verify_protocol(payload: Mapping[str, Any], root: Path) -> dict[str, Any]:
     protocol = _mapping(payload.get("evidence_protocol"), "evidence protocol")
+    if protocol.get("schema_version") != "1.1.0":
+        _fail("evidence protocol schema differs")
     if payload.get("safe_seed") != 404 or protocol.get("safe_development_test_seed") != 404:
         _fail("safe evidence seed must equal 404")
     if protocol.get("locked_development_test_seed") != 2404:
@@ -1028,6 +1032,37 @@ def _verify_protocol(payload: Mapping[str, Any], root: Path) -> dict[str, Any]:
         "max_serialized_evidence_bytes": 536_870_912,
     }:
         _fail("evidence bounds differ from frozen semantics")
+    if protocol.get("run_modes") != {
+        "safe_validation": {
+            "profile": "smoke",
+            "development_test_seed": 404,
+            "repeatable": True,
+            "authorization_required": False,
+        },
+        "locked_development": {
+            "profile": "production",
+            "development_test_seed": 2404,
+            "repeatable": False,
+            "authorization_required": True,
+        },
+    }:
+        _fail("closed evidence run-mode protocol differs")
+    if protocol.get("locked_artifact_storage") != {
+        "schema_version": "apar-sentinel-v5-chunked-evidence/1",
+        "candidate_manifest_path": (
+            "docs/experiments/defense-v5-locked-development-candidate.manifest.json"
+        ),
+        "judge_summary_path": (
+            "docs/experiments/defense-v5-locked-development-summary.json"
+        ),
+        "chunk_size_bytes": 67_108_864,
+        "expected_envelope_upper_bound_bytes": 805_306_368,
+        "maximum_envelope_bytes": 1_073_741_824,
+        "maximum_chunk_count": 16,
+        "normal_git_blob_limit_bytes": 104_857_600,
+        "publication": "content_chunks_then_atomic_exclusive_manifest",
+    }:
+        _fail("locked artifact storage protocol differs")
     prior_result = root / str(protocol.get("existing_development_result_path"))
     if not prior_result.is_file() or hashlib.sha256(
         prior_result.read_bytes()
@@ -4442,7 +4477,842 @@ def verify_evidence_bytes(serialized: bytes, *, root: Path) -> dict[str, object]
         ) from error
 
 
+def verify_locked_evidence_payload_bytes(
+    serialized: bytes, *, root: Path
+) -> dict[str, object]:
+    """Independently replay one complete locked-development payload."""
+    try:
+        payload = _mapping(json.loads(serialized), "locked payload")
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise IndependentVerificationError("locked payload schema is invalid") from error
+    if payload.get("schema_version") != (
+        "apar-sentinel-v5-locked-development-payload/1"
+    ):
+        _fail("locked payload schema differs")
+    _exact_fields(
+        payload,
+        {
+            "schema_version",
+            "run_binding",
+            "evidence_protocol",
+            "catalog_sha256",
+            "execution_artifact_pool",
+            "arm_results",
+            "complete_metrics",
+            "controls",
+            "readiness",
+            "deterministic_core",
+            "observational_latency",
+            "payload_sha256",
+        },
+        "locked payload fields",
+    )
+    if serialized != _canonical_bytes(payload):
+        _fail("locked payload is not canonical JSON")
+    if payload["payload_sha256"] != _digest(
+        {key: value for key, value in payload.items() if key != "payload_sha256"}
+    ):
+        _fail("locked payload digest mismatch")
+    binding = _mapping(payload["run_binding"], "locked run binding")
+    if (
+        binding.get("mode") != "locked_development"
+        or binding.get("profile") != "production"
+        or binding.get("development_test_seed") != 2404
+    ):
+        _fail("locked run mode/profile/seed differs")
+    return _verify_locked_payload_document(payload, root=root.resolve())
+
+
+def _locked_legitimate_plan(count: int) -> tuple[int, int]:
+    remaining = count - 24
+    if remaining < 0:
+        _fail("locked legitimate support cannot cover all base rails")
+    full, final = divmod(remaining, 96)
+    artifact_count = 3 + full + (1 if final else 0)
+    estimate = 221_072 + full * 320_768
+    if final:
+        estimate += 32_768 + final * 3_000
+    return artifact_count, estimate
+
+
+def _independent_locked_support_plan(base: Mapping[str, Any]) -> dict[str, Any]:
+    production = _mapping(base.get("production_profile"), "production profile")
+    campaign_counts = _mapping(
+        production.get("campaigns_per_family"), "production campaign counts"
+    )
+    expected_campaigns = {family: 100 for family in _FAMILIES}
+    if campaign_counts != expected_campaigns or base.get(
+        "production_dev_test_campaigns_per_family"
+    ) != expected_campaigns:
+        _fail("locked production campaign plan differs")
+    if production.get("legitimate_decisions") != 50_000 or base.get(
+        "production_dev_test_legitimate"
+    ) != 50_000:
+        _fail("locked production legitimate plan differs")
+    event_rows = {
+        "agentic_intent_abuse": 25,
+        "app_scam_mule": 36,
+        "card_testing_cnp": 26,
+        "synthetic_merchant_refund": 46,
+    }
+    artifact_estimates = {
+        "agentic_intent_abuse": 365_536,
+        "app_scam_mule": 140_768,
+        "card_testing_cnp": 110_768,
+        "synthetic_merchant_refund": 170_768,
+    }
+    partitions: list[dict[str, Any]] = []
+    for partition in ("train", "calibration", "threshold", "development_test"):
+        legitimate = 50_000 if partition == "development_test" else 12_500
+        legitimate_artifacts, legitimate_estimate = _locked_legitimate_plan(
+            legitimate
+        )
+        fraud: list[list[Any]] = [
+            [family, int(campaign_counts[family]) * event_rows[family]]
+            for family in sorted(_FAMILIES)
+        ]
+        partitions.append(
+            {
+                "partition": partition,
+                "legitimate_rows": legitimate,
+                "fraud_rows_by_family": fraud,
+                "total_rows": legitimate + sum(int(item[1]) for item in fraud),
+                "execution_artifacts": legitimate_artifacts
+                + sum(int(value) for value in campaign_counts.values()),
+                "execution_payload_estimate_bytes": legitimate_estimate
+                + sum(
+                    int(campaign_counts[family]) * artifact_estimates[family]
+                    for family in _FAMILIES
+                ),
+            }
+        )
+    values = {
+        "mode": "locked_development",
+        "profile": "production",
+        "partitions": partitions,
+        "retained_execution_artifacts": sum(
+            int(item["execution_artifacts"]) for item in partitions
+        ),
+        "retained_execution_payload_estimate_bytes": sum(
+            int(item["execution_payload_estimate_bytes"]) for item in partitions
+        ),
+    }
+    values["support_plan_sha256"] = _digest(values)
+    return values
+
+
+def _independent_locked_core_document(
+    *,
+    payload: Mapping[str, Any],
+    artifacts: Sequence[Mapping[str, Any]],
+    retained_results: Sequence[Mapping[str, Any]],
+    complete: Sequence[Mapping[str, Any]],
+    controls: Mapping[str, Any],
+    readiness: Mapping[str, Any],
+) -> dict[str, Any]:
+    proxy = dict(payload)
+    proxy["safe_seed"] = 404
+    document = _independent_core_document(
+        payload=proxy,
+        artifacts=artifacts,
+        retained_results=retained_results,
+        complete=complete,
+        controls=controls,
+        readiness=readiness,
+    )
+    document["schema_version"] = (
+        "apar-sentinel-v5-locked-deterministic-core/1"
+    )
+    document.pop("safe_seed")
+    document["run_binding"] = payload["run_binding"]
+    return document
+
+
+def _git_value(root: Path, *arguments: str) -> str:
+    completed = subprocess.run(
+        ["git", *arguments],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        _fail("locked source/preregistration Git binding cannot be resolved")
+    return completed.stdout.strip()
+
+
+def _locked_preregistration_source_paths(root: Path) -> tuple[str, ...]:
+    arms = _mapping(
+        json.loads((root / "config/defense/defense-v5-arms.json").read_bytes()),
+        "locked arm protocol source",
+    )
+    evidence = _mapping(
+        json.loads(
+            (root / "config/defense/defense-v5-evidence.json").read_bytes()
+        ),
+        "locked evidence protocol source",
+    )
+    paths = {
+        "config/defense/defense-v5-arms.json",
+        "config/defense/defense-v5-development.json",
+        "config/defense/defense-v5-evidence.json",
+        "config/defense/feature-catalog-v5.json",
+        *[str(item) for item in _sequence(arms["implementation_paths"], "arm paths")],
+        *[
+            str(item)
+            for item in _sequence(evidence["implementation_paths"], "evidence paths")
+        ],
+    }
+    return tuple(sorted(paths))
+
+
+def _independent_locked_source_records(
+    root: Path, source_commit: str
+) -> list[list[str]]:
+    records: list[list[str]] = []
+    for relative in _locked_preregistration_source_paths(root):
+        path = root / relative
+        if not path.is_file():
+            _fail(f"locked SOURCE file is missing: {relative}")
+        tree_record = _git_value(root, "ls-tree", source_commit, "--", relative)
+        if not tree_record or "\t" not in tree_record:
+            _fail(f"locked SOURCE file is not tracked: {relative}")
+        mode = tree_record.split(maxsplit=1)[0]
+        if mode not in {"100644", "100755"}:
+            _fail(f"locked SOURCE file mode differs: {relative}")
+        records.append([relative, mode, hashlib.sha256(path.read_bytes()).hexdigest()])
+    return records
+
+
+def _verify_locked_preregistration_document(
+    *,
+    preregistration: Mapping[str, Any],
+    protocol: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    expected_plan: Mapping[str, Any],
+    root: Path,
+    source_commit: str,
+) -> None:
+    _exact_fields(
+        preregistration,
+        {
+            "schema_version",
+            "source_commit",
+            "source_tree_oid",
+            "preregistration_path",
+            "source_bindings",
+            "source_files",
+            "safe_validation",
+            "closed_run_mode",
+            "production_support_plan",
+            "frozen_definitions",
+            "output_contract",
+            "exact_command",
+            "manifest_sha256",
+        },
+        "locked preregistration fields",
+    )
+    if preregistration["schema_version"] != (
+        "apar-sentinel-v5-locked-preregistration/1"
+    ):
+        _fail("locked preregistration schema differs")
+    if preregistration["manifest_sha256"] != _digest(
+        {
+            key: value
+            for key, value in preregistration.items()
+            if key != "manifest_sha256"
+        }
+    ):
+        _fail("locked preregistration digest differs")
+    if preregistration["source_files"] != _independent_locked_source_records(
+        root, source_commit
+    ):
+        _fail("locked SOURCE file set/modes/content hashes differ")
+    source_bindings = {
+        "base_protocol_sha256": protocol["base_protocol_sha256"],
+        "arm_protocol_sha256": protocol["arm_protocol_sha256"],
+        "evidence_protocol_sha256": protocol["evidence_protocol_sha256"],
+        "implementation_sha256": protocol["implementation_sha256"],
+        "catalog_sha256": payload["catalog_sha256"],
+        "verifier_sha256": hashlib.sha256(
+            (root / "src/apar/v5_independent_verifier.py").read_bytes()
+        ).hexdigest(),
+    }
+    if preregistration["source_bindings"] != source_bindings:
+        _fail("locked preregistration source bindings differ")
+    if preregistration["safe_validation"] != {
+        "historical_deterministic_core_sha256": (
+            "784a762fd90a65219a233e87df35290ac87c8fe8e4b9024de46564568f633719"
+        ),
+        "approved_deterministic_core_sha256": _mapping(
+            preregistration["safe_validation"], "locked safe validation"
+        ).get("approved_deterministic_core_sha256"),
+        "approved_observational_environment_sha256": _mapping(
+            preregistration["safe_validation"], "locked safe validation"
+        ).get("approved_observational_environment_sha256"),
+    }:
+        _fail("locked preregistration safe validation fields differ")
+    safe = _mapping(preregistration["safe_validation"], "locked safe validation")
+    historical_safe_freeze = _mapping(
+        json.loads(
+            (
+                root / "config/defense/defense-v5-safe-core-freeze.json"
+            ).read_bytes()
+        ),
+        "historical safe-core freeze",
+    )
+    if historical_safe_freeze.get("approved_deterministic_core_sha256") != (
+        "784a762fd90a65219a233e87df35290ac87c8fe8e4b9024de46564568f633719"
+    ):
+        _fail("historical approved safe core differs")
+    for field in (
+        "approved_deterministic_core_sha256",
+        "approved_observational_environment_sha256",
+    ):
+        value = safe[field]
+        if type(value) is not str or len(value) != 64 or any(
+            character not in "0123456789abcdef" for character in value
+        ):
+            _fail("locked approved safe evidence digest differs")
+    if preregistration["closed_run_mode"] != {
+        "mode": "locked_development",
+        "profile": "production",
+        "development_test_seed": 2404,
+        "repeatable": False,
+        "authorization_required": True,
+    }:
+        _fail("locked preregistration closed run mode differs")
+    if preregistration["production_support_plan"] != expected_plan:
+        _fail("locked preregistration support plan differs")
+    if preregistration["frozen_definitions"] != {
+        "controls": protocol["controls"],
+        "calibration": protocol["calibration"],
+        "bootstrap": protocol["bootstrap"],
+        "economics": protocol["economics"],
+        "metric_definitions": protocol["metric_definitions"],
+        "gates": protocol["gates"],
+    }:
+        _fail("locked preregistration frozen definitions differ")
+    storage = _mapping(protocol["locked_artifact_storage"], "locked storage")
+    if preregistration["output_contract"] != {
+        **storage,
+        "candidate_must_be_absent": True,
+        "historical_result_path": protocol["existing_development_result_path"],
+        "historical_result_sha256": protocol[
+            "existing_development_result_sha256"
+        ],
+        "one_time_no_resume_or_retry": True,
+        "legacy_summary_is_not_evidence": True,
+    }:
+        _fail("locked preregistration output/storage contract differs")
+    if preregistration["exact_command"] != (
+        ".venv/bin/python scripts/run_defense_v5_locked_development.py --root . "
+        "--safe-evidence /private/tmp/apar-v5-approved-safe-evidence.json "
+        "--approved-commit HEAD --authorize-exactly-once"
+    ):
+        _fail("locked preregistration exact command differs")
+
+
+def _verify_locked_run_binding(
+    *,
+    binding: Mapping[str, Any],
+    protocol: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    root: Path,
+) -> dict[str, Any]:
+    _exact_fields(
+        binding,
+        {
+            "schema_version",
+            "mode",
+            "profile",
+            "development_test_seed",
+            "source_commit",
+            "source_tree_oid",
+            "preregistration_commit",
+            "preregistration_path",
+            "preregistration_sha256",
+            "base_protocol_sha256",
+            "arm_protocol_sha256",
+            "evidence_protocol_sha256",
+            "implementation_sha256",
+            "catalog_sha256",
+            "support_plan",
+            "candidate_manifest_path",
+            "storage_schema_version",
+            "payload_schema_version",
+            "run_binding_sha256",
+        },
+        "locked run binding",
+    )
+    if (
+        binding["schema_version"] != "apar-sentinel-v5-locked-run-binding/1"
+        or binding["mode"] != "locked_development"
+        or binding["profile"] != "production"
+        or binding["development_test_seed"] != 2404
+    ):
+        _fail("locked run mode/profile/seed differs")
+    if binding["run_binding_sha256"] != _digest(
+        {key: value for key, value in binding.items() if key != "run_binding_sha256"}
+    ):
+        _fail("locked run-binding digest differs")
+    for binding_field, protocol_field in (
+        ("base_protocol_sha256", "base_protocol_sha256"),
+        ("arm_protocol_sha256", "arm_protocol_sha256"),
+        ("evidence_protocol_sha256", "evidence_protocol_sha256"),
+        ("implementation_sha256", "implementation_sha256"),
+    ):
+        if binding[binding_field] != protocol[protocol_field]:
+            _fail(f"locked {binding_field} differs")
+    if binding["catalog_sha256"] != payload["catalog_sha256"]:
+        _fail("locked catalog binding differs")
+    storage = _mapping(protocol["locked_artifact_storage"], "locked storage")
+    if (
+        binding["candidate_manifest_path"] != storage["candidate_manifest_path"]
+        or binding["storage_schema_version"] != storage["schema_version"]
+        or binding["payload_schema_version"]
+        != "apar-sentinel-v5-locked-development-payload/1"
+    ):
+        _fail("locked output/storage schema binding differs")
+    base_path = root / str(protocol["base_protocol_path"])
+    base = _mapping(json.loads(base_path.read_bytes()), "locked base protocol")
+    expected_plan = _independent_locked_support_plan(base)
+    if binding["support_plan"] != expected_plan:
+        _fail("locked production support plan differs")
+    prereg_path = str(binding["preregistration_path"])
+    if prereg_path != (
+        "config/defense/defense-v5-locked-development-preregistration.json"
+    ):
+        _fail("locked preregistration path differs")
+    preregistration_path = root / prereg_path
+    if not preregistration_path.is_file():
+        _fail("locked preregistration is missing")
+    preregistration_bytes = preregistration_path.read_bytes()
+    if hashlib.sha256(preregistration_bytes).hexdigest() != binding[
+        "preregistration_sha256"
+    ]:
+        _fail("locked preregistration digest differs")
+    preregistration = _mapping(
+        json.loads(preregistration_bytes), "locked preregistration"
+    )
+    if (
+        preregistration.get("source_commit") != binding["source_commit"]
+        or preregistration.get("source_tree_oid") != binding["source_tree_oid"]
+        or preregistration.get("production_support_plan") != expected_plan
+    ):
+        _fail("locked preregistration source/support binding differs")
+    _verify_locked_preregistration_document(
+        preregistration=preregistration,
+        protocol=protocol,
+        payload=payload,
+        expected_plan=expected_plan,
+        root=root,
+        source_commit=str(binding["source_commit"]),
+    )
+    source_commit = str(binding["source_commit"])
+    preregistration_commit = str(binding["preregistration_commit"])
+    if _git_value(root, "rev-parse", f"{source_commit}^{{tree}}") != binding[
+        "source_tree_oid"
+    ]:
+        _fail("locked SOURCE tree differs")
+    parents = _git_value(
+        root, "rev-list", "--parents", "-n", "1", preregistration_commit
+    ).split()
+    if len(parents) != 2 or parents[1] != source_commit:
+        _fail("locked PREREGISTRATION is not the single SOURCE child")
+    changed = tuple(
+        line
+        for line in _git_value(
+            root,
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            preregistration_commit,
+        ).splitlines()
+        if line
+    )
+    if changed != (prereg_path,):
+        _fail("locked PREREGISTRATION commit is not manifest-only")
+    return expected_plan
+
+
+def _support_distribution(
+    rows: Sequence[Mapping[str, Any]],
+) -> tuple[int, dict[str, int]]:
+    legitimate = 0
+    fraud: dict[str, int] = {}
+    for row in rows:
+        support = _mapping(row["support"], "locked support row")
+        if support["label"] == 0:
+            legitimate += 1
+        elif support["label"] == 1:
+            family = str(support["family"])
+            fraud[family] = fraud.get(family, 0) + 1
+        else:
+            _fail("locked support label differs")
+    return legitimate, dict(sorted(fraud.items()))
+
+
+def _verify_locked_support(
+    *,
+    expected_plan: Mapping[str, Any],
+    result: Mapping[str, Any],
+    rows: Sequence[Mapping[str, Any]],
+    artifact_count: int,
+) -> None:
+    plans = {
+        str(item["partition"]): _mapping(item, "locked partition plan")
+        for item in _sequence(expected_plan["partitions"], "locked partitions")
+    }
+    development = plans["development_test"]
+    legitimate, fraud = _support_distribution(rows)
+    if (
+        legitimate != development["legitimate_rows"]
+        or fraud != dict(development["fraud_rows_by_family"])
+        or len(rows) != development["total_rows"]
+    ):
+        _fail("locked development-test production support differs")
+    arm_spec = _mapping(result["arm_spec"], "locked arm specification")
+    for partition in _sequence(
+        arm_spec["training_partitions"], "locked training partitions"
+    ):
+        partition = _mapping(partition, "locked training partition")
+        expected = plans[str(partition["partition"])]
+        support_rows = [
+            {"support": item}
+            for item in _sequence(
+                partition["support_records"], "locked training support"
+            )
+        ]
+        legitimate, fraud = _support_distribution(support_rows)
+        if (
+            legitimate != expected["legitimate_rows"]
+            or fraud != dict(expected["fraud_rows_by_family"])
+            or len(support_rows) != expected["total_rows"]
+        ):
+            _fail(f"locked {partition['partition']} production support differs")
+    if artifact_count != expected_plan["retained_execution_artifacts"]:
+        _fail("locked retained execution artifact count differs")
+
+
+def _verify_locked_protocol(
+    payload: Mapping[str, Any], root: Path
+) -> dict[str, Any]:
+    proxy = dict(payload)
+    proxy["safe_seed"] = 404
+    protocol = _verify_protocol(proxy, root)
+    base = _mapping(
+        json.loads((root / str(protocol["base_protocol_path"])).read_bytes()),
+        "locked base protocol",
+    )
+    if _mapping(base["seeds"], "locked seeds")["development_test"] != 2404:
+        _fail("locked base protocol seed differs from 2404")
+    protocol["_base_protocol_sha256"] = _digest(base)
+    return protocol
+
+
+def _verify_locked_payload_document(
+    payload: Mapping[str, Any], *, root: Path
+) -> dict[str, object]:
+    protocol = _verify_locked_protocol(payload, root)
+    binding = _mapping(payload["run_binding"], "locked run binding")
+    expected_plan = _verify_locked_run_binding(
+        binding=binding,
+        protocol=protocol,
+        payload=payload,
+        root=root,
+    )
+    packed_artifacts = _sequence(
+        payload["execution_artifact_pool"], "locked execution artifact pool"
+    )
+    if not 1 <= len(packed_artifacts) <= 4_096:
+        _fail("locked execution artifact pool count exceeds bound")
+    artifact_pool: dict[str, dict[str, Any]] = {}
+    aggregate_artifact_bytes = 0
+    for item in packed_artifacts:
+        packed = _mapping(item, "locked packed execution artifact")
+        artifact = _unpack_document(
+            packed,
+            expected_kind="execution_artifact",
+            max_uncompressed_bytes=16_777_216,
+        )
+        evidence_id = artifact.get("evidence_sha256")
+        if type(evidence_id) is not str or evidence_id in artifact_pool:
+            _fail("locked execution artifact identifiers differ")
+        artifact_pool[evidence_id] = artifact
+        aggregate_artifact_bytes += int(packed["uncompressed_bytes"])
+    if aggregate_artifact_bytes > 1_073_741_824:
+        _fail("locked execution artifact pool exceeds production bound")
+    results: list[dict[str, Any]] = []
+    retained_results: list[dict[str, Any]] = []
+    used_artifact_ids: set[str] = set()
+    for item in _sequence(payload["arm_results"], "locked arm results"):
+        retained = _unpack_document(item, expected_kind="arm_result")
+        retained_results.append(retained)
+        expanded, used = _expand_retained_result(retained, artifact_pool)
+        results.append(expanded)
+        used_artifact_ids.update(used)
+    if used_artifact_ids != set(artifact_pool):
+        _fail("locked artifact pool contains cherry-picked support")
+    complete = [
+        _unpack_document(item, expected_kind="complete_metrics")
+        for item in _sequence(payload["complete_metrics"], "locked complete metrics")
+    ]
+    if [item["arm"] for item in results] != list(_ARMS) or [
+        item["arm"] for item in complete
+    ] != list(_ARMS):
+        _fail("locked payload does not contain exact ordered four arms")
+    verified_rows: list[list[dict[str, Any]]] = []
+    verified_manifests: list[dict[str, dict[str, Any]]] = []
+    for result in results:
+        rows, _artifacts, manifests = _verify_arm_result(
+            result, str(payload["catalog_sha256"]), protocol
+        )
+        verified_rows.append(rows)
+        verified_manifests.append(manifests)
+    reference_support = [row["support"] for row in verified_rows[0]]
+    reference_features = [row["catalog_feature_values"] for row in verified_rows[0]]
+    for rows in verified_rows[1:]:
+        if [row["support"] for row in rows] != reference_support or [
+            row["catalog_feature_values"] for row in rows
+        ] != reference_features:
+            _fail("locked arms use different ordered support/features")
+    if any(
+        manifests != verified_manifests[0]
+        for manifests in verified_manifests[1:]
+    ):
+        _fail("locked arms retain different execution artifacts")
+    _verify_locked_support(
+        expected_plan=expected_plan,
+        result=results[0],
+        rows=verified_rows[0],
+        artifact_count=len(artifact_pool),
+    )
+    for result, metrics, rows, manifests in zip(
+        results, complete, verified_rows, verified_manifests, strict=True
+    ):
+        _verify_complete_metrics(metrics, result=result, rows=rows, manifests=manifests)
+    controls = _unpack_document(
+        payload["controls"], expected_kind="executed_controls"
+    )
+    _verify_controls(
+        controls,
+        protocol=protocol,
+        support_ids=[str(item["event_id"]) for item in reference_support],
+        execution_manifests=verified_manifests[0],
+        reference_rows=verified_rows[0],
+    )
+    readiness = _mapping(payload["readiness"], "locked readiness")
+    _verify_readiness(readiness, complete_metrics=complete[-1], controls=controls)
+    core_binding = _mapping(
+        payload["deterministic_core"], "locked deterministic core binding"
+    )
+    _exact_fields(
+        core_binding,
+        {"schema_version", "exclusion_schema", "core_sha256"},
+        "locked deterministic core binding",
+    )
+    if core_binding["schema_version"] != (
+        "apar-sentinel-v5-locked-deterministic-core/1"
+    ):
+        _fail("locked deterministic core schema differs")
+    if core_binding["exclusion_schema"] != json.loads(
+        _canonical_bytes(_DETERMINISTIC_CORE_EXCLUSION_SCHEMA)
+    ):
+        _fail("locked deterministic core exclusion schema differs")
+    core_document = _independent_locked_core_document(
+        payload=payload,
+        artifacts=list(artifact_pool.values()),
+        retained_results=retained_results,
+        complete=complete,
+        controls=controls,
+        readiness=readiness,
+    )
+    core_sha256 = _digest(core_document)
+    if core_binding["core_sha256"] != core_sha256:
+        _fail("locked deterministic core digest differs")
+    observational = _unpack_document(
+        payload["observational_latency"], expected_kind="observational_latency"
+    )
+    expected_observational = _independent_observational_document(
+        core_sha256=core_sha256,
+        retained_results=retained_results,
+        complete=complete,
+        controls=controls,
+        readiness=readiness,
+    )
+    if observational != expected_observational:
+        _fail("locked observational latency evidence differs")
+    return {
+        "verified": True,
+        "run_mode": "locked_development",
+        "profile": "production",
+        "development_test_seed": 2404,
+        "status": readiness["status"],
+        "arm_count": 4,
+        "support_count": len(reference_support),
+        "payload_sha256": payload["payload_sha256"],
+        "deterministic_core_sha256": core_sha256,
+        "observational_latency_sha256": observational[
+            "observational_latency_sha256"
+        ],
+        "observational_environment_sha256": observational["environment_sha256"],
+        "run_binding_sha256": binding["run_binding_sha256"],
+        "support_plan_sha256": expected_plan["support_plan_sha256"],
+        "evidence_protocol_sha256": protocol["evidence_protocol_sha256"],
+        "base_protocol_sha256": protocol["base_protocol_sha256"],
+        "arm_protocol_sha256": protocol["arm_protocol_sha256"],
+        "implementation_sha256": protocol["implementation_sha256"],
+        "catalog_sha256": payload["catalog_sha256"],
+    }
+
+
+def read_locked_evidence_storage_bytes(
+    *,
+    target_manifest: Path,
+    chunk_size_bytes: int,
+    maximum_envelope_bytes: int,
+    maximum_chunk_count: int,
+    normal_git_blob_limit_bytes: int,
+) -> bytes:
+    """Independently authenticate and reconstruct a manifest-last artifact."""
+    target_manifest = target_manifest.absolute()
+    try:
+        manifest_metadata = target_manifest.lstat()
+    except OSError as error:
+        raise IndependentVerificationError("locked storage manifest is missing") from error
+    if (
+        not stat.S_ISREG(manifest_metadata.st_mode)
+        or manifest_metadata.st_nlink != 1
+        or manifest_metadata.st_size > 1_048_576
+    ):
+        _fail("locked storage manifest topology/size differs")
+    raw_manifest = target_manifest.read_bytes()
+    try:
+        manifest = _mapping(json.loads(raw_manifest), "locked storage manifest")
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise IndependentVerificationError("locked storage manifest is not JSON") from error
+    if raw_manifest != _canonical_bytes(manifest):
+        _fail("locked storage manifest is not canonical JSON")
+    _exact_fields(
+        manifest,
+        {
+            "schema_version",
+            "content_encoding",
+            "publication",
+            "chunks_directory",
+            "chunk_size_bytes",
+            "maximum_envelope_bytes",
+            "maximum_chunk_count",
+            "normal_git_blob_limit_bytes",
+            "payload_sha256",
+            "payload_bytes",
+            "run_binding_sha256",
+            "start_receipt",
+            "completion_receipt",
+            "chunks",
+            "manifest_sha256",
+        },
+        "locked storage manifest",
+    )
+    if (
+        manifest["schema_version"] != "apar-sentinel-v5-chunked-evidence/1"
+        or manifest["content_encoding"] != "opaque-locked-evidence-bytes"
+        or manifest["publication"]
+        != "content_chunks_then_atomic_exclusive_manifest"
+    ):
+        _fail("locked storage schema/publication differs")
+    if manifest["manifest_sha256"] != _digest(
+        {key: value for key, value in manifest.items() if key != "manifest_sha256"}
+    ):
+        _fail("locked storage manifest digest differs")
+    if (
+        manifest["chunk_size_bytes"] != chunk_size_bytes
+        or manifest["maximum_envelope_bytes"] != maximum_envelope_bytes
+        or manifest["maximum_chunk_count"] != maximum_chunk_count
+        or manifest["normal_git_blob_limit_bytes"] != normal_git_blob_limit_bytes
+        or not 0 < chunk_size_bytes < normal_git_blob_limit_bytes
+    ):
+        _fail("locked storage limits differ")
+    chunks = _sequence(manifest["chunks"], "locked storage chunks")
+    if not 0 < len(chunks) <= maximum_chunk_count:
+        _fail("locked storage chunk count differs")
+    expected_names = [f"part-{index:04d}.bin" for index in range(len(chunks))]
+    for index, raw_chunk in enumerate(chunks):
+        chunk = _mapping(raw_chunk, "locked storage chunk")
+        _exact_fields(chunk, {"index", "filename", "bytes", "sha256"}, "chunk")
+        if chunk["index"] != index or chunk["filename"] != expected_names[index]:
+            _fail("locked storage chunk order differs")
+        if (
+            type(chunk["bytes"]) is not int
+            or not 0 < chunk["bytes"] <= chunk_size_bytes
+            or (index < len(chunks) - 1 and chunk["bytes"] != chunk_size_bytes)
+        ):
+            _fail("locked storage chunk size differs")
+    chunks_name = manifest["chunks_directory"]
+    if chunks_name != f"{target_manifest.name}.chunks":
+        _fail("locked storage chunk directory name differs")
+    chunks_directory = target_manifest.parent / str(chunks_name)
+    try:
+        directory_metadata = chunks_directory.lstat()
+    except OSError as error:
+        raise IndependentVerificationError("locked storage chunk directory is missing") from error
+    if not stat.S_ISDIR(directory_metadata.st_mode):
+        _fail("locked storage chunk directory topology differs")
+    if {path.name for path in chunks_directory.iterdir()} != set(expected_names):
+        _fail("locked storage chunk set differs")
+    content = bytearray()
+    for raw_chunk in chunks:
+        chunk = _mapping(raw_chunk, "locked storage chunk")
+        path = chunks_directory / str(chunk["filename"])
+        try:
+            metadata = path.lstat()
+        except OSError as error:
+            raise IndependentVerificationError("locked storage chunk is missing") from error
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_size != chunk["bytes"]
+        ):
+            _fail("locked storage chunk topology/size differs")
+        raw = path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != chunk["sha256"]:
+            _fail("locked storage chunk digest differs")
+        content.extend(raw)
+        if len(content) > maximum_envelope_bytes:
+            _fail("locked storage payload exceeds the maximum envelope")
+    payload = bytes(content)
+    if (
+        manifest["payload_bytes"] != len(payload)
+        or manifest["payload_sha256"] != hashlib.sha256(payload).hexdigest()
+    ):
+        _fail("locked storage payload digest/size differs")
+    start = _mapping(manifest["start_receipt"], "locked start receipt")
+    completion = _mapping(
+        manifest["completion_receipt"], "locked completion receipt"
+    )
+    if start.get("receipt_sha256") != _digest(
+        {key: value for key, value in start.items() if key != "receipt_sha256"}
+    ):
+        _fail("locked start receipt digest differs")
+    if completion.get("receipt_sha256") != _digest(
+        {key: value for key, value in completion.items() if key != "receipt_sha256"}
+    ):
+        _fail("locked completion receipt digest differs")
+    if (
+        start.get("run_binding_sha256") != manifest["run_binding_sha256"]
+        or completion.get("start_receipt_sha256") != start.get("receipt_sha256")
+        or completion.get("payload_sha256") != manifest["payload_sha256"]
+        or completion.get("payload_bytes") != manifest["payload_bytes"]
+    ):
+        _fail("locked storage receipt lineage differs")
+    return payload
+
+
 __all__ = [
     "IndependentVerificationError",
+    "read_locked_evidence_storage_bytes",
     "verify_evidence_bytes",
+    "verify_locked_evidence_payload_bytes",
 ]

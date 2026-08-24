@@ -55,7 +55,6 @@
     "src/apar/features/parity.py",
     "src/apar/features/sentinel.py",
     "src/apar/features/state.py",
-    "src/apar/generators/Population.py",
     "src/apar/generators/__init__.py",
     "src/apar/generators/campaigns.py",
     "src/apar/generators/population.py",

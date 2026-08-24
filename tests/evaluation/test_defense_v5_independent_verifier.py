@@ -389,8 +389,11 @@ def test_independent_verifier_has_a_static_production_import_boundary() -> None:
         "apar.evaluation.v5_evaluation",
         "apar.evaluation.v5_evidence_bundle",
         "apar.evaluation.v5_evidence_layers",
+        "apar.evaluation.v5_evidence_storage",
+        "apar.evaluation.v5_locked_evidence",
         "apar.evaluation.v5_metrics",
         "apar.evaluation.v5_population",
+        "apar.evaluation.v5_run_mode",
         "apar.simulator",
         "apar.trust",
     )

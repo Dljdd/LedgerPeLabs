@@ -156,9 +156,21 @@ def _canonical_digest(document: object) -> str:
     ).hexdigest()
 
 
+def _canonical_v5_source_path(path: Path) -> Path:
+    """Return the directory entry's real casing for an existing source path."""
+    resolved = path.resolve()
+    try:
+        for candidate in path.parent.iterdir():
+            if candidate.samefile(resolved):
+                return candidate.resolve()
+    except OSError as error:
+        raise ValueError(f"cannot canonicalize v5 source path: {path}") from error
+    raise ValueError(f"cannot canonicalize v5 source path: {path}")
+
+
 def _module_name_for_v5_source(root: Path, source_path: Path) -> str | None:
     package_root = (root / _V5_FIRST_PARTY_PACKAGE_ROOT).resolve()
-    resolved = source_path.resolve()
+    resolved = _canonical_v5_source_path(source_path)
     if not resolved.is_relative_to(package_root) or source_path.suffix != ".py":
         return None
     relative = resolved.relative_to((root / "src").resolve()).with_suffix("")
@@ -209,7 +221,10 @@ def _resolve_v5_first_party_module(
     if any(not path.resolve().is_relative_to(package_root) for path in paths):
         raise ValueError("first-party implementation import escaped its allowed root")
     return tuple(
-        sorted(path.resolve().relative_to(root).as_posix() for path in paths)
+        sorted(
+            _canonical_v5_source_path(path).relative_to(root).as_posix()
+            for path in paths
+        )
     )
 
 

@@ -245,7 +245,7 @@ _score_and_evaluate = _score_all_arms_and_evaluate
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--profile", choices=["smoke", "production"], required=True)
+    parser.add_argument("--profile", choices=["smoke"], required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 

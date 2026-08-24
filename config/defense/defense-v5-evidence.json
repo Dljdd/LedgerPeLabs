@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.0.0",
+  "schema_version": "1.1.0",
   "protocol_id": "apar-sentinel-v5-development-evidence",
   "base_protocol_path": "config/defense/defense-v5-development.json",
   "arm_protocol_path": "config/defense/defense-v5-arms.json",
@@ -134,15 +134,48 @@
     "max_bootstrap_replicates": 10000,
     "max_serialized_evidence_bytes": 536870912
   },
+  "run_modes": {
+    "safe_validation": {
+      "profile": "smoke",
+      "development_test_seed": 404,
+      "repeatable": true,
+      "authorization_required": false
+    },
+    "locked_development": {
+      "profile": "production",
+      "development_test_seed": 2404,
+      "repeatable": false,
+      "authorization_required": true
+    }
+  },
+  "locked_artifact_storage": {
+    "schema_version": "apar-sentinel-v5-chunked-evidence/1",
+    "candidate_manifest_path": "docs/experiments/defense-v5-locked-development-candidate.manifest.json",
+    "judge_summary_path": "docs/experiments/defense-v5-locked-development-summary.json",
+    "chunk_size_bytes": 67108864,
+    "expected_envelope_upper_bound_bytes": 805306368,
+    "maximum_envelope_bytes": 1073741824,
+    "maximum_chunk_count": 16,
+    "normal_git_blob_limit_bytes": 104857600,
+    "publication": "content_chunks_then_atomic_exclusive_manifest"
+  },
   "implementation_paths": [
     "scripts/build_defense_v5_safe_evidence.py",
+    "scripts/run_defense_v5_development.py",
+    "scripts/run_defense_v5_locked_development.py",
+    "scripts/v5_complete_evidence_execution.py",
     "scripts/verify_defense_v5_evidence.py",
+    "scripts/verify_defense_v5_locked_evidence.py",
+    "scripts/verify_defense_v5_locked_preexecution.py",
     "scripts/verify_defense_v5_preexecution.py",
     "src/apar/evaluation/v5_controls.py",
     "src/apar/evaluation/v5_evidence_bundle.py",
     "src/apar/evaluation/v5_evidence_layers.py",
     "src/apar/evaluation/v5_evidence_protocol.py",
+    "src/apar/evaluation/v5_evidence_storage.py",
+    "src/apar/evaluation/v5_locked_evidence.py",
     "src/apar/evaluation/v5_metrics.py",
+    "src/apar/evaluation/v5_run_mode.py",
     "src/apar/v5_independent_verifier.py"
   ]
 }

@@ -816,53 +816,70 @@ Record:
 - a clean tracked worktree.
 
 Commit behavior, source, tests, and documentation as the SOURCE commit. Build
-and independently verify two safe artifacts at that clean commit. Then add only
-`config/defense/defense-v5-safe-core-freeze.json` in its direct child FREEZE
-commit. The one-time pre-execution audit command is:
+and independently verify two safe artifacts at that clean commit. They must
+share a deterministic core while retaining authentic, independently verified
+observational latency. Then add only
+`config/defense/defense-v5-locked-development-preregistration.json` in the
+direct child PREREGISTRATION commit. The one-time pre-execution audit command
+is:
 
 ```bash
-.venv/bin/python scripts/verify_defense_v5_preexecution.py \
+.venv/bin/python scripts/verify_defense_v5_locked_preexecution.py \
   --root . \
-  --safe-evidence /private/tmp/apar-v5-safe-404.json \
-  --approved-commit <exact-40-character-FREEZE-commit>
+  --safe-evidence /private/tmp/apar-v5-approved-safe-evidence.json \
+  --approved-commit HEAD
 ```
 
-The audit must reject any other deterministic core or any non-manifest change
-in the FREEZE commit. It may accept fresh, independently verified latency
-observations from the pinned environment because latency is not the safe-core
-commitment.
+The audit must reject any other deterministic core, non-manifest change,
+descendant HEAD, changed SOURCE mode/content, changed historical result,
+existing candidate/chunks/summary, altered production support, or changed
+protocol/config/catalog/verifier binding. It may accept fresh, independently
+verified latency observations from the pinned environment because latency is
+not the safe-core commitment. It must report seed `404` as the only executed
+seed and seed `2404` as asserted only.
 
 Do not edit model, thresholds, targets, or population parameters after reading the production development-test result. If a genuine execution bug occurs, preserve the failed result outside the canonical path, add a failing regression test, fix the bug, and rerun the entire development experiment with a new explicitly recorded attempt ID.
 
 ### Step 4: Execute the production development run
 
 ```bash
-uv run --python 3.12.5 --with-editable . --extra dev \
-  python scripts/run_defense_v5_development.py \
-  --profile production \
-  --output docs/experiments/defense-v5-development-result.json
+.venv/bin/python scripts/run_defense_v5_locked_development.py \
+  --root . \
+  --safe-evidence /private/tmp/apar-v5-approved-safe-evidence.json \
+  --approved-commit HEAD \
+  --authorize-exactly-once
 ```
 
-This command is a development run only. It must not invoke a hidden/sealed/confirmatory runner.
+This exact command is a development run only. It must not be executed while
+building the SOURCE or PREREGISTRATION commits. It has no arbitrary seed,
+profile, output, retry, or resume surface. It writes chunks followed by exactly
+one exclusive candidate manifest at
+`docs/experiments/defense-v5-locked-development-candidate.manifest.json`; it
+never writes or replaces the historical result.
 
 ### Step 5: Independently verify the result
 
 ```bash
-uv run --python 3.12.5 --with-editable . --extra dev \
-  python scripts/verify_defense_v5_readiness.py \
-  docs/experiments/defense-v5-development-result.json
+.venv/bin/python scripts/verify_defense_v5_locked_evidence.py \
+  --root . \
+  docs/experiments/defense-v5-locked-development-candidate.manifest.json
 ```
 
-Accept `development_not_ready` or `invalid_corpus` as honest outcomes. Do not change thresholds, targets, labels, seeds, or verdict logic to obtain `development_ready`.
+The verifier reconstructs the bounded chunked payload and independently
+recomputes support, lineage, arms, controls, metrics, economics, calibration,
+bootstrap intervals, deterministic core, observational latency, and readiness.
+Accept `development_not_ready` or an invalid result as honest outcomes. Do not
+change thresholds, targets, labels, seeds, or verdict logic to obtain
+`development_ready`.
 
 ### Step 6: Commit raw development evidence unchanged
 
-```bash
-git add docs/experiments/defense-v5-development-result.json
-git -c user.name="Dylan Moraes" \
-  -c user.email="dylanmoraesdljdd@gmail.com" \
-  commit -m "test: preserve sentinel v5 development evidence"
-```
+Do not commit a monolithic payload. Preserve the manifest and its ordered
+64 MiB chunks according to the preregistered durability contract, verify every
+chunk remains below 100 MiB and the complete payload remains below 1 GiB, and
+only then create a separate compact judge-facing summary. No summary claim may
+exist before the raw candidate has been durably published and independently
+verified.
 
 ---
 

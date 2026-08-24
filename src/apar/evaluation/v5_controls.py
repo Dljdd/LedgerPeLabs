@@ -34,6 +34,7 @@ from apar.evaluation.v5_evaluation import (
 from apar.evaluation.v5_evidence_protocol import V5EvidenceProtocol, V5MetricApplicability
 from apar.evaluation.v5_population import V5Corpus, V5DecisionRow, V5ExecutionManifest
 from apar.evaluation.v5_protocol import V5DevelopmentProtocol
+from apar.evaluation.v5_run_mode import V5RunMode, resolve_v5_run_mode
 from apar.features.sentinel import (
     SentinelFeatureBatch,
     SentinelFeatureCatalog,
@@ -1245,6 +1246,32 @@ def _single_class_control(
     )
 
 
+def validate_v5_control_run_mode(
+    *,
+    protocol: V5DevelopmentProtocol,
+    evidence_protocol: V5EvidenceProtocol,
+    mode: V5RunMode,
+) -> None:
+    """Reject every seed/profile combination outside the two closed modes."""
+    binding = resolve_v5_run_mode(
+        mode=mode,
+        evidence_protocol=evidence_protocol,
+        development_protocol=(
+            protocol
+            if protocol.seeds.development_test == 2404
+            else protocol.model_copy(
+                update={
+                    "seeds": protocol.seeds.model_copy(
+                        update={"development_test": 2404}
+                    )
+                }
+            )
+        ),
+    )
+    if protocol.seeds.development_test != binding.development_test_seed:
+        raise ValueError("executed-control seed differs from its closed run mode")
+
+
 def execute_v5_controls(
     *,
     protocol: V5DevelopmentProtocol,
@@ -1252,12 +1279,14 @@ def execute_v5_controls(
     corpus: V5Corpus,
     catalog: SentinelFeatureCatalog,
     configuration: V5ArmConfiguration,
+    mode: V5RunMode = V5RunMode.SAFE_VALIDATION,
 ) -> V5ExecutedControlSuite:
-    """Execute every frozen control against real safe-seed evidence."""
-    if protocol.seeds.development_test != evidence_protocol.safe_development_test_seed:
-        raise ValueError("executed controls require the frozen safe development-test seed")
-    if int(protocol.seeds.development_test) == int(evidence_protocol.locked_development_test_seed):
-        raise ValueError("executed controls cannot use the locked development-test seed")
+    """Execute every frozen control against one exact closed run mode."""
+    validate_v5_control_run_mode(
+        protocol=protocol,
+        evidence_protocol=evidence_protocol,
+        mode=mode,
+    )
     runtime = _build_runtime(
         protocol=protocol,
         corpus=corpus,
@@ -1353,4 +1382,5 @@ __all__ = [
     "V5ExecutedControlResult",
     "V5ExecutedControlSuite",
     "execute_v5_controls",
+    "validate_v5_control_run_mode",
 ]
