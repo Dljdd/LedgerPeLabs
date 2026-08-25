@@ -181,6 +181,31 @@ def test_notebooks_use_owner_namespaced_kaggle_mounts(tmp_path: Path) -> None:
             )
 
 
+def test_notebooks_use_kaggle_extracted_source_tree(tmp_path: Path) -> None:
+    """Catch attempts to reopen an archive Kaggle has materialized as a directory."""
+
+    first = _generate(tmp_path / "notebooks")[0]
+    bootstrap = _cell_sources(_load_notebook(first.notebook_path))[0]
+    namespace: dict[str, object] = {"Path": Path}
+    tree = ast.parse(bootstrap)
+    assignments = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id
+        in {"DATASET_INPUT_ROOT", "SOURCE_INPUT", "EXTRACT_ROOT", "SOURCE_ROOT"}
+    ]
+    exec(
+        compile(ast.Module(assignments, type_ignores=[]), "<source-root>", "exec"),
+        namespace,
+    )
+    assert namespace["SOURCE_ROOT"] == Path(
+        "/kaggle/input/datasets/dylanmoraes/apar-sentinel-v5-source3/"
+        "apar-v5-source3/apar-v5-source"
+    )
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

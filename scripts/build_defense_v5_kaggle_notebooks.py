@@ -63,7 +63,6 @@ import hashlib
 import json
 import os
 import sys
-import tarfile
 from pathlib import Path, PurePosixPath
 
 
@@ -112,13 +111,12 @@ SAFE_MANIFEST = _manifest(
     schema="apar-sentinel-v5-kaggle-execution-input/1",
 )
 
-SOURCE_ARCHIVE = SOURCE_INPUT / "apar-v5-source3.tar.gz"
 SAFE_EVIDENCE = SAFE_INPUT / "safe-evidence.json"
 if (
-    SOURCE_MANIFEST.get("artifact_name") != SOURCE_ARCHIVE.name
-    or SOURCE_MANIFEST.get("artifact_sha256") != _sha256(SOURCE_ARCHIVE)
+    SOURCE_MANIFEST.get("artifact_name") != "apar-v5-source3.tar.gz"
+    or not isinstance(SOURCE_MANIFEST.get("artifact_sha256"), str)
 ):
-    raise RuntimeError("source archive binding differs")
+    raise RuntimeError("source artifact binding differs")
 if (
     SAFE_MANIFEST.get("artifact_name") != SAFE_EVIDENCE.name
     or SAFE_MANIFEST.get("artifact_sha256") != _sha256(SAFE_EVIDENCE)
@@ -138,26 +136,42 @@ for entry in wheel_entries:
     ):
         raise RuntimeError("wheelhouse file binding differs")
 
-EXTRACT_ROOT = Path("/kaggle/working/apar-v5-source-extract")
-if EXTRACT_ROOT.exists():
-    raise RuntimeError("source extraction root already exists")
-EXTRACT_ROOT.mkdir(parents=True, mode=0o700)
-with tarfile.open(SOURCE_ARCHIVE, "r:gz") as archive:
-    members = archive.getmembers()
-    if not members:
-        raise RuntimeError("source archive is empty")
-    for member in members:
-        relative = PurePosixPath(member.name)
-        if (
-            relative.is_absolute()
-            or ".." in relative.parts
-            or relative.parts[0] != "apar-v5-source"
-        ):
-            raise RuntimeError("source archive path is unsafe")
-        if not (member.isfile() or member.isdir()):
-            raise RuntimeError("source archive contains a non-file entry")
-    archive.extractall(EXTRACT_ROOT, members=members, filter="data")
-SOURCE_ROOT = EXTRACT_ROOT / "apar-v5-source"
+SOURCE_ROOT = SOURCE_INPUT / "apar-v5-source3" / "apar-v5-source"
+source_entries = SOURCE_MANIFEST.get("files")
+if not SOURCE_ROOT.is_dir() or not isinstance(source_entries, list) or not source_entries:
+    raise RuntimeError("materialized source tree is absent")
+expected_source_paths: set[str] = set()
+for entry in source_entries:
+    if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+        raise RuntimeError("source manifest entry is malformed")
+    source_name = entry["path"]
+    relative = PurePosixPath(source_name)
+    if (
+        not source_name
+        or relative.is_absolute()
+        or ".." in relative.parts
+        or "\\\\" in source_name
+        or relative.as_posix() != source_name
+        or source_name in expected_source_paths
+    ):
+        raise RuntimeError("source manifest path is unsafe")
+    source_file = SOURCE_ROOT.joinpath(*relative.parts)
+    if (
+        source_file.is_symlink()
+        or not source_file.is_file()
+        or entry.get("size_bytes") != source_file.stat().st_size
+        or entry.get("sha256") != _sha256(source_file)
+    ):
+        raise RuntimeError("materialized source file binding differs")
+    expected_source_paths.add(source_name)
+actual_source_paths: set[str] = set()
+for source_file in SOURCE_ROOT.rglob("*"):
+    if source_file.is_symlink() or not (source_file.is_file() or source_file.is_dir()):
+        raise RuntimeError("materialized source tree contains an unsafe entry")
+    if source_file.is_file():
+        actual_source_paths.add(source_file.relative_to(SOURCE_ROOT).as_posix())
+if actual_source_paths != expected_source_paths:
+    raise RuntimeError("materialized source tree differs")
 if not (SOURCE_ROOT / "scripts/run_defense_v5_kaggle_stage.py").is_file():
     raise RuntimeError("closed stage entrypoint is absent")
 
@@ -182,7 +196,9 @@ os.environ.update(
         "APAR_V5_DEPENDENCY_MANIFEST_SHA256": hashlib.sha256(
             (WHEELHOUSE_INPUT / "wheelhouse-manifest.json").read_bytes()
         ).hexdigest(),
-        "APAR_V5_SOURCE_ARCHIVE_SHA256": _sha256(SOURCE_ARCHIVE),
+        "APAR_V5_SOURCE_ARCHIVE_SHA256": str(
+            SOURCE_MANIFEST.get("artifact_sha256")
+        ),
         "APAR_V5_SOURCE_MANIFEST_PATH": str(
             SOURCE_INPUT / "source-manifest.json"
         ),
