@@ -215,6 +215,38 @@ def test_capacity_support_plan_is_production_sized_without_population_execution(
     assert capacity.retained_execution_payload_estimate_bytes == 608_083_936
 
 
+def test_support_plan_label_split_matches_executed_ground_truth(
+    safe_smoke_corpus: V5Corpus,
+) -> None:
+    """The static production plan must count benign controls emitted by attack campaigns."""
+    protocol = load_v5_development_protocol(
+        ROOT / "config/defense/defense-v5-development.json"
+    )
+    support = build_v5_kaggle_support_plan(
+        root=ROOT,
+        protocol=_protocol(),
+        mode=V5KaggleMode.CAPACITY_VALIDATION,
+    ).partitions[-1]
+    smoke = safe_smoke_corpus.partitions["development_test"]
+
+    expected_fraud: dict[str, int] = {}
+    expected_campaign_controls = 0
+    for family, production_campaigns in sorted(
+        protocol.production_dev_test_campaigns_per_family.items()
+    ):
+        smoke_campaigns = protocol.smoke_profile.campaigns_per_family[family]
+        family_rows = tuple(row for row in smoke.decisions if row.family == family)
+        fraud_per_campaign = sum(row.is_fraud for row in family_rows) // smoke_campaigns
+        benign_per_campaign = sum(not row.is_fraud for row in family_rows) // smoke_campaigns
+        expected_fraud[family] = fraud_per_campaign * production_campaigns
+        expected_campaign_controls += benign_per_campaign * production_campaigns
+
+    assert dict(support.fraud_rows_by_family) == expected_fraud
+    assert support.legitimate_rows == (
+        protocol.production_dev_test_legitimate + expected_campaign_controls
+    )
+
+
 def test_authorization_capability_emits_one_canonical_closed_record() -> None:
     """Stage 00 must bind mode, support, source, recovery, and attempt authority."""
     protocol = _protocol()

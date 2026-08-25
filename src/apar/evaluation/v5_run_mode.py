@@ -222,6 +222,12 @@ _FAMILY_EVENT_ROWS = {
     "card_testing_cnp": 26,
     "synthetic_merchant_refund": 46,
 }
+_FAMILY_FRAUD_EVENT_ROWS = {
+    "agentic_intent_abuse": 23,
+    "app_scam_mule": 24,
+    "card_testing_cnp": 17,
+    "synthetic_merchant_refund": 34,
+}
 _FAMILY_ARTIFACT_ESTIMATES = {
     "agentic_intent_abuse": 365_536,
     "app_scam_mule": 140_768,
@@ -271,7 +277,7 @@ def build_v5_run_support_plan(
         raise ValueError("production campaign plan differs across frozen fields")
     partitions: list[V5PartitionSupportPlan] = []
     for partition in _RETAINED_PARTITIONS:
-        legitimate = (
+        operational_legitimate = (
             development_protocol.production_dev_test_legitimate
             if mode is V5RunMode.LOCKED_DEVELOPMENT
             and partition == "development_test"
@@ -279,11 +285,17 @@ def build_v5_run_support_plan(
         )
         campaigns = counts.campaigns_per_family
         fraud = tuple(
-            (family, campaigns[family] * event_rows)
-            for family, event_rows in sorted(_FAMILY_EVENT_ROWS.items())
+            (family, campaigns[family] * fraud_rows)
+            for family, fraud_rows in sorted(_FAMILY_FRAUD_EVENT_ROWS.items())
         )
+        campaign_controls = sum(
+            campaigns[family]
+            * (_FAMILY_EVENT_ROWS[family] - _FAMILY_FRAUD_EVENT_ROWS[family])
+            for family in _FAMILY_EVENT_ROWS
+        )
+        legitimate = operational_legitimate + campaign_controls
         legitimate_artifacts, legitimate_estimate = _legitimate_artifact_plan(
-            legitimate
+            operational_legitimate
         )
         fraud_artifacts = sum(campaigns.values())
         fraud_estimate = sum(

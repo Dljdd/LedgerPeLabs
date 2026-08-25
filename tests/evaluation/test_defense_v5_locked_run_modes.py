@@ -151,10 +151,10 @@ def test_locked_support_plan_is_exact_without_executing_population() -> None:
         development_protocol=development,
     )
     expected = {
-        "train": (12_500, 25_800, 533),
-        "calibration": (12_500, 25_800, 533),
-        "threshold": (12_500, 25_800, 533),
-        "development_test": (50_000, 63_300, 924),
+        "train": (16_000, 25_800, 533),
+        "calibration": (16_000, 25_800, 533),
+        "threshold": (16_000, 25_800, 533),
+        "development_test": (53_500, 63_300, 924),
     }
     assert {
         partition.partition: (
@@ -166,10 +166,10 @@ def test_locked_support_plan_is_exact_without_executing_population() -> None:
     } == expected
     development_test = plan.partitions[-1]
     assert dict(development_test.fraud_rows_by_family) == {
-        "agentic_intent_abuse": 2_500,
-        "app_scam_mule": 3_600,
-        "card_testing_cnp": 2_600,
-        "synthetic_merchant_refund": 4_600,
+        "agentic_intent_abuse": 2_300,
+        "app_scam_mule": 2_400,
+        "card_testing_cnp": 1_700,
+        "synthetic_merchant_refund": 3_400,
     }
     assert plan.retained_execution_artifacts == 2_523
     assert plan.retained_execution_payload_estimate_bytes == 608_083_936
