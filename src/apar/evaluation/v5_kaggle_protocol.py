@@ -187,7 +187,7 @@ class V5KagglePrivateInputs(_FrozenModel):
 class V5KaggleExecutionManifest(_FrozenModel):
     """Closed private-input authority selecting capacity or locked execution."""
 
-    schema_version: Literal["apar-sentinel-v5-kaggle-execution-input/1"]
+    schema_version: Literal["apar-sentinel-v5-kaggle-execution-input/2"]
     execution_mode: V5KaggleMode
     profile: Literal["production"]
     development_test_seed: int = Field(gt=0)
@@ -201,6 +201,10 @@ class V5KaggleExecutionManifest(_FrozenModel):
     artifact_name: Literal["safe-evidence.json"]
     artifact_size_bytes: int = Field(gt=0)
     artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    safe_deterministic_core_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    safe_observational_environment_sha256: str = Field(
+        pattern=r"^[0-9a-f]{64}$"
+    )
     manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")

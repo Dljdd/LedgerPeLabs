@@ -108,6 +108,8 @@ def _advance(
             approved_commit="a" * 40,
             protocol_sha256=protocol.protocol_sha256,
             run_binding_sha256=protocol.run_binding_sha256(mode),
+            safe_deterministic_core_sha256="7" * 64,
+            safe_observational_environment_sha256="8" * 64,
             successor_authorization_sha256=(
                 "6" * 64 if mode is V5KaggleMode.LOCKED_SUCCESSOR else None
             ),
@@ -197,6 +199,8 @@ def test_malformed_visible_checkpoint_is_terminal(tmp_path: Path) -> None:
         run_binding_sha256=protocol.run_binding_sha256(
             V5KaggleMode.CAPACITY_VALIDATION
         ),
+        safe_deterministic_core_sha256="7" * 64,
+        safe_observational_environment_sha256="8" * 64,
     )
     execution_path = tmp_path / "safe-evidence-manifest.json"
     execution_path.write_text(
@@ -235,6 +239,8 @@ def test_unknown_later_stage_and_existing_output_fail_before_execution(
         run_binding_sha256=protocol.run_binding_sha256(
             V5KaggleMode.CAPACITY_VALIDATION
         ),
+        safe_deterministic_core_sha256="7" * 64,
+        safe_observational_environment_sha256="8" * 64,
     )
     execution_path = tmp_path / "safe-evidence-manifest.json"
     execution_path.write_text(
@@ -345,7 +351,20 @@ def test_archive_preflight_recomputes_exact_source_tree_without_git(
     manifest = tmp_path / "source-manifest.json"
     manifest.write_text(json.dumps(values, sort_keys=True, separators=(",", ":")))
     monkeypatch.setenv("APAR_V5_SOURCE_MANIFEST_PATH", os.fspath(manifest))
-    monkeypatch.setattr(runner_module, "verify_evidence_bytes", lambda *_args, **_kwargs: {})
+    verification_call: dict[str, object] = {}
+
+    def record_portable_verification(
+        serialized: bytes, **kwargs: object
+    ) -> dict[str, object]:
+        verification_call["serialized"] = serialized
+        verification_call.update(kwargs)
+        return {}
+
+    monkeypatch.setattr(
+        runner_module,
+        "verify_portable_evidence_bytes",
+        record_portable_verification,
+    )
     protocol = runner_module.load_v5_kaggle_protocol(
         ROOT / "config/defense/defense-v5-kaggle-recovery.json",
         root=ROOT,
@@ -355,10 +374,18 @@ def test_archive_preflight_recomputes_exact_source_tree_without_git(
         root=source,
         approved_commit=commit,
         safe_evidence=safe,
+        safe_deterministic_core_sha256="7" * 64,
+        safe_observational_environment_sha256="8" * 64,
         protocol=protocol,
         mode=runner_module.V5KaggleMode.CAPACITY_VALIDATION,
         stage=V5KaggleStage.AUTHORIZE,
     )
+    assert verification_call == {
+        "serialized": b"{}",
+        "root": source,
+        "expected_deterministic_core_sha256": "7" * 64,
+        "expected_observational_environment_sha256": "8" * 64,
+    }
 
     entrypoint.write_bytes(b"print('tampered')\n")
     with pytest.raises(ValueError, match="source"):
@@ -366,6 +393,8 @@ def test_archive_preflight_recomputes_exact_source_tree_without_git(
             root=source,
             approved_commit=commit,
             safe_evidence=safe,
+            safe_deterministic_core_sha256="7" * 64,
+            safe_observational_environment_sha256="8" * 64,
             protocol=protocol,
             mode=runner_module.V5KaggleMode.CAPACITY_VALIDATION,
             stage=V5KaggleStage.AUTHORIZE,
@@ -378,6 +407,8 @@ def test_archive_preflight_recomputes_exact_source_tree_without_git(
             root=source,
             approved_commit=commit,
             safe_evidence=safe,
+            safe_deterministic_core_sha256="7" * 64,
+            safe_observational_environment_sha256="8" * 64,
             protocol=protocol,
             mode=runner_module.V5KaggleMode.CAPACITY_VALIDATION,
             stage=V5KaggleStage.AUTHORIZE,

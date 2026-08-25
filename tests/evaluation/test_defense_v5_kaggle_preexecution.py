@@ -145,12 +145,16 @@ def test_safe_evidence_input_manifest_binds_bytes_without_modifying_them(
         approved_commit="a" * 40,
         protocol_sha256="b" * 64,
         run_binding_sha256="c" * 64,
+        safe_deterministic_core_sha256="d" * 64,
+        safe_observational_environment_sha256="e" * 64,
     )
     assert safe.read_bytes() == before
     assert manifest.artifact_sha256 == hashlib.sha256(before).hexdigest()
     assert manifest.artifact_name == "safe-evidence.json"
     assert manifest.execution_mode is V5KaggleMode.CAPACITY_VALIDATION
     assert manifest.development_test_seed == 404
+    assert manifest.safe_deterministic_core_sha256 == "d" * 64
+    assert manifest.safe_observational_environment_sha256 == "e" * 64
 
 
 def test_safe_input_manifest_rejects_mode_seed_or_authorization_relabel(
@@ -164,6 +168,8 @@ def test_safe_input_manifest_rejects_mode_seed_or_authorization_relabel(
         approved_commit="a" * 40,
         protocol_sha256="b" * 64,
         run_binding_sha256="c" * 64,
+        safe_deterministic_core_sha256="d" * 64,
+        safe_observational_environment_sha256="e" * 64,
     )
     document = manifest.model_dump(mode="json")
     document["execution_mode"] = V5KaggleMode.LOCKED_SUCCESSOR.value

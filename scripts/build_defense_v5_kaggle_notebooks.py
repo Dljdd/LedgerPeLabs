@@ -108,7 +108,7 @@ WHEELHOUSE_MANIFEST = _manifest(
 )
 SAFE_MANIFEST = _manifest(
     SAFE_INPUT / "safe-evidence-manifest.json",
-    schema="apar-sentinel-v5-kaggle-execution-input/1",
+    schema="apar-sentinel-v5-kaggle-execution-input/2",
 )
 
 SAFE_EVIDENCE = SAFE_INPUT / "safe-evidence.json"

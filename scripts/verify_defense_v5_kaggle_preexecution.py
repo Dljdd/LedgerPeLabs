@@ -387,6 +387,8 @@ def build_v5_safe_evidence_input_manifest(
     approved_commit: str,
     protocol_sha256: str,
     run_binding_sha256: str,
+    safe_deterministic_core_sha256: str,
+    safe_observational_environment_sha256: str,
     successor_authorization_sha256: str | None = None,
 ) -> V5KaggleExecutionManifest:
     """Bind an existing approved safe artifact without changing its bytes."""
@@ -398,7 +400,7 @@ def build_v5_safe_evidence_input_manifest(
     ):
         raise ValueError("safe evidence input path is not an exact unlinked file")
     values: dict[str, object] = {
-        "schema_version": "apar-sentinel-v5-kaggle-execution-input/1",
+        "schema_version": "apar-sentinel-v5-kaggle-execution-input/2",
         "execution_mode": mode,
         "profile": "production",
         "development_test_seed": (
@@ -412,6 +414,10 @@ def build_v5_safe_evidence_input_manifest(
         "artifact_name": "safe-evidence.json",
         "artifact_size_bytes": safe_evidence.stat().st_size,
         "artifact_sha256": _sha256(safe_evidence),
+        "safe_deterministic_core_sha256": safe_deterministic_core_sha256,
+        "safe_observational_environment_sha256": (
+            safe_observational_environment_sha256
+        ),
     }
     values["manifest_sha256"] = _digest(values)
     return V5KaggleExecutionManifest.model_validate(values)

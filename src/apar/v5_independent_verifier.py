@@ -659,6 +659,73 @@ def _current_latency_environment() -> dict[str, Any]:
     }
 
 
+def _bound_latency_environment(
+    value: object, *, expected_sha256: str
+) -> dict[str, Any]:
+    environment = _mapping(value, "retained observational environment")
+    _exact_fields(
+        environment,
+        {
+            "python_implementation",
+            "python_version",
+            "platform_system",
+            "platform_release",
+            "platform_machine",
+            "executable_abi",
+            "catboost_version",
+            "numpy_version",
+            "scikit_learn_version",
+            "clock",
+        },
+        "retained observational environment",
+    )
+    clock = _mapping(environment["clock"], "retained observational clock")
+    _exact_fields(
+        clock,
+        {
+            "implementation",
+            "monotonic",
+            "adjustable",
+            "resolution_seconds",
+        },
+        "retained observational clock",
+    )
+    text_fields = {
+        "python_implementation",
+        "python_version",
+        "platform_system",
+        "platform_release",
+        "platform_machine",
+        "executable_abi",
+        "catboost_version",
+        "numpy_version",
+        "scikit_learn_version",
+    }
+    if any(
+        type(environment[field]) is not str or not environment[field]
+        for field in text_fields
+    ):
+        _fail("retained observational environment text differs")
+    if (
+        type(clock["implementation"]) is not str
+        or not clock["implementation"]
+        or type(clock["monotonic"]) is not bool
+        or type(clock["adjustable"]) is not bool
+        or _finite(clock["resolution_seconds"], "clock resolution") <= 0.0
+    ):
+        _fail("retained observational environment clock differs")
+    if (
+        len(expected_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in expected_sha256)
+        or _digest(environment) != expected_sha256
+    ):
+        _fail("retained observational environment digest differs")
+    return _mapping(
+        json.loads(_canonical_bytes(environment)),
+        "canonical retained observational environment",
+    )
+
+
 def _independent_observational_document(
     *,
     core_sha256: str,
@@ -666,6 +733,7 @@ def _independent_observational_document(
     complete: Sequence[Mapping[str, Any]],
     controls: Mapping[str, Any],
     readiness: Mapping[str, Any],
+    environment: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     arm_observations = []
     for result, metrics in zip(retained_results, complete, strict=True):
@@ -743,14 +811,16 @@ def _independent_observational_document(
     ]
     if len(latency_gates) != 1:
         _fail("observational latency gate is missing or duplicated")
-    environment = _current_latency_environment()
+    observed_environment = (
+        _current_latency_environment() if environment is None else dict(environment)
+    )
     document = {
         "schema_version": _OBSERVATIONAL_LATENCY_SCHEMA,
         "measurement_method": _OBSERVATIONAL_MEASUREMENT_METHOD,
         "synthetic_values": False,
         "deterministic_core_sha256": core_sha256,
-        "environment": environment,
-        "environment_sha256": _digest(environment),
+        "environment": observed_environment,
+        "environment_sha256": _digest(observed_environment),
         "arm_observations": arm_observations,
         "control_observations": control_observations,
         "latency_gate": latency_gates[0],
@@ -4320,7 +4390,13 @@ def _verify_readiness(
         _fail("final readiness status mismatch")
 
 
-def _verify_evidence_bytes(serialized: bytes, *, root: Path) -> dict[str, object]:
+def _verify_evidence_bytes(
+    serialized: bytes,
+    *,
+    root: Path,
+    expected_deterministic_core_sha256: str | None = None,
+    expected_observational_environment_sha256: str | None = None,
+) -> dict[str, object]:
     envelope, payload = _parse_envelope(serialized)
     _exact_fields(
         payload,
@@ -4439,15 +4515,27 @@ def _verify_evidence_bytes(serialized: bytes, *, root: Path) -> dict[str, object
     expected_core_sha256 = _digest(core_document)
     if core_binding["core_sha256"] != expected_core_sha256:
         _fail("deterministic core digest mismatch")
+    if (
+        expected_deterministic_core_sha256 is not None
+        and expected_core_sha256 != expected_deterministic_core_sha256
+    ):
+        _fail("deterministic core differs from the approved portable binding")
     observational = _unpack_document(
         payload["observational_latency"], expected_kind="observational_latency"
     )
+    retained_environment = None
+    if expected_observational_environment_sha256 is not None:
+        retained_environment = _bound_latency_environment(
+            observational.get("environment"),
+            expected_sha256=expected_observational_environment_sha256,
+        )
     expected_observational = _independent_observational_document(
         core_sha256=expected_core_sha256,
         retained_results=retained_results,
         complete=complete,
         controls=controls,
         readiness=readiness,
+        environment=retained_environment,
     )
     if observational != expected_observational:
         _fail("observational latency evidence differs from retained samples")
@@ -4488,6 +4576,38 @@ def verify_evidence_bytes(serialized: bytes, *, root: Path) -> dict[str, object]
     ) as error:
         raise IndependentVerificationError(
             "serialized evidence is malformed or internally inconsistent"
+        ) from error
+
+
+def verify_portable_evidence_bytes(
+    serialized: bytes,
+    *,
+    root: Path,
+    expected_deterministic_core_sha256: str,
+    expected_observational_environment_sha256: str,
+) -> dict[str, object]:
+    """Verify retained observations against explicit cross-host bindings."""
+    try:
+        return _verify_evidence_bytes(
+            serialized,
+            root=root,
+            expected_deterministic_core_sha256=expected_deterministic_core_sha256,
+            expected_observational_environment_sha256=(
+                expected_observational_environment_sha256
+            ),
+        )
+    except IndependentVerificationError:
+        raise
+    except (
+        KeyError,
+        IndexError,
+        OSError,
+        StopIteration,
+        TypeError,
+        ValueError,
+    ) as error:
+        raise IndependentVerificationError(
+            "serialized portable evidence is malformed or internally inconsistent"
         ) from error
 
 
@@ -5561,5 +5681,6 @@ __all__ = [
     "read_locked_evidence_storage_bytes",
     "verify_locked_judge_summary",
     "verify_evidence_bytes",
+    "verify_portable_evidence_bytes",
     "verify_locked_evidence_payload_bytes",
 ]

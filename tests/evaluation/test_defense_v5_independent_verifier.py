@@ -18,6 +18,7 @@ import pytest
 from apar.v5_independent_verifier import (
     IndependentVerificationError,
     verify_evidence_bytes,
+    verify_portable_evidence_bytes,
 )
 from tests.evaluation.v5_safe_evidence_fixture import (
     ROOT,
@@ -328,6 +329,94 @@ def test_independent_verifier_rejects_rebound_latency_environment_mutation() -> 
                 lambda payload: _mutate_observational(payload, mutate)
             ),
             root=ROOT,
+        )
+
+
+def test_portable_verifier_accepts_bound_foreign_observation_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = verify_evidence_bytes(safe_v5_evidence_bytes(), root=ROOT)
+    monkeypatch.setattr(
+        "apar.v5_independent_verifier._current_latency_environment",
+        lambda: {
+            "python_implementation": "CPython",
+            "python_version": "3.12.99",
+            "platform_system": "Linux",
+            "platform_release": "foreign-kernel",
+            "platform_machine": "x86_64",
+            "executable_abi": "cpython-312",
+            "catboost_version": "foreign",
+            "numpy_version": "foreign",
+            "scikit_learn_version": "foreign",
+            "clock": {
+                "implementation": "foreign-clock",
+                "monotonic": True,
+                "adjustable": False,
+                "resolution_seconds": 1e-09,
+            },
+        },
+    )
+
+    portable = verify_portable_evidence_bytes(
+        safe_v5_evidence_bytes(),
+        root=ROOT,
+        expected_deterministic_core_sha256=str(
+            report["deterministic_core_sha256"]
+        ),
+        expected_observational_environment_sha256=str(
+            report["observational_environment_sha256"]
+        ),
+    )
+
+    assert portable["deterministic_core_sha256"] == report[
+        "deterministic_core_sha256"
+    ]
+    assert portable["observational_environment_sha256"] == report[
+        "observational_environment_sha256"
+    ]
+
+
+def test_portable_verifier_rejects_rebound_or_unapproved_environment() -> None:
+    report = verify_evidence_bytes(safe_v5_evidence_bytes(), root=ROOT)
+
+    def mutate(document: dict[str, object]) -> None:
+        document["environment"]["python_version"] = "0.0-forged"
+        document["environment_sha256"] = _digest(document["environment"])
+
+    with pytest.raises(IndependentVerificationError, match="environment"):
+        verify_portable_evidence_bytes(
+            _mutated_envelope(
+                lambda payload: _mutate_observational(payload, mutate)
+            ),
+            root=ROOT,
+            expected_deterministic_core_sha256=str(
+                report["deterministic_core_sha256"]
+            ),
+            expected_observational_environment_sha256=str(
+                report["observational_environment_sha256"]
+            ),
+        )
+    with pytest.raises(IndependentVerificationError, match="environment"):
+        verify_portable_evidence_bytes(
+            safe_v5_evidence_bytes(),
+            root=ROOT,
+            expected_deterministic_core_sha256=str(
+                report["deterministic_core_sha256"]
+            ),
+            expected_observational_environment_sha256="f" * 64,
+        )
+
+
+def test_portable_verifier_rejects_unapproved_deterministic_core() -> None:
+    report = verify_evidence_bytes(safe_v5_evidence_bytes(), root=ROOT)
+    with pytest.raises(IndependentVerificationError, match="deterministic core"):
+        verify_portable_evidence_bytes(
+            safe_v5_evidence_bytes(),
+            root=ROOT,
+            expected_deterministic_core_sha256="f" * 64,
+            expected_observational_environment_sha256=str(
+                report["observational_environment_sha256"]
+            ),
         )
 
 

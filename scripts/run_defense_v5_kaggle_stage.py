@@ -46,7 +46,9 @@ from apar.evaluation.v5_staged_evidence import (  # noqa: E402
     execute_v5_finalize_stage,
     execute_v5_metric_stage,
 )
-from apar.v5_independent_verifier import verify_evidence_bytes  # noqa: E402
+from apar.v5_independent_verifier import (  # noqa: E402
+    verify_portable_evidence_bytes,
+)
 
 _PROTOCOL_PATH = Path("config/defense/defense-v5-kaggle-recovery.json")
 
@@ -74,6 +76,8 @@ class V5KaggleStageAuthority(Protocol):
         root: Path,
         approved_commit: str,
         safe_evidence: Path,
+        safe_deterministic_core_sha256: str,
+        safe_observational_environment_sha256: str,
         protocol: V5KaggleProtocol,
         mode: V5KaggleMode,
         stage: V5KaggleStage,
@@ -107,6 +111,8 @@ class _FrozenRepositoryAuthority:
         root: Path,
         approved_commit: str,
         safe_evidence: Path,
+        safe_deterministic_core_sha256: str,
+        safe_observational_environment_sha256: str,
         protocol: V5KaggleProtocol,
         mode: V5KaggleMode,
         stage: V5KaggleStage,
@@ -139,7 +145,16 @@ class _FrozenRepositoryAuthority:
             self._verify_archived_source(root=root, approved_commit=approved_commit)
         if safe_evidence.is_symlink() or not safe_evidence.is_file():
             raise ValueError("approved safe evidence is missing or linked")
-        verify_evidence_bytes(safe_evidence.read_bytes(), root=root)
+        verify_portable_evidence_bytes(
+            safe_evidence.read_bytes(),
+            root=root,
+            expected_deterministic_core_sha256=(
+                safe_deterministic_core_sha256
+            ),
+            expected_observational_environment_sha256=(
+                safe_observational_environment_sha256
+            ),
+        )
 
     @staticmethod
     def _verify_archived_source(*, root: Path, approved_commit: str) -> None:
@@ -449,6 +464,12 @@ def execute_next_v5_kaggle_stage(
         root=root,
         approved_commit=approved_commit,
         safe_evidence=safe_evidence,
+        safe_deterministic_core_sha256=(
+            execution.safe_deterministic_core_sha256
+        ),
+        safe_observational_environment_sha256=(
+            execution.safe_observational_environment_sha256
+        ),
         protocol=protocol,
         mode=mode,
         stage=stage,
