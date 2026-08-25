@@ -211,8 +211,25 @@ def test_capacity_support_plan_is_production_sized_without_population_execution(
         25_800,
         63_300,
     )
-    assert capacity.retained_execution_artifacts == 2_523
-    assert capacity.retained_execution_payload_estimate_bytes == 608_083_936
+    assert capacity.retained_execution_artifacts == 2_526
+    assert capacity.retained_execution_payload_estimate_bytes == 608_386_240
+
+
+def test_capacity_support_plan_batches_from_projected_base_decisions() -> None:
+    """Artifact counts must batch remaining decision rows, not lifecycle event rows."""
+    capacity = build_v5_kaggle_support_plan(
+        root=ROOT,
+        protocol=_protocol(),
+        mode=V5KaggleMode.CAPACITY_VALIDATION,
+    )
+
+    assert tuple(item.execution_artifacts for item in capacity.partitions) == (
+        534,
+        534,
+        534,
+        924,
+    )
+    assert capacity.retained_execution_artifacts == 2_526
 
 
 def test_support_plan_label_split_matches_executed_ground_truth(
@@ -245,6 +262,27 @@ def test_support_plan_label_split_matches_executed_ground_truth(
     assert support.legitimate_rows == (
         protocol.production_dev_test_legitimate + expected_campaign_controls
     )
+
+
+def test_support_mismatch_reports_exact_observed_and_expected_counts(
+    safe_smoke_corpus: V5Corpus,
+) -> None:
+    """A rejected staged corpus must identify the exact immutable support delta."""
+    support = build_v5_kaggle_support_plan(
+        root=ROOT,
+        protocol=_protocol(),
+        mode=V5KaggleMode.CAPACITY_VALIDATION,
+    )
+
+    with pytest.raises(ValueError, match='"partition":"train"') as raised:
+        staged._validate_corpus_support(
+            corpus=safe_smoke_corpus,
+            support_plan=support,
+        )
+
+    assert '"observed"' in str(raised.value)
+    assert '"expected"' in str(raised.value)
+    assert '"execution_artifacts"' in str(raised.value)
 
 
 def test_authorization_capability_emits_one_canonical_closed_record() -> None:
@@ -280,7 +318,7 @@ def test_authorization_capability_emits_one_canonical_closed_record() -> None:
     assert document["profile"] == "production"
     assert document["attempt_receipt_sha256"] == "5" * 64
     assert document["run_binding_sha256"] == capability.run_binding_sha256
-    assert document["support_plan"]["retained_execution_artifacts"] == 2_523
+    assert document["support_plan"]["retained_execution_artifacts"] == 2_526
     assert document["recovery"]["retry_permitted"] is False
     assert set(document).isdisjoint(
         {"labels", "probabilities", "actions", "metrics", "readiness"}

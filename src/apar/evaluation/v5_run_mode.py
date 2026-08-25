@@ -235,13 +235,18 @@ _FAMILY_ARTIFACT_ESTIMATES = {
     "synthetic_merchant_refund": 170_768,
 }
 _RETAINED_PARTITIONS = ("train", "calibration", "threshold", "development_test")
+_LEGITIMATE_BASE_DECISION_ROWS = 7
 
 
 def _legitimate_artifact_plan(count: int) -> tuple[int, int]:
-    base_events = 24
+    # The three base execution manifests retain 24 lifecycle events, but projection
+    # emits only seven decision rows (three card, two A2A, and two agentic).  Filler
+    # batches are sized from the requested decision support, so their remainder must
+    # be computed from projected decisions rather than retained lifecycle events.
+    base_decisions = _LEGITIMATE_BASE_DECISION_ROWS
     base_artifacts = 3
     base_estimate = 221_072
-    remaining = count - base_events
+    remaining = count - base_decisions
     if remaining < 0:
         raise ValueError("legitimate support cannot cover the three base rails")
     full_batches, final_events = divmod(remaining, 96)

@@ -474,13 +474,33 @@ def _validate_corpus_support(*, corpus: V5Corpus, support_plan: V5KaggleSupportP
             )
             for family, _count in item.fraud_rows_by_family
         )
-        if (
-            partition.benign_count != item.legitimate_rows
-            or fraud_by_family != item.fraud_rows_by_family
-            or len(partition.decisions) != item.total_rows
-            or len(partition.executions) != item.execution_artifacts
-        ):
-            raise ValueError("production corpus support differs from frozen plan")
+        observed = {
+            "legitimate_rows": partition.benign_count,
+            "fraud_rows_by_family": fraud_by_family,
+            "total_rows": len(partition.decisions),
+            "execution_artifacts": len(partition.executions),
+        }
+        expected = {
+            "legitimate_rows": item.legitimate_rows,
+            "fraud_rows_by_family": item.fraud_rows_by_family,
+            "total_rows": item.total_rows,
+            "execution_artifacts": item.execution_artifacts,
+        }
+        if observed != expected:
+            diagnostic = {
+                "partition": item.partition,
+                "observed": observed,
+                "expected": expected,
+            }
+            raise ValueError(
+                "production corpus support differs from frozen plan: "
+                + json.dumps(
+                    diagnostic,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+            )
 
 
 def execute_v5_corpus_stage(

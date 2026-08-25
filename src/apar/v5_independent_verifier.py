@@ -4659,7 +4659,9 @@ def verify_locked_evidence_payload_bytes(
 
 
 def _locked_legitimate_plan(count: int) -> tuple[int, int]:
-    remaining = count - 24
+    # Independent constants: the three base manifests contain 24 lifecycle
+    # events but project three card, two A2A, and two agentic decision rows.
+    remaining = count - 7
     if remaining < 0:
         _fail("locked legitimate support cannot cover all base rails")
     full, final = divmod(remaining, 96)
@@ -4684,11 +4686,17 @@ def _independent_locked_support_plan(base: Mapping[str, Any]) -> dict[str, Any]:
         "production_dev_test_legitimate"
     ) != 50_000:
         _fail("locked production legitimate plan differs")
-    event_rows = {
+    campaign_event_rows = {
         "agentic_intent_abuse": 25,
         "app_scam_mule": 36,
         "card_testing_cnp": 26,
         "synthetic_merchant_refund": 46,
+    }
+    fraud_decision_rows = {
+        "agentic_intent_abuse": 23,
+        "app_scam_mule": 24,
+        "card_testing_cnp": 17,
+        "synthetic_merchant_refund": 34,
     }
     artifact_estimates = {
         "agentic_intent_abuse": 365_536,
@@ -4698,14 +4706,22 @@ def _independent_locked_support_plan(base: Mapping[str, Any]) -> dict[str, Any]:
     }
     partitions: list[dict[str, Any]] = []
     for partition in ("train", "calibration", "threshold", "development_test"):
-        legitimate = 50_000 if partition == "development_test" else 12_500
+        operational_legitimate = (
+            50_000 if partition == "development_test" else 12_500
+        )
         legitimate_artifacts, legitimate_estimate = _locked_legitimate_plan(
-            legitimate
+            operational_legitimate
         )
         fraud: list[list[Any]] = [
-            [family, int(campaign_counts[family]) * event_rows[family]]
+            [family, int(campaign_counts[family]) * fraud_decision_rows[family]]
             for family in sorted(_FAMILIES)
         ]
+        campaign_controls = sum(
+            int(campaign_counts[family])
+            * (campaign_event_rows[family] - fraud_decision_rows[family])
+            for family in _FAMILIES
+        )
+        legitimate = operational_legitimate + campaign_controls
         partitions.append(
             {
                 "partition": partition,
