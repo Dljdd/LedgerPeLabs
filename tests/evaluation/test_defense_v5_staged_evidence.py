@@ -13,6 +13,7 @@ from apar.evaluation import v5_staged_evidence as staged
 from apar.evaluation.v5_checkpoint_storage import (
     V5CheckpointInput,
     V5CheckpointObservation,
+    iter_v5_checkpoint_records,
     publish_v5_checkpoint,
 )
 from apar.evaluation.v5_evaluation import (
@@ -77,6 +78,37 @@ def _observation() -> V5CheckpointObservation:
         peak_rss_bytes=100_000,
         environment=_environment(),
     )
+
+
+def test_arm_section_records_split_before_checkpoint_record_limit() -> None:
+    """Large arm evidence must be partitioned before V5CheckpointInput validation."""
+    assert hasattr(staged, "_iter_bounded_arm_section_records"), (
+        "arm checkpoint sections are not yet bounded"
+    )
+    items = tuple(
+        {"event_id": f"event-{index}", "value": "x" * 180}
+        for index in range(6)
+    )
+
+    records = tuple(
+        staged._iter_bounded_arm_section_records(
+            kind="arm_result_rows",
+            arm="full_sentinel",
+            section="row_evidence",
+            items=items,
+            max_record_bytes=1_024,
+        )
+    )
+
+    assert len(records) > 1
+    assert all(len(record.canonical_bytes) <= 1_024 for record in records)
+    documents = [json.loads(record.canonical_bytes) for record in records]
+    assert [document["index"] for document in documents] == list(range(len(records)))
+    assert [document["start"] for document in documents] == [
+        sum(len(previous["items"]) for previous in documents[:index])
+        for index in range(len(documents))
+    ]
+    assert [item for document in documents for item in document["items"]] == list(items)
 
 
 @pytest.fixture(scope="module")
@@ -625,7 +657,18 @@ def test_arm_stage_matches_existing_safe_path_except_real_latency(
         for arm in _CURRENT_ARMS
     )
 
-    assert arm_manifest.record_count == 5
+    deterministic_records = tuple(
+        iter_v5_checkpoint_records(
+            output_root=arm_root,
+            limits=protocol.resources,
+        )
+    )
+    assert arm_manifest.record_count > 5
+    assert all(len(record.canonical_bytes) <= 16_777_216 for record in deterministic_records)
+    assert "arm_result" not in {record.kind for record in deterministic_records}
+    assert {"arm_result_meta", "arm_execution_artifacts", "arm_result_rows"} <= {
+        record.kind for record in deterministic_records
+    }
     assert tuple(result.arm for result in staged_results) == tuple(
         arm.value for arm in _CURRENT_ARMS
     )

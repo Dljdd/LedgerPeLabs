@@ -120,6 +120,7 @@ _MAX_MANIFEST_BYTES = 1_048_576
 _MAX_OBSERVATION_BYTES = 4_194_304
 _MAX_RECORD_HEADER_BYTES = 65_536
 _MAX_RECORD_BYTES = 1_073_741_824
+_MAX_ARM_SECTION_RECORD_BYTES = 16_777_216
 _READ_BLOCK_BYTES = 1_048_576
 _EMPTY_LAYER_MARKER = "empty-layer.json"
 
@@ -423,7 +424,14 @@ def _read_checkpoint(root: Path) -> _VerifiedCheckpoint:
             "feature_batch",
             "training_evidence",
         },
-        "30_arms": {"arm_header", "arm_result", "arm_latency"},
+        "30_arms": {
+            "arm_header",
+            "arm_result_meta",
+            "arm_execution_artifacts",
+            "arm_result_rows",
+            "arm_latency_meta",
+            "arm_latency_samples",
+        },
         "40_label_shuffle": {"control_group", "control_observation"},
         "50_invariance_controls": {"control_group", "control_observation"},
         "60_single_class_controls": {"control_group", "control_observation"},
@@ -807,6 +815,210 @@ def _json_record(record: _Record, label: str) -> dict[str, Any]:
     return document
 
 
+def _canonical_sequence_digest(items: Sequence[Mapping[str, Any]]) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"[")
+    for index, item in enumerate(items):
+        if index:
+            digest.update(b",")
+        digest.update(_canonical_bytes(item))
+    digest.update(b"]")
+    return digest.hexdigest()
+
+
+def _arm_section_index(value: object, label: str) -> tuple[int, int, str]:
+    index = _mapping(value, f"{label} index")
+    _exact(index, {"count", "record_count", "sha256"}, f"{label} index")
+    count = index["count"]
+    record_count = index["record_count"]
+    digest = index["sha256"]
+    if (
+        type(count) is not int
+        or type(record_count) is not int
+        or count <= 0
+        or record_count <= 0
+        or record_count > count
+        or not _is_sha256(digest)
+    ):
+        _fail(f"{label} index differs")
+    return count, record_count, cast(str, digest)
+
+
+def _consume_arm_section(
+    *,
+    records: Sequence[_Record],
+    cursor: int,
+    arm: str,
+    kind: str,
+    section: str,
+    index: tuple[int, int, str],
+    layer: Literal["deterministic", "observational"],
+) -> tuple[list[dict[str, Any]], int]:
+    count, record_count, expected_digest = index
+    items: list[dict[str, Any]] = []
+    for record_index in range(record_count):
+        if cursor >= len(records):
+            _fail(f"{arm} {section} record is missing")
+        record = records[cursor]
+        cursor += 1
+        if (
+            record.layer != layer
+            or record.kind != kind
+            or record.key != f"{arm}:{record_index:04d}"
+            or len(record.payload) > _MAX_ARM_SECTION_RECORD_BYTES
+        ):
+            _fail(f"{arm} {section} record order differs")
+        document = _json_record(record, f"{arm} {section} record")
+        _exact(
+            document,
+            {"schema_version", "arm", "section", "index", "start", "items"},
+            f"{arm} {section} record",
+        )
+        raw_items = _sequence(document["items"], f"{arm} {section} items")
+        if (
+            document["schema_version"] != "apar-sentinel-v5-kaggle-arm-section/1"
+            or document["arm"] != arm
+            or document["section"] != section
+            or document["index"] != record_index
+            or document["start"] != len(items)
+            or not raw_items
+        ):
+            _fail(f"{arm} {section} record differs")
+        items.extend(
+            _mapping(item, f"{arm} {section} item") for item in raw_items
+        )
+    if len(items) != count or _canonical_sequence_digest(items) != expected_digest:
+        _fail(f"{arm} {section} index binding differs")
+    return items, cursor
+
+
+def _decode_arm_checkpoint_records(
+    *,
+    deterministic: Sequence[_Record],
+    observational: Sequence[_Record],
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    if not deterministic or deterministic[0].kind != "arm_header":
+        _fail("arm checkpoint header differs")
+    header = _json_record(deterministic[0], "arm header")
+    _exact(
+        header,
+        {
+            "schema_version",
+            "arm_order",
+            "support_event_ids",
+            "support_sha256",
+            "deterministic_result_sha256",
+        },
+        "arm header",
+    )
+    deterministic_cursor = 1
+    observational_cursor = 0
+    cores: list[dict[str, Any]] = []
+    observations: list[dict[str, Any]] = []
+    for arm in _ARMS:
+        if deterministic_cursor >= len(deterministic):
+            _fail("arm result metadata is missing")
+        core_record = deterministic[deterministic_cursor]
+        deterministic_cursor += 1
+        if (
+            core_record.layer != "deterministic"
+            or core_record.kind != "arm_result_meta"
+            or core_record.key != arm
+        ):
+            _fail("arm result metadata order differs")
+        core_meta = _json_record(core_record, f"{arm} result metadata")
+        _exact(
+            core_meta,
+            {"schema_version", "arm", "fields", "sections"},
+            "arm result metadata",
+        )
+        core_sections = _mapping(core_meta["sections"], "arm result sections")
+        _exact(
+            core_sections,
+            {"execution_artifacts", "row_evidence"},
+            "arm result sections",
+        )
+        if (
+            core_meta["schema_version"]
+            != "apar-sentinel-v5-kaggle-arm-result-meta/1"
+            or core_meta["arm"] != arm
+        ):
+            _fail("arm result metadata differs")
+        artifacts, deterministic_cursor = _consume_arm_section(
+            records=deterministic,
+            cursor=deterministic_cursor,
+            arm=arm,
+            kind="arm_execution_artifacts",
+            section="execution_artifacts",
+            index=_arm_section_index(
+                core_sections["execution_artifacts"], f"{arm} execution artifacts"
+            ),
+            layer="deterministic",
+        )
+        rows, deterministic_cursor = _consume_arm_section(
+            records=deterministic,
+            cursor=deterministic_cursor,
+            arm=arm,
+            kind="arm_result_rows",
+            section="row_evidence",
+            index=_arm_section_index(
+                core_sections["row_evidence"], f"{arm} row evidence"
+            ),
+            layer="deterministic",
+        )
+        core = dict(_mapping(core_meta["fields"], "arm result fields"))
+        core["execution_artifacts"] = artifacts
+        core["row_evidence"] = rows
+        cores.append(core)
+
+        if observational_cursor >= len(observational):
+            _fail("arm latency metadata is missing")
+        latency_record = observational[observational_cursor]
+        observational_cursor += 1
+        if (
+            latency_record.layer != "observational"
+            or latency_record.kind != "arm_latency_meta"
+            or latency_record.key != arm
+        ):
+            _fail("arm latency metadata order differs")
+        latency_meta = _json_record(latency_record, f"{arm} latency metadata")
+        _exact(
+            latency_meta,
+            {"schema_version", "arm", "fields", "sections"},
+            "arm latency metadata",
+        )
+        latency_sections = _mapping(
+            latency_meta["sections"], "arm latency sections"
+        )
+        _exact(latency_sections, {"samples"}, "arm latency sections")
+        if (
+            latency_meta["schema_version"]
+            != "apar-sentinel-v5-kaggle-arm-latency-meta/1"
+            or latency_meta["arm"] != arm
+        ):
+            _fail("arm latency metadata differs")
+        samples, observational_cursor = _consume_arm_section(
+            records=observational,
+            cursor=observational_cursor,
+            arm=arm,
+            kind="arm_latency_samples",
+            section="samples",
+            index=_arm_section_index(
+                latency_sections["samples"], f"{arm} latency samples"
+            ),
+            layer="observational",
+        )
+        observation = dict(_mapping(latency_meta["fields"], "arm latency fields"))
+        observation["samples"] = samples
+        observations.append(observation)
+    if (
+        deterministic_cursor != len(deterministic)
+        or observational_cursor != len(observational)
+    ):
+        _fail("arm checkpoint contains extra records")
+    return header, cores, observations
+
+
 def _verify_corpus_records(
     *, records: Sequence[_Record], payload: Mapping[str, Any] | None
 ) -> dict[str, dict[str, list[dict[str, Any]]]]:
@@ -1177,9 +1389,10 @@ def _verify_stage_record_bindings(
 
     arm_records = checkpoints[3].deterministic_records
     arm_observations = checkpoints[3].observational_records
-    if len(arm_records) != 5 or arm_records[0].kind != "arm_header":
-        _fail("arm checkpoint header differs")
-    arm_header = _json_record(arm_records[0], "arm header")
+    arm_header, actual_cores, actual_observations = _decode_arm_checkpoint_records(
+        deterministic=arm_records,
+        observational=arm_observations,
+    )
     retained_results = [
         semantic._unpack_document(item, expected_kind="arm_result")  # noqa: SLF001
         for item in _sequence(payload["arm_results"], "arm results")
@@ -1257,7 +1470,7 @@ def _verify_stage_record_bindings(
     ):
         _fail("feature checkpoint corpus/count binding differs")
     if (
-        arm_header.get("schema_version") != "apar-sentinel-v5-kaggle-arms/1"
+        arm_header.get("schema_version") != "apar-sentinel-v5-kaggle-arms/2"
         or arm_header.get("arm_order") != list(_ARMS)
         or arm_header.get("deterministic_result_sha256") != expected_result_digests
         or arm_header.get("support_event_ids")
@@ -1267,20 +1480,15 @@ def _verify_stage_record_bindings(
         ]
         or arm_header.get("support_sha256")
         != expanded_results[0]["support_sha256"]
-        or checkpoints[3].manifest["record_count"] != 5
-        or checkpoints[3].manifest["observational_record_count"] != 4
+        or checkpoints[3].manifest["record_count"] != len(arm_records)
+        or checkpoints[3].manifest["observational_record_count"]
+        != len(arm_observations)
     ):
         _fail("arm checkpoint/final payload binding differs")
-    for index, arm in enumerate(_ARMS):
+    for index, _arm in enumerate(_ARMS):
         if (
-            arm_records[index + 1].kind != "arm_result"
-            or arm_records[index + 1].key != arm
-            or _json_record(arm_records[index + 1], "arm deterministic result")
-            != expected_cores[index]
-            or arm_observations[index].kind != "arm_latency"
-            or arm_observations[index].key != arm
-            or _json_record(arm_observations[index], "arm latency result")
-            != expected_observations[index]
+            actual_cores[index] != expected_cores[index]
+            or actual_observations[index] != expected_observations[index]
         ):
             _fail("arm checkpoint result differs from final payload")
 

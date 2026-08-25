@@ -34,6 +34,7 @@ from apar.evaluation.v5_staged_evidence import (
     _arm_core_and_observation,
     _control_group_core_and_observation,
     _issue_stage_capability,
+    _iter_arm_result_checkpoint_records,
     _iter_prepared_partition_records,
     _iter_v5_corpus_records,
     _metric_stage_core_and_observation,
@@ -44,6 +45,8 @@ from apar.evaluation.v5_staged_evidence import (
 from apar.features.sentinel import SentinelFeatureCatalog
 from apar.v5_kaggle_independent_verifier import (
     V5KaggleIndependentVerificationError,
+    _decode_arm_checkpoint_records,
+    _Record,
     _verify_v5_kaggle_test_fixture,
     verify_v5_kaggle_evidence,
     verify_v5_kaggle_prefix,
@@ -196,6 +199,170 @@ def _digest(document: object) -> str:
     ).hexdigest()
 
 
+def _multipart_arm_record_fixture() -> tuple[list[_Record], list[_Record]]:
+    arms = (
+        "rules_only",
+        "ensemble_no_graph",
+        "ensemble_with_graph",
+        "full_sentinel",
+    )
+    deterministic = [
+        _Record(
+            layer="deterministic",
+            kind="arm_header",
+            key="arms",
+            payload=json.dumps(
+                {
+                    "schema_version": "apar-sentinel-v5-kaggle-arms/2",
+                    "arm_order": arms,
+                    "support_event_ids": ["event-0"],
+                    "support_sha256": "1" * 64,
+                    "deterministic_result_sha256": ["2" * 64] * 4,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode(),
+        )
+    ]
+    observational: list[_Record] = []
+    for arm in arms:
+        artifacts = [{"evidence_sha256": f"artifact-{arm}"}]
+        rows = [{"event_id": "event-0", "arm": arm}]
+        samples = [{"event_id": "event-0", "latency_ms": 1.0}]
+        deterministic.append(
+            _Record(
+                layer="deterministic",
+                kind="arm_result_meta",
+                key=arm,
+                payload=json.dumps(
+                    {
+                        "schema_version": "apar-sentinel-v5-kaggle-arm-result-meta/1",
+                        "arm": arm,
+                        "fields": {"deterministic_result_sha256": "2" * 64},
+                        "sections": {
+                            "execution_artifacts": {
+                                "count": 1,
+                                "record_count": 1,
+                                "sha256": _digest(artifacts),
+                            },
+                            "row_evidence": {
+                                "count": 1,
+                                "record_count": 1,
+                                "sha256": _digest(rows),
+                            },
+                        },
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode(),
+            )
+        )
+        for kind, section, items in (
+            ("arm_execution_artifacts", "execution_artifacts", artifacts),
+            ("arm_result_rows", "row_evidence", rows),
+        ):
+            deterministic.append(
+                _Record(
+                    layer="deterministic",
+                    kind=kind,
+                    key=f"{arm}:0000",
+                    payload=json.dumps(
+                        {
+                            "schema_version": "apar-sentinel-v5-kaggle-arm-section/1",
+                            "arm": arm,
+                            "section": section,
+                            "index": 0,
+                            "start": 0,
+                            "items": items,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode(),
+                )
+            )
+        observational.extend(
+            (
+                _Record(
+                    layer="observational",
+                    kind="arm_latency_meta",
+                    key=arm,
+                    payload=json.dumps(
+                        {
+                            "schema_version": "apar-sentinel-v5-kaggle-arm-latency-meta/1",
+                            "arm": arm,
+                            "fields": {"observational_sha256": "3" * 64},
+                            "sections": {
+                                "samples": {
+                                    "count": 1,
+                                    "record_count": 1,
+                                    "sha256": _digest(samples),
+                                }
+                            },
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode(),
+                ),
+                _Record(
+                    layer="observational",
+                    kind="arm_latency_samples",
+                    key=f"{arm}:0000",
+                    payload=json.dumps(
+                        {
+                            "schema_version": "apar-sentinel-v5-kaggle-arm-section/1",
+                            "arm": arm,
+                            "section": "samples",
+                            "index": 0,
+                            "start": 0,
+                            "items": samples,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode(),
+                ),
+            )
+        )
+    return deterministic, observational
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing", "reordered", "start", "digest", "observation_missing"),
+)
+def test_independent_arm_section_parser_rejects_mutation(mutation: str) -> None:
+    deterministic, observational = _multipart_arm_record_fixture()
+    if mutation == "missing":
+        deterministic.pop(2)
+    elif mutation == "reordered":
+        deterministic[2], deterministic[3] = deterministic[3], deterministic[2]
+    elif mutation == "start":
+        document = json.loads(deterministic[2].payload)
+        document["start"] = 1
+        deterministic[2] = _Record(
+            layer="deterministic",
+            kind=deterministic[2].kind,
+            key=deterministic[2].key,
+            payload=json.dumps(document, sort_keys=True, separators=(",", ":")).encode(),
+        )
+    elif mutation == "digest":
+        document = json.loads(deterministic[1].payload)
+        document["sections"]["execution_artifacts"]["sha256"] = "0" * 64
+        deterministic[1] = _Record(
+            layer="deterministic",
+            kind=deterministic[1].kind,
+            key=deterministic[1].key,
+            payload=json.dumps(document, sort_keys=True, separators=(",", ":")).encode(),
+        )
+    else:
+        observational.pop(1)
+
+    with pytest.raises(V5KaggleIndependentVerificationError):
+        _decode_arm_checkpoint_records(
+            deterministic=deterministic,
+            observational=observational,
+        )
+
+
 @pytest.fixture(scope="module")
 def complete_safe_evidence() -> object:
     return staged_fixtures.executed_group_evidence.__wrapped__()
@@ -296,7 +463,7 @@ def _materialize_complete_chain(
                     key="arms",
                     canonical_bytes=json.dumps(
                         {
-                            "schema_version": "apar-sentinel-v5-kaggle-arms/1",
+                            "schema_version": "apar-sentinel-v5-kaggle-arms/2",
                             "arm_order": [item.arm for item in arm_results],
                             "support_event_ids": [
                                 row.support.event_id for row in arm_results[0].row_evidence
@@ -312,28 +479,14 @@ def _materialize_complete_chain(
                     ).encode(),
                 ),
                 *tuple(
-                    V5CheckpointInput(
-                        kind="arm_result",
-                        key=result.arm,
-                        canonical_bytes=json.dumps(
-                            core, sort_keys=True, separators=(",", ":")
-                        ).encode(),
-                    )
+                    record
                     for result, (core, _observation) in zip(
                         arm_results, cores_and_observations, strict=True
                     )
-                ),
-                *tuple(
-                    V5CheckpointInput(
-                        kind="arm_latency",
-                        key=result.arm,
-                        canonical_bytes=json.dumps(
-                            observation, sort_keys=True, separators=(",", ":")
-                        ).encode(),
-                        layer="observational",
-                    )
-                    for result, (_core, observation) in zip(
-                        arm_results, cores_and_observations, strict=True
+                    for record in _iter_arm_result_checkpoint_records(
+                        result=result,
+                        core=core,
+                        observation=_observation,
                     )
                 ),
             )
@@ -411,10 +564,12 @@ def _materialize_complete_chain(
         if semantic_mutation == "arm" and stage is V5KaggleStage.ARMS:
             mutated = list(records)
             index = next(
-                offset for offset, item in enumerate(mutated) if item.kind == "arm_result"
+                offset
+                for offset, item in enumerate(mutated)
+                if item.kind == "arm_result_meta"
             )
             core = json.loads(mutated[index].canonical_bytes)
-            core["support_total"] += 1
+            core["fields"]["support_total"] += 1
             mutated[index] = V5CheckpointInput(
                 kind=mutated[index].kind,
                 key=mutated[index].key,

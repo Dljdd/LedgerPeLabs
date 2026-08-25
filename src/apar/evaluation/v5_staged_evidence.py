@@ -108,6 +108,12 @@ _INVARIANCE_CONTROL_NAMES = {
     "feature_leakage",
 }
 _WORKLOAD_CONTROL_NAMES = {"benign_only", "fraud_only_diagnostic"}
+_MAX_ARM_SECTION_RECORD_BYTES = 16_777_216
+_ARM_SECTION_ENVELOPE_BYTES = 512
+_ARM_HEADER_SCHEMA = "apar-sentinel-v5-kaggle-arms/2"
+_ARM_RESULT_META_SCHEMA = "apar-sentinel-v5-kaggle-arm-result-meta/1"
+_ARM_LATENCY_META_SCHEMA = "apar-sentinel-v5-kaggle-arm-latency-meta/1"
+_ARM_SECTION_SCHEMA = "apar-sentinel-v5-kaggle-arm-section/1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,6 +220,82 @@ def _canonical_bytes(document: object) -> bytes:
         ensure_ascii=False,
         allow_nan=False,
     ).encode()
+
+
+def _iter_bounded_arm_section_records(
+    *,
+    kind: str,
+    arm: str,
+    section: str,
+    items: Sequence[dict[str, object]],
+    max_record_bytes: int,
+) -> Iterator[V5CheckpointInput]:
+    """Encode one ordered arm section without exceeding a record byte bound."""
+    ranges = _bounded_arm_section_ranges(
+        items=items,
+        max_record_bytes=max_record_bytes,
+    )
+    for index, (start, end) in enumerate(ranges):
+        document = {
+            "schema_version": _ARM_SECTION_SCHEMA,
+            "arm": arm,
+            "section": section,
+            "index": index,
+            "start": start,
+            "items": items[start:end],
+        }
+        encoded = _canonical_bytes(document)
+        if len(encoded) > max_record_bytes:
+            raise ValueError("arm section record exceeds its byte bound")
+        yield V5CheckpointInput(
+            kind=kind,
+            key=f"{arm}:{index:04d}",
+            canonical_bytes=encoded,
+        )
+
+
+def _bounded_arm_section_ranges(
+    *,
+    items: Sequence[dict[str, object]],
+    max_record_bytes: int,
+) -> tuple[tuple[int, int], ...]:
+    if max_record_bytes <= _ARM_SECTION_ENVELOPE_BYTES:
+        raise ValueError("arm section record byte bound is too small")
+    ranges: list[tuple[int, int]] = []
+    start = 0
+    encoded_items_bytes = 2
+    for index, item in enumerate(items):
+        item_bytes = len(_canonical_bytes(item))
+        if item_bytes + _ARM_SECTION_ENVELOPE_BYTES > max_record_bytes:
+            raise ValueError("one arm section item exceeds the record byte bound")
+        separator_bytes = int(index > start)
+        if (
+            index > start
+            and encoded_items_bytes
+            + separator_bytes
+            + item_bytes
+            + _ARM_SECTION_ENVELOPE_BYTES
+            > max_record_bytes
+        ):
+            ranges.append((start, index))
+            start = index
+            encoded_items_bytes = 2
+            separator_bytes = 0
+        encoded_items_bytes += separator_bytes + item_bytes
+    if start < len(items):
+        ranges.append((start, len(items)))
+    return tuple(ranges)
+
+
+def _canonical_sequence_sha256(items: Sequence[dict[str, object]]) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"[")
+    for index, item in enumerate(items):
+        if index:
+            digest.update(b",")
+        digest.update(_canonical_bytes(item))
+    digest.update(b"]")
+    return digest.hexdigest()
 
 
 def _sha256(content: bytes) -> str:
@@ -945,6 +1027,192 @@ def _arm_core_and_observation(
     return core, observation
 
 
+def _pop_document_sequence(
+    document: dict[str, object], *, field: str
+) -> tuple[dict[str, object], ...]:
+    raw_items = document.pop(field, None)
+    if not isinstance(raw_items, list) or not raw_items:
+        raise ValueError(f"arm checkpoint {field} is missing")
+    if any(not isinstance(item, dict) for item in raw_items):
+        raise ValueError(f"arm checkpoint {field} contains a malformed item")
+    return tuple(cast(dict[str, object], item) for item in raw_items)
+
+
+def _arm_section_index(items: Sequence[dict[str, object]]) -> dict[str, object]:
+    return {
+        "count": len(items),
+        "record_count": len(
+            _bounded_arm_section_ranges(
+                items=items,
+                max_record_bytes=_MAX_ARM_SECTION_RECORD_BYTES,
+            )
+        ),
+        "sha256": _canonical_sequence_sha256(items),
+    }
+
+
+def _iter_arm_result_checkpoint_records(
+    *,
+    result: V5EvaluationResult,
+    core: dict[str, object],
+    observation: dict[str, object],
+) -> Iterator[V5CheckpointInput]:
+    artifacts = _pop_document_sequence(core, field="execution_artifacts")
+    rows = _pop_document_sequence(core, field="row_evidence")
+    samples = _pop_document_sequence(observation, field="samples")
+    core_meta = {
+        "schema_version": _ARM_RESULT_META_SCHEMA,
+        "arm": result.arm,
+        "fields": core,
+        "sections": {
+            "execution_artifacts": _arm_section_index(artifacts),
+            "row_evidence": _arm_section_index(rows),
+        },
+    }
+    yield V5CheckpointInput(
+        kind="arm_result_meta",
+        key=result.arm,
+        canonical_bytes=_canonical_bytes(core_meta),
+    )
+    yield from _iter_bounded_arm_section_records(
+        kind="arm_execution_artifacts",
+        arm=result.arm,
+        section="execution_artifacts",
+        items=artifacts,
+        max_record_bytes=_MAX_ARM_SECTION_RECORD_BYTES,
+    )
+    yield from _iter_bounded_arm_section_records(
+        kind="arm_result_rows",
+        arm=result.arm,
+        section="row_evidence",
+        items=rows,
+        max_record_bytes=_MAX_ARM_SECTION_RECORD_BYTES,
+    )
+    latency_meta = {
+        "schema_version": _ARM_LATENCY_META_SCHEMA,
+        "arm": result.arm,
+        "fields": observation,
+        "sections": {"samples": _arm_section_index(samples)},
+    }
+    yield V5CheckpointInput(
+        kind="arm_latency_meta",
+        key=result.arm,
+        canonical_bytes=_canonical_bytes(latency_meta),
+        layer="observational",
+    )
+    for record in _iter_bounded_arm_section_records(
+        kind="arm_latency_samples",
+        arm=result.arm,
+        section="samples",
+        items=samples,
+        max_record_bytes=_MAX_ARM_SECTION_RECORD_BYTES,
+    ):
+        yield V5CheckpointInput(
+            kind=record.kind,
+            key=record.key,
+            canonical_bytes=record.canonical_bytes,
+            layer="observational",
+        )
+
+
+def _read_arm_section_index(
+    value: object, *, label: str
+) -> tuple[int, int, str]:
+    if not isinstance(value, dict) or set(value) != {"count", "record_count", "sha256"}:
+        raise ValueError(f"{label} index is malformed")
+    count = value.get("count")
+    record_count = value.get("record_count")
+    digest = value.get("sha256")
+    if (
+        type(count) is not int
+        or type(record_count) is not int
+        or count <= 0
+        or record_count <= 0
+        or record_count > count
+        or type(digest) is not str
+    ):
+        raise ValueError(f"{label} index is malformed")
+    _require_sha256(digest, label=f"{label} digest")
+    return count, record_count, digest
+
+
+def _read_arm_meta_record(
+    record: V5CheckpointInput,
+    *,
+    kind: str,
+    arm: str,
+    schema: str,
+    section_names: tuple[str, ...],
+    layer: str,
+) -> tuple[dict[str, object], dict[str, tuple[int, int, str]]]:
+    if record.kind != kind or record.key != arm or record.layer != layer:
+        raise ValueError("arm result metadata order differs")
+    document = _read_json_record(record, label=f"{arm} {kind}")
+    if (
+        set(document) != {"schema_version", "arm", "fields", "sections"}
+        or document.get("schema_version") != schema
+        or document.get("arm") != arm
+        or not isinstance(document.get("fields"), dict)
+        or not isinstance(document.get("sections"), dict)
+    ):
+        raise ValueError("arm result metadata differs")
+    raw_sections = cast(dict[str, object], document["sections"])
+    if tuple(raw_sections) != section_names:
+        raise ValueError("arm result metadata sections differ")
+    sections = {
+        name: _read_arm_section_index(raw_sections[name], label=f"{arm} {name}")
+        for name in section_names
+    }
+    return dict(cast(dict[str, object], document["fields"])), sections
+
+
+def _read_arm_section_records(
+    records: Iterator[V5CheckpointInput],
+    *,
+    kind: str,
+    arm: str,
+    section: str,
+    index: tuple[int, int, str],
+    layer: str,
+) -> list[dict[str, object]]:
+    expected_count, record_count, expected_digest = index
+    items: list[dict[str, object]] = []
+    for record_index in range(record_count):
+        try:
+            record = next(records)
+        except StopIteration as error:
+            raise ValueError(f"{arm} {section} record is missing") from error
+        if (
+            record.kind != kind
+            or record.key != f"{arm}:{record_index:04d}"
+            or record.layer != layer
+            or len(record.canonical_bytes) > _MAX_ARM_SECTION_RECORD_BYTES
+        ):
+            raise ValueError(f"{arm} {section} record order differs")
+        document = _read_json_record(record, label=f"{arm} {section} record")
+        raw_items = document.get("items")
+        if (
+            set(document)
+            != {"schema_version", "arm", "section", "index", "start", "items"}
+            or document.get("schema_version") != _ARM_SECTION_SCHEMA
+            or document.get("arm") != arm
+            or document.get("section") != section
+            or document.get("index") != record_index
+            or document.get("start") != len(items)
+            or not isinstance(raw_items, list)
+            or not raw_items
+            or any(not isinstance(item, dict) for item in raw_items)
+        ):
+            raise ValueError(f"{arm} {section} record differs")
+        items.extend(cast(list[dict[str, object]], raw_items))
+    if (
+        len(items) != expected_count
+        or _canonical_sequence_sha256(items) != expected_digest
+    ):
+        raise ValueError(f"{arm} {section} index binding differs")
+    return items
+
+
 def _restore_arm_result(
     *, core: dict[str, object], observation: dict[str, object]
 ) -> V5EvaluationResult:
@@ -1127,7 +1395,7 @@ def execute_v5_arm_stage(
         key="arms",
         canonical_bytes=_canonical_bytes(
             {
-                "schema_version": "apar-sentinel-v5-kaggle-arms/1",
+                "schema_version": _ARM_HEADER_SCHEMA,
                 "arm_order": tuple(arm.value for arm in _STAGED_ARMS),
                 "support_event_ids": evaluation.event_ids,
                 "support_sha256": results[0].support_sha256,
@@ -1139,16 +1407,10 @@ def execute_v5_arm_stage(
         ),
     )
     for result, (core, observation) in zip(results, cores_and_observations, strict=True):
-        yield V5CheckpointInput(
-            kind="arm_result",
-            key=result.arm,
-            canonical_bytes=_canonical_bytes(core),
-        )
-        yield V5CheckpointInput(
-            kind="arm_latency",
-            key=result.arm,
-            canonical_bytes=_canonical_bytes(observation),
-            layer="observational",
+        yield from _iter_arm_result_checkpoint_records(
+            result=result,
+            core=core,
+            observation=observation,
         )
 
 
@@ -1169,9 +1431,17 @@ def load_v5_arm_checkpoint(
     header = _read_json_record(header_record, label="arm header")
     expected_order = tuple(arm.value for arm in _STAGED_ARMS)
     if (
-        header_record.kind != "arm_header"
+        set(header)
+        != {
+            "schema_version",
+            "arm_order",
+            "support_event_ids",
+            "support_sha256",
+            "deterministic_result_sha256",
+        }
+        or header_record.kind != "arm_header"
         or header_record.key != "arms"
-        or header.get("schema_version") != "apar-sentinel-v5-kaggle-arms/1"
+        or header.get("schema_version") != _ARM_HEADER_SCHEMA
         or header.get("arm_order") != list(expected_order)
     ):
         raise ValueError("arm checkpoint header differs")
@@ -1183,19 +1453,50 @@ def load_v5_arm_checkpoint(
     results: list[V5EvaluationResult] = []
     for index, arm in enumerate(expected_order):
         try:
-            core_record = next(deterministic)
-            latency_record = next(observational)
+            core_meta_record = next(deterministic)
+            latency_meta_record = next(observational)
         except StopIteration as error:
             raise ValueError("arm result or latency evidence is missing") from error
-        if (
-            core_record.kind != "arm_result"
-            or latency_record.kind != "arm_latency"
-            or core_record.key != arm
-            or latency_record.key != arm
-        ):
-            raise ValueError("arm result order differs")
-        core = _read_json_record(core_record, label="arm deterministic result")
-        observation = _read_json_record(latency_record, label="arm latency observation")
+        core, core_sections = _read_arm_meta_record(
+            core_meta_record,
+            kind="arm_result_meta",
+            arm=arm,
+            schema=_ARM_RESULT_META_SCHEMA,
+            section_names=("execution_artifacts", "row_evidence"),
+            layer="deterministic",
+        )
+        core["execution_artifacts"] = _read_arm_section_records(
+            deterministic,
+            kind="arm_execution_artifacts",
+            arm=arm,
+            section="execution_artifacts",
+            index=core_sections["execution_artifacts"],
+            layer="deterministic",
+        )
+        core["row_evidence"] = _read_arm_section_records(
+            deterministic,
+            kind="arm_result_rows",
+            arm=arm,
+            section="row_evidence",
+            index=core_sections["row_evidence"],
+            layer="deterministic",
+        )
+        observation, observation_sections = _read_arm_meta_record(
+            latency_meta_record,
+            kind="arm_latency_meta",
+            arm=arm,
+            schema=_ARM_LATENCY_META_SCHEMA,
+            section_names=("samples",),
+            layer="observational",
+        )
+        observation["samples"] = _read_arm_section_records(
+            observational,
+            kind="arm_latency_samples",
+            arm=arm,
+            section="samples",
+            index=observation_sections["samples"],
+            layer="observational",
+        )
         if core.get("deterministic_result_sha256") != expected_core_digests[index]:
             raise ValueError("arm deterministic result index binding differs")
         results.append(_restore_arm_result(core=core, observation=observation))
