@@ -28,6 +28,7 @@ _MAX_OBSERVATION_BYTES = 4_194_304
 _MAX_RECORD_HEADER_BYTES = 65_536
 _MAX_RECORD_BYTES = 536_870_912
 _DECOMPRESS_BLOCK_BYTES = 1_048_576
+_EMPTY_LAYER_MARKER = "empty-layer.json"
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -42,6 +43,17 @@ def _canonical_bytes(value: object) -> bytes:
 
 def _digest(value: object) -> str:
     return hashlib.sha256(_canonical_bytes(value)).hexdigest()
+
+
+def _empty_observational_layer_bytes() -> bytes:
+    return _canonical_bytes(
+        {
+            "schema_version": "apar-sentinel-v5-kaggle-empty-checkpoint-layer/1",
+            "layer": "observational",
+            "record_count": 0,
+            "record_stream_sha256": hashlib.sha256(b"").hexdigest(),
+        }
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -459,6 +471,12 @@ def publish_v5_checkpoint(
     if observational_count:
         observational_writer.write(observational_compressor.flush())
     observational_chunks = observational_writer.finish(allow_empty=True)
+    if not observational_count:
+        _write_exclusive(
+            observational_chunks_directory / _EMPTY_LAYER_MARKER,
+            _empty_observational_layer_bytes(),
+        )
+        _fsync_directory(observational_chunks_directory)
     compressed_bytes = sum(item.bytes for item in chunks) + sum(
         item.bytes for item in observational_chunks
     )
@@ -569,9 +587,18 @@ def _validate_storage_topology(
     if not stat.S_ISDIR(observational_chunks_metadata.st_mode):
         raise ValueError("observational checkpoint chunk root is not a real directory")
     observed_observational_names = {item.name for item in observational_chunks_directory.iterdir()}
-    expected_observational_names = {item.filename for item in manifest.observational_chunks}
+    expected_observational_names = (
+        {_EMPTY_LAYER_MARKER}
+        if manifest.observational_record_count == 0
+        else {item.filename for item in manifest.observational_chunks}
+    )
     if observed_observational_names != expected_observational_names:
         raise ValueError("observational checkpoint chunk set differs")
+    if manifest.observational_record_count == 0:
+        marker_path = observational_chunks_directory / _EMPTY_LAYER_MARKER
+        _regular_single_link(marker_path, "empty observational checkpoint marker")
+        if marker_path.read_bytes() != _empty_observational_layer_bytes():
+            raise ValueError("empty observational checkpoint marker differs")
     observation_document = _read_canonical_object(
         output_root / "observational.json",
         label="checkpoint observation",

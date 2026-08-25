@@ -121,6 +121,7 @@ _MAX_OBSERVATION_BYTES = 4_194_304
 _MAX_RECORD_HEADER_BYTES = 65_536
 _MAX_RECORD_BYTES = 1_073_741_824
 _READ_BLOCK_BYTES = 1_048_576
+_EMPTY_LAYER_MARKER = "empty-layer.json"
 
 
 class V5KaggleIndependentVerificationError(ValueError):
@@ -143,6 +144,17 @@ def _canonical_bytes(document: object) -> bytes:
 
 def _digest(document: object) -> str:
     return hashlib.sha256(_canonical_bytes(document)).hexdigest()
+
+
+def _empty_observational_layer_bytes() -> bytes:
+    return _canonical_bytes(
+        {
+            "schema_version": "apar-sentinel-v5-kaggle-empty-checkpoint-layer/1",
+            "layer": "observational",
+            "record_count": 0,
+            "record_stream_sha256": hashlib.sha256(b"").hexdigest(),
+        }
+    )
 
 
 def _is_sha256(value: object) -> bool:
@@ -236,9 +248,25 @@ class _RecordStream:
         if len(self.chunks) > self.max_chunks:
             _fail(f"{self.layer} chunk count exceeds bound")
         expected_names = {str(item.get("filename")) for item in self.chunks}
+        if self.layer == "observational" and not self.chunks:
+            expected_names = {_EMPTY_LAYER_MARKER}
         if {item.name for item in directory.iterdir()} != expected_names:
             _fail(f"{self.layer} chunk set differs")
         if not self.chunks:
+            marker = directory / _EMPTY_LAYER_MARKER
+            try:
+                marker_metadata = marker.lstat()
+            except OSError as error:
+                raise V5KaggleIndependentVerificationError(
+                    "empty observational checkpoint marker is missing"
+                ) from error
+            if (
+                self.layer != "observational"
+                or not stat.S_ISREG(marker_metadata.st_mode)
+                or marker_metadata.st_nlink != 1
+                or marker.read_bytes() != _empty_observational_layer_bytes()
+            ):
+                _fail("empty observational checkpoint marker differs")
             return
         decompressor = zlib.decompressobj(wbits=31)
         for expected_index, descriptor in enumerate(self.chunks):

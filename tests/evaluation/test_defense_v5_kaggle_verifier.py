@@ -83,9 +83,7 @@ def test_independent_verifier_module_and_import_boundary() -> None:
     assert _imports(VERIFIER).isdisjoint(forbidden)
 
 
-def test_public_prefix_verifier_accepts_nonexecuting_authorization_stage(
-    tmp_path: Path,
-) -> None:
+def _materialize_authorization_checkpoint(tmp_path: Path) -> Path:
     protocol = load_v5_kaggle_protocol(
         ROOT / "config/defense/defense-v5-kaggle-recovery.json", root=ROOT
     )
@@ -132,6 +130,13 @@ def test_public_prefix_verifier_accepts_nonexecuting_authorization_stage(
         ),
         limits=protocol.resources,
     )
+    return checkpoint
+
+
+def test_public_prefix_verifier_accepts_nonexecuting_authorization_stage(
+    tmp_path: Path,
+) -> None:
+    checkpoint = _materialize_authorization_checkpoint(tmp_path)
     report = verify_v5_kaggle_prefix(
         root=ROOT,
         checkpoint_roots=(checkpoint,),
@@ -155,6 +160,34 @@ def test_public_prefix_verifier_accepts_nonexecuting_authorization_stage(
         text=True,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize("mutation", ["tampered", "symlink", "hardlink"])
+def test_independent_verifier_rejects_empty_layer_marker_substitution(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    checkpoint = _materialize_authorization_checkpoint(tmp_path)
+    marker = checkpoint / "observational-chunks" / "empty-layer.json"
+    if mutation == "tampered":
+        marker.write_bytes(b"{}")
+    else:
+        real = tmp_path / "real-empty-layer.json"
+        marker.rename(real)
+        if mutation == "symlink":
+            marker.symlink_to(real)
+        else:
+            os.link(real, marker)
+
+    with pytest.raises(
+        V5KaggleIndependentVerificationError,
+        match="empty observational checkpoint marker",
+    ):
+        verify_v5_kaggle_prefix(
+            root=ROOT,
+            checkpoint_roots=(checkpoint,),
+            expected_mode="kaggle_capacity_validation",
+        )
 
 
 def _digest(document: object) -> str:

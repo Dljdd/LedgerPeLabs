@@ -126,6 +126,58 @@ def test_checkpoint_is_manifest_last_content_addressed_and_reconstructable(
     ).peak_rss_bytes == 200_000
 
 
+def test_empty_observational_layer_survives_file_only_checkpoint_transport(
+    tmp_path: Path,
+) -> None:
+    """A file-only notebook output must retain an authenticated empty layer."""
+    published = tmp_path / "published"
+    manifest = _publish(published)
+    marker = published / "observational-chunks" / "empty-layer.json"
+
+    assert manifest.observational_record_count == 0
+    assert marker.read_bytes() == (
+        b'{"layer":"observational","record_count":0,'
+        b'"record_stream_sha256":'
+        b'"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",'
+        b'"schema_version":"apar-sentinel-v5-kaggle-empty-checkpoint-layer/1"}'
+    )
+
+    transported = tmp_path / "transported"
+    for source in published.rglob("*"):
+        if source.is_file():
+            destination = transported / source.relative_to(published)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(source.read_bytes())
+
+    assert read_v5_checkpoint_manifest(
+        output_root=transported,
+        limits=_limits(),
+    ) == manifest
+
+
+@pytest.mark.parametrize("mutation", ["tampered", "symlink", "hardlink"])
+def test_empty_observational_layer_marker_rejects_substitution(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    """The portability marker cannot become an unauthenticated substitute."""
+    output = tmp_path / "out"
+    _publish(output)
+    marker = output / "observational-chunks" / "empty-layer.json"
+    if mutation == "tampered":
+        marker.write_bytes(b"{}")
+    else:
+        real = output / "real-empty-layer.json"
+        marker.rename(real)
+        if mutation == "symlink":
+            marker.symlink_to(real)
+        else:
+            os.link(real, marker)
+
+    with pytest.raises(ValueError, match="empty observational checkpoint marker"):
+        read_v5_checkpoint_manifest(output_root=output, limits=_limits())
+
+
 def test_deterministic_digest_excludes_only_authenticated_observation(
     tmp_path: Path,
 ) -> None:
