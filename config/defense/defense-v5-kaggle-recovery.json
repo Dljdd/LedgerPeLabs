@@ -1,0 +1,91 @@
+{
+  "schema_version": "apar-sentinel-v5-kaggle-recovery-protocol/1",
+  "protocol_id": "apar-sentinel-v5-kaggle-staged-recovery",
+  "stage_order": [
+    "00_authorize",
+    "10_corpus",
+    "20_features",
+    "30_arms",
+    "40_label_shuffle",
+    "50_invariance_controls",
+    "60_single_class_controls",
+    "70_metrics",
+    "80_finalize"
+  ],
+  "capacity": {
+    "mode": "kaggle_capacity_validation",
+    "profile": "production",
+    "development_test_seed": 404,
+    "repeatable": true,
+    "authorization_required": false
+  },
+  "locked": {
+    "mode": "kaggle_locked_successor",
+    "profile": "production",
+    "development_test_seed": 2404,
+    "repeatable": false,
+    "authorization_required": true
+  },
+  "resources": {
+    "max_peak_rss_bytes": 19327352832,
+    "max_stage_seconds": 21600,
+    "max_stage_output_bytes": 10000000000,
+    "max_checkpoint_chunk_bytes": 67108864,
+    "max_checkpoint_chunks": 160
+  },
+  "checkpoint": {
+    "manifest_schema_version": "apar-sentinel-v5-kaggle-checkpoint-manifest/1",
+    "observation_schema_version": "apar-sentinel-v5-kaggle-observation/1",
+    "record_stream_schema_version": "apar-sentinel-v5-kaggle-record-stream/1",
+    "compression": "gzip-zlib-level-9",
+    "checkpoint_directory": "apar-v5-checkpoint",
+    "final_directory": "apar-v5-final",
+    "manifest_name": "checkpoint.manifest.json",
+    "observation_name": "observational.json",
+    "chunks_directory": "chunks"
+  },
+  "private_inputs": {
+    "owner_slug": "dylanmoraes",
+    "source_dataset_slug": "apar-sentinel-v5-source3",
+    "source_archive_name": "apar-v5-source3.tar.gz",
+    "source_manifest_name": "source-manifest.json",
+    "wheelhouse_dataset_slug": "apar-sentinel-v5-wheelhouse-py312-linux-x86-64",
+    "wheelhouse_manifest_name": "wheelhouse-manifest.json",
+    "safe_evidence_dataset_slug": "apar-sentinel-v5-safe-evidence",
+    "safe_evidence_name": "safe-evidence.json",
+    "safe_evidence_manifest_name": "safe-evidence-manifest.json",
+    "notebook_slug_prefix": "apar-sentinel-v5"
+  },
+  "successor_outputs": {
+    "attempt_receipt_path": "docs/experiments/defense-v5-kaggle-successor-attempt.json",
+    "checkpoint_directory_path": "docs/experiments/defense-v5-kaggle-successor-checkpoints",
+    "candidate_manifest_path": "docs/experiments/defense-v5-kaggle-development-candidate.manifest.json",
+    "candidate_chunks_path": "docs/experiments/defense-v5-kaggle-development-candidate.manifest.json.chunks",
+    "judge_summary_path": "docs/experiments/defense-v5-kaggle-development-summary.json"
+  },
+  "recovery": {
+    "attempt_receipt_path": "docs/experiments/defense-v5-locked-development-attempt.json",
+    "attempt_receipt_raw_sha256": "c9093272309605293f6377699df1810485901e0e3c5dfa9f81226ddea31151e8",
+    "attempt_receipt_self_sha256": "2cd207fdef0b808a8623843152195495d25d40b5d7903c5e71fd936611a09b93",
+    "abort_record_path": "docs/experiments/defense-v5-locked-development-abort.json",
+    "abort_record_sha256": "dc0743f1fe93356ea1e06af188d7a0e08cf46f0fcea02a674dbc1b2ec63d94d8",
+    "historical_result_path": "docs/experiments/defense-v5-development-result.json",
+    "historical_result_sha256": "af326f3a0fcbbe12c9b8623fc7d82a1ba6d0f327ec9a80f462cacd4bea1dd185",
+    "historical_safe_core_path": "config/defense/defense-v5-safe-core-freeze.json",
+    "historical_safe_core_file_sha256": "6c38f80c49826659e7484c56b24c797436fa050275252a39b6db36bf5d89f830",
+    "historical_safe_core_sha256": "784a762fd90a65219a233e87df35290ac87c8fe8e4b9024de46564568f633719",
+    "consumed_attempt_safe_core_sha256": "8cd3bba2cda47aa5b0d0a85fed4476eeeff787f3f0d2fcec973cc3e30a7b0435",
+    "observational_environment_sha256": "415902f1184ebe83deac0380e419a2eb6f11c3d7147c2c67fe38f76fe72ecc33",
+    "retry_permitted": false
+  },
+  "source_bindings": {
+    "base_protocol_path": "config/defense/defense-v5-development.json",
+    "base_protocol_sha256": "751db3b095ebb162c5856284b9afee4ab9d934eee3e4f2a2aba401beeb46b799",
+    "evidence_protocol_path": "config/defense/defense-v5-evidence.json",
+    "evidence_protocol_sha256": "b3eb5b50dda7f5aab9b324327069ef461e892e49b1e8ef47e232856fae3ecf1f",
+    "arm_protocol_path": "config/defense/defense-v5-arms.json",
+    "arm_protocol_sha256": "6014b3273b3ab5098c1da2a0ed3f8b58b51299625318d9d259283c5b6f635469",
+    "feature_catalog_path": "config/defense/feature-catalog-v5.json",
+    "feature_catalog_sha256": "4a4e807d61654691811f91ac79e1f71c6bbb1e4d16e3c6f2a4c2ee988b0dd9e8"
+  }
+}

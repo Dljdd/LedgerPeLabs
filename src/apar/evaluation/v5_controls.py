@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from enum import StrEnum
 from typing import Literal, Self
 from uuid import NAMESPACE_URL, uuid5
 
@@ -41,7 +43,16 @@ from apar.features.sentinel import (
     build_sentinel_features,
 )
 
-_CONTROL_NAMES = (
+_V5ControlName = Literal[
+    "label_shuffle",
+    "identity_rename",
+    "future_causality",
+    "equal_time_isolation",
+    "benign_only",
+    "fraud_only_diagnostic",
+    "feature_leakage",
+]
+_CONTROL_NAMES: tuple[_V5ControlName, ...] = (
     "label_shuffle",
     "identity_rename",
     "future_causality",
@@ -53,6 +64,34 @@ _CONTROL_NAMES = (
 _MAX_CONTROL_ROWS = 100_000
 _MAX_CONTROL_ARTIFACTS = 4_096
 _MAX_CONTROL_EVIDENCE_BYTES = 128 * 1024 * 1024
+
+
+class V5ControlGroup(StrEnum):
+    """Closed staged-execution decomposition of the seven frozen controls."""
+
+    LABEL_SHUFFLE = "label_shuffle"
+    INVARIANCE = "invariance"
+    SINGLE_CLASS = "single_class"
+
+
+_CONTROL_GROUP_ORDER = (
+    V5ControlGroup.LABEL_SHUFFLE,
+    V5ControlGroup.INVARIANCE,
+    V5ControlGroup.SINGLE_CLASS,
+)
+_CONTROL_NAMES_BY_GROUP = {
+    V5ControlGroup.LABEL_SHUFFLE: ("label_shuffle",),
+    V5ControlGroup.INVARIANCE: (
+        "identity_rename",
+        "future_causality",
+        "equal_time_isolation",
+        "feature_leakage",
+    ),
+    V5ControlGroup.SINGLE_CLASS: (
+        "benign_only",
+        "fraud_only_diagnostic",
+    ),
+}
 
 
 def _canonical_digest(document: object) -> str:
@@ -122,15 +161,7 @@ class V5ExecutedControlResult(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    name: Literal[
-        "label_shuffle",
-        "identity_rename",
-        "future_causality",
-        "equal_time_isolation",
-        "benign_only",
-        "fraud_only_diagnostic",
-        "feature_leakage",
-    ]
+    name: _V5ControlName
     executed: Literal[True]
     qualifies_for_readiness: bool
     spec_json: str = Field(max_length=65_536)
@@ -184,6 +215,34 @@ class V5ExecutedControlResult(BaseModel):
         document = self.model_dump(mode="json", exclude={"control_sha256"})
         if self.control_sha256 != _canonical_digest(document):
             raise ValueError("executed control digest mismatch")
+        return self
+
+
+class V5ExecutedControlGroup(BaseModel):
+    """One immutable staged group of actually executed controls."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["apar-sentinel-v5-control-group/1"] = "apar-sentinel-v5-control-group/1"
+    group: V5ControlGroup
+    run_mode: V5RunMode
+    controls: tuple[V5ExecutedControlResult, ...]
+    evidence_protocol_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    support_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    implementation_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    group_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_group(self) -> Self:
+        if tuple(control.name for control in self.controls) != _CONTROL_NAMES_BY_GROUP[self.group]:
+            raise ValueError("control group requires its exact controls")
+        if any(
+            control.implementation_sha256 != self.implementation_sha256 for control in self.controls
+        ):
+            raise ValueError("control group contains mixed implementation evidence")
+        document = self.model_dump(mode="json", exclude={"group_sha256"})
+        if self.group_sha256 != _canonical_digest(document):
+            raise ValueError("executed control group digest mismatch")
         return self
 
 
@@ -1260,16 +1319,133 @@ def validate_v5_control_run_mode(
             protocol
             if protocol.seeds.development_test == 2404
             else protocol.model_copy(
-                update={
-                    "seeds": protocol.seeds.model_copy(
-                        update={"development_test": 2404}
-                    )
-                }
+                update={"seeds": protocol.seeds.model_copy(update={"development_test": 2404})}
             )
         ),
     )
     if protocol.seeds.development_test != binding.development_test_seed:
         raise ValueError("executed-control seed differs from its closed run mode")
+
+
+def _execute_v5_control_group_from_runtime(
+    *,
+    group: V5ControlGroup,
+    runtime: _ControlRuntime,
+    evidence_protocol: V5EvidenceProtocol,
+    catalog: SentinelFeatureCatalog,
+) -> tuple[V5ExecutedControlResult, ...]:
+    if group is V5ControlGroup.LABEL_SHUFFLE:
+        return (
+            _label_shuffle_control(
+                runtime=runtime,
+                evidence_protocol=evidence_protocol,
+                catalog=catalog,
+            ),
+        )
+    if group is V5ControlGroup.INVARIANCE:
+        return (
+            _invariance_control(
+                name="identity_rename",
+                runtime=runtime,
+                evidence_protocol=evidence_protocol,
+                catalog=catalog,
+            ),
+            _invariance_control(
+                name="future_causality",
+                runtime=runtime,
+                evidence_protocol=evidence_protocol,
+                catalog=catalog,
+            ),
+            _invariance_control(
+                name="equal_time_isolation",
+                runtime=runtime,
+                evidence_protocol=evidence_protocol,
+                catalog=catalog,
+            ),
+            _invariance_control(
+                name="feature_leakage",
+                runtime=runtime,
+                evidence_protocol=evidence_protocol,
+                catalog=catalog,
+            ),
+        )
+    return (
+        _single_class_control(
+            fraud=False,
+            runtime=runtime,
+            evidence_protocol=evidence_protocol,
+            catalog=catalog,
+        ),
+        _single_class_control(
+            fraud=True,
+            runtime=runtime,
+            evidence_protocol=evidence_protocol,
+            catalog=catalog,
+        ),
+    )
+
+
+def _build_v5_control_group(
+    *,
+    group: V5ControlGroup,
+    mode: V5RunMode,
+    controls: tuple[V5ExecutedControlResult, ...],
+    evidence_protocol: V5EvidenceProtocol,
+    support_ids: tuple[str, ...],
+) -> V5ExecutedControlGroup:
+    values = {
+        "schema_version": "apar-sentinel-v5-control-group/1",
+        "group": group,
+        "run_mode": mode,
+        "controls": controls,
+        "evidence_protocol_sha256": evidence_protocol.evidence_protocol_sha256,
+        "support_sha256": _support_digest(support_ids),
+        "implementation_sha256": evidence_protocol.implementation_sha256,
+    }
+    digest_values = dict(values)
+    digest_values["group"] = group.value
+    digest_values["run_mode"] = mode.value
+    digest_values["controls"] = [item.model_dump(mode="json") for item in controls]
+    values["group_sha256"] = _canonical_digest(digest_values)
+    return V5ExecutedControlGroup.model_validate(values)
+
+
+def execute_v5_control_group(
+    *,
+    group: V5ControlGroup,
+    protocol: V5DevelopmentProtocol,
+    evidence_protocol: V5EvidenceProtocol,
+    corpus: V5Corpus,
+    catalog: SentinelFeatureCatalog,
+    configuration: V5ArmConfiguration,
+    mode: V5RunMode,
+) -> V5ExecutedControlGroup:
+    """Execute exactly one frozen control group for a closed run mode."""
+    if type(group) is not V5ControlGroup:
+        raise TypeError("control execution requires an exact V5ControlGroup")
+    validate_v5_control_run_mode(
+        protocol=protocol,
+        evidence_protocol=evidence_protocol,
+        mode=mode,
+    )
+    runtime = _build_runtime(
+        protocol=protocol,
+        corpus=corpus,
+        catalog=catalog,
+        configuration=configuration,
+    )
+    return _build_v5_control_group(
+        group=group,
+        mode=mode,
+        controls=_execute_v5_control_group_from_runtime(
+            group=group,
+            runtime=runtime,
+            evidence_protocol=evidence_protocol,
+            catalog=catalog,
+        ),
+        evidence_protocol=evidence_protocol,
+        support_ids=tuple(row.event_id for row in runtime.development_rows),
+    )
 
 
 def execute_v5_controls(
@@ -1293,49 +1469,17 @@ def execute_v5_controls(
         catalog=catalog,
         configuration=configuration,
     )
-    controls = (
-        _label_shuffle_control(
+    by_name = {
+        control.name: control
+        for group in _CONTROL_GROUP_ORDER
+        for control in _execute_v5_control_group_from_runtime(
+            group=group,
             runtime=runtime,
             evidence_protocol=evidence_protocol,
             catalog=catalog,
-        ),
-        _invariance_control(
-            name="identity_rename",
-            runtime=runtime,
-            evidence_protocol=evidence_protocol,
-            catalog=catalog,
-        ),
-        _invariance_control(
-            name="future_causality",
-            runtime=runtime,
-            evidence_protocol=evidence_protocol,
-            catalog=catalog,
-        ),
-        _invariance_control(
-            name="equal_time_isolation",
-            runtime=runtime,
-            evidence_protocol=evidence_protocol,
-            catalog=catalog,
-        ),
-        _single_class_control(
-            fraud=False,
-            runtime=runtime,
-            evidence_protocol=evidence_protocol,
-            catalog=catalog,
-        ),
-        _single_class_control(
-            fraud=True,
-            runtime=runtime,
-            evidence_protocol=evidence_protocol,
-            catalog=catalog,
-        ),
-        _invariance_control(
-            name="feature_leakage",
-            runtime=runtime,
-            evidence_protocol=evidence_protocol,
-            catalog=catalog,
-        ),
-    )
+        )
+    }
+    controls = tuple(by_name[name] for name in _CONTROL_NAMES)
     support_ids = tuple(row.event_id for row in runtime.development_rows)
     values = {
         "controls": controls,
@@ -1377,10 +1521,49 @@ class V5ExecutedControlSuite(BaseModel):
         return self
 
 
+def assemble_v5_control_suite(
+    groups: Sequence[V5ExecutedControlGroup],
+) -> V5ExecutedControlSuite:
+    """Assemble the three immutable groups into the original suite contract."""
+    frozen = tuple(groups)
+    if tuple(group.group for group in frozen) != _CONTROL_GROUP_ORDER:
+        raise ValueError("control suite requires the exact ordered control groups")
+    bindings = {
+        (
+            group.run_mode,
+            group.evidence_protocol_sha256,
+            group.support_sha256,
+            group.implementation_sha256,
+        )
+        for group in frozen
+    }
+    if len(bindings) != 1:
+        raise ValueError("control groups have mixed run-mode or evidence bindings")
+    by_name = {control.name: control for group in frozen for control in group.controls}
+    if set(by_name) != set(_CONTROL_NAMES):
+        raise ValueError("control groups do not cover the exact control suite")
+    controls = tuple(by_name[name] for name in _CONTROL_NAMES)
+    _mode, evidence_sha, support_sha, implementation_sha = next(iter(bindings))
+    values = {
+        "controls": controls,
+        "evidence_protocol_sha256": evidence_sha,
+        "support_sha256": support_sha,
+        "implementation_sha256": implementation_sha,
+    }
+    digest_values = dict(values)
+    digest_values["controls"] = [item.model_dump(mode="json") for item in controls]
+    values["suite_sha256"] = _canonical_digest(digest_values)
+    return V5ExecutedControlSuite.model_validate(values)
+
+
 __all__ = [
+    "V5ControlGroup",
     "V5ControlMeasurement",
+    "V5ExecutedControlGroup",
     "V5ExecutedControlResult",
     "V5ExecutedControlSuite",
+    "assemble_v5_control_suite",
+    "execute_v5_control_group",
     "execute_v5_controls",
     "validate_v5_control_run_mode",
 ]

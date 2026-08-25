@@ -12,6 +12,7 @@ import pytest
 from pydantic import ValidationError
 
 from apar.evaluation.v5_evidence_protocol import load_v5_evidence_protocol
+from apar.evaluation.v5_locked_evidence import V5CheckpointChainBinding
 from apar.evaluation.v5_protocol import load_v5_development_protocol
 from apar.evaluation.v5_run_mode import (
     V5RunMode,
@@ -31,15 +32,59 @@ def _canonical_bytes(value: object) -> bytes:
     ).encode()
 
 
+def _checkpoint_chain() -> V5CheckpointChainBinding:
+    values = {
+        "schema_version": "apar-sentinel-v5-checkpoint-chain/1",
+        "attempt_receipt_sha256": "9" * 64,
+        "predecessor_stage_manifest_sha256": tuple(
+            (stage, f"{index:x}" * 64)
+            for index, stage in enumerate(
+                (
+                    "00_authorize",
+                    "10_corpus",
+                    "20_features",
+                    "30_arms",
+                    "40_label_shuffle",
+                    "50_invariance_controls",
+                    "60_single_class_controls",
+                    "70_metrics",
+                ),
+                start=1,
+            )
+        ),
+    }
+    values["predecessor_chain_root_sha256"] = hashlib.sha256(_canonical_bytes(values)).hexdigest()
+    return V5CheckpointChainBinding.model_validate(values)
+
+
+def test_checkpoint_chain_binding_is_exact_and_non_self_referential() -> None:
+    """Stage 80 binds Stage 00-70 without placing its own manifest in its payload."""
+    chain = _checkpoint_chain()
+    assert chain.predecessor_stage_manifest_sha256[-1][0] == "70_metrics"
+    assert len(chain.predecessor_stage_manifest_sha256) == 8
+
+    for mutation in (
+        {"attempt_receipt_sha256": "8" * 64},
+        {
+            "predecessor_stage_manifest_sha256": tuple(
+                reversed(chain.predecessor_stage_manifest_sha256)
+            )
+        },
+        {"predecessor_chain_root_sha256": "0" * 64},
+    ):
+        with pytest.raises(ValueError, match="chain|order|digest"):
+            V5CheckpointChainBinding.model_validate(
+                chain.model_copy(update=mutation).model_dump(mode="json")
+            )
+
+
 def _locked_binding_values() -> dict[str, object]:
     from apar.evaluation.v5_run_mode import V5LockedEvidenceRunBinding
 
     evidence = load_v5_evidence_protocol(
         ROOT / "config/defense/defense-v5-evidence.json", root=ROOT
     )
-    development = load_v5_development_protocol(
-        ROOT / "config/defense/defense-v5-development.json"
-    )
+    development = load_v5_development_protocol(ROOT / "config/defense/defense-v5-development.json")
     plan = build_v5_run_support_plan(
         mode=V5RunMode.LOCKED_DEVELOPMENT,
         evidence_protocol=evidence,
@@ -63,15 +108,9 @@ def _locked_binding_values() -> dict[str, object]:
         "implementation_sha256": evidence.implementation_sha256,
         "catalog_sha256": "4" * 64,
         "support_plan": plan.model_dump(mode="json"),
-        "candidate_manifest_path": (
-            evidence.locked_artifact_storage.candidate_manifest_path
-        ),
-        "storage_schema_version": (
-            evidence.locked_artifact_storage.schema_version
-        ),
-        "payload_schema_version": (
-            "apar-sentinel-v5-locked-development-payload/2"
-        ),
+        "candidate_manifest_path": (evidence.locked_artifact_storage.candidate_manifest_path),
+        "storage_schema_version": (evidence.locked_artifact_storage.schema_version),
+        "payload_schema_version": ("apar-sentinel-v5-locked-development-payload/2"),
     }
     values["run_binding_sha256"] = V5LockedEvidenceRunBinding.compute_digest(values)
     return values
@@ -126,9 +165,7 @@ def test_independent_locked_payload_verifier_exists() -> None:
     """The locked path must not depend on the legacy summary readiness verifier."""
     from apar import v5_independent_verifier
 
-    assert callable(
-        getattr(v5_independent_verifier, "verify_locked_evidence_payload_bytes", None)
-    )
+    assert callable(getattr(v5_independent_verifier, "verify_locked_evidence_payload_bytes", None))
 
 
 def test_locked_payload_builder_requires_exact_ordered_four_arms() -> None:
@@ -176,18 +213,13 @@ def test_independent_locked_support_rejects_partial_production_rows() -> None:
     evidence = load_v5_evidence_protocol(
         ROOT / "config/defense/defense-v5-evidence.json", root=ROOT
     )
-    development = load_v5_development_protocol(
-        ROOT / "config/defense/defense-v5-development.json"
-    )
+    development = load_v5_development_protocol(ROOT / "config/defense/defense-v5-development.json")
     expected = build_v5_run_support_plan(
         mode=V5RunMode.LOCKED_DEVELOPMENT,
         evidence_protocol=evidence,
         development_protocol=development,
     ).model_dump(mode="json")
-    rows = [
-        {"support": {"label": 0, "family": "legitimate"}}
-        for _index in range(200)
-    ]
+    rows = [{"support": {"label": 0, "family": "legitimate"}} for _index in range(200)]
     result = {
         "arm_spec": {
             "training_partitions": [
@@ -215,9 +247,7 @@ def test_locked_verifier_rejects_legacy_summary_and_safe_envelope() -> None:
         verify_locked_evidence_payload_bytes,
     )
 
-    legacy = (
-        ROOT / "docs/experiments/defense-v5-development-result.json"
-    ).read_bytes()
+    legacy = (ROOT / "docs/experiments/defense-v5-development-result.json").read_bytes()
     with pytest.raises(IndependentVerificationError, match="locked payload schema"):
         verify_locked_evidence_payload_bytes(legacy, root=ROOT)
 
@@ -240,9 +270,7 @@ def test_safe_verifier_rejects_a_locked_payload_schema() -> None:
         verify_evidence_bytes,
     )
 
-    locked = _canonical_bytes(
-        {"schema_version": "apar-sentinel-v5-locked-development-payload/2"}
-    )
+    locked = _canonical_bytes({"schema_version": "apar-sentinel-v5-locked-development-payload/2"})
     with pytest.raises(IndependentVerificationError, match="envelope"):
         verify_evidence_bytes(locked, root=ROOT)
 
@@ -254,9 +282,7 @@ def test_locked_verifier_rejects_partial_payload_before_evidence_replay() -> Non
         verify_locked_evidence_payload_bytes,
     )
 
-    partial = _canonical_bytes(
-        {"schema_version": "apar-sentinel-v5-locked-development-payload/2"}
-    )
+    partial = _canonical_bytes({"schema_version": "apar-sentinel-v5-locked-development-payload/2"})
     with pytest.raises(IndependentVerificationError, match="locked payload fields"):
         verify_locked_evidence_payload_bytes(partial, root=ROOT)
 
@@ -269,9 +295,7 @@ def test_locked_verifier_rejects_partial_payload_before_evidence_replay() -> Non
         ("development_test_seed", 404),
     ],
 )
-def test_locked_verifier_rejects_raw_run_relabeling(
-    field: str, replacement: object
-) -> None:
+def test_locked_verifier_rejects_raw_run_relabeling(field: str, replacement: object) -> None:
     """Independent verification must not rely on the production Pydantic model."""
     from apar.v5_independent_verifier import (
         IndependentVerificationError,
@@ -295,7 +319,5 @@ def test_locked_verifier_rejects_raw_run_relabeling(
         "observational_latency": {},
     }
     payload["payload_sha256"] = hashlib.sha256(_canonical_bytes(payload)).hexdigest()
-    with pytest.raises(
-        IndependentVerificationError, match="locked run mode/profile/seed"
-    ):
+    with pytest.raises(IndependentVerificationError, match="locked run mode/profile/seed"):
         verify_locked_evidence_payload_bytes(_canonical_bytes(payload), root=ROOT)
