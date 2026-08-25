@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the closed SOURCE3 or frozen Kaggle Sentinel v5 execution boundary."""
+"""Verify the closed linear-source or frozen Kaggle Sentinel v5 boundary."""
 
 from __future__ import annotations
 
@@ -440,6 +440,31 @@ def _sole_parent(root: Path, commit: str) -> str:
     return values[1]
 
 
+def _linear_source_lineage(
+    root: Path, *, source_commit: str, recovery_commit: str
+) -> tuple[str, ...]:
+    """Return the exact no-merge source series after the preserved recovery commit."""
+    source = _resolve_commit(root, source_commit)
+    recovery = _resolve_commit(root, recovery_commit)
+    if source == recovery:
+        raise ValueError("source lineage contains no source commit")
+    reverse_lineage: list[str] = []
+    visited: set[str] = set()
+    current = source
+    while current != recovery:
+        if current in visited:
+            raise ValueError("source lineage contains a cycle")
+        visited.add(current)
+        reverse_lineage.append(current)
+        try:
+            current = _sole_parent(root, current)
+        except ValueError as error:
+            raise ValueError(
+                "source is not a linear descendant of the preserved recovery commit"
+            ) from error
+    return tuple(reversed(reverse_lineage))
+
+
 def _verify_successor_outputs_absent(root: Path) -> None:
     paths = (
         "docs/experiments/defense-v5-kaggle-successor-attempt.json",
@@ -632,7 +657,7 @@ def verify_v5_kaggle_preexecution(
     rehearsal_chain_roots: Sequence[Path],
     expected_recovery_commit: str = _RECOVERY_COMMIT,
 ) -> V5KagglePreexecutionReport:
-    """Verify source or frozen topology without issuing an execution capability."""
+    """Verify linear source or frozen topology without issuing a capability."""
     root = root.resolve()
     if phase is V5KagglePreexecutionPhase.FROZEN and len(rehearsal_chain_roots) != 2:
         raise ValueError("frozen preexecution requires exactly two rehearsals")
@@ -655,10 +680,13 @@ def verify_v5_kaggle_preexecution(
     if phase is V5KagglePreexecutionPhase.SOURCE:
         if rehearsal_chain_roots:
             raise ValueError("source preexecution cannot accept rehearsals")
-        if _sole_parent(root, head) != expected_recovery_commit:
-            raise ValueError("SOURCE3 is not the sole child of RECOVERY")
+        _linear_source_lineage(
+            root,
+            source_commit=head,
+            recovery_commit=expected_recovery_commit,
+        )
         if os.path.lexists(root / _PREREGISTRATION_PATH):
-            raise FileExistsError("Kaggle preregistration exists before SOURCE3 freeze")
+            raise FileExistsError("Kaggle preregistration exists before source freeze")
         if source_archive is None or wheelhouse is None:
             raise ValueError("source audit requires archive and wheelhouse inputs")
         source_manifest = _verify_source_archive(
@@ -678,14 +706,19 @@ def verify_v5_kaggle_preexecution(
         if not isinstance(source, dict):
             raise ValueError("preregistration source binding is absent")
         source_commit = str(source.get("commit"))
-        recovery_commit = str(source.get("parent"))
+        recovery_commit = str(source.get("recovery_commit"))
+        source_lineage = _linear_source_lineage(
+            root,
+            source_commit=source_commit,
+            recovery_commit=recovery_commit,
+        )
         if (
             _sole_parent(root, head) != source_commit
-            or _sole_parent(root, source_commit) != recovery_commit
             or recovery_commit != expected_recovery_commit
+            or source.get("lineage") != list(source_lineage)
             or _git(root, "rev-parse", f"{source_commit}^{{tree}}") != source.get("tree")
         ):
-            raise ValueError("frozen SOURCE3/preregistration chronology differs")
+            raise ValueError("frozen source/preregistration chronology differs")
         changed = _git(root, "diff-tree", "--no-commit-id", "--name-only", "-r", head)
         assert isinstance(changed, str)
         if changed.splitlines() != [_PREREGISTRATION_PATH.as_posix()]:

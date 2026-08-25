@@ -176,7 +176,7 @@ def test_safe_input_manifest_rejects_mode_seed_or_authorization_relabel(
         type(manifest).model_validate(document)
 
 
-def test_source_preexecution_accepts_exact_clean_child_and_rejects_dirty_tree(
+def test_source_preexecution_accepts_exact_clean_linear_repairs_and_rejects_dirty_tree(
     tmp_path: Path,
 ) -> None:
     repository = tmp_path / "repository"
@@ -202,6 +202,10 @@ def test_source_preexecution_accepts_exact_clean_child_and_rejects_dirty_tree(
     marker.write_text("source\n")
     _git(repository, "add", "SOURCE3")
     _git(repository, "commit", "-q", "-m", "source fixture")
+    repair = repository / "SOURCE4"
+    repair.write_text("browser-derived repair\n")
+    _git(repository, "add", "SOURCE4")
+    _git(repository, "commit", "-q", "-m", "source repair fixture")
     source = _git(repository, "rev-parse", "HEAD")
 
     archive = tmp_path / "apar-v5-source3.tar.gz"
@@ -234,6 +238,37 @@ def test_source_preexecution_accepts_exact_clean_child_and_rejects_dirty_tree(
             wheelhouse=wheelhouse,
             rehearsal_chain_roots=(),
             expected_recovery_commit=recovery,
+        )
+
+
+def test_source_lineage_rejects_merge_ancestry(tmp_path: Path) -> None:
+    from scripts import verify_defense_v5_kaggle_preexecution as module
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+    _git(repository, "config", "user.name", "Dylan Moraes")
+    _git(repository, "config", "user.email", "dylanmoraesdljdd@gmail.com")
+    (repository / "recovery").write_text("preserved\n")
+    _git(repository, "add", "recovery")
+    _git(repository, "commit", "-q", "-m", "recovery")
+    recovery = _git(repository, "rev-parse", "HEAD")
+    primary = _git(repository, "branch", "--show-current")
+    _git(repository, "checkout", "-q", "-b", "repair-a")
+    (repository / "repair-a").write_text("a\n")
+    _git(repository, "add", "repair-a")
+    _git(repository, "commit", "-q", "-m", "repair a")
+    _git(repository, "checkout", "-q", primary)
+    (repository / "repair-b").write_text("b\n")
+    _git(repository, "add", "repair-b")
+    _git(repository, "commit", "-q", "-m", "repair b")
+    _git(repository, "merge", "-q", "--no-ff", "repair-a", "-m", "merge repairs")
+
+    with pytest.raises(ValueError, match="linear descendant"):
+        module._linear_source_lineage(  # type: ignore[attr-defined]
+            repository,
+            source_commit=_git(repository, "rev-parse", "HEAD"),
+            recovery_commit=recovery,
         )
 
 
