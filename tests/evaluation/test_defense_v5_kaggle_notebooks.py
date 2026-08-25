@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import re
@@ -120,6 +121,64 @@ def test_notebooks_have_only_closed_bootstrap_install_and_invoke_cells(
         assert hashlib.sha256(item.notebook_path.read_bytes()).hexdigest() == (
             item.notebook_sha256
         )
+
+
+def test_notebooks_use_owner_namespaced_kaggle_mounts(tmp_path: Path) -> None:
+    """Catch regressions to Kaggle's retired flat /kaggle/input mount layout."""
+
+    generated = _generate(tmp_path / "notebooks")
+    dataset_root = f"/kaggle/input/datasets/{FROZEN_OWNER}"
+    notebook_root = f"/kaggle/input/notebooks/{FROZEN_OWNER}"
+    for index, item in enumerate(generated):
+        notebook = _load_notebook(item.notebook_path)
+        sources = _cell_sources(notebook)
+        bootstrap_namespace: dict[str, object] = {"Path": Path}
+        bootstrap_tree = ast.parse(sources[0])
+        bootstrap_assignments = [
+            node
+            for node in bootstrap_tree.body
+            if isinstance(node, ast.Assign)
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id
+            in {"DATASET_INPUT_ROOT", "SOURCE_INPUT", "WHEELHOUSE_INPUT", "SAFE_INPUT"}
+        ]
+        exec(
+            compile(ast.Module(bootstrap_assignments, type_ignores=[]), "<mounts>", "exec"),
+            bootstrap_namespace,
+        )
+        assert bootstrap_namespace["SOURCE_INPUT"] == Path(
+            f"{dataset_root}/{FROZEN_SOURCE}"
+        )
+        assert bootstrap_namespace["WHEELHOUSE_INPUT"] == Path(
+            f"{dataset_root}/{FROZEN_WHEELS}"
+        )
+        assert bootstrap_namespace["SAFE_INPUT"] == Path(
+            f"{dataset_root}/{FROZEN_SAFE}"
+        )
+        if index == 0:
+            assert "PREDECESSOR_CHAIN" not in sources[2]
+        else:
+            predecessor = generated[index - 1].kernel_id.split("/", maxsplit=1)[1]
+            invoke_namespace: dict[str, object] = {"Path": Path}
+            invoke_tree = ast.parse(sources[2])
+            predecessor_assignment = next(
+                node
+                for node in invoke_tree.body
+                if isinstance(node, ast.Assign)
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == "PREDECESSOR_CHAIN"
+            )
+            exec(
+                compile(
+                    ast.Module([predecessor_assignment], type_ignores=[]),
+                    "<predecessor>",
+                    "exec",
+                ),
+                invoke_namespace,
+            )
+            assert invoke_namespace["PREDECESSOR_CHAIN"] == Path(
+                f"{notebook_root}/{predecessor}/apar-v5-chain"
+            )
 
 
 @pytest.mark.parametrize(

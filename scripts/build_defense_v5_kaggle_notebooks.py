@@ -50,7 +50,12 @@ def _canonical_bytes(document: object) -> bytes:
 
 
 def _bootstrap_cell(
-    *, stage: V5KaggleStage, source_slug: str, wheelhouse_slug: str, safe_slug: str
+    *,
+    stage: V5KaggleStage,
+    owner_slug: str,
+    source_slug: str,
+    wheelhouse_slug: str,
+    safe_slug: str,
 ) -> str:
     return f'''from __future__ import annotations
 
@@ -90,9 +95,10 @@ def _manifest(path: Path, *, schema: str) -> dict[str, object]:
     return document
 
 
-SOURCE_INPUT = Path("/kaggle/input/{source_slug}")
-WHEELHOUSE_INPUT = Path("/kaggle/input/{wheelhouse_slug}")
-SAFE_INPUT = Path("/kaggle/input/{safe_slug}")
+DATASET_INPUT_ROOT = Path("/kaggle/input/datasets/{owner_slug}")
+SOURCE_INPUT = DATASET_INPUT_ROOT / "{source_slug}"
+WHEELHOUSE_INPUT = DATASET_INPUT_ROOT / "{wheelhouse_slug}"
+SAFE_INPUT = DATASET_INPUT_ROOT / "{safe_slug}"
 SOURCE_MANIFEST = _manifest(
     SOURCE_INPUT / "source-manifest.json",
     schema="apar-sentinel-v5-source-archive/1",
@@ -215,14 +221,18 @@ if install.returncode != 0:
 
 
 def _invoke_cell(
-    *, stage: V5KaggleStage, predecessor_kernel_slug: str | None
+    *, stage: V5KaggleStage, owner_slug: str, predecessor_kernel_slug: str | None
 ) -> str:
     predecessor_setup = (
         '''CHAIN_ROOT = Path("/kaggle/working/apar-v5-chain")
 CHAIN_ROOT.mkdir(mode=0o700)
 '''
         if predecessor_kernel_slug is None
-        else f'''PREDECESSOR_CHAIN = Path("/kaggle/input/{predecessor_kernel_slug}/apar-v5-chain")
+        else f'''PREDECESSOR_CHAIN = (
+    Path("/kaggle/input/notebooks/{owner_slug}")
+    / "{predecessor_kernel_slug}"
+    / "apar-v5-chain"
+)
 CHAIN_ROOT = Path("/kaggle/working/apar-v5-chain")
 if not PREDECESSOR_CHAIN.is_dir():
     raise RuntimeError("exact predecessor checkpoint chain is absent")
@@ -284,6 +294,7 @@ print(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
 def _notebook_document(
     *,
     stage: V5KaggleStage,
+    owner_slug: str,
     source_slug: str,
     wheelhouse_slug: str,
     safe_slug: str,
@@ -292,12 +303,17 @@ def _notebook_document(
     sources = (
         _bootstrap_cell(
             stage=stage,
+            owner_slug=owner_slug,
             source_slug=source_slug,
             wheelhouse_slug=wheelhouse_slug,
             safe_slug=safe_slug,
         ),
         _install_cell(),
-        _invoke_cell(stage=stage, predecessor_kernel_slug=predecessor_kernel_slug),
+        _invoke_cell(
+            stage=stage,
+            owner_slug=owner_slug,
+            predecessor_kernel_slug=predecessor_kernel_slug,
+        ),
     )
     cells: list[dict[str, Any]] = []
     for index, source in enumerate(sources):
@@ -371,6 +387,7 @@ def build_v5_kaggle_notebooks(
         notebook_bytes = _canonical_bytes(
             _notebook_document(
                 stage=stage,
+                owner_slug=owner_slug,
                 source_slug=source_dataset_slug,
                 wheelhouse_slug=wheelhouse_dataset_slug,
                 safe_slug=safe_evidence_dataset_slug,
