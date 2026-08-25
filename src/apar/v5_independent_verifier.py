@@ -4659,9 +4659,9 @@ def verify_locked_evidence_payload_bytes(
 
 
 def _locked_legitimate_plan(count: int) -> tuple[int, int]:
-    # Independent constants: the three base manifests contain 24 lifecycle
-    # events but project three card, two A2A, and two agentic decision rows.
-    remaining = count - 7
+    # Independently reproduce the 12 card, 10 A2A, and two agentic base
+    # decisions emitted by real executed legitimate traffic.
+    remaining = count - 24
     if remaining < 0:
         _fail("locked legitimate support cannot cover all base rails")
     full, final = divmod(remaining, 96)

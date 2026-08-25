@@ -151,9 +151,9 @@ def test_locked_support_plan_is_exact_without_executing_population() -> None:
         development_protocol=development,
     )
     expected = {
-        "train": (16_000, 25_800, 534),
-        "calibration": (16_000, 25_800, 534),
-        "threshold": (16_000, 25_800, 534),
+        "train": (16_000, 25_800, 533),
+        "calibration": (16_000, 25_800, 533),
+        "threshold": (16_000, 25_800, 533),
         "development_test": (53_500, 63_300, 924),
     }
     assert {
@@ -171,8 +171,8 @@ def test_locked_support_plan_is_exact_without_executing_population() -> None:
         "card_testing_cnp": 1_700,
         "synthetic_merchant_refund": 3_400,
     }
-    assert plan.retained_execution_artifacts == 2_526
-    assert plan.retained_execution_payload_estimate_bytes == 608_386_240
+    assert plan.retained_execution_artifacts == 2_523
+    assert plan.retained_execution_payload_estimate_bytes == 608_083_936
     assert len(plan.support_plan_sha256) == 64
 
 

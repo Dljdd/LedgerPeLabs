@@ -211,12 +211,26 @@ def test_capacity_support_plan_is_production_sized_without_population_execution(
         25_800,
         63_300,
     )
-    assert capacity.retained_execution_artifacts == 2_526
-    assert capacity.retained_execution_payload_estimate_bytes == 608_386_240
+    assert capacity.retained_execution_artifacts == 2_523
+    assert capacity.retained_execution_payload_estimate_bytes == 608_083_936
 
 
-def test_capacity_support_plan_batches_from_projected_base_decisions() -> None:
-    """Artifact counts must batch remaining decision rows, not lifecycle event rows."""
+def test_capacity_support_plan_batches_from_executed_base_decisions() -> None:
+    """Artifact planning must use the actual 24 decisions emitted by base traffic."""
+    from apar.evaluation.v5_population import _execute_legitimate_traffic
+
+    rows, executions = _execute_legitimate_traffic(
+        partition_name="train",
+        partition_seed=404,
+        requested_decisions=24,
+    )
+    assert len(rows) == 24
+    assert tuple((manifest.rail, len(manifest.lineage)) for manifest in executions) == (
+        ("card", 12),
+        ("a2a", 10),
+        ("agentic", 2),
+    )
+
     capacity = build_v5_kaggle_support_plan(
         root=ROOT,
         protocol=_protocol(),
@@ -224,12 +238,12 @@ def test_capacity_support_plan_batches_from_projected_base_decisions() -> None:
     )
 
     assert tuple(item.execution_artifacts for item in capacity.partitions) == (
-        534,
-        534,
-        534,
+        533,
+        533,
+        533,
         924,
     )
-    assert capacity.retained_execution_artifacts == 2_526
+    assert capacity.retained_execution_artifacts == 2_523
 
 
 def test_support_plan_label_split_matches_executed_ground_truth(
@@ -318,7 +332,7 @@ def test_authorization_capability_emits_one_canonical_closed_record() -> None:
     assert document["profile"] == "production"
     assert document["attempt_receipt_sha256"] == "5" * 64
     assert document["run_binding_sha256"] == capability.run_binding_sha256
-    assert document["support_plan"]["retained_execution_artifacts"] == 2_526
+    assert document["support_plan"]["retained_execution_artifacts"] == 2_523
     assert document["recovery"]["retry_permitted"] is False
     assert set(document).isdisjoint(
         {"labels", "probabilities", "actions", "metrics", "readiness"}
