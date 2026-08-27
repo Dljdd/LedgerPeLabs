@@ -45,7 +45,10 @@ def _checkpoint_chain() -> V5CheckpointChainBinding:
                     "20_features",
                     "30_arms",
                     "40_label_shuffle",
-                    "50_invariance_controls",
+                    "50_identity_rename",
+                    "51_future_causality",
+                    "52_equal_time_isolation",
+                    "53_feature_leakage",
                     "60_single_class_controls",
                     "70_metrics",
                 ),
@@ -61,7 +64,7 @@ def test_checkpoint_chain_binding_is_exact_and_non_self_referential() -> None:
     """Stage 80 binds Stage 00-70 without placing its own manifest in its payload."""
     chain = _checkpoint_chain()
     assert chain.predecessor_stage_manifest_sha256[-1][0] == "70_metrics"
-    assert len(chain.predecessor_stage_manifest_sha256) == 8
+    assert len(chain.predecessor_stage_manifest_sha256) == 11
 
     for mutation in (
         {"attempt_receipt_sha256": "8" * 64},

@@ -29,7 +29,10 @@ _STAGES = (
     "20_features",
     "30_arms",
     "40_label_shuffle",
-    "50_invariance_controls",
+    "50_identity_rename",
+    "51_future_causality",
+    "52_equal_time_isolation",
+    "53_feature_leakage",
     "60_single_class_controls",
     "70_metrics",
     "80_finalize",
@@ -433,7 +436,10 @@ def _read_checkpoint(root: Path) -> _VerifiedCheckpoint:
             "arm_latency_samples",
         },
         "40_label_shuffle": {"control_group", "control_observation"},
-        "50_invariance_controls": {"control_group", "control_observation"},
+        "50_identity_rename": {"control_group", "control_observation"},
+        "51_future_causality": {"control_group", "control_observation"},
+        "52_equal_time_isolation": {"control_group", "control_observation"},
+        "53_feature_leakage": {"control_group", "control_observation"},
         "60_single_class_controls": {"control_group", "control_observation"},
         "70_metrics": {"metric_evidence", "metric_observation"},
         "80_finalize": {"final_core", "final_payload"},
@@ -1498,19 +1504,14 @@ def _verify_stage_record_bindings(
     observed_controls: dict[str, dict[str, Any]] = {}
     expected_groups = (
         ("label_shuffle", ("label_shuffle",)),
-        (
-            "invariance",
-            (
-                "identity_rename",
-                "future_causality",
-                "equal_time_isolation",
-                "feature_leakage",
-            ),
-        ),
+        ("identity_rename", ("identity_rename",)),
+        ("future_causality", ("future_causality",)),
+        ("equal_time_isolation", ("equal_time_isolation",)),
+        ("feature_leakage", ("feature_leakage",)),
         ("single_class", ("benign_only", "fraud_only_diagnostic")),
     )
     for checkpoint, (group_name, control_names) in zip(
-        checkpoints[4:7], expected_groups, strict=True
+        checkpoints[4:10], expected_groups, strict=True
     ):
         if (
             len(checkpoint.deterministic_records) != 1
@@ -1543,7 +1544,7 @@ def _verify_stage_record_bindings(
     ) or set(observed_controls) != {str(item["name"]) for item in final_control_sequence}:
         _fail("control checkpoints differ from final control suite")
 
-    metric_checkpoint = checkpoints[7]
+    metric_checkpoint = checkpoints[10]
     if (
         len(metric_checkpoint.deterministic_records) != 1
         or len(metric_checkpoint.observational_records) != 1
@@ -1642,7 +1643,7 @@ def verify_v5_kaggle_prefix(
     try:
         roots = tuple(checkpoint_roots)
         if not 1 <= len(roots) < len(_STAGES):
-            _fail("prefix verification requires one through eight checkpoint roots")
+            _fail("prefix verification requires a non-final ordered checkpoint prefix")
         protocol, run, run_binding = _protocol_and_run_binding(
             root=root.resolve(), expected_mode=expected_mode
         )
@@ -1803,10 +1804,10 @@ def _verify_v5_kaggle_evidence(
     expected_mode: Literal["kaggle_capacity_validation", "kaggle_locked_successor"],
     enforce_production_support: bool,
 ) -> V5KaggleVerificationReport:
-    """Independently verify the complete nine-stage chain and final payload."""
+    """Independently verify the complete twelve-stage chain and final payload."""
     try:
         roots = tuple(checkpoint_roots)
-        if len(roots) != 8:
+        if len(roots) != len(_STAGES) - 1:
             _fail("verification requires exact Stage 00-70 checkpoint roots")
         _protocol, _run, run_binding = _protocol_and_run_binding(
             root=root.resolve(), expected_mode=expected_mode

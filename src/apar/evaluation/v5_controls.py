@@ -72,11 +72,23 @@ class V5ControlGroup(StrEnum):
     LABEL_SHUFFLE = "label_shuffle"
     INVARIANCE = "invariance"
     SINGLE_CLASS = "single_class"
+    IDENTITY_RENAME = "identity_rename"
+    FUTURE_CAUSALITY = "future_causality"
+    EQUAL_TIME_ISOLATION = "equal_time_isolation"
+    FEATURE_LEAKAGE = "feature_leakage"
 
 
 _CONTROL_GROUP_ORDER = (
     V5ControlGroup.LABEL_SHUFFLE,
     V5ControlGroup.INVARIANCE,
+    V5ControlGroup.SINGLE_CLASS,
+)
+_STAGED_CONTROL_GROUP_ORDER = (
+    V5ControlGroup.LABEL_SHUFFLE,
+    V5ControlGroup.IDENTITY_RENAME,
+    V5ControlGroup.FUTURE_CAUSALITY,
+    V5ControlGroup.EQUAL_TIME_ISOLATION,
+    V5ControlGroup.FEATURE_LEAKAGE,
     V5ControlGroup.SINGLE_CLASS,
 )
 _CONTROL_NAMES_BY_GROUP = {
@@ -91,6 +103,24 @@ _CONTROL_NAMES_BY_GROUP = {
         "benign_only",
         "fraud_only_diagnostic",
     ),
+    V5ControlGroup.IDENTITY_RENAME: ("identity_rename",),
+    V5ControlGroup.FUTURE_CAUSALITY: ("future_causality",),
+    V5ControlGroup.EQUAL_TIME_ISOLATION: ("equal_time_isolation",),
+    V5ControlGroup.FEATURE_LEAKAGE: ("feature_leakage",),
+}
+_INDIVIDUAL_INVARIANCE_BY_GROUP: dict[
+    V5ControlGroup,
+    Literal[
+        "identity_rename",
+        "future_causality",
+        "equal_time_isolation",
+        "feature_leakage",
+    ],
+] = {
+    V5ControlGroup.IDENTITY_RENAME: "identity_rename",
+    V5ControlGroup.FUTURE_CAUSALITY: "future_causality",
+    V5ControlGroup.EQUAL_TIME_ISOLATION: "equal_time_isolation",
+    V5ControlGroup.FEATURE_LEAKAGE: "feature_leakage",
 }
 
 
@@ -1369,6 +1399,16 @@ def _execute_v5_control_group_from_runtime(
                 catalog=catalog,
             ),
         )
+    if group in _INDIVIDUAL_INVARIANCE_BY_GROUP:
+        name = _INDIVIDUAL_INVARIANCE_BY_GROUP[group]
+        return (
+            _invariance_control(
+                name=name,
+                runtime=runtime,
+                evidence_protocol=evidence_protocol,
+                catalog=catalog,
+            ),
+        )
     return (
         _single_class_control(
             fraud=False,
@@ -1524,9 +1564,10 @@ class V5ExecutedControlSuite(BaseModel):
 def assemble_v5_control_suite(
     groups: Sequence[V5ExecutedControlGroup],
 ) -> V5ExecutedControlSuite:
-    """Assemble the three immutable groups into the original suite contract."""
+    """Assemble either closed grouping into the original seven-control suite."""
     frozen = tuple(groups)
-    if tuple(group.group for group in frozen) != _CONTROL_GROUP_ORDER:
+    observed_order = tuple(group.group for group in frozen)
+    if observed_order not in {_CONTROL_GROUP_ORDER, _STAGED_CONTROL_GROUP_ORDER}:
         raise ValueError("control suite requires the exact ordered control groups")
     bindings = {
         (

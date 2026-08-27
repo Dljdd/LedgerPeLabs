@@ -51,7 +51,10 @@ _PREDECESSOR_STAGES = (
     "20_features",
     "30_arms",
     "40_label_shuffle",
-    "50_invariance_controls",
+    "50_identity_rename",
+    "51_future_causality",
+    "52_equal_time_isolation",
+    "53_feature_leakage",
     "60_single_class_controls",
     "70_metrics",
 )
@@ -172,7 +175,7 @@ class V5StagedDeterministicCoreBinding(BaseModel):
 
 
 class V5StagedEvidencePayload(BaseModel):
-    """Complete nine-stage evidence for capacity validation or locked execution."""
+    """Complete staged evidence for capacity validation or locked execution."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 

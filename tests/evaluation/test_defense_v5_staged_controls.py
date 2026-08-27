@@ -54,6 +54,8 @@ from apar.evaluation.v5_staged_evidence import (
     _restore_metric_stage_evidence,
     build_v5_metric_stage_evidence,
     execute_v5_control_stage,
+    execute_v5_finalize_stage,
+    execute_v5_metric_stage,
     load_v5_control_group_checkpoint,
 )
 from apar.features.sentinel import SentinelFeatureCatalog
@@ -65,7 +67,10 @@ KAGGLE_CONFIG = ROOT / "config/defense/defense-v5-kaggle-recovery.json"
 
 _EXPECTED_GROUPS = (
     V5ControlGroup.LABEL_SHUFFLE,
-    V5ControlGroup.INVARIANCE,
+    V5ControlGroup.IDENTITY_RENAME,
+    V5ControlGroup.FUTURE_CAUSALITY,
+    V5ControlGroup.EQUAL_TIME_ISOLATION,
+    V5ControlGroup.FEATURE_LEAKAGE,
     V5ControlGroup.SINGLE_CLASS,
 )
 _ExecutedEvidence = tuple[
@@ -74,6 +79,16 @@ _ExecutedEvidence = tuple[
     V5Corpus,
     tuple[V5EvaluationResult, ...],
 ]
+
+
+def test_staged_control_contract_has_one_group_per_invariance_workload() -> None:
+    """A future change cannot silently reunite the four long-running controls."""
+    assert {
+        "identity_rename",
+        "future_causality",
+        "equal_time_isolation",
+        "feature_leakage",
+    } <= {group.value for group in V5ControlGroup}
 
 
 def _digest(document: object) -> str:
@@ -303,14 +318,14 @@ def test_grouped_controls_match_the_existing_one_shot_suite_deterministically(
 def test_control_group_contract_rejects_missing_duplicate_and_reordered_groups(
     executed_group_evidence: _ExecutedEvidence,
 ) -> None:
-    """The suite assembler must accept exactly the three frozen groups once."""
+    """The suite assembler must accept exactly the six resource-bounded groups once."""
     _one_shot, groups, _corpus, _arm_results = executed_group_evidence
     with pytest.raises(ValueError, match="exact ordered control groups"):
         assemble_v5_control_suite(groups[:-1])
     with pytest.raises(ValueError, match="exact ordered control groups"):
-        assemble_v5_control_suite((groups[0], groups[0], groups[2]))
+        assemble_v5_control_suite((groups[0], groups[0], *groups[2:]))
     with pytest.raises(ValueError, match="exact ordered control groups"):
-        assemble_v5_control_suite((groups[1], groups[0], groups[2]))
+        assemble_v5_control_suite((groups[1], groups[0], *groups[2:]))
 
 
 def test_control_group_digest_and_membership_fail_closed(
@@ -365,13 +380,13 @@ def test_control_checkpoint_layers_recombine_and_reject_each_layer_mutation(
             _restore_control_group(core=core, observation=changed_observation)
 
 
-def test_stage_40_50_60_publish_exact_groups_in_predecessor_order(
+def test_control_stages_publish_exact_groups_in_predecessor_order(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     executed_group_evidence: _ExecutedEvidence,
 ) -> None:
-    """The three jobs cannot skip, reorder, or combine frozen control groups."""
-    _one_shot, groups, corpus, _arm_results = executed_group_evidence
+    """The six jobs cannot skip, reorder, or recombine frozen control workloads."""
+    _one_shot, groups, corpus, arm_results = executed_group_evidence
     protocol = load_v5_kaggle_protocol(KAGGLE_CONFIG, root=ROOT)
     dummy = lambda name: iter(  # noqa: E731
         (
@@ -422,10 +437,14 @@ def test_stage_40_50_60_publish_exact_groups_in_predecessor_order(
         frozen_group,
     )
     loaded: list[V5ExecutedControlGroup] = []
+    control_roots: list[Path] = []
     for stage, expected_group in zip(
         (
             V5KaggleStage.LABEL_SHUFFLE,
-            V5KaggleStage.INVARIANCE_CONTROLS,
+            V5KaggleStage.IDENTITY_RENAME,
+            V5KaggleStage.FUTURE_CAUSALITY,
+            V5KaggleStage.EQUAL_TIME_ISOLATION,
+            V5KaggleStage.FEATURE_LEAKAGE,
             V5KaggleStage.SINGLE_CLASS_CONTROLS,
         ),
         _EXPECTED_GROUPS,
@@ -439,6 +458,7 @@ def test_stage_40_50_60_publish_exact_groups_in_predecessor_order(
         )
         assert capability.stage is stage
         output = tmp_path / stage.value
+        control_roots.append(output)
         predecessor = _publish(
             output_root=output,
             stage=stage,
@@ -459,6 +479,35 @@ def test_stage_40_50_60_publish_exact_groups_in_predecessor_order(
         )
         assert loaded[-1].group is expected_group
     assert assemble_v5_control_suite(tuple(loaded)).controls
+
+    monkeypatch.setattr(
+        "apar.evaluation.v5_staged_evidence.load_v5_arm_checkpoint",
+        lambda **_kwargs: arm_results,
+    )
+    groups_by_root = dict(zip(control_roots, groups, strict=True))
+    monkeypatch.setattr(
+        "apar.evaluation.v5_staged_evidence.load_v5_control_group_checkpoint",
+        lambda *, checkpoint_root, limits: groups_by_root[checkpoint_root],
+    )
+    metric_capability = _issue_stage_capability(
+        protocol=protocol,
+        mode=V5KaggleMode.CAPACITY_VALIDATION,
+        attempt_receipt_sha256="5" * 64,
+        predecessor=predecessor,
+    )
+    metric_records = tuple(
+        execute_v5_metric_stage(
+            root=ROOT,
+            capability=metric_capability,
+            corpus_checkpoint_root=corpus_root,
+            arm_checkpoint_root=tmp_path / "30",
+            control_checkpoint_roots=tuple(control_roots),
+        )
+    )
+    assert tuple(record.kind for record in metric_records) == (
+        "metric_evidence",
+        "metric_observation",
+    )
 
 
 def test_metric_stage_matches_existing_complete_metrics_and_readiness(
@@ -499,6 +548,56 @@ def test_metric_stage_matches_existing_complete_metrics_and_readiness(
     changed_observation["observational_metric_stage_sha256"] = "0" * 64
     with pytest.raises(ValueError, match="observational metric stage"):
         _restore_metric_stage_evidence(core=core, observation=changed_observation)
+
+
+def test_finalization_accepts_the_exact_split_stage_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finalization must consume all eleven predecessors after the split."""
+    protocol = load_v5_kaggle_protocol(KAGGLE_CONFIG, root=ROOT)
+    predecessor = None
+    roots: list[Path] = []
+    for stage in tuple(V5KaggleStage)[:-1]:
+        output = tmp_path / stage.value
+        roots.append(output)
+        predecessor = _publish(
+            output_root=output,
+            stage=stage,
+            predecessor=predecessor,
+            records=(
+                V5CheckpointInput(
+                    kind="stage_placeholder",
+                    key=stage.value,
+                    canonical_bytes=json.dumps(
+                        {"stage": stage.value}, sort_keys=True
+                    ).encode(),
+                ),
+            ),
+        )
+    assert predecessor is not None
+    capability = _issue_stage_capability(
+        protocol=protocol,
+        mode=V5KaggleMode.CAPACITY_VALIDATION,
+        attempt_receipt_sha256="5" * 64,
+        predecessor=predecessor,
+    )
+
+    def arm_loader_reached(**_kwargs: object) -> tuple[V5EvaluationResult, ...]:
+        raise RuntimeError("arm loader reached")
+
+    monkeypatch.setattr(
+        "apar.evaluation.v5_staged_evidence.load_v5_arm_checkpoint",
+        arm_loader_reached,
+    )
+    with pytest.raises(RuntimeError, match="arm loader reached"):
+        tuple(
+            execute_v5_finalize_stage(
+                root=ROOT,
+                capability=capability,
+                predecessor_checkpoint_roots=tuple(roots),
+            )
+        )
 
 
 def test_final_payload_retains_complete_staged_semantics_and_chain(

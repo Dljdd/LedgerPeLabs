@@ -6,6 +6,7 @@ import hashlib
 import json
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
 from typing import Literal, cast
 
@@ -98,7 +99,10 @@ _STAGED_ARMS = (
 )
 _CONTROL_GROUP_BY_STAGE = {
     V5KaggleStage.LABEL_SHUFFLE: V5ControlGroup.LABEL_SHUFFLE,
-    V5KaggleStage.INVARIANCE_CONTROLS: V5ControlGroup.INVARIANCE,
+    V5KaggleStage.IDENTITY_RENAME: V5ControlGroup.IDENTITY_RENAME,
+    V5KaggleStage.FUTURE_CAUSALITY: V5ControlGroup.FUTURE_CAUSALITY,
+    V5KaggleStage.EQUAL_TIME_ISOLATION: V5ControlGroup.EQUAL_TIME_ISOLATION,
+    V5KaggleStage.FEATURE_LEAKAGE: V5ControlGroup.FEATURE_LEAKAGE,
     V5KaggleStage.SINGLE_CLASS_CONTROLS: V5ControlGroup.SINGLE_CLASS,
 }
 _INVARIANCE_CONTROL_NAMES = {
@@ -1896,7 +1900,7 @@ def execute_v5_metric_stage(
     arm_checkpoint_root: Path,
     control_checkpoint_roots: Sequence[Path],
 ) -> Iterator[V5CheckpointInput]:
-    """Build complete metrics from exact arm and three control checkpoints."""
+    """Build complete metrics from exact arm and six control checkpoints."""
     _validate_capability(capability, required_stage=V5KaggleStage.METRICS)
     protocol = load_v5_kaggle_protocol(root / _PROTOCOL_PATH, root=root)
     corpus_manifest = read_v5_checkpoint_manifest(
@@ -1906,15 +1910,18 @@ def execute_v5_metric_stage(
         output_root=arm_checkpoint_root, limits=protocol.resources
     )
     control_roots = tuple(control_checkpoint_roots)
-    if len(control_roots) != 3:
-        raise ValueError("metric stage requires exact three control checkpoints")
+    if len(control_roots) != 6:
+        raise ValueError("metric stage requires exact six control checkpoints")
     control_manifests = tuple(
         read_v5_checkpoint_manifest(output_root=path, limits=protocol.resources)
         for path in control_roots
     )
     expected_control_stages = (
         V5KaggleStage.LABEL_SHUFFLE,
-        V5KaggleStage.INVARIANCE_CONTROLS,
+        V5KaggleStage.IDENTITY_RENAME,
+        V5KaggleStage.FUTURE_CAUSALITY,
+        V5KaggleStage.EQUAL_TIME_ISOLATION,
+        V5KaggleStage.FEATURE_LEAKAGE,
         V5KaggleStage.SINGLE_CLASS_CONTROLS,
     )
     manifests = (corpus_manifest, arm_manifest, *control_manifests)
@@ -1927,7 +1934,7 @@ def execute_v5_metric_stage(
         or control_manifests[0].predecessor_manifest_sha256 != arm_manifest.manifest_sha256
         or any(
             current.predecessor_manifest_sha256 != previous.manifest_sha256
-            for previous, current in zip(control_manifests, control_manifests[1:], strict=True)
+            for previous, current in pairwise(control_manifests)
         )
         or any(
             item.run_binding_sha256 != capability.run_binding_sha256
@@ -1999,7 +2006,7 @@ def _build_checkpoint_chain_binding(
         raise ValueError("checkpoint chain requires exact Stage 00-70 manifests")
     if any(
         current.predecessor_manifest_sha256 != previous.manifest_sha256
-        for previous, current in zip(frozen, frozen[1:], strict=True)
+        for previous, current in pairwise(frozen)
     ):
         raise ValueError("checkpoint chain predecessor linkage differs")
     run_bindings = {item.run_binding_sha256 for item in frozen}
@@ -2027,7 +2034,8 @@ def execute_v5_finalize_stage(
     _validate_capability(capability, required_stage=V5KaggleStage.FINALIZE)
     protocol = load_v5_kaggle_protocol(root / _PROTOCOL_PATH, root=root)
     roots = tuple(predecessor_checkpoint_roots)
-    if len(roots) != 8:
+    predecessor_stages = tuple(V5KaggleStage)[:-1]
+    if len(roots) != len(predecessor_stages):
         raise ValueError("finalization requires exact Stage 00-70 checkpoint roots")
     manifests = tuple(
         read_v5_checkpoint_manifest(output_root=path, limits=protocol.resources) for path in roots
@@ -2039,13 +2047,25 @@ def execute_v5_finalize_stage(
         or chain.attempt_receipt_sha256 != capability.attempt_receipt_sha256
     ):
         raise PermissionError("finalization capability or chain differs")
-    arm_results = load_v5_arm_checkpoint(checkpoint_root=roots[3], limits=protocol.resources)
+    roots_by_stage = dict(zip(predecessor_stages, roots, strict=True))
+    arm_results = load_v5_arm_checkpoint(
+        checkpoint_root=roots_by_stage[V5KaggleStage.ARMS], limits=protocol.resources
+    )
     control_groups = tuple(
-        load_v5_control_group_checkpoint(checkpoint_root=roots[index], limits=protocol.resources)
-        for index in (4, 5, 6)
+        load_v5_control_group_checkpoint(
+            checkpoint_root=roots_by_stage[stage], limits=protocol.resources
+        )
+        for stage in (
+            V5KaggleStage.LABEL_SHUFFLE,
+            V5KaggleStage.IDENTITY_RENAME,
+            V5KaggleStage.FUTURE_CAUSALITY,
+            V5KaggleStage.EQUAL_TIME_ISOLATION,
+            V5KaggleStage.FEATURE_LEAKAGE,
+            V5KaggleStage.SINGLE_CLASS_CONTROLS,
+        )
     )
     retained_metrics = load_v5_metric_checkpoint(
-        checkpoint_root=roots[7], limits=protocol.resources
+        checkpoint_root=roots_by_stage[V5KaggleStage.METRICS], limits=protocol.resources
     )
     evidence_protocol = load_v5_evidence_protocol(
         root / protocol.source_bindings.evidence_protocol_path, root=root

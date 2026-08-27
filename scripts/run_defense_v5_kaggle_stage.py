@@ -306,7 +306,10 @@ class _FrozenRepositoryAuthority:
             )
         if stage in {
             V5KaggleStage.LABEL_SHUFFLE,
-            V5KaggleStage.INVARIANCE_CONTROLS,
+            V5KaggleStage.IDENTITY_RENAME,
+            V5KaggleStage.FUTURE_CAUSALITY,
+            V5KaggleStage.EQUAL_TIME_ISOLATION,
+            V5KaggleStage.FEATURE_LEAKAGE,
             V5KaggleStage.SINGLE_CLASS_CONTROLS,
         }:
             return execute_v5_control_stage(
@@ -324,7 +327,10 @@ class _FrozenRepositoryAuthority:
                     stage_roots[item]
                     for item in (
                         V5KaggleStage.LABEL_SHUFFLE,
-                        V5KaggleStage.INVARIANCE_CONTROLS,
+                        V5KaggleStage.IDENTITY_RENAME,
+                        V5KaggleStage.FUTURE_CAUSALITY,
+                        V5KaggleStage.EQUAL_TIME_ISOLATION,
+                        V5KaggleStage.FEATURE_LEAKAGE,
                         V5KaggleStage.SINGLE_CLASS_CONTROLS,
                     )
                 ),

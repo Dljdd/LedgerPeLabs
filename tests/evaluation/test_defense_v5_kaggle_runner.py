@@ -142,6 +142,42 @@ def test_staged_runner_module_and_legacy_boundary_are_explicit() -> None:
     assert "--checkpoint" not in legacy
 
 
+def test_repository_authority_routes_each_invariance_stage_as_a_control(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An invariance shard must never fall through to finalization or another workload."""
+    sentinel = (
+        V5CheckpointInput(
+            kind="control_sentinel",
+            key="identity_rename",
+            canonical_bytes=b"{}",
+        ),
+    )
+
+    def control_records(**kwargs: object) -> tuple[V5CheckpointInput, ...]:
+        del kwargs
+        return sentinel
+
+    monkeypatch.setattr(runner_module, "execute_v5_control_stage", control_records)
+    capability = V5StageCapability(
+        stage=V5KaggleStage.IDENTITY_RENAME,
+        mode=V5KaggleMode.CAPACITY_VALIDATION,
+        run_binding_sha256="1" * 64,
+        attempt_receipt_sha256="2" * 64,
+        predecessor_manifest_sha256="3" * 64,
+        execution_manifest_sha256="4" * 64,
+        seal=object(),
+    )
+
+    observed = runner_module._FrozenRepositoryAuthority().records(
+        root=ROOT,
+        capability=capability,
+        stage_roots={V5KaggleStage.CORPUS: ROOT},
+    )
+
+    assert observed is sentinel
+
+
 def test_completed_stage_advances_and_incomplete_stage_can_repeat(
     tmp_path: Path,
 ) -> None:

@@ -396,8 +396,11 @@ def _materialize_complete_chain(
     )
     group_by_stage = {
         V5KaggleStage.LABEL_SHUFFLE: groups[0],
-        V5KaggleStage.INVARIANCE_CONTROLS: groups[1],
-        V5KaggleStage.SINGLE_CLASS_CONTROLS: groups[2],
+        V5KaggleStage.IDENTITY_RENAME: groups[1],
+        V5KaggleStage.FUTURE_CAUSALITY: groups[2],
+        V5KaggleStage.EQUAL_TIME_ISOLATION: groups[3],
+        V5KaggleStage.FEATURE_LEAKAGE: groups[4],
+        V5KaggleStage.SINGLE_CLASS_CONTROLS: groups[5],
     }
     for stage in tuple(V5KaggleStage)[:-1]:
         if stage is V5KaggleStage.AUTHORIZE:
@@ -786,7 +789,7 @@ def test_chain_topology_environment_and_cross_stage_mutations_fail_closed(
     )
     target = (
         substitution
-        / V5KaggleStage.INVARIANCE_CONTROLS.value
+        / V5KaggleStage.IDENTITY_RENAME.value
         / "observational-chunks"
         / "part-0000.bin"
     )

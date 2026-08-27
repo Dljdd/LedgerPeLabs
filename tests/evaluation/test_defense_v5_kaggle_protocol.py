@@ -107,6 +107,24 @@ def test_kaggle_protocol_has_exact_closed_stage_order_and_modes() -> None:
     )
 
 
+def test_invariance_controls_are_independent_resource_bounded_stages() -> None:
+    """Recombining all invariance work must not recreate the 6-hour Stage-50 failure."""
+    assert tuple(stage.value for stage in V5KaggleStage) == (
+        "00_authorize",
+        "10_corpus",
+        "20_features",
+        "30_arms",
+        "40_label_shuffle",
+        "50_identity_rename",
+        "51_future_causality",
+        "52_equal_time_isolation",
+        "53_feature_leakage",
+        "60_single_class_controls",
+        "70_metrics",
+        "80_finalize",
+    )
+
+
 def test_next_stage_is_derived_only_from_the_verified_predecessor() -> None:
     """A caller cannot skip, repeat, or choose an arbitrary stage."""
     assert resolve_next_v5_kaggle_stage(None) is V5KaggleStage.AUTHORIZE
