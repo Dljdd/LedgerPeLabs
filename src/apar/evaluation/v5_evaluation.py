@@ -1024,7 +1024,7 @@ class V5IsolationTreeManifest(BaseModel):
                 raise ValueError("isolation tree source feature is invalid")
             node = (
                 self.children_left[node]
-                if values[source_feature] <= self.threshold[node]
+                if float(values[source_feature]) <= self.threshold[node]
                 else self.children_right[node]
             )
             traversed += 1

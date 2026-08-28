@@ -9,6 +9,7 @@ import subprocess
 from copy import deepcopy
 from pathlib import Path
 
+import numpy as np
 import pytest
 from catboost import CatBoostClassifier
 
@@ -28,6 +29,24 @@ from apar.features.sentinel import SentinelFeatureCatalog
 from tests.evaluation.v5_safe_protocol import load_safe_v5_test_protocol
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_isolation_tree_replay_preserves_float64_threshold_boundary() -> None:
+    """A float32 feature just above a retained threshold must take the right branch."""
+    threshold = 5.148292989539119
+    rounded_feature = float(np.float32(threshold))
+    assert rounded_feature > threshold
+    tree = V5IsolationTreeManifest(
+        children_left=(1, -1, -1),
+        children_right=(2, -1, -1),
+        feature=(0, -2, -2),
+        threshold=(threshold, -2.0, -2.0),
+        decision_path_lengths=(1.0, 2.0, 2.0),
+        average_path_lengths=(0.0, 0.0, 0.0),
+        estimator_features=(0,),
+    )
+
+    assert tree.leaf_index((rounded_feature,)) == 2
 
 
 def test_v5_implementation_paths_use_tracked_canonical_case() -> None:
