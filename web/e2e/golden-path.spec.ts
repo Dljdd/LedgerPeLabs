@@ -27,17 +27,20 @@ test("every judge route renders without viewport overflow", async ({ page }) => 
 
 test("five-minute golden path moves from threat to assurance", async ({ page }) => {
   await page.goto("/overview");
+  await expect(page.getByRole("img", { name: /12 ordered calibrated decisions/i })).toBeVisible();
   await page.getByRole("link", { name: /inspect scenario controls/i }).click();
   await expect(page.getByRole("heading", { name: "Bounded campaign replay" })).toBeVisible();
 
   await page.getByRole("link", { name: /start verified replay/i }).click();
   await expect(page.locator(".live-arm").getByText(/ensemble_with_graph/)).toBeVisible();
   await expect(page.getByText(/Event 01 \/ 12/)).toBeVisible();
+  await expect(page.getByRole("img", { name: /calibrated risk 100.0%.*bound action thresholds/i })).toBeVisible();
   await page.getByRole("button", { name: "Step forward" }).click();
   await expect(page.getByText(/Event 02 \/ 12/)).toBeVisible();
 
   await page.getByRole("navigation", { name: "Primary" }).getByRole("link", { name: /investigation/i }).click();
-  await expect(page.getByRole("img", { name: /fourteen linked entities/i })).toBeVisible();
+  await expect(page.getByRole("img", { name: /14 linked entities and 10 directional payment edges/i })).toBeVisible();
+  await expect(page.getByText("Arrow = payment direction")).toBeVisible();
 
   await page.getByRole("navigation", { name: "Primary" }).getByRole("link", { name: /defenses/i }).click();
   await expect(page.getByText("Recovered diagnostic evidence — non-authoritative")).toBeVisible();

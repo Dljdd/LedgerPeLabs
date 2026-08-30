@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import type { CSSProperties, KeyboardEvent } from "react";
 
 import { formatMoney, formatPercent, shortHash, titleCase } from "../format";
 import type { ConsoleEvidence, GraphNode, VerifiedTrace } from "../types";
@@ -6,21 +7,56 @@ import type { ConsoleEvidence, GraphNode, VerifiedTrace } from "../types";
 function Graph({ evidence, selected, onSelect }: { evidence: ConsoleEvidence; selected: string | null; onSelect: (node: GraphNode) => void }) {
   const { edges, nodes } = evidence.scenario_context.graph;
   const byId = new Map(nodes.map((node) => [node.id, node]));
+  const edgeAmounts = edges.map((edge) => Number(edge.amount));
+  const minAmount = Math.min(...edgeAmounts);
+  const maxAmount = Math.max(...edgeAmounts);
+  const edgeWidth = (amount: number) => maxAmount === minAmount ? 2 : 1.2 + ((amount - minAmount) / (maxAmount - minAmount)) * 2.8;
+  const selectFromKeyboard = (event: KeyboardEvent<SVGGElement>, node: GraphNode) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      onSelect(node);
+    }
+  };
+
   return (
-    <svg aria-label="Campaign entity graph with fourteen linked entities and ten payment edges" className="campaign-graph" role="img" viewBox="20 20 650 660">
+    <svg aria-label={`Campaign entity graph with ${nodes.length} linked entities and ${edges.length} directional payment edges; edge weight represents payment amount`} className={`campaign-graph ${selected ? "has-selection" : ""}`} role="img" viewBox="20 20 650 660">
+      <defs>
+        <marker id="payment-arrow" markerHeight="6" markerUnits="strokeWidth" markerWidth="6" orient="auto" refX="5" refY="3" viewBox="0 0 6 6"><path d="M0 0L6 3L0 6Z" /></marker>
+        <marker id="payment-arrow-focused" markerHeight="6" markerUnits="strokeWidth" markerWidth="6" orient="auto" refX="5" refY="3" viewBox="0 0 6 6"><path d="M0 0L6 3L0 6Z" /></marker>
+      </defs>
       <g className="graph-edges">
         {edges.map((edge) => {
           const source = byId.get(edge.source);
           const target = byId.get(edge.target);
           if (!source || !target) return null;
           const isFocused = selected === source.id || selected === target.id;
-          return <line className={isFocused ? "is-focused" : ""} key={edge.payment_id} x1={source.x} x2={target.x} y1={source.y} y2={target.y} />;
+          const isDimmed = selected !== null && !isFocused;
+          const distance = Math.hypot(target.x - source.x, target.y - source.y);
+          const targetInset = distance === 0 ? 0 : 22 / distance;
+          const x2 = target.x - (target.x - source.x) * targetInset;
+          const y2 = target.y - (target.y - source.y) * targetInset;
+          return (
+            <line
+              className={`${isFocused ? "is-focused" : ""} ${isDimmed ? "is-dimmed" : ""}`}
+              key={edge.payment_id}
+              markerEnd={`url(#${isFocused ? "payment-arrow-focused" : "payment-arrow"})`}
+              style={{ "--edge-width": edgeWidth(Number(edge.amount)) } as CSSProperties}
+              vectorEffect="non-scaling-stroke"
+              x1={source.x}
+              x2={x2}
+              y1={source.y}
+              y2={y2}
+            >
+              <title>{`${edge.payment_id}: ${source.label} to ${target.label}, ${formatMoney(edge.amount, edge.currency)}, ${titleCase(edge.stage)}`}</title>
+            </line>
+          );
         })}
       </g>
       <g className="graph-nodes">
         {nodes.map((node) => (
-          <g className={`${node.illicit ? "is-illicit" : ""} ${selected === node.id ? "is-selected" : ""}`} key={node.id} onClick={() => onSelect(node)} role="button" tabIndex={0} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") onSelect(node); }} aria-label={`${node.label}, ${node.role}, ${node.country}${node.illicit ? ", known illicit in synthetic truth" : ""}`}>
-            <circle cx={node.x} cy={node.y} r="17" />
+          <g className={`${node.illicit ? "is-illicit" : ""} ${selected === node.id ? "is-selected" : ""}`} key={node.id} onClick={() => onSelect(node)} role="button" tabIndex={0} onKeyDown={(event) => selectFromKeyboard(event, node)} aria-label={`${node.label}, ${node.role}, ${node.country}${node.illicit ? ", known illicit in synthetic truth" : ""}`}>
+            <circle className="node-halo" cx={node.x} cy={node.y} r="25" />
+            <circle className="node-body" cx={node.x} cy={node.y} r="17" />
             <circle className="node-core" cx={node.x} cy={node.y} r="5" />
             <text x={node.x + 25} y={node.y - 3}>{node.label}</text>
             <text className="node-meta" x={node.x + 25} y={node.y + 13}>{node.role.toUpperCase()} · {node.country}</text>
@@ -50,20 +86,20 @@ export function Investigation({ evidence, trace }: { evidence: ConsoleEvidence; 
         <article className="graph-panel">
           <div className="panel-head"><div><p className="eyebrow">Entity graph</p><h2>APP–mule value path</h2></div><div className="graph-legend"><span><i className="legend-neutral" />Entity</span><span><i className="legend-risk" />Synthetic illicit truth</span></div></div>
           <Graph evidence={evidence} onSelect={setSelected} selected={selected?.id ?? null} />
-          <div className="graph-foot"><span>{evidence.scenario_context.graph.nodes.length} entities</span><span>{edges.length} payment edges</span><span>{illicitCount} synthetic illicit nodes</span><code title={evidence.scenario_context.graph.graph_sha256}>graph {shortHash(evidence.scenario_context.graph.graph_sha256, 8)}</code></div>
+          <div className="graph-foot"><span>{evidence.scenario_context.graph.nodes.length} entities</span><span>{edges.length} payment edges</span><span>{illicitCount} synthetic illicit nodes</span><span>Arrow = payment direction</span><span>Weight = amount</span><code title={evidence.scenario_context.graph.graph_sha256}>graph {shortHash(evidence.scenario_context.graph.graph_sha256, 8)}</code></div>
         </article>
 
         <aside className="entity-inspector" aria-label="Selected entity details">
           <div className="panel-head"><div><p className="eyebrow">Focused entity</p><h2>{selected?.label ?? "Select a node"}</h2></div>{selected?.illicit ? <span className="pill pill-critical">Illicit truth</span> : <span className="pill">Context node</span>}</div>
-          {selected ? <>
-            <dl className="definition-table compact-definitions">
-              <div><dt>Role</dt><dd>{titleCase(selected.role)}</dd></div>
-              <div><dt>Country</dt><dd>{selected.country}</dd></div>
-              <div><dt>Linked payments</dt><dd>{linkedEdges.length}</dd></div>
-              <div><dt>Account</dt><dd><code>{shortHash(selected.account_id, 12)}</code></dd></div>
-            </dl>
-            <div className="linked-events"><span className="eyebrow">Connected value</span>{linkedEdges.map((edge) => <div key={edge.payment_id}><span><b>{titleCase(edge.stage)}</b><small>{edge.event_time.slice(11, 19)} UTC</small></span><strong>{formatMoney(edge.amount, edge.currency)}</strong></div>)}</div>
-          </> : null}
+          {selected ? <div className="entity-selection" key={selected.id}>
+              <dl className="definition-table compact-definitions">
+                <div><dt>Role</dt><dd>{titleCase(selected.role)}</dd></div>
+                <div><dt>Country</dt><dd>{selected.country}</dd></div>
+                <div><dt>Linked payments</dt><dd>{linkedEdges.length}</dd></div>
+                <div><dt>Account</dt><dd><code>{shortHash(selected.account_id, 12)}</code></dd></div>
+              </dl>
+              <div className="linked-events"><span className="eyebrow">Connected value</span>{linkedEdges.map((edge) => <div key={edge.payment_id}><span><b>{titleCase(edge.stage)}</b><small>{edge.event_time.slice(11, 19)} UTC</small></span><strong>{formatMoney(edge.amount, edge.currency)}</strong></div>)}</div>
+            </div> : null}
         </aside>
       </section>
 

@@ -11,6 +11,56 @@ function actionTone(action: string): string {
   return "good";
 }
 
+function DecisionRuler({ action, probability, thresholds }: { action: string; probability: number; thresholds: Record<string, number> }) {
+  const challenge = thresholds.model_challenge;
+  const review = thresholds.model_review;
+  const decline = thresholds.model_decline;
+  if (typeof challenge !== "number"
+    || typeof review !== "number"
+    || typeof decline !== "number"
+    || !Number.isFinite(challenge)
+    || !Number.isFinite(review)
+    || !Number.isFinite(decline)
+    || challenge < 0
+    || challenge > review
+    || review > decline
+    || decline > 1) {
+    return <div className="decision-ruler-unavailable"><strong>{formatPercent(probability, 1)}</strong><span>Threshold evidence unavailable</span></div>;
+  }
+
+  const style = {
+    "--risk": Math.max(0, Math.min(1, probability)),
+    "--challenge-threshold": `${challenge * 100}%`,
+    "--review-threshold": `${review * 100}%`,
+    "--decline-threshold": `${decline * 100}%`,
+    gridTemplateColumns: `${challenge}fr ${review - challenge}fr ${decline - review}fr`,
+  } as CSSProperties;
+  const label = `Calibrated risk ${formatPercent(probability, 1)} with final action ${titleCase(action)}. Bound action thresholds: challenge ${formatPercent(challenge, 1)}, review ${formatPercent(review, 1)}, decline ${formatPercent(decline, 1)}.`;
+
+  return (
+    <div className={`decision-ruler is-${actionTone(action)}`} aria-label={label} role="img">
+      <div className="risk-readout" key={`${probability}-${action}`}>
+        <strong>{formatPercent(probability, 1)}</strong>
+        <span><small>Calibrated risk</small><b>{titleCase(action)}</b></span>
+      </div>
+      <div className="decision-scale" style={style} aria-hidden="true">
+        <span className="decision-band band-approve">Approve</span>
+        <span className="decision-band band-challenge">Challenge</span>
+        <span className="decision-band band-review">Review</span>
+        <i className="decision-observed" />
+        <i className="threshold-marker marker-challenge" />
+        <i className="threshold-marker marker-review" />
+        <i className="threshold-marker marker-decline" />
+      </div>
+      <div className="threshold-labels">
+        <span>Challenge <b>{formatPercent(challenge, 1)}</b></span>
+        <span>Review <b>{formatPercent(review, 1)}</b></span>
+        <span>Decline <b>{formatPercent(decline, 1)}</b></span>
+      </div>
+    </div>
+  );
+}
+
 export function Replay({ evidence, trace, traceMode }: { evidence: ConsoleEvidence; trace: VerifiedTrace; traceMode: TraceMode }) {
   const [current, setCurrent] = useState(0);
   const [playing, setPlaying] = useState(false);
@@ -78,9 +128,7 @@ export function Replay({ evidence, trace, traceMode }: { evidence: ConsoleEviden
         <article className="decision-main" aria-label="Model evidence" role="region">
           <div className="panel-head"><div><p className="eyebrow">Model evidence</p><h2>Decision at event time</h2></div><span className={`pill pill-${actionTone(record.final_action)}`}>{titleCase(record.final_action)}</span></div>
           <div className="decision-score">
-            <div className="probability-ring" style={{ "--score": `${record.calibrated_probability * 100}%` } as React.CSSProperties}>
-              <span><strong>{formatPercent(record.calibrated_probability, 1)}</strong><small>calibrated risk</small></span>
-            </div>
+            <DecisionRuler action={record.final_action} probability={record.calibrated_probability} thresholds={evidence.portable.thresholds} />
             <dl>
               <div><dt>Final action</dt><dd>{titleCase(record.final_action)}</dd></div>
               <div><dt>{traceMode === "live_local_scorer" ? "Local scorer latency" : "Fixed-trace latency"}</dt><dd>{record.latency_ms.toFixed(3)} ms</dd></div>

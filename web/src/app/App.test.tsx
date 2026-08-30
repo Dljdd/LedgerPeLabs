@@ -65,6 +65,7 @@ describe("native route boundary", () => {
     expect(screen.getByText("Event 01 / 12")).toBeVisible();
     expect(screen.getByRole("region", { name: /model evidence/i })).toBeVisible();
     expect(screen.getByRole("region", { name: /post-event truth/i })).toBeVisible();
+    expect(screen.getByRole("img", { name: /calibrated risk 100.0%.*challenge 10.0%.*review 50.4%.*decline 100.0%/i })).toBeVisible();
 
     await user.click(screen.getByRole("button", { name: /step forward/i }));
     expect(screen.getByText("Event 02 / 12")).toBeVisible();
@@ -96,5 +97,15 @@ describe("native route boundary", () => {
 
     expect(screen.getByText("First curated APP intervention")).toBeVisible();
     expect(screen.getByText(/event 02 · 100.0% calibrated/i)).toBeVisible();
+    expect(screen.getByRole("img", { name: /14 linked entities and 10 directional payment edges; edge weight represents payment amount/i })).toBeVisible();
+    expect(screen.getByText("Arrow = payment direction")).toBeVisible();
+    expect(screen.getByText("Weight = amount")).toBeVisible();
+  });
+
+  it("renders the overview footprint from the ordered verified trace", () => {
+    const evidence = parseEvidence(rawEvidence);
+    render(<App evidence={evidence} trace={parseTrace(rawTrace, evidence)} />);
+
+    expect(screen.getByRole("img", { name: /12 ordered calibrated decisions: 6 decline hold, 2 review hold, 1 challenge, and 3 approve/i })).toBeVisible();
   });
 });
