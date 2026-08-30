@@ -107,6 +107,42 @@ It shows the actual ordered outcomes for:
 This panel is labeled deterministic trust verification and remains separate from the
 `ensemble_with_graph` prediction claim.
 
+### 2.4 Recovered diagnostic metrics
+
+The following recovered-metrics artifacts may supply genuine four-arm comparison
+values and readiness gates:
+
+- `docs/demo/SENTINEL_V5_RECOVERED_METRICS.md`
+- `evidence/sentinel-v5-recovered-metrics/verified-report.json`
+- `evidence/sentinel-v5-recovered-metrics/source-rescue-receipt.json`
+
+Every surface using these values displays the exact qualifier
+`Recovered diagnostic evidence — non-authoritative`. The qualifier must remain visible
+with the table or gate result at every supported breakpoint.
+
+The required boundary is:
+
+- `authoritative=false`;
+- `accepted_capacity_evidence=false`;
+- official chain status `incomplete`;
+- first missing official stage `70_metrics`;
+- readiness `not_ready`;
+- the accepted portable `ensemble_with_graph` arm remains the live demo model;
+- `full_sentinel` failed false-decline, challenge-rate, and `benign_only` gates.
+
+The recovered four-arm metrics are diagnostic projections of verified self-hashed
+documents. They are not accepted Stage 70 results and must not be combined with the
+12-case portable replay metrics into one estimate. The strongest supported conclusion
+is stated plainly: the graph ensemble is the currently usable competition model, while
+deterministic full-hybrid routing requires policy refinement.
+
+Seed and attempt wording must remain exact. The portable demo and recovered Kaggle
+metrics use seed 404 only. No Kaggle locked-successor/seed-2404 chain was run. An
+earlier local locked-development attempt was started and irreversibly aborted; it
+published no candidate manifest, chunks, judge summary, or successful seed-2404 result.
+No retry is permitted. The UI and walkthrough must not claim that the seed had no
+prior execution history.
+
 ## 3. Technical architecture
 
 ### 3.1 Stack
@@ -278,8 +314,18 @@ disagreement, available evidence, and live-demo status. The portable spec is the
 for `ensemble_with_graph` switches. Repository arm contracts are the source for the
 other architecture rows.
 
-Only the portable arm may display the bound 12-case metrics. Every absent comparison
-metric reads `Evidence pending`; no placeholder bars, values, or rankings are drawn.
+The view may display the genuine four-arm recovered metrics from
+`verified-report.json`, provided the complete table is headed
+`Recovered diagnostic evidence — non-authoritative` and visibly binds the incomplete
+official chain and `not_ready` status. The portable arm's 12-case replay metrics remain
+in a separate block labeled curated synthetic replay descriptions. Any metric absent
+from both sources reads `Evidence pending`; no placeholder bars, values, or rankings
+are drawn.
+
+The `full_sentinel` row and detail must expose its false-decline rate, challenge rate,
+and failed gates without collapse or euphemism. It must not be styled as champion-ready.
+The primary conclusion names `ensemble_with_graph` as the usable competition model and
+names full-hybrid policy refinement as remaining work.
 
 ### 4.6 Assurance
 
@@ -290,6 +336,12 @@ The page presents:
 - manifest, source checkpoint, spec, threshold, scenario, and trace hashes;
 - verified file and replay checks with textual pass/fail state;
 - synthetic, demo-only, non-authoritative, and not-capacity-evidence badges;
+- recovered report verification hash, incomplete official chain, first missing
+  `70_metrics` stage, and `not_ready` readiness;
+- all failed `full_sentinel` readiness gates alongside passed gates;
+- exact seed-404 recovery and irreversibly aborted local-attempt wording, including the
+  absence of published candidate artifacts or a successful seed-2404 result and the
+  no-retry boundary;
 - known limitations and remaining submission gaps;
 - the TrustVerifier proof point;
 - an explicit human promotion gate.
@@ -463,6 +515,9 @@ Production behavior is added only after a focused failing test demonstrates it.
 - Overview distinguishes fact from inference;
 - Replay separates input/output from post-event truth;
 - Defenses renders all four arms and `Evidence pending` where required;
+- recovered metrics retain both non-authoritative flags and cannot be rendered without
+  the exact recovered-evidence qualifier;
+- `full_sentinel` failures and the incomplete Stage 70 chain remain visible;
 - Investigation keeps graph and relationship table synchronized;
 - Assurance cannot promote itself;
 - loading, empty, degraded, and failure notices expose cause and action;
