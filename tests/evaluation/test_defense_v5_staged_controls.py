@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from apar.evaluation import v5_kaggle_rescue as rescue
 from apar.evaluation.v5_checkpoint_storage import (
     V5CheckpointInput,
     V5CheckpointObservation,
@@ -28,6 +29,7 @@ from apar.evaluation.v5_evaluation import (
     load_v5_arm_configuration,
 )
 from apar.evaluation.v5_evidence_bundle import build_v5_readiness_evidence
+from apar.evaluation.v5_evidence_layers import _stable_complete_metrics
 from apar.evaluation.v5_evidence_protocol import load_v5_evidence_protocol
 from apar.evaluation.v5_kaggle_protocol import (
     V5KaggleEnvironmentBinding,
@@ -46,6 +48,7 @@ from apar.evaluation.v5_population import V5Corpus, build_v5_corpus
 from apar.evaluation.v5_protocol import V5Profile
 from apar.evaluation.v5_run_mode import V5PartitionSupportPlan, V5RunMode
 from apar.evaluation.v5_staged_evidence import (
+    _arm_core_and_observation,
     _control_group_core_and_observation,
     _issue_stage_capability,
     _iter_v5_corpus_records,
@@ -539,6 +542,35 @@ def test_metric_stage_matches_existing_complete_metrics_and_readiness(
     assert all(item.calibration.calibration_sha256 for item in staged.complete_metrics)
 
     core, observation = _metric_stage_core_and_observation(evidence=staged, arm_results=arm_results)
+    deterministic_digests = tuple(
+        _arm_core_and_observation(result)[0]["deterministic_result_sha256"]
+        for result in arm_results
+    )
+    rescue_core, rescue_observation = rescue.build_non_authoritative_rescue_metric_documents(
+        complete_metrics=staged.complete_metrics,
+        controls=staged.controls,
+        readiness=staged.readiness,
+        deterministic_result_sha256=deterministic_digests,
+    )
+    assert rescue_core == core
+    assert rescue_observation == observation
+    for metric, result_digest in zip(
+        staged.complete_metrics,
+        deterministic_digests,
+        strict=True,
+    ):
+        compact_core, compact_observation = (
+            rescue.build_non_authoritative_compact_arm_metric_documents(
+                metric=metric,
+                deterministic_result_sha256=result_digest,
+            )
+        )
+        assert compact_core == _stable_complete_metrics(
+            metric.model_dump(mode="json"),
+            deterministic_result_sha256=result_digest,
+        )
+        assert compact_observation["arm"] == metric.arm.value
+        assert compact_observation["complete_metrics_sha256"] == (metric.complete_metrics_sha256)
     assert _restore_metric_stage_evidence(core=core, observation=observation) == staged
     changed_core = dict(core)
     changed_core["deterministic_metric_stage_sha256"] = "0" * 64
