@@ -1,0 +1,1 @@
+"""Judge-console verification tests."""
