@@ -10,6 +10,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -156,6 +157,9 @@ def _build_client(root: Path) -> None:
 
 class ConsoleHandler(SimpleHTTPRequestHandler):
     server_version = "APARConsole/1"
+    _scorer_lock = threading.Lock()
+    _trace_cache: dict[str, Any] | None = None
+    scorer_enabled = True
 
     def __init__(
         self,
@@ -209,10 +213,20 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
         if self.path != "/api/score":
             self._send_json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
             return
+        if not self.scorer_enabled:
+            self._send_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"status": "scorer_unavailable", "fallback_available": True},
+            )
+            return
         try:
-            runtime = self.root / ".apar/console"
-            runtime.mkdir(parents=True, exist_ok=True)
-            report = score_live_trace(self.root, runtime / "live-trace.json")
+            with self._scorer_lock:
+                report = type(self)._trace_cache
+                if report is None:
+                    runtime = self.root / ".apar/console"
+                    runtime.mkdir(parents=True, exist_ok=True)
+                    report = score_live_trace(self.root, runtime / "live-trace.json")
+                    type(self)._trace_cache = report
             self._send_json(HTTPStatus.OK, report)
         except (OSError, RuntimeError, ValueError) as exc:
             self._send_json(
@@ -230,6 +244,11 @@ def _parse_args() -> argparse.Namespace:
     start = subparsers.add_parser("start", help="verify, build, and serve the console")
     start.add_argument("--host", default="127.0.0.1")
     start.add_argument("--port", default=4173, type=int)
+    start.add_argument(
+        "--fallback-only",
+        action="store_true",
+        help="serve the verified committed trace without starting the scorer",
+    )
     start.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     subparsers.add_parser("health", help="verify committed console assets")
     subparsers.add_parser("reset", help="remove only the generated live trace")
@@ -255,6 +274,8 @@ def main() -> int:
     if not (dist / "index.html").is_file():
         raise RuntimeError("web/dist is missing; run without --skip-build")
     class BoundConsoleHandler(ConsoleHandler):
+        scorer_enabled = not args.fallback_only
+
         def __init__(
             self,
             request: socket.socket,

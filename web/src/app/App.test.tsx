@@ -86,4 +86,15 @@ describe("native route boundary", () => {
     expect(screen.getByText(/no Kaggle locked-successor\/seed-2404 chain was run/i)).toBeVisible();
     expect(screen.getByRole("region", { name: /agentic integrity proof/i })).toBeVisible();
   });
+
+  it("binds the investigation first alert to a curated APP replay record", async () => {
+    const user = userEvent.setup();
+    const evidence = parseEvidence(rawEvidence);
+    render(<App evidence={evidence} trace={parseTrace(rawTrace, evidence)} />);
+
+    await user.click(within(screen.getByRole("navigation", { name: "Primary" })).getByRole("link", { name: /investigation/i }));
+
+    expect(screen.getByText("First curated APP intervention")).toBeVisible();
+    expect(screen.getByText(/event 02 · 100.0% calibrated/i)).toBeVisible();
+  });
 });

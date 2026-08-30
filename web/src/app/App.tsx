@@ -42,7 +42,7 @@ export function App({ evidence, trace, traceMode = "hash_bound_verified_fallback
     case "/overview": view = <Overview evidence={evidence} navigate={navigate} trace={trace} />; break;
     case "/scenario": view = <Scenario evidence={evidence} navigate={navigate} trace={trace} />; break;
     case "/replay": view = <Replay evidence={evidence} trace={trace} traceMode={traceMode} />; break;
-    case "/investigation": view = <Investigation evidence={evidence} />; break;
+    case "/investigation": view = <Investigation evidence={evidence} trace={trace} />; break;
     case "/defenses": view = <Defenses evidence={evidence} />; break;
     case "/assurance": view = <Assurance evidence={evidence} trace={trace} traceMode={traceMode} />; break;
   }

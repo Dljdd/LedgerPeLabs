@@ -74,13 +74,13 @@ export function Replay({ evidence, trace, traceMode }: { evidence: ConsoleEviden
             </div>
             <dl>
               <div><dt>Final action</dt><dd>{titleCase(record.final_action)}</dd></div>
-              <div><dt>Fixed-trace latency</dt><dd>{record.latency_ms.toFixed(3)} ms</dd></div>
+              <div><dt>{traceMode === "live_local_scorer" ? "Local scorer latency" : "Fixed-trace latency"}</dt><dd>{record.latency_ms.toFixed(3)} ms</dd></div>
               <div><dt>Member disagreement</dt><dd>{record.disagreement.toFixed(4)}</dd></div>
               <div><dt>Feature vector</dt><dd>{inputRecord.model_input.features.length} bound features</dd></div>
             </dl>
           </div>
           <div className="reason-box"><span>Reason evidence</span>{record.reason_codes.map((reason) => <code key={reason}>{reason}</code>)}</div>
-          <p className="technical-note">Latency is preserved from this committed fallback trace and is not a production latency estimate.</p>
+          <p className="technical-note">{traceMode === "live_local_scorer" ? "Latency was observed during this local scoring run and is not a production latency estimate." : "Latency is preserved from this committed fallback trace and is not a production latency estimate."}</p>
         </article>
 
         <article className="truth-panel" aria-label="Post-event truth" role="region">

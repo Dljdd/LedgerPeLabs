@@ -26,6 +26,8 @@ The canonical design is [SOLUTION_SPEC.md](../SOLUTION_SPEC.md). The documents i
 - [Glossary](GLOSSARY.md)
 - [Diagram catalog and editable Mermaid sources](diagrams/README.md)
 - [Empirical validation spike](../validation_spike/README.md)
+- [APAR console walkthrough](demo/APAR_CONSOLE_WALKTHROUGH.md)
+- [APAR console verification and remaining gaps](demo/APAR_CONSOLE_VERIFICATION.md)
 
 ## Status language
 

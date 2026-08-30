@@ -11,6 +11,22 @@ The product is an assurance layer, not a replacement payment-decision engine. It
 - [Approved implementation plans](docs/superpowers/plans/README.md)
 - [Diagram catalog](docs/diagrams/README.md)
 - [Empirical validation spike](validation_spike/README.md)
+- [Judge-facing APAR console](web/README.md)
+
+## Run the judge-facing console
+
+After installing the Python project and the frontend dependencies with
+`npm ci --prefix web`, start the complete offline console from the repository
+root:
+
+```bash
+.venv/bin/python scripts/run_apar_console.py start
+```
+
+Open `http://127.0.0.1:4173/overview`. The launcher verifies the committed
+evidence and fallback trace, builds the client, and serves the real local
+portable scorer. See [web/README.md](web/README.md) for preflight, reset,
+fallback-only, test, and offline instructions.
 
 ## Install and verify the G0 foundation
 
@@ -52,7 +68,7 @@ scenario compiler, API, and immutable artifact store from clean temporary state.
 | Adaptive red-team optimizer | Harness validated; adaptive optimizer not implemented |
 | Defender service | Implemented; 200-campaign v1 evidence is signed and hash-pinned, with truthful `no_promotion` after the frozen 1% workload budget proved infeasible |
 | Agentic trust plane | Specified, not implemented |
-| Web prototype and walkthrough | Specified, not implemented |
+| Web prototype and walkthrough | Implemented and locally verified; walkthrough video not recorded |
 
 The `validation_spike` is retained as supporting evidence. It must not be represented as the complete competition solution.
 

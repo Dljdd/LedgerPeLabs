@@ -6,8 +6,20 @@ import tseslint from "typescript-eslint";
 export default tseslint.config(
   { ignores: ["dist", "node_modules", "playwright-report", "test-results", "eslint.config.js"] },
   eslint.configs.recommended,
-  ...tseslint.configs.recommendedTypeChecked,
-  ...reactHooks.configs["flat/recommended"],
+  ...tseslint.configs.recommendedTypeChecked.map((config) => ({
+    ...config,
+    files: ["**/*.{ts,tsx}"],
+  })),
+  ...reactHooks.configs["flat/recommended"].map((config) => ({
+    ...config,
+    files: ["src/**/*.{ts,tsx}"],
+  })),
+  {
+    files: ["scripts/**/*.mjs"],
+    languageOptions: {
+      globals: { console: "readonly", process: "readonly" },
+    },
+  },
   {
     files: ["**/*.{ts,tsx}"],
     languageOptions: {

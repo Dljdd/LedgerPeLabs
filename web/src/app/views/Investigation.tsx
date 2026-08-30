@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 
-import { formatMoney, shortHash, titleCase } from "../format";
-import type { ConsoleEvidence, GraphNode } from "../types";
+import { formatMoney, formatPercent, shortHash, titleCase } from "../format";
+import type { ConsoleEvidence, GraphNode, VerifiedTrace } from "../types";
 
 function Graph({ evidence, selected, onSelect }: { evidence: ConsoleEvidence; selected: string | null; onSelect: (node: GraphNode) => void }) {
   const { edges, nodes } = evidence.scenario_context.graph;
@@ -31,10 +31,11 @@ function Graph({ evidence, selected, onSelect }: { evidence: ConsoleEvidence; se
   );
 }
 
-export function Investigation({ evidence }: { evidence: ConsoleEvidence }) {
+export function Investigation({ evidence, trace }: { evidence: ConsoleEvidence; trace: VerifiedTrace }) {
   const [selected, setSelected] = useState<GraphNode | null>(() => evidence.scenario_context.graph.nodes.find((node) => node.illicit) ?? null);
   const edges = evidence.scenario_context.graph.edges;
-  const firstEdge = edges[0];
+  const firstAppAlert = trace.traces.find((record) => record.presentation_ground_truth.family === "app_scam_mule" && record.final_action !== "approve");
+  const firstAppAlertIndex = firstAppAlert ? trace.traces.indexOf(firstAppAlert) : -1;
   const linkedEdges = useMemo(() => selected ? edges.filter((edge) => edge.source === selected.id || edge.target === selected.id) : [], [edges, selected]);
   const illicitCount = evidence.scenario_context.graph.nodes.filter((node) => node.illicit).length;
 
@@ -67,7 +68,7 @@ export function Investigation({ evidence }: { evidence: ConsoleEvidence }) {
       </section>
 
       <section className="investigation-strip">
-        <article><span className="card-index">FIRST GRAPH EDGE</span><strong>{firstEdge ? formatMoney(firstEdge.amount, firstEdge.currency) : "Evidence pending"}</strong><p>{firstEdge ? `${firstEdge.event_time.slice(11, 19)} UTC · ${titleCase(firstEdge.stage)}` : "No bound edge"}</p></article>
+        <article><span className="card-index">First curated APP intervention</span><strong>{firstAppAlert ? titleCase(firstAppAlert.final_action) : "Evidence pending"}</strong><p>{firstAppAlert ? `${formatMoney(firstAppAlert.presentation_ground_truth.amount)} · event ${String(firstAppAlertIndex + 1).padStart(2, "0")} · ${formatPercent(firstAppAlert.calibrated_probability, 1)} calibrated` : "No bound APP intervention"}</p></article>
         <article><span className="card-index">CUMULATIVE ATTEMPTED VALUE</span><strong>{formatMoney(evidence.scenario_context.value_total)}</strong><p>{evidence.scenario_context.payment_count} ordered campaign payments</p></article>
         <article><span className="card-index">ANALYST TIME ESTIMATE</span><strong>Evidence pending</strong><p>No placeholder productivity claim</p></article>
         <article><span className="card-index">CASE GROUPING</span><strong>1 campaign case</strong><p>{evidence.scenario_context.case_grouping.event_count} grouped events</p></article>
