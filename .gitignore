@@ -27,6 +27,7 @@ web/playwright.config.js
 web/playwright.config.d.ts
 web/playwright-report/
 web/test-results/
+web/.vercel/
 dist/
 
 # Local application and agent state
