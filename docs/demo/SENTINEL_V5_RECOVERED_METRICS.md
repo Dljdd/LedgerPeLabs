@@ -11,7 +11,8 @@ This document records the seed-404 Kaggle capacity-validation recovery. The reco
 - Official Stage 80: absent/invalid because its required Stage 70 predecessor does not exist.
 - Non-authoritative recovery: saved-successful script version `346022855`, `12225.0s`, accelerator `None`. All four arm workers reported `fresh_interpreter: true` before compact finalization.
 - Recovered readiness: `not_ready`. This is diagnostic evidence only.
-- Seed 2404 was not executed.
+- This Kaggle recovery and every accepted safe checkpoint used development-test seed 404 only. No Kaggle locked-successor or seed-2404 chain was run.
+- An earlier local locked-development attempt started at `2026-08-24T13:32:54.948338Z` and was irreversibly aborted by the host watchdog at `2026-08-24T13:48:11Z`. It published no candidate manifest, candidate chunks, or judge summary, and produced no successful seed-2404 result. The retained execution-boundary artifacts do not prove which internal sub-step the attempt reached, so this report makes no stronger claim.
 
 The accepted terminal Stage 60 rerun is saved-successful script version `345946007` (`9911.9s`) with deterministic digest `a8caf985a2459fc9792b0de744defdd496f62654ed000108de93db7f6f8a0e5f`, manifest `d13122fc912aaec48574c67e3e3a0891abb133d76a247c90f337d9de2f1cfcfc`, and observational digest `c0d59d3bec2afb6179ae9615e8cb8ed2670656cc46809eaeb05fb2e06ffe5593`.
 
