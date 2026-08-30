@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import gc
 import json
+import weakref
 from collections.abc import Iterator
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+from apar.evaluation import v5_kaggle_rescue as rescue
 from apar.evaluation import v5_staged_evidence as staged
 from apar.evaluation.v5_checkpoint_storage import (
     V5CheckpointInput,
@@ -693,3 +696,68 @@ def test_arm_stage_matches_existing_safe_path_except_real_latency(
         not row.model_raw_scores
         for row in by_arm[V5Arm.RULES_ONLY.value].row_evidence
     )
+
+
+def test_non_authoritative_rescue_stream_releases_each_exact_arm(
+    tmp_path: Path,
+    safe_smoke_corpus: V5Corpus,
+) -> None:
+    """The OOM rescue must restore exactly one arm before advancing to the next."""
+    protocol = _protocol()
+    feature_root, feature_manifest = _build_feature_chain(
+        tmp_path=tmp_path, corpus=safe_smoke_corpus
+    )
+    arm_capability = staged._issue_stage_capability(
+        protocol=protocol,
+        mode=V5KaggleMode.CAPACITY_VALIDATION,
+        attempt_receipt_sha256="5" * 64,
+        predecessor=feature_manifest,
+    )
+    arm_root = tmp_path / "arms"
+    _publish_stage(
+        output_root=arm_root,
+        stage=V5KaggleStage.ARMS,
+        records=staged.execute_v5_arm_stage(
+            root=ROOT,
+            capability=arm_capability,
+            corpus_checkpoint_root=tmp_path / "corpus",
+            feature_checkpoint_root=feature_root,
+        ),
+        predecessor=feature_manifest,
+    )
+    expected = staged.load_v5_arm_checkpoint(
+        checkpoint_root=arm_root,
+        limits=protocol.resources,
+    )
+
+    streamed = rescue.iter_non_authoritative_rescue_arm_results(
+        checkpoint_root=arm_root,
+        limits=protocol.resources,
+    )
+    first = next(streamed)
+    assert first.arm == expected[0].arm
+    assert first.result.model_dump(mode="json") == expected[0].model_dump(mode="json")
+    assert (
+        first.deterministic_result_sha256
+        == staged._arm_core_and_observation(expected[0])[0]["deterministic_result_sha256"]
+    )
+    first_reference = weakref.ref(first.result)
+    del first
+
+    second = next(streamed)
+    gc.collect()
+    assert first_reference() is None
+    observed = [second]
+    observed.extend(streamed)
+    assert tuple(item.arm for item in observed) == tuple(result.arm for result in expected[1:])
+    assert [item.result.model_dump(mode="json") for item in observed] == [
+        result.model_dump(mode="json") for result in expected[1:]
+    ]
+    for expected_result in expected:
+        isolated = rescue.load_non_authoritative_rescue_arm_result(
+            checkpoint_root=arm_root,
+            limits=protocol.resources,
+            target_arm=expected_result.arm,
+        )
+        assert isolated.arm == expected_result.arm
+        assert isolated.result.model_dump(mode="json") == expected_result.model_dump(mode="json")
