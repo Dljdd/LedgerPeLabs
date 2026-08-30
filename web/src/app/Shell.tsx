@@ -14,16 +14,19 @@ interface ShellProps {
 export function RouteLink({
   children,
   className = "",
+  current = false,
   navigate,
   path,
 }: {
   children: ReactNode;
   className?: string;
+  current?: boolean;
   navigate: (path: RoutePath) => void;
   path: RoutePath;
 }) {
   return (
     <a
+      aria-current={current ? "page" : undefined}
       className={className}
       href={path}
       onClick={(event) => {
@@ -40,6 +43,8 @@ export function RouteLink({
 
 export function Shell({ children, route, navigate, traceMode }: ShellProps) {
   const currentIndex = routes.findIndex((item) => item.path === route);
+  const current = routes.find((item) => item.path === route);
+  if (!current) throw new Error(`Missing route metadata for ${route}`);
   const next = routes[currentIndex + 1];
 
   return (
@@ -56,6 +61,7 @@ export function Shell({ children, route, navigate, traceMode }: ShellProps) {
               <li key={item.path}>
                 <RouteLink
                   className={item.path === route ? "nav-link is-active" : "nav-link"}
+                  current={item.path === route}
                   navigate={navigate}
                   path={item.path}
                 >
@@ -76,10 +82,10 @@ export function Shell({ children, route, navigate, traceMode }: ShellProps) {
 
       <div className="workspace">
         <header className="topbar">
-          <p><span className="muted">Competition console</span><span className="slash">/</span> Synthetic evidence</p>
-          <div className="top-status" aria-label="Evidence status: verified local inputs">
+          <p><span className="topbar-product">APAR assurance</span><span className="slash">/</span><span className="topbar-route">{current.index} {current.label}</span></p>
+          <div className="top-status" aria-label={traceMode === "live_local_scorer" ? "Evidence status: local scorer verified" : "Evidence status: offline trace verified"}>
             <span className="status-dot" aria-hidden="true" />
-            Verified local inputs
+            {traceMode === "live_local_scorer" ? "Local scorer verified" : "Offline trace verified"}
           </div>
         </header>
         <main id="main-content" tabIndex={-1}>{children}</main>
