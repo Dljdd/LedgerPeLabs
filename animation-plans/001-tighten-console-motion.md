@@ -1,6 +1,6 @@
 # 001 — Tighten replay and interaction motion
 
-- **Status**: TODO
+- **Status**: DONE
 - **Commit**: 1beb91a
 - **Severity**: MEDIUM
 - **Category**: Performance, accessibility, purpose and frequency

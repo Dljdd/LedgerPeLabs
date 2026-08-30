@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import type { CSSProperties } from "react";
 
 import { Icon } from "../Icon";
 import { formatMoney, formatPercent, shortHash, titleCase } from "../format";
@@ -60,7 +61,15 @@ export function Replay({ evidence, trace, traceMode }: { evidence: ConsoleEviden
         </div>
         <div className="replay-progress">
           <div><span aria-live="polite">Event {String(current + 1).padStart(2, "0")} / {String(total).padStart(2, "0")}</span><span>{playing ? "Advancing" : current === total - 1 ? "Complete" : "Ready"}</span></div>
-          <progress max={total} value={current + 1}>{current + 1} of {total}</progress>
+          <div className="replay-progress-track" aria-hidden="true">
+            <span
+              className="replay-progress-fill"
+              style={{ "--replay-progress": (current + 1) / total } as CSSProperties}
+            />
+          </div>
+          <progress className="sr-only" max={total} value={current + 1}>
+            {current + 1} of {total}
+          </progress>
         </div>
           <div className="trace-bind"><span>Trace</span><code title={trace.trace_sha256}>{shortHash(trace.trace_sha256, 8)}</code><span className="pill pill-good">{traceMode === "live_local_scorer" ? "Scored locally" : "Verified fallback"}</span></div>
       </section>

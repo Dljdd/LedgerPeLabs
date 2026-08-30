@@ -2,7 +2,7 @@
 
 | Plan | Title | Severity | Status |
 | --- | --- | --- | --- |
-| [001](001-tighten-console-motion.md) | Tighten replay and interaction motion | MEDIUM | TODO |
+| [001](001-tighten-console-motion.md) | Tighten replay and interaction motion | MEDIUM | DONE |
 
 ## Recommended execution order
 
