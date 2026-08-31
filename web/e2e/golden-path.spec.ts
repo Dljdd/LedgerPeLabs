@@ -114,3 +114,26 @@ test("reduced motion campaign advances only on explicit steps", async ({ page })
   const animationName = await page.locator(".replay-value-packet").evaluate((element) => getComputedStyle(element).animationName);
   expect(animationName).toBe("none");
 });
+
+test("campaign tape stays compact beside its evidence footer", async ({ page }) => {
+  await page.goto("/replay");
+  await expect(page.getByRole("list", { name: "Ordered campaign payments" })).toBeVisible();
+
+  const spacing = await page.evaluate(() => {
+    const tapeScroll = document.querySelector<HTMLElement>(".campaign-tape-scroll");
+    const tape = document.querySelector<HTMLElement>(".campaign-tape");
+    const footer = document.querySelector<HTMLElement>(".campaign-evidence-foot");
+    if (!tapeScroll || !tape || !footer) throw new Error("Replay spacing elements are unavailable");
+    const tapeScrollRect = tapeScroll.getBoundingClientRect();
+    const tapeRect = tape.getBoundingClientRect();
+    const footerRect = footer.getBoundingClientRect();
+    return {
+      footerGap: footerRect.top - tapeScrollRect.bottom,
+      tapeHeight: tapeRect.height,
+      tapeScrollHeight: tapeScrollRect.height,
+    };
+  });
+
+  expect(spacing.tapeScrollHeight).toBeLessThanOrEqual(spacing.tapeHeight + 2);
+  expect(Math.abs(spacing.footerGap)).toBeLessThanOrEqual(1);
+});

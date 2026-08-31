@@ -34,7 +34,7 @@ architecture-arm inspection, or full lineage inspection.
 - TypeScript project check: passed.
 - ESLint with zero warnings: passed.
 - Vite production build: passed.
-- Playwright desktop/mobile suite: 10 tests passed.
+- Playwright desktop/mobile suite: 12 tests passed.
 - Playwright route smoke: all six routes, both breakpoints.
 - Axe automated checks: no violations on Overview, Replay, and Assurance,
   desktop/mobile.

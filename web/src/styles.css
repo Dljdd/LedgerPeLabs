@@ -308,7 +308,7 @@ meter::-webkit-meter-optimum-value { background: var(--orange); }
 
 /* Editorial Casefile — accepted graph-led replay narrative */
 .replay-narrative { display: grid; grid-template-columns: minmax(0, 1fr) 350px; border: 1px solid #766957; background: #100f0c; }
-.campaign-playback { min-width: 0; display: grid; grid-template-rows: 76px 470px 34px auto 58px; padding: 0 24px; }
+.campaign-playback { min-width: 0; display: grid; grid-template-rows: 76px minmax(470px, 1fr) 34px 117px 58px; padding: 0 24px; }
 .campaign-playback-head { display: flex; align-items: center; justify-content: space-between; gap: 20px; border-bottom: 1px solid #5b5144; }
 .campaign-playback-head > div:first-child { display: grid; gap: 7px; }
 .campaign-playback-head span, .scenario-payment-state > header, .portable-response-state > header { color: var(--orange-hot); font: 700 8px/1 var(--mono); letter-spacing: .11em; }
@@ -319,7 +319,7 @@ meter::-webkit-meter-optimum-value { background: var(--orange); }
 .campaign-play-button[aria-pressed="true"] i { border-radius: 0; animation: campaign-play-pulse 900ms linear infinite; }
 .campaign-reset-button { border-color: #4f483e; color: var(--muted); }
 .campaign-reset-button span { color: var(--text-soft); font-size: 13px; letter-spacing: 0; }
-.replay-campaign-graph { width: 100%; height: 470px; display: block; overflow: visible; }
+.replay-campaign-graph { width: 100%; height: 100%; display: block; overflow: visible; }
 .replay-graph-edges line { stroke: #675f54; stroke-width: 1.1; opacity: .78; vector-effect: non-scaling-stroke; transition: opacity var(--duration-standard) var(--ease-out), stroke 180ms var(--ease-out), stroke-width 180ms var(--ease-out); }
 .replay-graph-edges line.is-selected { stroke: var(--orange); stroke-width: 2.5; opacity: 1; }
 .replay-graph-edges line.is-concealed { opacity: .07; }
