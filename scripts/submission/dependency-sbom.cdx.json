@@ -1,0 +1,46 @@
+{
+  "bomFormat": "CycloneDX",
+  "components": [
+    {"licenses": [{"license": {"id": "MIT"}}], "name": "annotated-types", "purl": "pkg:pypi/annotated-types@0.8.0", "type": "library", "version": "0.8.0"},
+    {"licenses": [{"license": {"id": "Apache-2.0"}}], "name": "catboost", "purl": "pkg:pypi/catboost@1.2.10", "type": "library", "version": "1.2.10"},
+    {"licenses": [{"license": {"id": "BSD-3-Clause"}}], "name": "contourpy", "purl": "pkg:pypi/contourpy@1.3.3", "type": "library", "version": "1.3.3"},
+    {"licenses": [{"license": {"id": "BSD-3-Clause"}}], "name": "cycler", "purl": "pkg:pypi/cycler@0.12.1", "type": "library", "version": "0.12.1"},
+    {"licenses": [{"license": {"id": "MIT"}}], "name": "fonttools", "purl": "pkg:pypi/fonttools@4.63.0", "type": "library", "version": "4.63.0"},
+    {"licenses": [{"license": {"id": "MIT"}}], "name": "graphviz", "purl": "pkg:pypi/graphviz@0.21", "type": "library", "version": "0.21"},
+    {"licenses": [{"license": {"id": "BSD-3-Clause"}}], "name": "joblib", "purl": "pkg:pypi/joblib@1.5.3", "type": "library", "version": "1.5.3"},
+    {"licenses": [{"license": {"id": "BSD-3-Clause"}}], "name": "kiwisolver", "purl": "pkg:pypi/kiwisolver@1.5.1", "type": "library", "version": "1.5.1"},
+    {"licenses": [{"license": {"id": "PSF-2.0"}}], "name": "matplotlib", "purl": "pkg:pypi/matplotlib@3.11.1", "type": "library", "version": "3.11.1"},
+    {"licenses": [{"license": {"id": "MIT"}}], "name": "narwhals", "purl": "pkg:pypi/narwhals@2.25.0", "type": "library", "version": "2.25.0"},
+    {"licenses": [{"license": {"id": "BSD-3-Clause"}}], "name": "numpy", "purl": "pkg:pypi/numpy@2.5.2", "type": "library", "version": "2.5.2"},
+    {"licenses": [{"expression": "Apache-2.0 OR BSD-2-Clause"}], "name": "packaging", "purl": "pkg:pypi/packaging@26.3", "type": "library", "version": "26.3"},
+    {"licenses": [{"license": {"id": "BSD-3-Clause"}}], "name": "pandas", "purl": "pkg:pypi/pandas@3.0.5", "type": "library", "version": "3.0.5"},
+    {"licenses": [{"license": {"id": "HPND"}}], "name": "pillow", "purl": "pkg:pypi/pillow@12.3.0", "type": "library", "version": "12.3.0"},
+    {"licenses": [{"license": {"id": "MIT"}}], "name": "plotly", "purl": "pkg:pypi/plotly@7.0.0", "type": "library", "version": "7.0.0"},
+    {"licenses": [{"license": {"id": "MIT"}}], "name": "pydantic", "purl": "pkg:pypi/pydantic@2.13.5", "type": "library", "version": "2.13.5"},
+    {"licenses": [{"license": {"id": "MIT"}}], "name": "pydantic-core", "purl": "pkg:pypi/pydantic-core@2.46.5", "type": "library", "version": "2.46.5"},
+    {"licenses": [{"license": {"id": "MIT"}}], "name": "pyparsing", "purl": "pkg:pypi/pyparsing@3.3.2", "type": "library", "version": "3.3.2"},
+    {"licenses": [{"expression": "Apache-2.0 OR BSD-3-Clause"}], "name": "python-dateutil", "purl": "pkg:pypi/python-dateutil@2.9.0.post0", "type": "library", "version": "2.9.0.post0"},
+    {"licenses": [{"license": {"id": "BSD-3-Clause"}}], "name": "scikit-learn", "purl": "pkg:pypi/scikit-learn@1.9.0", "type": "library", "version": "1.9.0"},
+    {"licenses": [{"license": {"id": "BSD-3-Clause"}}], "name": "scipy", "purl": "pkg:pypi/scipy@1.18.1", "type": "library", "version": "1.18.1"},
+    {"licenses": [{"license": {"id": "MIT"}}], "name": "six", "purl": "pkg:pypi/six@1.17.0", "type": "library", "version": "1.17.0"},
+    {"licenses": [{"license": {"id": "BSD-3-Clause"}}], "name": "threadpoolctl", "purl": "pkg:pypi/threadpoolctl@3.6.0", "type": "library", "version": "3.6.0"},
+    {"licenses": [{"license": {"id": "PSF-2.0"}}], "name": "typing-extensions", "purl": "pkg:pypi/typing-extensions@4.16.0", "type": "library", "version": "4.16.0"},
+    {"licenses": [{"license": {"id": "MIT"}}], "name": "typing-inspection", "purl": "pkg:pypi/typing-inspection@0.4.4", "type": "library", "version": "0.4.4"},
+    {"licenses": [{"license": {"id": "Apache-2.0"}}], "name": "tzdata", "purl": "pkg:pypi/tzdata@2026.3", "type": "library", "version": "2026.3"}
+  ],
+  "metadata": {
+    "component": {
+      "name": "APAR portable Sentinel submission",
+      "type": "application",
+      "version": "1"
+    },
+    "properties": [
+      {"name": "apar:dependencies-vendored", "value": "false"},
+      {"name": "apar:project-license-status", "value": "unspecified"},
+      {"name": "apar:web-dependencies-shipped", "value": "false"}
+    ]
+  },
+  "serialNumber": "urn:uuid:5cae4f40-d1fb-4316-ae2d-4fdb235c0043",
+  "specVersion": "1.6",
+  "version": 1
+}
