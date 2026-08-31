@@ -12,7 +12,9 @@ network. The shift is bounded: personalization and message iteration become
 faster; we do not claim autonomous settlement access.”
 
 Point to the three rail contexts, then the evidence boundary. Note that FCA and
-FBI facts are visually separated from the APAR modeling inference. Click
+FBI facts are visually separated from the APAR modeling inference. Briefly
+select event **04** in the decision footprint to show that the chart exposes
+only the bound probability and action—not post-event truth. Click
 **Inspect scenario controls**.
 
 ## 0:40–1:15 — Scenario
@@ -23,7 +25,9 @@ $500 synthetic ledger.”
 
 The displayed campaign generator seed `260816` belongs to this deterministic
 network illustration. It is not the portable checkpoint evidence seed. Point
-to the fan-in, layer, fan-out, cash-out motif and click **Start verified replay**.
+to the fan-in, layer, fan-out, cash-out motif; select the three configured stage
+cards to show the ordered emphasis without autoplay, then click **Start verified
+replay**.
 
 ## 1:15–2:15 — Replay / Intervention
 
@@ -32,9 +36,10 @@ shows `ensemble_with_graph`. If the worker fails, the same view explicitly
 switches to a hash-bound verified fallback.”
 
 Click **Play campaign** briefly. The left surface reveals the 10 genuine payment
-edges in order while the scenario payment inspector shows the selected stage,
-amount, route, time, and cumulative attempted value. Say: “This is the campaign
-story; it is not a row-level join to the portable trace.”
+edges in order; an orange transfer marker moves between the active source and
+target while the scenario payment inspector shows the selected stage, amount,
+route, time, and cumulative attempted value. Say: “This is the campaign story;
+it is not a row-level join to the portable trace.”
 
 On the right, point out the independently selected calibrated probability,
 bound action thresholds, final action, observed local or fixed-trace latency,
@@ -54,8 +59,9 @@ is a genuine deterministic synthetic graph: 14 entities, 10 payment edges, and
 a conserved $500 attempted-value progression.”
 
 Select the central mule node. Point to its linked payments and the single
-deterministic case group. Call out **Evidence pending** for analyst time: the UI
-does not invent a productivity number.
+deterministic case group. The proportional orange bars use only the selected
+node's genuine linked payment amounts. Call out **Evidence pending** for analyst
+time: the UI does not invent a productivity number.
 
 Open **Defenses**.
 
@@ -63,6 +69,10 @@ Open **Defenses**.
 
 Say: “Four architecture arms are visible, but only one is the demo champion.
 The accepted portable arm is the Stage 30 `ensemble_with_graph` model.”
+
+Use **Inspect arm** to compare `rules_only` with `ensemble_with_graph`; the
+focused readout exposes the existing description, status, and deterministic
+result hash without inventing a new architecture metric.
 
 Point to the exact recovered-evidence qualifier and the two false flags. Say:
 “These four-arm metrics are recovered diagnostics. They are non-authoritative,
@@ -78,7 +88,8 @@ Open **Assurance**.
 
 ## 4:05–5:00 — Assurance / Integrity
 
-Walk down the artifact hashes and the blocked human-promotion gate. Say:
+Select two artifact rows to expose their full hashes, then walk down the blocked
+human-promotion gate. Say:
 “No model can approve itself.”
 
 In the green TrustVerifier section, say: “This separate proof shows genuine

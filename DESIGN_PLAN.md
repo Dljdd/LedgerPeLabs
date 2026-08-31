@@ -5,11 +5,17 @@
 - **Scope:** Six-route judge-facing assurance console
 - **Target:** `web/src/app` and `web/src/styles.css`
 - **Winning direction:** Variant F campaign narrative with Variant B Editorial Casefile treatment
-- **Key improvements:** graph-led campaign playback, persistent detection inspector, independent evidence selectors, serif narrative hierarchy, warm ink surfaces, and reduced card/pill repetition
+- **Key improvements:** graph-led campaign playback, visible value transfer, persistent detection inspector, independent evidence selectors, route-specific evidence interactions, serif narrative hierarchy, warm ink surfaces, and reduced card/pill repetition
 
 ## Files Changed
 
 - [x] `web/src/app/views/Replay.tsx` — graph-led campaign and portable-response narrative
+- [x] `web/src/app/views/Overview.tsx` — inspectable 12-event decision footprint
+- [x] `web/src/app/views/Scenario.tsx` — configured-stage motif focus
+- [x] `web/src/app/views/Investigation.tsx` — selected-entity value bars and graph focus
+- [x] `web/src/app/views/Defenses.tsx` — deliberate architecture-arm inspection
+- [x] `web/src/app/views/Assurance.tsx` — keyboard-ready lineage inspection and TrustVerifier sequence
+- [x] `web/src/app/useReducedMotion.ts` — preference-aware campaign control
 - [x] `web/src/styles.css` — Editorial Casefile tokens, typography, surfaces, responsive behavior, and state motion
 - [x] `DESIGN_MEMORY.md` — durable product design rules
 
@@ -23,6 +29,8 @@
 6. Move post-event truth into a separate examination panel marked as withheld from the model.
 7. Carry warm dossier surfaces, fine rulework, and semantic orange/red/amber/green states through every console route.
 8. Preserve offline behavior, deterministic reset, keyboard operation, reduced motion, and responsive breakpoints.
+9. Let judges inspect trace events, configured stages, linked value, architecture arms, and full lineage hashes without adding unsupported metrics.
+10. Replace campaign autoplay with explicit Step/Reset behavior when reduced motion is requested.
 
 ## Component Contract
 
@@ -39,13 +47,14 @@
 - **Empty/degraded:** replay stops safely when bound scenario or trace evidence is absent
 - **Disabled:** portable step-forward control disables at the final trace event
 - **Selected:** scenario and portable selectors expose `aria-current` or `aria-pressed`
-- **Playing:** campaign progress and graph-edge reveal are the only continuous motion
-- **Reduced motion:** state transitions collapse under `prefers-reduced-motion`
+- **Playing:** campaign progress, active endpoint focus, and the bound value-transfer marker communicate the selected genuine edge
+- **Reduced motion:** campaign playback becomes explicit Step/Reset; positional travel is removed while brief state feedback remains
 
 ## Accessibility Checklist
 
 - [x] Semantic buttons, headings, regions, lists, tables, and SVG descriptions
 - [x] Keyboard-accessible campaign and portable controls
+- [x] Keyboard-accessible trace, scenario-stage, defense-arm, investigation-node, and lineage controls
 - [x] Visible focus treatment
 - [x] Non-color state labels and icons
 - [x] Desktop and mobile Playwright journey
@@ -59,6 +68,7 @@
 - [x] Focused unit tests
 - [x] Production build after Design Lab cleanup
 - [x] Existing portable-model replay verification
+- [x] Reduced-motion no-autoplay verification
 - [x] Final screenshots
 - [x] Repository hygiene scans and diff validation
 

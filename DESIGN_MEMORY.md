@@ -31,10 +31,13 @@
 ## Interaction Patterns
 
 - Motion is reserved for campaign playback, graph focus, calibrated progress, and meaningful state changes.
+- Every route may expose one user-driven evidence interaction when it helps a judge inspect genuine repository-bound data; do not add ambient motion merely to fill space.
+- Campaign playback may use a transform-only value-transfer marker and active endpoint focus while the underlying event order and inspector values remain authoritative.
 - Selected ordered steps use `aria-current`; independent selectors use `aria-pressed`.
 - Preserve visible reset and step-forward controls for deterministic demonstrations.
 - Do not animate content into existence or hide judge-critical evidence behind hover.
-- Respect `prefers-reduced-motion` and keep touch targets at least 44 CSS pixels where practical.
+- In reduced-motion mode, campaign autoplay becomes explicit Step/Reset control; retain short opacity and color feedback while removing travel.
+- Keep touch targets at least 44 CSS pixels where practical.
 
 ## Evidence Presentation
 
