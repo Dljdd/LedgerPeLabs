@@ -84,11 +84,23 @@ function shapesAt(slideNumber, predicate) {
 }
 
 function setPanel(item, fill = C.surface, line = C.line, width = 1) {
+  if (!item) return;
   item.target.fill = fill;
   item.target.line = { style: "solid", fill: line, width };
   if (["rect", "roundRect", "textbox"].includes(String(item.target.geometry))) {
     item.target.borderRadius = "rounded-none";
   }
+}
+
+function setRule(item, position, color = C.lineStrong) {
+  if (!item) return;
+  setPosition(item, position);
+  setPanel(item, color, color, 0);
+}
+
+function clearShape(item) {
+  if (!item) return;
+  setPanel(item, "none", C.bg, 0);
 }
 
 function setText(item, options = {}) {
@@ -139,7 +151,7 @@ function styleHeader(slideNumber, titleSize = 39) {
   }
 }
 
-// 01 — Opening thesis: dark casefile cover with the real console as proof.
+// 01 — Opening thesis: restrained editorial cover with the real console as proof.
 {
   const slide = presentation.slides.items[0];
   slide.background.fill = C.bg;
@@ -151,9 +163,12 @@ function styleHeader(slideNumber, titleSize = 39) {
   setText(textItem(1, "SYNTHETIC • OFFLINE • REPLAYABLE"), { typeface: "Menlo", size: 11, bold: true, color: C.orangeHot, align: "center" });
   setText(textItem(1, "Dylan Moraes  •  Competition submission"), { size: 14, color: C.muted });
   const pill = shapesAt(1, (entry) => at(entry, 42, 494, 288, 32))[0];
-  setPanel(pill, C.surface3, C.orange, 1);
+  setRule(pill, { left: 42, top: 494, width: 108, height: 2 }, C.orange);
+  const proofLabel = textItem(1, "SYNTHETIC • OFFLINE • REPLAYABLE");
+  setPosition(proofLabel, { left: 42, top: 508, width: 390, height: 24 });
+  setText(proofLabel, { typeface: "Menlo", size: 11, bold: true, color: C.orangeHot, align: "left" });
   const frame = shapesAt(1, (entry) => at(entry, 656, 40, 590, 610))[0];
-  setPanel(frame, C.surface, C.lineStrong, 1);
+  setPanel(frame, "none", C.lineStrong, 1);
   const image = items(1, "image")[0];
   if (image) {
     image.target.borderRadius = "rounded-none";
@@ -161,95 +176,124 @@ function styleHeader(slideNumber, titleSize = 39) {
   }
 }
 
-// 02 — Threat capability delta.
+// 02 — Threat capability delta as a flat editorial sequence.
 {
   styleHeader(2, 39);
   const cards = shapesAt(2, (entry) => {
     const box = entry.bbox ?? [];
     return within(box[1], 182) && within(box[2], 260) && within(box[3], 210);
   });
-  cards.forEach((card, index) => setPanel(card, index === 2 ? C.surface3 : C.surface, index === 2 ? C.orange : C.lineStrong, index === 2 ? 2 : 1));
-  for (const item of textsAt(2, (entry) => /^0[1-4]$/.test(entry.text))) setText(item, { typeface: "Menlo", size: 13, bold: true, color: C.orangeHot });
-  for (const item of textsAt(2, (entry) => ["PERSONALIZE", "ITERATE", "COORDINATE", "DELEGATE"].includes(entry.text))) setText(item, { size: 20, bold: true, color: C.text });
-  for (const item of textsAt(2, (entry) => entry.text.includes("\n") && !entry.text.includes("Campaign-aware"))) setText(item, { size: 17, color: C.muted });
-  for (const item of textsAt(2, (entry) => entry.text === "→")) setText(item, { size: 24, bold: true, color: C.orange, align: "center" });
+  cards.forEach((card, index) => {
+    const x = [42, 340, 638, 936][index];
+    setRule(card, { left: x, top: 184, width: 2, height: 206 }, index === 2 ? C.orange : C.line);
+  });
+  for (const item of textsAt(2, (entry) => /^0[1-4]$/.test(entry.text))) {
+    setPosition(item, { top: 184, height: 30 });
+    setText(item, { typeface: "Georgia", size: 20, bold: false, color: C.orangeHot });
+  }
+  for (const item of textsAt(2, (entry) => ["PERSONALIZE", "ITERATE", "COORDINATE", "DELEGATE"].includes(entry.text))) {
+    setPosition(item, { top: 232, height: 38 });
+    setText(item, { typeface: "Menlo", size: 16, bold: true, color: C.text });
+  }
+  for (const item of textsAt(2, (entry) => entry.text.includes("\n") && !entry.text.includes("Campaign-aware"))) {
+    setPosition(item, { top: 292, height: 72 });
+    setText(item, { size: 16, color: C.muted });
+  }
+  for (const item of textsAt(2, (entry) => entry.text === "→")) setText(item, { size: 18, bold: false, color: C.lineStrong, align: "center" });
   const band = shapesAt(2, (entry) => at(entry, 42, 448, 1196, 138))[0];
-  setPanel(band, C.surface2, C.lineStrong, 1);
+  setRule(band, { left: 42, top: 454, width: 1196, height: 2 }, C.lineStrong);
   setText(textItem(2, "Transaction classifier"), { size: 16, color: C.muted });
   setText(textItem(2, "Campaign-aware assurance system"), { typeface: "Georgia", size: 28, bold: false, color: C.text });
   setText(textItem(2, "Behavior + lifecycle + economics + authority + governance"), { typeface: "Menlo", size: 12, color: C.textSoft });
 }
 
-// 03 — Assurance loop.
+// 03 — Assurance loop with open typographic planes.
 {
   styleHeader(3, 39);
   const cards = shapesAt(3, (entry) => {
     const box = entry.bbox ?? [];
     return within(box[1], 188) && within(box[2], 214) && within(box[3], 236);
   });
-  cards.forEach((card, index) => setPanel(card, index === 2 ? C.greenDark : C.surface, index === 2 ? C.green : C.lineStrong, index === 2 ? 2 : 1));
+  cards.forEach((card, index) => {
+    const x = [42, 284, 526, 768, 1010][index];
+    setRule(card, { left: x, top: 188, width: 214, height: index === 2 ? 3 : 1 }, index === 2 ? C.green : C.lineStrong);
+  });
   for (const item of textsAt(3, (entry) => ["IDENTIFY", "GENERATE", "DEFEND", "VERIFY", "GOVERN"].includes(entry.text))) {
     setText(item, { typeface: "Menlo", size: 12, bold: true, color: item.text === "DEFEND" ? C.green : C.orangeHot });
   }
-  for (const item of textsAt(3, (entry) => entry.text.includes("\n"))) setText(item, { size: 20, bold: true, color: C.text });
+  for (const item of textsAt(3, (entry) => entry.text.includes("\n"))) setText(item, { typeface: "Georgia", size: 19, bold: false, color: C.text });
   for (const item of textsAt(3, (entry) => entry.text === "→")) setText(item, { size: 22, bold: true, color: C.orange, align: "center" });
   for (const line of shapesAt(3, (entry) => (entry.bbox ?? [])[1] >= 470)) {
     const box = line.bbox ?? [];
-    setPanel(line, box[2] < 30 ? C.orange : C.lineStrong, box[2] < 30 ? C.orange : C.lineStrong, 0);
+    if (box[2] < 30) {
+      setRule(line, { left: box[0] + 4, top: 479, width: 9, height: 9 }, box[0] > 1000 ? C.green : C.orange);
+    } else {
+      setRule(line, { left: 146, top: 483, width: 988, height: 1 }, C.lineStrong);
+    }
   }
   setText(textItem(3, "Bounded feedback returns failed controls to the research backlog—never directly to deployment."), { size: 19, color: C.textSoft, align: "center" });
 }
 
-// 04 — Experiment record.
+// 04 — Experiment record as an alternating evidence timeline.
 {
   styleHeader(4, 39);
   const cards = shapesAt(4, (entry) => {
     const box = entry.bbox ?? [];
     return within(box[2], 210) && within(box[3], 144);
   });
-  cards.forEach((card, index) => setPanel(card, index === 4 ? C.greenDark : C.surface, index === 4 ? C.green : C.lineStrong, index === 4 ? 2 : 1));
+  cards.forEach((card, index) => {
+    const x = [58, 294, 530, 766, 1002][index];
+    const top = [166, 348, 166, 348, 166][index];
+    setRule(card, { left: x, top, width: 2, height: 144 }, index === 4 ? C.green : C.lineStrong);
+  });
   const rail = shapesAt(4, (entry) => at(entry, 88, 316, 1100, 3))[0];
   setPanel(rail, C.lineStrong, C.lineStrong, 0);
   const dots = shapesAt(4, (entry) => within((entry.bbox ?? [])[2], 18) && within((entry.bbox ?? [])[3], 18));
-  dots.forEach((dot, index) => setPanel(dot, index === dots.length - 1 ? C.green : C.orange, C.bg, 2));
-  for (const item of textsAt(4, (entry) => /^V/.test(entry.text))) setText(item, { typeface: "Menlo", size: 12, bold: true, color: item.text === "V5c" ? C.green : C.orangeHot });
-  for (const item of textsAt(4, (entry) => ["Workload cap failed", "Missing metrics failed closed", "Perfect score rejected", "Real rail evidence", "Graph arm selected"].includes(entry.text))) setText(item, { size: 17, bold: true, color: C.text });
+  dots.forEach((dot, index) => {
+    const x = [159, 395, 631, 867, 1103][index];
+    setRule(dot, { left: x, top: 311, width: 10, height: 10 }, index === dots.length - 1 ? C.green : C.orange);
+  });
+  for (const item of textsAt(4, (entry) => /^V/.test(entry.text))) setText(item, { typeface: "Georgia", size: 18, bold: false, color: item.text === "V5c" ? C.green : C.orangeHot });
+  for (const item of textsAt(4, (entry) => ["Workload cap failed", "Missing metrics failed closed", "Perfect score rejected", "Real rail evidence", "Graph arm selected"].includes(entry.text))) setText(item, { typeface: "Georgia", size: 17, bold: false, color: C.text });
   for (const item of textsAt(4, (entry) => entry.text.includes("\n"))) setText(item, { size: 14, color: C.muted });
   setText(textItem(4, "Novelty: not a single algorithm—an evidence-governed loop that learns from its own failure modes."), { typeface: "Georgia", size: 20, bold: false, color: C.text, align: "center" });
 }
 
-// 05 — Recovered diagnostic comparison.
+// 05 — Recovered diagnostic comparison; keep the data table, remove dashboard chrome.
 {
   styleHeader(5, 39);
   setText(textItem(5, "Verified recovered diagnostics — synthetic and non-authoritative"), { typeface: "Menlo", size: 12, bold: true, color: C.orangeHot });
   for (const shape of shapesAt(5, () => true)) {
     const box = shape.bbox ?? [];
-    if (within(box[1], 200) && within(box[3], 48)) setPanel(shape, C.surface3, C.lineStrong, 1);
-    else if (within(box[1], 248) || within(box[1], 314)) setPanel(shape, box[1] < 300 ? C.raised : C.surface, C.line, 1);
-    else if (within(box[1], 380)) setPanel(shape, C.greenDark, C.green, 1);
-    else if (within(box[1], 446)) setPanel(shape, C.redDark, C.red, 1);
-    else if (within(box[1], 548)) setPanel(shape, C.surface3, C.orange, 1);
+    if (within(box[1], 200) && within(box[3], 48)) setPanel(shape, "none", C.lineStrong, 0.6);
+    else if (within(box[1], 248) || within(box[1], 314)) setPanel(shape, "none", C.line, 0.5);
+    else if (within(box[1], 380)) setPanel(shape, C.surface2, C.green, 0.8);
+    else if (within(box[1], 446)) setPanel(shape, "none", C.line, 0.5);
+    else if (within(box[1], 548)) setRule(shape, { left: 42, top: 548, width: 1196, height: 2 }, C.orange);
   }
   for (const item of items(5, "textbox")) {
     const box = item.bbox ?? [];
     if (within(box[1], 214, 8)) setText(item, { typeface: "Menlo", size: 11, bold: true, color: C.text });
-    else if (box[1] >= 260 && box[1] <= 500) setText(item, { typeface: box[0] > 330 ? "Menlo" : "Arial", size: 15, bold: box[1] >= 390 && box[1] < 440, color: box[1] >= 450 ? C.redSoft : C.text });
+    else if (box[1] >= 260 && box[1] <= 500) setText(item, { typeface: box[0] > 330 ? "Menlo" : "Arial", size: 15, bold: box[1] >= 390 && box[1] < 440, color: box[1] >= 450 ? C.redSoft : (box[1] >= 390 && box[1] < 440 ? C.green : C.textSoft) });
     else if (box[1] >= 560) setText(item, { typeface: "Menlo", size: 16, bold: true, color: C.orangeHot, align: "center" });
   }
 }
 
-// 06 — Portable model proof.
+// 06 — Portable model proof with documentary screenshot and typeset facts.
 {
   styleHeader(6, 39);
   const frame = shapesAt(6, (entry) => at(entry, 34, 160, 762, 460))[0];
-  setPanel(frame, C.surface, C.lineStrong, 1);
+  setPanel(frame, "none", C.lineStrong, 1);
   const image = items(6, "image")[0];
   if (image) image.target.borderRadius = "rounded-none";
   const stats = shapesAt(6, (entry) => {
     const box = entry.bbox ?? [];
     return within(box[0], 830) && within(box[2], 408) && within(box[3], 86);
   });
-  stats.forEach((stat, index) => setPanel(stat, index === 3 ? C.greenDark : C.surface, index === 3 ? C.green : C.lineStrong, index === 3 ? 2 : 1));
+  stats.forEach((stat, index) => {
+    const top = [168, 272, 376, 480][index];
+    setRule(stat, { left: 830, top, width: 408, height: index === 3 ? 2 : 1 }, index === 3 ? C.green : C.lineStrong);
+  });
   for (const item of textsAt(6, (entry) => ["3 ×", "46", "12", "0.0"].includes(entry.text))) setText(item, { typeface: "Georgia", size: 31, bold: false, color: item.text === "0.0" ? C.green : C.orangeHot });
   for (const item of textsAt(6, (entry) => ["CatBoost members", "frozen causal features", "hash-bound scenarios", "max replay error"].includes(entry.text))) setText(item, { size: 17, bold: true, color: C.text });
   const actionLine = textItem(6, "Approve • Challenge • Review hold • Decline hold");
@@ -257,41 +301,55 @@ function styleHeader(slideNumber, titleSize = 39) {
   setText(actionLine, { typeface: "Menlo", size: 12, bold: true, color: C.muted, align: "center" });
 }
 
-// 07 — Case-centric investigation.
+// 07 — Case-centric investigation with an open evidence margin.
 {
   styleHeader(7, 39);
   const frame = shapesAt(7, (entry) => at(entry, 386, 152, 860, 494))[0];
-  setPanel(frame, C.surface, C.lineStrong, 1);
+  setPanel(frame, "none", C.lineStrong, 1);
   const image = items(7, "image")[0];
   if (image) image.target.borderRadius = "rounded-none";
   const pill = shapesAt(7, (entry) => at(entry, 42, 174, 150, 32))[0];
-  setPanel(pill, C.greenDark, C.green, 1);
-  setText(textItem(7, "CASE-CENTRIC"), { typeface: "Menlo", size: 10, bold: true, color: C.green, align: "center" });
+  setRule(pill, { left: 42, top: 208, width: 150, height: 2 }, C.green);
+  const caseLabel = textItem(7, "CASE-CENTRIC");
+  setPosition(caseLabel, { left: 42, top: 176, width: 150, height: 22 });
+  setText(caseLabel, { typeface: "Menlo", size: 10, bold: true, color: C.green, align: "left" });
   for (const item of textsAt(7, (entry) => ["14", "10", "$500"].includes(entry.text))) setText(item, { typeface: "Georgia", size: 42, bold: false, color: C.orangeHot });
   for (const item of textsAt(7, (entry) => ["entities", "payment edges", "conserved synthetic ledger"].includes(entry.text))) setText(item, { size: 15, color: C.muted });
   const pending = shapesAt(7, (entry) => at(entry, 42, 574, 304, 64))[0];
-  setPanel(pending, C.surface3, C.lineStrong, 1);
-  setText(textItem(7, "Analyst-time benefit: evidence pending"), { typeface: "Menlo", size: 11, bold: true, color: C.textSoft, align: "center" });
+  setRule(pending, { left: 42, top: 574, width: 304, height: 1 }, C.lineStrong);
+  const pendingText = textItem(7, "Analyst-time benefit: evidence pending");
+  setPosition(pendingText, { left: 42, top: 590, width: 304, height: 28 });
+  setText(pendingText, { typeface: "Menlo", size: 11, bold: true, color: C.textSoft, align: "left" });
 }
 
-// 08 — Deterministic authority proof.
+// 08 — Deterministic authority proof as a verification ledger.
 {
   styleHeader(8, 39);
   const checks = shapesAt(8, (entry) => {
     const box = entry.bbox ?? [];
     return [42, 452].some((x) => within(box[0], x)) && within(box[2], 374) && within(box[3], 88);
   });
-  checks.forEach((check) => setPanel(check, C.surface, C.lineStrong, 1));
+  checks.forEach((check) => {
+    const [left, top] = check.bbox;
+    setRule(check, { left, top, width: 374, height: 1 }, C.lineStrong);
+  });
   const circles = shapesAt(8, (entry) => within((entry.bbox ?? [])[2], 34) && within((entry.bbox ?? [])[3], 34));
-  circles.forEach((circle) => setPanel(circle, C.greenDark, C.green, 1));
-  for (const item of textsAt(8, (entry) => entry.text === "✓")) setText(item, { size: 16, bold: true, color: C.green, align: "center" });
-  for (const item of textsAt(8, (entry) => ["Agent identity", "User mandate", "Scope + amount", "Merchant + cart", "Expiry + nonce", "Replay rejection"].includes(entry.text))) setText(item, { size: 18, bold: true, color: C.text });
+  circles.forEach((circle) => {
+    const [left, top] = circle.bbox;
+    setRule(circle, { left, top: top + 12, width: 8, height: 8 }, C.green);
+  });
+  for (const item of textsAt(8, (entry) => entry.text === "✓")) setText(item, { size: 1, bold: false, color: C.bg, align: "center" });
+  for (const item of textsAt(8, (entry) => ["Agent identity", "User mandate", "Scope + amount", "Merchant + cart", "Expiry + nonce", "Replay rejection"].includes(entry.text))) {
+    const [left, top] = item.bbox;
+    setPosition(item, { left: left - 28, top: top - 4, width: 308, height: 36 });
+    setText(item, { typeface: "Georgia", size: 19, bold: false, color: C.text });
+  }
   const failure = shapesAt(8, (entry) => at(entry, 42, 554, 784, 88))[0];
-  setPanel(failure, C.surface3, C.red, 1);
+  setRule(failure, { left: 42, top: 554, width: 784, height: 2 }, C.red);
   setText(textItem(8, "DEFINITIVE FAILURE"), { typeface: "Menlo", size: 11, bold: true, color: C.redSoft });
   setText(textItem(8, "DECLINE_HOLD before statistical risk"), { typeface: "Menlo", size: 20, bold: true, color: C.text });
   const frame = shapesAt(8, (entry) => at(entry, 924, 154, 286, 496))[0];
-  setPanel(frame, C.surface, C.lineStrong, 1);
+  setPanel(frame, "none", C.lineStrong, 1);
   const image = items(8, "image")[0];
   if (image) {
     image.target.borderRadius = "rounded-none";
@@ -299,15 +357,18 @@ function styleHeader(slideNumber, titleSize = 39) {
   }
 }
 
-// 09 — Evidence governance stair.
+// 09 — Evidence governance as a stepped, unboxed sequence.
 {
   styleHeader(9, 39);
   const cards = shapesAt(9, (entry) => {
     const box = entry.bbox ?? [];
     return box[1] >= 170 && box[1] <= 300 && box[2] >= 200 && box[2] <= 220 && box[3] >= 230;
   });
-  cards.forEach((card, index) => setPanel(card, index === 4 ? C.greenDark : C.surface, index === 4 ? C.green : C.lineStrong, index === 4 ? 2 : 1));
-  for (const item of textsAt(9, (entry) => /^0[1-5]$/.test(entry.text))) setText(item, { typeface: "Menlo", size: 11, bold: true, color: C.orangeHot });
+  cards.forEach((card, index) => {
+    const [left, top, width] = card.bbox;
+    setRule(card, { left, top, width, height: index === 4 ? 3 : 1 }, index === 4 ? C.green : C.lineStrong);
+  });
+  for (const item of textsAt(9, (entry) => /^0[1-5]$/.test(entry.text))) setText(item, { typeface: "Georgia", size: 18, bold: false, color: C.orangeHot });
   for (const item of textsAt(9, (entry) => ["Causal features", "Executed controls", "Immutable evidence", "Independent replay", "Human promotion"].includes(entry.text))) setText(item, { typeface: "Georgia", size: 20, bold: false, color: C.text });
   for (const item of textsAt(9, (entry) => entry.text.includes("\n") && !entry.text.includes("Evidence governance"))) setText(item, { size: 14, color: C.muted });
   const promotionLabel = rewriteText(9, "Official chain", "Promotion boundary");
@@ -317,31 +378,32 @@ function styleHeader(slideNumber, titleSize = 39) {
   setText(textItem(9, "52ed4c31…dbc900"), { typeface: "Menlo", size: 16, bold: true, color: C.text });
   setText(promotionValue, { typeface: "Menlo", size: 16, bold: true, color: C.amber });
   const pill = shapesAt(9, (entry) => at(entry, 912, 550, 250, 32))[0];
-  setPanel(pill, C.amberDark, C.amber, 1);
-  setText(promotionPill, { typeface: "Menlo", size: 10, bold: true, color: C.amber, align: "center" });
+  setRule(pill, { left: 912, top: 584, width: 250, height: 2 }, C.amber);
+  setPosition(promotionPill, { left: 912, top: 552, width: 250, height: 22 });
+  setText(promotionPill, { typeface: "Menlo", size: 10, bold: true, color: C.amber, align: "left" });
   const notes = presentation.slides.items[8].speakerNotes;
   notes.textFrame.setText("Show that every evidence step stays auditable and that promotion remains a human decision; recovered metrics remain diagnostics.\n\n[Sources]\n- demo/sentinel-v5/manifest.json\n- evidence/sentinel-v5-recovered-metrics/verified-report.json\n- docs/submission/RELEASE_CHECKLIST.md\n[/Sources]");
   notes.setVisible(true);
 }
 
-// 10 — Explicit proof/claim boundary.
+// 10 — Explicit proof/claim boundary without colored container panels.
 {
   styleHeader(10, 39);
   const proof = shapesAt(10, (entry) => at(entry, 42, 170, 568, 438))[0];
   const boundary = shapesAt(10, (entry) => at(entry, 632, 170, 606, 438))[0];
-  setPanel(proof, C.greenDark, C.green, 2);
-  setPanel(boundary, C.redDark, C.red, 2);
+  setRule(proof, { left: 620, top: 188, width: 1, height: 378 }, C.lineStrong);
+  setRule(boundary, { left: 42, top: 594, width: 1196, height: 1 }, C.lineStrong);
   setText(textItem(10, "WHAT WE PROVE"), { typeface: "Menlo", size: 14, bold: true, color: C.green });
   setText(textItem(10, "WHAT WE DO NOT CLAIM"), { typeface: "Menlo", size: 14, bold: true, color: C.redSoft });
   for (const item of textsAt(10, (entry) => entry.text === "✓")) setText(item, { size: 17, bold: true, color: C.green });
   for (const item of textsAt(10, (entry) => entry.text === "×")) setText(item, { size: 20, bold: true, color: C.redSoft });
-  for (const item of textsAt(10, (entry) => !["WHAT WE PROVE", "WHAT WE DO NOT CLAIM", "✓", "×"].includes(entry.text) && (entry.bbox ?? [])[1] >= 250 && (entry.bbox ?? [])[1] < 590)) setText(item, { size: 17, bold: true, color: C.text });
-  setText(rewriteText(10, "Accepted official Stage 70 capacity evidence", "Production-readiness or scale evidence"), { size: 17, bold: true, color: C.text });
-  setText(rewriteText(10, "Full Sentinel as the champion", "Claims beyond the demonstrated model"), { size: 17, bold: true, color: C.text });
+  for (const item of textsAt(10, (entry) => !["WHAT WE PROVE", "WHAT WE DO NOT CLAIM", "✓", "×"].includes(entry.text) && (entry.bbox ?? [])[1] >= 250 && (entry.bbox ?? [])[1] < 590)) setText(item, { size: 17, bold: false, color: C.textSoft });
+  setText(rewriteText(10, "Accepted official Stage 70 capacity evidence", "Production-readiness or scale evidence"), { size: 17, bold: false, color: C.textSoft });
+  setText(rewriteText(10, "Full Sentinel as the champion", "Claims beyond the demonstrated model"), { size: 17, bold: false, color: C.textSoft });
   setText(textItem(10, "Synthetic evidence before assertion."), { typeface: "Georgia", size: 22, bold: false, color: C.text, align: "center" });
 }
 
-// 11 — Deployment path and close; fix the previous title/rule collision.
+// 11 — Deployment path and close as a continuous editorial roadmap.
 {
   styleHeader(11, 35);
   const title = textItem(11, "From competition prototype to governed payment assurance");
@@ -356,16 +418,19 @@ function styleHeader(slideNumber, titleSize = 39) {
     const box = entry.bbox ?? [];
     return within(box[1], 184) && within(box[2], 212) && within(box[3], 218);
   });
-  cards.forEach((card, index) => setPanel(card, index === 0 ? C.surface3 : C.surface, index === 0 ? C.orange : C.lineStrong, index === 0 ? 2 : 1));
-  for (const item of textsAt(11, (entry) => /^[1-5]$/.test(entry.text))) setText(item, { typeface: "Menlo", size: 12, bold: true, color: C.orangeHot });
-  for (const item of textsAt(11, (entry) => ["OFFLINE REPLAY", "SHADOW MODE", "ASSISTED OPS", "CHALLENGER", "GOVERNED SCALE"].includes(entry.text))) setText(item, { typeface: "Menlo", size: 15, bold: true, color: C.text });
+  cards.forEach((card, index) => {
+    const [left, top, width] = card.bbox;
+    setRule(card, { left, top, width, height: index === 0 ? 3 : 1 }, index === 0 ? C.orange : C.lineStrong);
+  });
+  for (const item of textsAt(11, (entry) => /^[1-5]$/.test(entry.text))) setText(item, { typeface: "Georgia", size: 19, bold: false, color: C.orangeHot });
+  for (const item of textsAt(11, (entry) => ["OFFLINE REPLAY", "SHADOW MODE", "ASSISTED OPS", "CHALLENGER", "GOVERNED SCALE"].includes(entry.text))) setText(item, { typeface: "Menlo", size: 13, bold: true, color: C.text });
   for (const item of textsAt(11, (entry) => entry.text.includes("\n") && (entry.bbox ?? [])[1] < 430)) setText(item, { size: 14, color: C.muted });
   const close = shapesAt(11, (entry) => at(entry, 42, 460, 1196, 144))[0];
-  setPanel(close, C.surface2, C.lineStrong, 1);
+  setRule(close, { left: 42, top: 460, width: 1196, height: 2 }, C.lineStrong);
   setText(textItem(11, "APAR"), { typeface: "Georgia", size: 38, bold: false, color: C.text });
   setText(textItem(11, "Assure the campaign. Verify the intent.\nPromote only the evidence."), { typeface: "Georgia", size: 28, bold: false, color: C.text });
   const pill = shapesAt(11, (entry) => at(entry, 1020, 506, 166, 32))[0];
-  setPanel(pill, C.greenDark, C.green, 1);
+  clearShape(pill);
   setText(textItem(11, "DEMO READY"), { typeface: "Menlo", size: 10, bold: true, color: C.green, align: "center" });
   setText(textItem(11, "Adaptive Payment Assurance Range  •  Dylan Moraes"), { typeface: "Menlo", size: 11, color: C.muted });
 }
