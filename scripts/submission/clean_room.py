@@ -50,26 +50,41 @@ def _run(command: list[str], *, cwd: Path | None = None, env: dict[str, str] | N
 def run_clean_room(archive_path: Path, *, python_executable: str) -> dict[str, Any]:
     """Install exact locks, replay the model, and build the extracted console."""
     uv = shutil.which("uv")
-    if uv is None:
-        raise ReleaseError("clean-room release gate requires uv")
     with tempfile.TemporaryDirectory(prefix="apar-submission-clean-room-") as temporary:
         temporary_root = Path(temporary)
         release_root = extract_verified_archive(archive_path, temporary_root / "extracted")
         venv = temporary_root / "venv"
-        _run([uv, "venv", "--no-project", "--python", python_executable, str(venv)])
+        if uv is not None:
+            _run([uv, "venv", "--no-project", "--python", python_executable, str(venv)])
+        else:
+            _run([python_executable, "-m", "venv", str(venv)])
         venv_python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
         requirements = release_root / "release" / "requirements-judge.txt"
-        _run(
-            [
-                uv,
-                "pip",
-                "install",
-                "--python",
-                str(venv_python),
-                "--requirement",
-                str(requirements),
-            ]
-        )
+        if uv is not None:
+            _run(
+                [
+                    uv,
+                    "pip",
+                    "install",
+                    "--python",
+                    str(venv_python),
+                    "--requirement",
+                    str(requirements),
+                ]
+            )
+        else:
+            _run(
+                [
+                    str(venv_python),
+                    "-m",
+                    "pip",
+                    "install",
+                    "--disable-pip-version-check",
+                    "--no-input",
+                    "--requirement",
+                    str(requirements),
+                ]
+            )
         environment = dict(os.environ)
         environment.pop("PYTHONPATH", None)
         environment.update(
