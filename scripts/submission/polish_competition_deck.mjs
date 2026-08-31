@@ -88,7 +88,7 @@ function setPanel(item, fill = C.surface, line = C.line, width = 1) {
   item.target.fill = fill;
   item.target.line = { style: "solid", fill: line, width };
   if (["rect", "roundRect", "textbox"].includes(String(item.target.geometry))) {
-    item.target.borderRadius = "rounded-none";
+    item.target.borderRadius = 0;
   }
 }
 
@@ -187,7 +187,10 @@ function styleHeader(slideNumber, titleSize = 39) {
     const x = [42, 340, 638, 936][index];
     setRule(card, { left: x, top: 184, width: 2, height: 206 }, index === 2 ? C.orange : C.line);
   });
-  for (const item of textsAt(2, (entry) => /^0[1-4]$/.test(entry.text))) {
+  const slideNumber = textsAt(2, (entry) => entry.text === "02" && (entry.bbox ?? [])[0] >= 1160)[0];
+  setPosition(slideNumber, { left: 1184, top: 36, width: 54, height: 22 });
+  setText(slideNumber, { typeface: "Menlo", size: 11, bold: false, color: C.muted, align: "right" });
+  for (const item of textsAt(2, (entry) => /^0[1-4]$/.test(entry.text) && (entry.bbox ?? [])[0] < 1100)) {
     setPosition(item, { top: 184, height: 30 });
     setText(item, { typeface: "Georgia", size: 20, bold: false, color: C.orangeHot });
   }
@@ -301,7 +304,7 @@ function styleHeader(slideNumber, titleSize = 39) {
   setText(actionLine, { typeface: "Menlo", size: 12, bold: true, color: C.muted, align: "center" });
 }
 
-// 07 — Case-centric investigation with an open evidence margin.
+// 07 — Case-centric investigation with a contained evidence card.
 {
   styleHeader(7, 39);
   const frame = shapesAt(7, (entry) => at(entry, 386, 152, 860, 494))[0];
@@ -309,17 +312,30 @@ function styleHeader(slideNumber, titleSize = 39) {
   const image = items(7, "image")[0];
   if (image) image.target.borderRadius = "rounded-none";
   const pill = shapesAt(7, (entry) => at(entry, 42, 174, 150, 32))[0];
-  setRule(pill, { left: 42, top: 208, width: 150, height: 2 }, C.green);
+  setPosition(pill, { left: 42, top: 168, width: 304, height: 386 });
+  setPanel(pill, "none", C.lineStrong, 0.8);
   const caseLabel = textItem(7, "CASE-CENTRIC");
-  setPosition(caseLabel, { left: 42, top: 176, width: 150, height: 22 });
+  setPosition(caseLabel, { left: 62, top: 188, width: 250, height: 22 });
   setText(caseLabel, { typeface: "Menlo", size: 10, bold: true, color: C.green, align: "left" });
-  for (const item of textsAt(7, (entry) => ["14", "10", "$500"].includes(entry.text))) setText(item, { typeface: "Georgia", size: 42, bold: false, color: C.orangeHot });
-  for (const item of textsAt(7, (entry) => ["entities", "payment edges", "conserved synthetic ledger"].includes(entry.text))) setText(item, { size: 15, color: C.muted });
+  const metricLayout = [
+    ["14", 232, "entities", 278],
+    ["10", 332, "payment edges", 378],
+    ["$500", 432, "conserved synthetic ledger", 478],
+  ];
+  for (const [value, valueTop, label, labelTop] of metricLayout) {
+    const valueItem = textItem(7, value);
+    const labelItem = textItem(7, label);
+    setPosition(valueItem, { left: 62, top: valueTop, width: 250, height: 46 });
+    setPosition(labelItem, { left: 62, top: labelTop, width: 250, height: 34 });
+    setText(valueItem, { typeface: "Georgia", size: 38, bold: false, color: C.orangeHot });
+    setText(labelItem, { size: 15, color: C.muted });
+  }
   const pending = shapesAt(7, (entry) => at(entry, 42, 574, 304, 64))[0];
-  setRule(pending, { left: 42, top: 574, width: 304, height: 1 }, C.lineStrong);
+  setPosition(pending, { left: 42, top: 570, width: 304, height: 68 });
+  setPanel(pending, "none", C.lineStrong, 0.8);
   const pendingText = textItem(7, "Analyst-time benefit: evidence pending");
-  setPosition(pendingText, { left: 42, top: 590, width: 304, height: 28 });
-  setText(pendingText, { typeface: "Menlo", size: 11, bold: true, color: C.textSoft, align: "left" });
+  setPosition(pendingText, { left: 58, top: 590, width: 272, height: 28 });
+  setText(pendingText, { typeface: "Menlo", size: 10, bold: true, color: C.textSoft, align: "left" });
 }
 
 // 08 — Deterministic authority proof as a verification ledger.
@@ -357,7 +373,7 @@ function styleHeader(slideNumber, titleSize = 39) {
   }
 }
 
-// 09 — Evidence governance as a stepped, unboxed sequence.
+// 09 — Evidence governance as a restrained staircase of evidence cards.
 {
   styleHeader(9, 39);
   const cards = shapesAt(9, (entry) => {
@@ -365,8 +381,9 @@ function styleHeader(slideNumber, titleSize = 39) {
     return box[1] >= 170 && box[1] <= 300 && box[2] >= 200 && box[2] <= 220 && box[3] >= 230;
   });
   cards.forEach((card, index) => {
-    const [left, top, width] = card.bbox;
-    setRule(card, { left, top, width, height: index === 4 ? 3 : 1 }, index === 4 ? C.green : C.lineStrong);
+    if (index === 0) setPanel(card, "none", C.orange, 1.2);
+    else if (index === 4) setPanel(card, "none", C.green, 1.2);
+    else setPanel(card, "none", C.line, 0.8);
   });
   for (const item of textsAt(9, (entry) => /^0[1-5]$/.test(entry.text))) setText(item, { typeface: "Georgia", size: 18, bold: false, color: C.orangeHot });
   for (const item of textsAt(9, (entry) => ["Causal features", "Executed controls", "Immutable evidence", "Independent replay", "Human promotion"].includes(entry.text))) setText(item, { typeface: "Georgia", size: 20, bold: false, color: C.text });
@@ -403,7 +420,7 @@ function styleHeader(slideNumber, titleSize = 39) {
   setText(textItem(10, "Synthetic evidence before assertion."), { typeface: "Georgia", size: 22, bold: false, color: C.text, align: "center" });
 }
 
-// 11 — Deployment path and close as a continuous editorial roadmap.
+// 11 — Deployment path and close with restrained roadmap cards.
 {
   styleHeader(11, 35);
   const title = textItem(11, "From competition prototype to governed payment assurance");
@@ -419,8 +436,9 @@ function styleHeader(slideNumber, titleSize = 39) {
     return within(box[1], 184) && within(box[2], 212) && within(box[3], 218);
   });
   cards.forEach((card, index) => {
-    const [left, top, width] = card.bbox;
-    setRule(card, { left, top, width, height: index === 0 ? 3 : 1 }, index === 0 ? C.orange : C.lineStrong);
+    if (index === 0) setPanel(card, "none", C.orange, 1.2);
+    else if (index === 4) setPanel(card, "none", C.green, 1.2);
+    else setPanel(card, "none", C.line, 0.8);
   });
   for (const item of textsAt(11, (entry) => /^[1-5]$/.test(entry.text))) setText(item, { typeface: "Georgia", size: 19, bold: false, color: C.orangeHot });
   for (const item of textsAt(11, (entry) => ["OFFLINE REPLAY", "SHADOW MODE", "ASSISTED OPS", "CHALLENGER", "GOVERNED SCALE"].includes(entry.text))) setText(item, { typeface: "Menlo", size: 13, bold: true, color: C.text });
