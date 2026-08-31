@@ -15,6 +15,7 @@
 
 | Step | Open | What it proves |
 |---:|---|---|
+| 00 | [Kaggle submission write-up](KAGGLE_SUBMISSION_WRITEUP.md) | Paste-ready title, summary, links, narrative, and media plan |
 | 01 | [Pitch deck (PDF)](APAR_COMPETITION_DECK.pdf) or [editable deck](APAR_COMPETITION_DECK.pptx) | The problem, system, evidence, and claim boundary in 11 slides |
 | 02 | [Five-minute walkthrough](FIVE_MINUTE_WALKTHROUGH.md) | A recording-ready route through the working console |
 | 03 | [Competition traceability](COMPETITION_TRACEABILITY.md) | Challenge requirement → APAR response → demonstrable proof |

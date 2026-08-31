@@ -20,6 +20,7 @@
     {"archive": "docs/submission/DATA_AND_SIMULATION_CARD.md", "required": true, "source": "docs/submission/DATA_AND_SIMULATION_CARD.md"},
     {"archive": "docs/submission/EVALUATION_AND_LIMITATIONS.md", "required": true, "source": "docs/submission/EVALUATION_AND_LIMITATIONS.md"},
     {"archive": "docs/submission/FIVE_MINUTE_WALKTHROUGH.md", "required": true, "source": "docs/submission/FIVE_MINUTE_WALKTHROUGH.md"},
+    {"archive": "docs/submission/KAGGLE_SUBMISSION_WRITEUP.md", "required": true, "source": "docs/submission/KAGGLE_SUBMISSION_WRITEUP.md"},
     {"archive": "docs/submission/MODEL_CARD.md", "required": true, "source": "docs/submission/MODEL_CARD.md"},
     {"archive": "docs/submission/README.md", "required": true, "source": "docs/submission/README.md"},
     {"archive": "docs/submission/RELEASE_CHECKLIST.md", "required": true, "source": "docs/submission/RELEASE_CHECKLIST.md"},
