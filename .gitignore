@@ -12,11 +12,22 @@ __pycache__/
 .ruff_cache/
 .coverage
 htmlcov/
+*.egg-info/
 
 # Node
 node_modules/
 web/node_modules/
 web/dist/
+web/*.tsbuildinfo
+web/vite.config.js
+web/vite.config.d.ts
+web/vitest.config.js
+web/vitest.config.d.ts
+web/playwright.config.js
+web/playwright.config.d.ts
+web/playwright-report/
+web/test-results/
+web/.vercel/
 dist/
 
 # Local application and agent state
