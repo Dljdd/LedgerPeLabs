@@ -46,6 +46,22 @@ fails over to `web/public/data/verified-trace.json`, labels it
 “Hash-bound verified fallback,” and checks it against the accepted scenario
 rows and bundle manifest before rendering model values.
 
+## Hosted judge copy
+
+The public competition prototype is available at
+`https://web-six-tau-bxhm7rwrzu.vercel.app/overview`. Vercel serves the static
+Vite build from this `web/` directory. It does not run the repository's Python
+scorer: hosted `POST /api/score` is unavailable, so the client validates and
+renders the committed hash-bound verified trace. The sidebar and Replay route
+identify this mode as **Verified fallback · offline** and **HASH-BOUND VERIFIED
+FALLBACK** respectively.
+
+For the final video, show the public URL briefly as the accessibility proof,
+then switch explicitly to the local URL for the packaged Python
+`ensemble_with_graph` replay. See
+[`VIDEO_RECORDING_RUNBOOK.md`](../VIDEO_RECORDING_RUNBOOK.md) for the exact
+setup, choreography, recovery path, and export checks.
+
 ## Preflight, reset, and fallback drill
 
 ```bash
