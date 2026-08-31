@@ -6,6 +6,11 @@ service. The live portable model is the accepted Stage 30
 `ensemble_with_graph` arm. It must not be described as `full_sentinel` or as a
 complete hybrid.
 
+The finalized interface uses an Editorial Casefile design system: serif
+narrative headings, warm ink surfaces, monospaced evidence, and a graph-led
+Replay route. The scenario graph and portable trace have independent selectors;
+the console does not assert a payment-to-trace record mapping.
+
 ## Prerequisites
 
 - Python 3.12 with the repository installed in `.venv`

@@ -34,7 +34,12 @@ test("five-minute golden path moves from threat to assurance", async ({ page }) 
   await page.getByRole("link", { name: /start verified replay/i }).click();
   await expect(page.locator(".live-arm").getByText(/ensemble_with_graph/)).toBeVisible();
   await expect(page.getByText(/Event 01 \/ 12/)).toBeVisible();
+  await expect(page.getByRole("img", { name: /14 genuine scenario entities and 10 ordered payment edges/i })).toBeVisible();
+  await expect(page.getByText(/no payment-to-trace record mapping asserted/i)).toBeVisible();
   await expect(page.getByRole("img", { name: /calibrated risk 100.0%.*bound action thresholds/i })).toBeVisible();
+  await page.getByRole("button", { name: /play campaign/i }).click();
+  await expect(page.getByRole("button", { name: /pause campaign/i })).toBeVisible();
+  await page.getByRole("button", { name: /pause campaign/i }).click();
   await page.getByRole("button", { name: "Step forward" }).click();
   await expect(page.getByText(/Event 02 \/ 12/)).toBeVisible();
 

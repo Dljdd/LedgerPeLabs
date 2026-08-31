@@ -66,11 +66,31 @@ describe("native route boundary", () => {
     expect(screen.getByRole("region", { name: /model evidence/i })).toBeVisible();
     expect(screen.getByRole("region", { name: /post-event truth/i })).toBeVisible();
     expect(screen.getByRole("img", { name: /calibrated risk 100.0%.*challenge 10.0%.*review 50.4%.*decline 100.0%/i })).toBeVisible();
+    expect(screen.getByRole("img", { name: /14 genuine scenario entities and 10 ordered payment edges/i })).toBeVisible();
+    expect(screen.getByText(/no payment-to-trace record mapping asserted/i)).toBeVisible();
 
     await user.click(screen.getByRole("button", { name: /step forward/i }));
     expect(screen.getByText("Event 02 / 12")).toBeVisible();
     await user.click(screen.getByRole("button", { name: /reset replay/i }));
     expect(screen.getByText("Event 01 / 12")).toBeVisible();
+  });
+
+  it("keeps scenario playback independent from portable event selection", async () => {
+    const user = userEvent.setup();
+    const evidence = parseEvidence(rawEvidence);
+    render(<App evidence={evidence} trace={parseTrace(rawTrace, evidence)} />);
+
+    await user.click(within(screen.getByRole("navigation", { name: "Primary" })).getByRole("link", { name: /replay/i }));
+    const campaign = within(screen.getByRole("list", { name: /ordered campaign payments/i })).getAllByRole("button");
+    await user.click(campaign[4]!);
+
+    expect(campaign[4]).toHaveAttribute("aria-current", "step");
+    expect(screen.getByText("Event 01 / 12")).toBeVisible();
+
+    const portable = within(screen.getByRole("group", { name: /select independent portable trace event/i })).getAllByRole("button");
+    await user.click(portable[1]!);
+    expect(portable[1]).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByText("Event 02 / 12")).toBeVisible();
   });
 
   it("keeps recovered metrics and integrity proof in their own claim lanes", async () => {

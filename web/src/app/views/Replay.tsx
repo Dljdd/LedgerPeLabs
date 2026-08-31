@@ -3,7 +3,7 @@ import type { CSSProperties } from "react";
 
 import { Icon } from "../Icon";
 import { formatMoney, formatPercent, shortHash, titleCase } from "../format";
-import type { ConsoleEvidence, TraceMode, VerifiedTrace } from "../types";
+import type { ConsoleEvidence, GraphEdge, TraceMode, VerifiedTrace } from "../types";
 
 function actionTone(action: string): string {
   if (action === "decline_hold") return "critical";
@@ -41,7 +41,7 @@ function DecisionRuler({ action, probability, thresholds }: { action: string; pr
     <div className={`decision-ruler is-${actionTone(action)}`} aria-label={label} role="img">
       <div className="risk-readout" key={`${probability}-${action}`}>
         <strong>{formatPercent(probability, 1)}</strong>
-        <span><small>Calibrated risk</small><b>{titleCase(action)}</b></span>
+        <span><small>Calibrated probability</small><b>{titleCase(action)}</b></span>
       </div>
       <div className="decision-scale" style={style} aria-hidden="true">
         <span className="decision-band band-approve">Approve</span>
@@ -61,106 +61,194 @@ function DecisionRuler({ action, probability, thresholds }: { action: string; pr
   );
 }
 
+function CampaignPlaybackGraph({ evidence, selectedEdge }: { evidence: ConsoleEvidence; selectedEdge: number }) {
+  const { edges, nodes } = evidence.scenario_context.graph;
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  return (
+    <svg className="replay-campaign-graph" aria-label={`${nodes.length} genuine scenario entities and ${edges.length} ordered payment edges; edges are revealed through payment ${selectedEdge + 1}`} role="img" viewBox="20 20 650 670">
+      <defs>
+        <marker id="replay-payment-arrow" markerHeight="6" markerWidth="6" orient="auto" refX="5" refY="3"><path d="M0,0 L0,6 L6,3 z" /></marker>
+      </defs>
+      <g className="replay-graph-edges">
+        {edges.map((edge, index) => {
+          const source = byId.get(edge.source);
+          const target = byId.get(edge.target);
+          if (!source || !target) return null;
+          const distance = Math.hypot(target.x - source.x, target.y - source.y);
+          const targetInset = distance === 0 ? 0 : 22 / distance;
+          return (
+            <line
+              className={`${index === selectedEdge ? "is-selected" : ""} ${index <= selectedEdge ? "is-revealed" : "is-concealed"}`}
+              key={edge.payment_id}
+              markerEnd="url(#replay-payment-arrow)"
+              x1={source.x}
+              x2={target.x - (target.x - source.x) * targetInset}
+              y1={source.y}
+              y2={target.y - (target.y - source.y) * targetInset}
+            >
+              <title>{`${source.label} to ${target.label}, ${formatMoney(edge.amount, edge.currency)}, ${titleCase(edge.stage)}`}</title>
+            </line>
+          );
+        })}
+      </g>
+      <g className="replay-graph-nodes">
+        {nodes.map((node) => (
+          <g key={node.id} transform={`translate(${node.x} ${node.y})`}>
+            <circle className="node-body" r="17" />
+            <circle className="node-core" r="4" />
+            <text x="27" y="-2">{node.label}</text>
+            <text className="node-meta" x="27" y="12">{node.role.toUpperCase()} / {node.country}</text>
+          </g>
+        ))}
+      </g>
+    </svg>
+  );
+}
+
+function scenarioParties(evidence: ConsoleEvidence, edge: GraphEdge) {
+  const nodes = evidence.scenario_context.graph.nodes;
+  return {
+    source: nodes.find((node) => node.id === edge.source)?.label ?? shortHash(edge.source, 8),
+    target: nodes.find((node) => node.id === edge.target)?.label ?? shortHash(edge.target, 8),
+  };
+}
+
 export function Replay({ evidence, trace, traceMode }: { evidence: ConsoleEvidence; trace: VerifiedTrace; traceMode: TraceMode }) {
   const [current, setCurrent] = useState(0);
-  const [playing, setPlaying] = useState(false);
+  const [campaignStep, setCampaignStep] = useState(0);
+  const [campaignPlaying, setCampaignPlaying] = useState(false);
   const record = trace.traces[current] ?? trace.traces[0];
   const inputRecord = evidence.portable.records[current] ?? evidence.portable.records[0];
+  const campaignEdges = evidence.scenario_context.graph.edges;
+  const campaignEdge = campaignEdges[campaignStep] ?? campaignEdges[0];
   const total = trace.traces.length;
 
   useEffect(() => {
-    if (!playing) return;
+    if (!campaignPlaying) return;
     const timer = window.setInterval(() => {
-      setCurrent((index) => {
-        if (index >= total - 1) {
-          setPlaying(false);
+      setCampaignStep((index) => {
+        if (index >= campaignEdges.length - 1) {
+          setCampaignPlaying(false);
           return index;
         }
         return index + 1;
       });
-    }, 850);
+    }, 900);
     return () => window.clearInterval(timer);
-  }, [playing, total]);
+  }, [campaignEdges.length, campaignPlaying]);
 
   const actionCounts = useMemo(() => trace.traces.reduce<Record<string, number>>((counts, item) => {
     counts[item.final_action] = (counts[item.final_action] ?? 0) + 1;
     return counts;
   }, {}), [trace.traces]);
 
-  if (!record || !inputRecord) {
-    return <div className="empty-state"><h1>No verified replay events</h1><p>The console stopped safely because the trace is empty.</p></div>;
+  if (!record || !inputRecord || !campaignEdge) {
+    return <div className="empty-state"><h1>No verified replay events</h1><p>The console stopped safely because the bound replay evidence is empty.</p></div>;
   }
 
+  const parties = scenarioParties(evidence, campaignEdge);
   const stepForward = () => setCurrent((index) => Math.min(index + 1, total - 1));
-  const reset = () => { setPlaying(false); setCurrent(0); };
+  const reset = () => setCurrent(0);
+  const toggleCampaign = () => {
+    if (!campaignPlaying && campaignStep === campaignEdges.length - 1) setCampaignStep(0);
+    setCampaignPlaying((value) => !value);
+  };
 
   return (
     <div className="page replay-page">
       <header className="page-header split-header replay-header">
-        <div><p className="eyebrow">03 · Decision surface</p><h1>Verified decision replay</h1><p>Accepted checkpoint evidence, scored by the local portable graph ensemble.</p></div>
+        <div><p className="eyebrow">03 · Detection narrative</p><h1>Verified decision replay</h1><p>Follow the genuine campaign path, then inspect the independent portable graph-ensemble response.</p></div>
         <div className="live-arm"><span className="status-dot" aria-hidden="true" /><span><small>{traceMode === "live_local_scorer" ? "LIVE LOCAL SCORER" : "HASH-BOUND VERIFIED FALLBACK"}</small><strong>ensemble_with_graph</strong></span></div>
       </header>
 
-      <section className="replay-controller" aria-label="Replay controls">
-        <div className="control-buttons">
-          <button className="button button-primary compact-button" onClick={() => setPlaying((value) => !value)} type="button">
-            <Icon name={playing ? "pause" : "play"} /> {playing ? "Pause replay" : current === total - 1 ? "Replay complete" : "Run replay"}
-          </button>
-          <button className="icon-button" disabled={current === total - 1} onClick={stepForward} title="Step forward" type="button"><Icon name="step" /><span className="sr-only">Step forward</span></button>
-          <button className="icon-button" onClick={reset} title="Reset replay" type="button"><Icon name="reset" /><span className="sr-only">Reset replay</span></button>
-        </div>
-        <div className="replay-progress">
-          <div><span aria-live="polite">Event {String(current + 1).padStart(2, "0")} / {String(total).padStart(2, "0")}</span><span>{playing ? "Advancing" : current === total - 1 ? "Complete" : "Ready"}</span></div>
-          <div className="replay-progress-track" aria-hidden="true">
-            <span
-              className="replay-progress-fill"
-              style={{ "--replay-progress": (current + 1) / total } as CSSProperties}
-            />
+      <section className="replay-narrative" aria-label="Campaign and detection narrative">
+        <div className="campaign-playback">
+          <header className="campaign-playback-head">
+            <div><span>CAMPAIGN PLAYBACK / {String(campaignStep + 1).padStart(2, "0")} OF {String(campaignEdges.length).padStart(2, "0")}</span><h2>Reveal the payment path in event order</h2></div>
+            <button aria-pressed={campaignPlaying} className="campaign-play-button" onClick={toggleCampaign} type="button"><i aria-hidden="true" />{campaignPlaying ? "Pause campaign" : "Play campaign"}</button>
+          </header>
+          <CampaignPlaybackGraph evidence={evidence} selectedEdge={campaignStep} />
+          <div className="campaign-progress"><i style={{ transform: `scaleX(${(campaignStep + 1) / campaignEdges.length})` }} /><span>{formatMoney(campaignEdge.cumulative_attempted_value, campaignEdge.currency)} cumulative attempted</span></div>
+          <div className="campaign-tape-scroll">
+            <ol className="campaign-tape" aria-label="Ordered campaign payments">
+              {campaignEdges.map((edge, index) => (
+                <li key={edge.payment_id}>
+                  <button aria-current={campaignStep === index ? "step" : undefined} onClick={() => { setCampaignPlaying(false); setCampaignStep(index); }} type="button">
+                    <span>{String(index + 1).padStart(2, "0")}</span><i aria-hidden="true" /><b>{formatMoney(edge.amount, edge.currency)}</b><small>{titleCase(edge.stage)}</small>
+                  </button>
+                </li>
+              ))}
+            </ol>
           </div>
-          <progress className="sr-only" max={total} value={current + 1}>
-            {current + 1} of {total}
-          </progress>
+          <footer className="campaign-evidence-foot">
+            <span>{evidence.scenario_context.graph.nodes.length} entities</span>
+            <span>{campaignEdges.length} genuine graph edges</span>
+            <span>Synthetic only</span>
+            <code title={evidence.scenario_context.graph.graph_sha256}>graph {shortHash(evidence.scenario_context.graph.graph_sha256, 8)}</code>
+          </footer>
         </div>
-          <div className="trace-bind"><span>Trace</span><code title={trace.trace_sha256}>{shortHash(trace.trace_sha256, 8)}</code><span className="pill pill-good">{traceMode === "live_local_scorer" ? "Scored locally" : "Verified fallback"}</span></div>
-      </section>
 
-      <section className="decision-grid">
-        <article className="decision-main" aria-label="Model evidence" role="region">
-          <div className="panel-head"><div><p className="eyebrow">Model evidence</p><h2>Decision at event time</h2></div><span className={`pill pill-${actionTone(record.final_action)}`}>{titleCase(record.final_action)}</span></div>
-          <div className="decision-score">
+        <aside className="replay-inspector">
+          <section className="scenario-payment" aria-live="polite">
+            <header><span>SCENARIO PAYMENT {String(campaignStep + 1).padStart(2, "0")}</span><b>Genuine graph edge</b></header>
+            <h2>{titleCase(campaignEdge.stage)}</h2>
+            <strong>{formatMoney(campaignEdge.amount, campaignEdge.currency)}</strong>
+            <div className="scenario-route"><b>{parties.source}</b><i aria-hidden="true">→</i><b>{parties.target}</b></div>
+            <dl><div><dt>Cumulative attempted</dt><dd>{formatMoney(campaignEdge.cumulative_attempted_value, campaignEdge.currency)}</dd></div><div><dt>Event time</dt><dd>{campaignEdge.event_time.slice(11, 19)} UTC</dd></div></dl>
+          </section>
+
+          <section className="portable-response" aria-label="Model evidence" role="region">
+            <header><span>PORTABLE REPLAY / EVENT {String(current + 1).padStart(2, "0")}</span><code>{record.arm}</code></header>
             <DecisionRuler action={record.final_action} probability={record.calibrated_probability} thresholds={evidence.portable.thresholds} />
-            <dl>
-              <div><dt>Final action</dt><dd>{titleCase(record.final_action)}</dd></div>
+            <dl className="portable-facts">
+              <div><dt>Event</dt><dd>{shortHash(record.event_id, 12)}</dd></div>
               <div><dt>{traceMode === "live_local_scorer" ? "Local scorer latency" : "Fixed-trace latency"}</dt><dd>{record.latency_ms.toFixed(3)} ms</dd></div>
-              <div><dt>Member disagreement</dt><dd>{record.disagreement.toFixed(4)}</dd></div>
+              <div><dt>Reason</dt><dd>{record.reason_codes.join(", ")}</dd></div>
               <div><dt>Feature vector</dt><dd>{inputRecord.model_input.features.length} bound features</dd></div>
             </dl>
+            <div className="portable-controls" aria-label="Portable replay controls">
+              <button className="icon-button" disabled={current === total - 1} onClick={stepForward} title="Step forward" type="button"><Icon name="step" /><span className="sr-only">Step forward</span></button>
+              <button className="icon-button" onClick={reset} title="Reset replay" type="button"><Icon name="reset" /><span className="sr-only">Reset replay</span></button>
+              <span aria-live="polite">Event {String(current + 1).padStart(2, "0")} / {String(total).padStart(2, "0")}</span>
+            </div>
+          </section>
+
+          <div className="trace-selector" aria-label="Select independent portable trace event" role="group">
+            {trace.traces.map((item, index) => (
+              <button aria-label={`Portable event ${index + 1}, ${formatPercent(item.calibrated_probability, 1)}, ${titleCase(item.final_action)}`} aria-pressed={current === index} className={`is-${actionTone(item.final_action)}`} key={item.event_id} onClick={() => setCurrent(index)} type="button"><span>{String(index + 1).padStart(2, "0")}</span><i aria-hidden="true" /><b>{formatPercent(item.calibrated_probability, 1)}</b></button>
+            ))}
           </div>
+
+          <p className="stream-boundary"><b>Scenario graph</b><span>and</span><b>portable replay</b><small>Both repository-bound. No payment-to-trace record mapping asserted.</small></p>
+        </aside>
+      </section>
+
+      <section className="replay-postscript">
+        <div className="replay-explanation">
+          <div><p className="eyebrow">Intervention explanation</p><h2>From calibrated probability to action.</h2><p>The threshold ruler is bound to the selected portable event. It visualizes the model response only; campaign edges and post-event truth remain separate.</p></div>
           <div className="reason-box"><span>Reason evidence</span>{record.reason_codes.map((reason) => <code key={reason}>{reason}</code>)}</div>
           <p className="technical-note">{traceMode === "live_local_scorer" ? "Latency was observed during this local scoring run and is not a production latency estimate." : "Latency is preserved from this committed fallback trace and is not a production latency estimate."}</p>
-        </article>
-
-        <article className="truth-panel" aria-label="Post-event truth" role="region">
-          <div className="truth-head"><p className="eyebrow">Truth · post-event only</p><span className="truth-lock">WITHHELD FROM MODEL</span></div>
+        </div>
+        <section className="truth-panel replay-truth" aria-label="Post-event truth" role="region">
+          <div className="truth-head"><p className="eyebrow">Truth · selected portable event</p><span className="truth-lock">WITHHELD FROM MODEL</span></div>
           <h2>{titleCase(record.presentation_ground_truth.family)}</h2>
           <dl>
             <div><dt>Observed label</dt><dd>{record.presentation_ground_truth.label === 1 ? "Positive fraud case" : "Legitimate case"}</dd></div>
             <div><dt>Rail</dt><dd>{record.presentation_ground_truth.rail.toUpperCase()}</dd></div>
             <div><dt>Amount</dt><dd>{formatMoney(record.presentation_ground_truth.amount, record.presentation_ground_truth.currency)}</dd></div>
           </dl>
-          <div className="separation-note"><Icon name="check" /><p><strong>Structural separation passed</strong>Truth is attached only after the model decision for presentation scoring.</p></div>
-        </article>
+        </section>
       </section>
 
       <section className="event-ledger">
-        <div className="panel-head"><div><p className="eyebrow">Ordered trace</p><h2>Curated event ledger</h2></div><div className="action-summary">{Object.entries(actionCounts).map(([action, count]) => <span key={action}>{count} {titleCase(action)}</span>)}</div></div>
+        <div className="panel-head"><div><p className="eyebrow">Ordered portable trace</p><h2>Curated event ledger</h2></div><div className="action-summary">{Object.entries(actionCounts).map(([action, count]) => <span key={action}>{count} {titleCase(action)}</span>)}</div></div>
         <div className="table-scroll">
           <table>
             <thead><tr><th scope="col">#</th><th scope="col">Event</th><th scope="col">Input context</th><th scope="col">Calibrated risk</th><th scope="col">Action</th><th className="truth-column" scope="col">Post-event truth</th></tr></thead>
             <tbody>
               {trace.traces.map((item, index) => (
                 <tr className={index === current ? "is-current" : ""} key={item.event_id}>
-                  <td><button aria-label={`Focus event ${index + 1}`} onClick={() => { setPlaying(false); setCurrent(index); }} type="button">{String(index + 1).padStart(2, "0")}</button></td>
+                  <td><button aria-label={`Focus event ${index + 1}`} onClick={() => setCurrent(index)} type="button">{String(index + 1).padStart(2, "0")}</button></td>
                   <td><code>{item.event_id.slice(0, 8)}</code></td>
                   <td>{item.presentation_ground_truth.rail.toUpperCase()} · {formatMoney(item.presentation_ground_truth.amount)}</td>
                   <td className="numeric">{formatPercent(item.calibrated_probability, 1)}</td>

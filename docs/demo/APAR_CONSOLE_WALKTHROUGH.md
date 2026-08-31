@@ -31,11 +31,19 @@ Say: “The console calls the real local scorer first. The green runtime label
 shows `ensemble_with_graph`. If the worker fails, the same view explicitly
 switches to a hash-bound verified fallback.”
 
-Point out the current calibrated probability, final action, observed local or
-fixed-trace latency, and repository reason code. Emphasize that the amber truth
-panel is structurally separate and attached post-event only. Click **Step
-forward** once to reach the A2A APP event, then use the event ledger to show the
-curated cross-rail cases. Do not describe the 12 cases as production estimates.
+Click **Play campaign** briefly. The left surface reveals the 10 genuine payment
+edges in order while the scenario payment inspector shows the selected stage,
+amount, route, time, and cumulative attempted value. Say: “This is the campaign
+story; it is not a row-level join to the portable trace.”
+
+On the right, point out the independently selected calibrated probability,
+bound action thresholds, final action, observed local or fixed-trace latency,
+feature count, and repository reason code. Call out the explicit “No
+payment-to-trace record mapping asserted” boundary. Emphasize that post-event
+truth sits in its own amber examination panel and was withheld from the model.
+Click **Step forward** once to reach the A2A APP event, then use the event ledger
+to show the curated cross-rail cases. Do not describe the 12 cases as production
+estimates.
 
 Open **Investigation**.
 

@@ -1,6 +1,6 @@
 # APAR console verification record
 
-Verification date: 2026-08-30
+Verification date: 2026-08-31
 
 ## Implemented surface
 
@@ -8,6 +8,11 @@ The console implements six native routes: Overview, Scenario, Replay,
 Investigation, Defenses, and Assurance. It uses committed local JSON only,
 calls the real Python portable scorer when available, and retains a labeled,
 hash-bound fixed trace for degraded operation.
+
+The finalized Editorial Casefile treatment uses a serif narrative hierarchy,
+warm ink surfaces, and graph-led replay. The 10 scenario payment edges and 12
+portable decisions remain independently selectable, with an explicit statement
+that no payment-to-trace record mapping is asserted.
 
 ## Representative screenshots
 
@@ -21,7 +26,7 @@ hash-bound fixed trace for degraded operation.
 
 - Console evidence builder: 5 tests passed.
 - Console server and live scorer worker: 3 tests passed.
-- Frontend unit and boundary checks: 9 tests passed.
+- Frontend unit and boundary checks: 11 tests passed.
 - TypeScript project check: passed.
 - ESLint with zero warnings: passed.
 - Vite production build: passed.
@@ -34,6 +39,7 @@ hash-bound fixed trace for degraded operation.
 - Fixed trace hash, bundle binding, accepted action/probability replay, and real
   scorer path: passed.
 - Motion audit: passed; see `animation-plans/apar-console-motion-audit.md`.
+- Design Lab and preview routes: removed after final approval.
 
 The exact commands are maintained in `web/README.md`. These check results are
 engineering verification of the prototype, not new model-performance evidence.
