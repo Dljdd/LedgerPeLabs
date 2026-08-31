@@ -109,7 +109,7 @@ const assuranceBytes = await fs.readFile(assurance);
   txt(s, "Assure the campaign,\nnot just the transaction.", 42, 112, 570, 190, { size: 48, bold: true });
   txt(s, "APAR turns emerging GenAI payment threats into rail-correct synthetic campaigns, tests layered defenses, and preserves a human promotion boundary.", 42, 330, 540, 126, { size: 23, color: C.muted });
   pill(s, "SYNTHETIC • OFFLINE • REPLAYABLE", 42, 494, 288);
-  txt(s, "Dylan Moraes  •  Competition submission", 42, 624, 480, 30, { size: 16, color: C.muted });
+  txt(s, "Team: LedgerPe Labs  •  Competition submission", 42, 624, 480, 30, { size: 16, color: C.muted });
   imageFrame(s, overviewBytes, "APAR console overview", 664, 48, 574, 594, "cover");
   note(s, "Open with the problem shift: AI changes attacker capability, so the unit of assurance becomes the campaign.", ["docs/demo/screenshots/apar-console-overview-desktop.png", "SOLUTION_SPEC.md"]);
 }
@@ -341,7 +341,7 @@ const assuranceBytes = await fs.readFile(assurance);
   txt(s, "APAR", 68, 484, 180, 52, { size: 40, bold: true, color: C.white });
   txt(s, "Assure the campaign. Verify the intent.\nPromote only the evidence.", 272, 480, 730, 82, { size: 30, bold: true, color: C.white });
   pill(s, "DEMO READY", 1020, 506, 166, C.greenSoft, C.green);
-  txt(s, "Adaptive Payment Assurance Range  •  Dylan Moraes", 42, 638, 660, 26, { size: 15, color: C.muted });
+  txt(s, "Adaptive Payment Assurance Range  •  Team: LedgerPe Labs", 42, 638, 660, 26, { size: 15, color: C.muted });
   note(s, "Close on the product promise and transition into the live console walkthrough.", ["docs/submission/COMMERCIAL_AND_DEPLOYMENT_PLAN.md", "docs/submission/FIVE_MINUTE_WALKTHROUGH.md"]);
 }
 

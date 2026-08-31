@@ -161,7 +161,10 @@ function styleHeader(slideNumber, titleSize = 39) {
   setText(textItem(1, "Assure the campaign,\nnot just the transaction."), { typeface: "Georgia", size: 50, bold: false, color: C.text });
   setText(textItem(1, "APAR turns emerging GenAI payment threats into rail-correct synthetic campaigns, tests layered defenses, and preserves a human promotion boundary."), { size: 21, color: C.textSoft });
   setText(textItem(1, "SYNTHETIC • OFFLINE • REPLAYABLE"), { typeface: "Menlo", size: 11, bold: true, color: C.orangeHot, align: "center" });
-  setText(textItem(1, "Dylan Moraes  •  Competition submission"), { size: 14, color: C.muted });
+  const attribution = textsAt(1, (entry) => at(entry, 42, 624, 480, 30))[0];
+  if (!attribution) throw new Error("Unable to find the slide 1 attribution footer");
+  attribution.target.text = "Team: LedgerPe Labs  •  Competition submission";
+  setText(attribution, { size: 14, color: C.muted });
   const pill = shapesAt(1, (entry) => at(entry, 42, 494, 288, 32))[0];
   setRule(pill, { left: 42, top: 494, width: 108, height: 2 }, C.orange);
   const proofLabel = textItem(1, "SYNTHETIC • OFFLINE • REPLAYABLE");
@@ -512,7 +515,10 @@ function styleHeader(slideNumber, titleSize = 39) {
   const pill = shapesAt(11, (entry) => at(entry, 1020, 506, 166, 32))[0];
   clearShape(pill);
   setText(textItem(11, "DEMO READY"), { typeface: "Menlo", size: 10, bold: true, color: C.green, align: "center" });
-  setText(textItem(11, "Adaptive Payment Assurance Range  •  Dylan Moraes"), { typeface: "Menlo", size: 11, color: C.muted });
+  const attribution = textsAt(11, (entry) => at(entry, 42, 638, 660, 26))[0];
+  if (!attribution) throw new Error("Unable to find the slide 11 attribution footer");
+  attribution.target.text = "Adaptive Payment Assurance Range  •  Team: LedgerPe Labs";
+  setText(attribution, { typeface: "Menlo", size: 11, color: C.muted });
 }
 
 async function writeBlob(target, blob) {
