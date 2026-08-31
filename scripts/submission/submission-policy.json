@@ -103,7 +103,7 @@
       "supported_os": ["Linux", "macOS"]
     },
     "runtime_verification": {
-      "fallback_trace_sha256": "f6ac54111981713b26a6345762aadb2df0d0c1b106358a675a10ca6bce5032bc",
+      "fallback_trace_sha256": "4a4ee2ac9964ed5555fe5d9024cb68021045e686688607a7a27722cd835a9aa0",
       "prediction_sha256": "5c8e4f40d1fb0316ae2d4fdb235c0043f69deff2816d89b870657db08131444e",
       "scenario_count": 12
     },

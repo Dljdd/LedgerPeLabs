@@ -31,7 +31,7 @@ The verifier must report:
 - prediction SHA-256
   `5c8e4f40d1fb0316ae2d4fdb235c0043f69deff2816d89b870657db08131444e`;
 - fallback trace SHA-256
-  `f6ac54111981713b26a6345762aadb2df0d0c1b106358a675a10ca6bce5032bc`.
+  `4a4ee2ac9964ed5555fe5d9024cb68021045e686688607a7a27722cd835a9aa0`.
 
 The expected action counts are three approvals, one challenge, two review holds,
 and six decline holds. Every probability and action is replayed against the
