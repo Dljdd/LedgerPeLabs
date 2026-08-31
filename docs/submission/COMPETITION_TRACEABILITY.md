@@ -1,4 +1,11 @@
+[Submission home](README.md) · [Pitch deck](APAR_COMPETITION_DECK.pdf) · [Walkthrough](FIVE_MINUTE_WALKTHROUGH.md) · [Model card](MODEL_CARD.md)
+
 # Competition traceability
+
+> **Judge file 03 · Requirement-to-proof map.** Read left to right: competition
+> need, APAR response, demonstrable proof, then evidence status.
+
+---
 
 APAR answers the challenge as a working assurance product: identify emerging
 GenAI-enabled payment threats, turn them into bounded synthetic campaigns,

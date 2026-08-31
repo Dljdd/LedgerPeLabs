@@ -1,4 +1,15 @@
+[Submission home](README.md) · [Pitch deck](APAR_COMPETITION_DECK.pdf) · [Traceability](COMPETITION_TRACEABILITY.md) · [Evidence limits](EVALUATION_AND_LIMITATIONS.md)
+
 # Five-minute APAR walkthrough
+
+> **Judge file 02 · Live demonstration.** A 4:40–4:55 recording route through
+> the working console, with the evidence language and claim boundary locked.
+
+| Runtime | Canvas | Start route | Required model label |
+|---:|---:|---|---|
+| 4:40–4:55 | 1080p · 100% zoom | `/overview` | `ensemble_with_graph` |
+
+---
 
 Target length: **4:40–4:55**. Record at 1080p, browser zoom 100%, with the console
 already running at `http://127.0.0.1:4173/overview`. Keep the cursor still while

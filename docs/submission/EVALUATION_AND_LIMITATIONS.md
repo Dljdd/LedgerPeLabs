@@ -1,4 +1,12 @@
+[Submission home](README.md) · [Pitch deck](APAR_COMPETITION_DECK.pdf) · [Model card](MODEL_CARD.md) · [Research journey](RESEARCH_AND_EXPERIMENT_JOURNEY.md)
+
 # Evaluation, results, and limitations
+
+> **Judge file 05 · Metrics and limits.** The four-arm numbers are verified
+> recovered diagnostics and non-authoritative; the official chain remains
+> incomplete at Stage 70.
+
+---
 
 ## Experiment ladder
 

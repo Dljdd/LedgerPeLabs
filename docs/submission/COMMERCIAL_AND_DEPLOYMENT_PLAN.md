@@ -1,4 +1,12 @@
+[Submission home](README.md) · [Pitch deck](APAR_COMPETITION_DECK.pdf) · [Traceability](COMPETITION_TRACEABILITY.md) · [Release checklist](RELEASE_CHECKLIST.md)
+
 # Commercial and deployment plan
+
+> **Judge file 08 · Adoption path.** A proposed, human-governed progression
+> from offline replay to controlled challenger use; no production deployment is
+> claimed.
+
+---
 
 ## Product position
 

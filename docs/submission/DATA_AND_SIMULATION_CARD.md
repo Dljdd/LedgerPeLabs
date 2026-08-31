@@ -1,4 +1,11 @@
+[Submission home](README.md) · [Pitch deck](APAR_COMPETITION_DECK.pdf) · [Model card](MODEL_CARD.md) · [Evaluation](EVALUATION_AND_LIMITATIONS.md)
+
 # Data and simulation card
+
+> **Judge file 06 · Synthetic evidence scope.** Four executable families across
+> card, A2A, and agentic rails; no real PANs, personal data, or live targets.
+
+---
 
 ## Purpose
 

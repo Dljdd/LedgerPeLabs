@@ -1,4 +1,12 @@
+[Submission home](README.md) · [Pitch deck](APAR_COMPETITION_DECK.pdf) · [Data card](DATA_AND_SIMULATION_CARD.md) · [Evaluation](EVALUATION_AND_LIMITATIONS.md)
+
 # Model card — Sentinel v5 graph ensemble
+
+> **Judge file 04 · Portable model identity.** Accepted Stage 30
+> `ensemble_with_graph`; CPU-scored, synthetic-only, and not a production
+> authorization model.
+
+---
 
 ## Intended use
 

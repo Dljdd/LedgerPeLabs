@@ -1,4 +1,12 @@
+[Submission home](README.md) · [Pitch deck](APAR_COMPETITION_DECK.pdf) · [Walkthrough](FIVE_MINUTE_WALKTHROUGH.md) · [Submission notices](THIRD_PARTY_NOTICES.md)
+
 # APAR judge release checklist
+
+> **Judge file 09 · Reproducibility runbook.** Cold-start the archive, verify
+> exact replay and hashes, then use the release gate to confirm the tracked
+> evidence boundary.
+
+---
 
 This release is a deterministic, offline-after-install demonstration of the
 accepted Stage 30 `ensemble_with_graph` portable Sentinel model. It does not

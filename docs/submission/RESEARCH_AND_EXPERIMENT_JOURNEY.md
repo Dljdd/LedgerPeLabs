@@ -1,4 +1,12 @@
+[Submission home](README.md) · [Pitch deck](APAR_COMPETITION_DECK.pdf) · [Evaluation](EVALUATION_AND_LIMITATIONS.md) · [Deployment plan](COMMERCIAL_AND_DEPLOYMENT_PLAN.md)
+
 # Research and experiment journey
+
+> **Judge file 07 · Design rationale.** The architecture is the result of
+> rejected capacity, completeness, leakage, fidelity, and policy outcomes—not a
+> post-hoc model story.
+
+---
 
 ## The starting question
 
