@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from apar.evaluation import v5_kaggle_rescue as rescue
+from apar.evaluation import v5_staged_evidence as staged
 from apar.evaluation.v5_checkpoint_storage import (
     V5CheckpointInput,
     V5CheckpointObservation,
@@ -483,14 +484,37 @@ def test_control_stages_publish_exact_groups_in_predecessor_order(
         assert loaded[-1].group is expected_group
     assert assemble_v5_control_suite(tuple(loaded)).controls
 
+    def monolithic_arm_loader_forbidden(**_kwargs: object) -> tuple[V5EvaluationResult, ...]:
+        raise AssertionError("Stage 70 candidate retained the monolithic four-arm tuple")
+
     monkeypatch.setattr(
         "apar.evaluation.v5_staged_evidence.load_v5_arm_checkpoint",
-        lambda **_kwargs: arm_results,
+        monolithic_arm_loader_forbidden,
     )
     groups_by_root = dict(zip(control_roots, groups, strict=True))
     monkeypatch.setattr(
         "apar.evaluation.v5_staged_evidence.load_v5_control_group_checkpoint",
         lambda *, checkpoint_root, limits: groups_by_root[checkpoint_root],
+    )
+
+    def memory_safe_metric_stage(**_kwargs: object) -> tuple[dict[str, object], dict[str, object]]:
+        evidence_protocol = load_v5_evidence_protocol(
+            ROOT / "config/defense/defense-v5-evidence.json", root=ROOT
+        )
+        evidence = build_v5_metric_stage_evidence(
+            arm_results=arm_results,
+            control_groups=groups,
+            evidence_protocol=evidence_protocol,
+        )
+        return _metric_stage_core_and_observation(
+            evidence=evidence,
+            arm_results=arm_results,
+        )
+
+    monkeypatch.setattr(
+        "apar.evaluation.v5_staged_evidence._execute_v5_memory_safe_metric_stage",
+        memory_safe_metric_stage,
+        raising=False,
     )
     metric_capability = _issue_stage_capability(
         protocol=protocol,
@@ -521,7 +545,7 @@ def test_metric_stage_matches_existing_complete_metrics_and_readiness(
     evidence_protocol = load_v5_evidence_protocol(
         ROOT / "config/defense/defense-v5-evidence.json", root=ROOT
     )
-    staged = build_v5_metric_stage_evidence(
+    stage_evidence = build_v5_metric_stage_evidence(
         arm_results=arm_results,
         control_groups=groups,
         evidence_protocol=evidence_protocol,
@@ -534,28 +558,31 @@ def test_metric_stage_matches_existing_complete_metrics_and_readiness(
         metrics=expected_metrics[-1], controls=assemble_v5_control_suite(groups)
     )
 
-    assert staged.complete_metrics == expected_metrics
-    assert staged.controls == assemble_v5_control_suite(groups)
-    assert staged.readiness == expected_readiness
-    assert all(item.economics.economics_sha256 for item in staged.complete_metrics)
-    assert all(item.bootstrap.bootstrap_sha256 for item in staged.complete_metrics)
-    assert all(item.calibration.calibration_sha256 for item in staged.complete_metrics)
+    assert stage_evidence.complete_metrics == expected_metrics
+    assert stage_evidence.controls == assemble_v5_control_suite(groups)
+    assert stage_evidence.readiness == expected_readiness
+    assert all(item.economics.economics_sha256 for item in stage_evidence.complete_metrics)
+    assert all(item.bootstrap.bootstrap_sha256 for item in stage_evidence.complete_metrics)
+    assert all(item.calibration.calibration_sha256 for item in stage_evidence.complete_metrics)
 
-    core, observation = _metric_stage_core_and_observation(evidence=staged, arm_results=arm_results)
+    core, observation = _metric_stage_core_and_observation(
+        evidence=stage_evidence,
+        arm_results=arm_results,
+    )
     deterministic_digests = tuple(
         _arm_core_and_observation(result)[0]["deterministic_result_sha256"]
         for result in arm_results
     )
     rescue_core, rescue_observation = rescue.build_non_authoritative_rescue_metric_documents(
-        complete_metrics=staged.complete_metrics,
-        controls=staged.controls,
-        readiness=staged.readiness,
+        complete_metrics=stage_evidence.complete_metrics,
+        controls=stage_evidence.controls,
+        readiness=stage_evidence.readiness,
         deterministic_result_sha256=deterministic_digests,
     )
     assert rescue_core == core
     assert rescue_observation == observation
     for metric, result_digest in zip(
-        staged.complete_metrics,
+        stage_evidence.complete_metrics,
         deterministic_digests,
         strict=True,
     ):
@@ -571,7 +598,71 @@ def test_metric_stage_matches_existing_complete_metrics_and_readiness(
         )
         assert compact_observation["arm"] == metric.arm.value
         assert compact_observation["complete_metrics_sha256"] == (metric.complete_metrics_sha256)
-    assert _restore_metric_stage_evidence(core=core, observation=observation) == staged
+    assert _restore_metric_stage_evidence(core=core, observation=observation) == (
+        stage_evidence
+    )
+    compact_stage_builder = getattr(
+        staged,
+        "build_v5_compact_metric_stage_documents",
+        None,
+    )
+    compact_stage_restore = getattr(
+        staged,
+        "_restore_v5_compact_metric_stage_evidence",
+        None,
+    )
+    assert compact_stage_builder is not None, "compact Stage 70 candidate builder is missing"
+    assert compact_stage_restore is not None, "compact Stage 70 candidate restore is missing"
+    arm_order = tuple(result.arm for result in arm_results)
+    receipts = tuple(
+        staged.build_v5_metric_arm_worker_receipt(
+            mode=V5KaggleMode.CAPACITY_VALIDATION,
+            run_binding_sha256="1" * 64,
+            attempt_receipt_sha256="2" * 64,
+            execution_manifest_sha256="3" * 64,
+            arm_manifest_sha256="4" * 64,
+            arm_manifest_deterministic_sha256="5" * 64,
+            arm_index=index,
+            arm_order=arm_order,
+            support_count=result.support_total,
+            support_event_ids_sha256="6" * 64,
+            summary=staged.summarize_v5_complete_arm_metrics(
+                metric=metric,
+                deterministic_result_sha256=result_digest,
+            ),
+            evidence_protocol_sha256=evidence_protocol.evidence_protocol_sha256,
+            implementation_sha256=evidence_protocol.implementation_sha256,
+            wall_seconds=1.0 + index,
+            peak_rss_bytes=1_000_000 + index,
+            artifact_bytes=10_000 + index,
+        )
+        for index, (metric, result_digest, result) in enumerate(
+            zip(
+                stage_evidence.complete_metrics,
+                deterministic_digests,
+                arm_results,
+                strict=True,
+            )
+        )
+    )
+    compact_core, compact_observation = compact_stage_builder(
+        receipts=receipts,
+        controls=stage_evidence.controls,
+    )
+    assert compact_core == core
+    assert compact_observation["schema_version"] == (
+        "apar-sentinel-v5-kaggle-metric-observation/2"
+    )
+    assert '"samples"' not in json.dumps(compact_observation, sort_keys=True)
+    compact_replay = compact_stage_restore(
+        core=compact_core,
+        observation=compact_observation,
+    )
+    assert compact_replay.controls == stage_evidence.controls
+    assert compact_replay.readiness == stage_evidence.readiness
+    assert tuple(item.metric_summary for item in compact_replay.worker_receipts) == tuple(
+        receipt.metric_summary for receipt in receipts
+    )
     changed_core = dict(core)
     changed_core["deterministic_metric_stage_sha256"] = "0" * 64
     with pytest.raises(ValueError, match="deterministic metric stage"):
@@ -582,11 +673,144 @@ def test_metric_stage_matches_existing_complete_metrics_and_readiness(
         _restore_metric_stage_evidence(core=core, observation=changed_observation)
 
 
-def test_finalization_accepts_the_exact_split_stage_chain(
+def test_memory_safe_metric_summary_preserves_frozen_semantics_without_draw_payload(
+    executed_group_evidence: _ExecutedEvidence,
+) -> None:
+    """Removing retained draw arrays must not change metrics, gates, or stable digests."""
+    _suite, groups, _corpus, arm_results = executed_group_evidence
+    evidence_protocol = load_v5_evidence_protocol(
+        ROOT / "config/defense/defense-v5-evidence.json", root=ROOT
+    )
+    result = arm_results[-1]
+    metric = evaluate_v5_complete_result(result=result, protocol=evidence_protocol)
+    deterministic_result_sha256 = _arm_core_and_observation(result)[0][
+        "deterministic_result_sha256"
+    ]
+
+    summarize = getattr(staged, "summarize_v5_complete_arm_metrics", None)
+    readiness_from_summary = getattr(
+        staged,
+        "build_v5_readiness_from_metric_summary",
+        None,
+    )
+    assert summarize is not None, "compact metric candidate summarizer is missing"
+    assert readiness_from_summary is not None, "summary readiness builder is missing"
+
+    summary = summarize(
+        metric=metric,
+        deterministic_result_sha256=deterministic_result_sha256,
+    )
+    controls = assemble_v5_control_suite(groups)
+
+    assert summary.arm is V5Arm.FULL_SENTINEL
+    assert summary.bootstrap.sample_count == metric.bootstrap.replicates
+    assert not hasattr(summary.bootstrap, "samples")
+    assert summary.stable_document() == _stable_complete_metrics(
+        metric.model_dump(mode="json"),
+        deterministic_result_sha256=deterministic_result_sha256,
+    )
+    assert readiness_from_summary(metrics=summary, controls=controls) == (
+        build_v5_readiness_evidence(metrics=metric, controls=controls)
+    )
+
+
+def test_metric_worker_receipt_rejects_cross_run_arm_support_and_resource_substitution(
+    executed_group_evidence: _ExecutedEvidence,
+) -> None:
+    """A compact worker result cannot move across an arm, predecessor, run, or gate."""
+    _suite, _groups, _corpus, arm_results = executed_group_evidence
+    evidence_protocol = load_v5_evidence_protocol(
+        ROOT / "config/defense/defense-v5-evidence.json", root=ROOT
+    )
+    result = arm_results[0]
+    metric = evaluate_v5_complete_result(result=result, protocol=evidence_protocol)
+    deterministic_result_sha256 = _arm_core_and_observation(result)[0][
+        "deterministic_result_sha256"
+    ]
+    summary = staged.summarize_v5_complete_arm_metrics(
+        metric=metric,
+        deterministic_result_sha256=deterministic_result_sha256,
+    )
+    build_receipt = getattr(staged, "build_v5_metric_arm_worker_receipt", None)
+    validate_receipt = getattr(staged, "validate_v5_metric_arm_worker_receipt", None)
+    assert build_receipt is not None, "candidate metric worker receipt builder is missing"
+    assert validate_receipt is not None, "candidate metric worker receipt validator is missing"
+
+    receipt = build_receipt(
+        mode=V5KaggleMode.CAPACITY_VALIDATION,
+        run_binding_sha256="1" * 64,
+        attempt_receipt_sha256="2" * 64,
+        execution_manifest_sha256="3" * 64,
+        arm_manifest_sha256="4" * 64,
+        arm_manifest_deterministic_sha256="5" * 64,
+        arm_index=0,
+        arm_order=tuple(item.arm for item in arm_results),
+        support_count=result.support_total,
+        support_event_ids_sha256="6" * 64,
+        summary=summary,
+        evidence_protocol_sha256=evidence_protocol.evidence_protocol_sha256,
+        implementation_sha256=evidence_protocol.implementation_sha256,
+        wall_seconds=1.5,
+        peak_rss_bytes=123_456,
+        artifact_bytes=654_321,
+    )
+    expected = {
+        "mode": V5KaggleMode.CAPACITY_VALIDATION,
+        "run_binding_sha256": "1" * 64,
+        "attempt_receipt_sha256": "2" * 64,
+        "execution_manifest_sha256": "3" * 64,
+        "arm_manifest_sha256": "4" * 64,
+        "arm_manifest_deterministic_sha256": "5" * 64,
+        "arm": V5Arm.RULES_ONLY,
+        "arm_index": 0,
+        "arm_order": tuple(item.arm for item in arm_results),
+        "support_sha256": result.support_sha256,
+        "support_count": result.support_total,
+        "support_event_ids_sha256": "6" * 64,
+        "deterministic_result_sha256": deterministic_result_sha256,
+        "evidence_protocol_sha256": evidence_protocol.evidence_protocol_sha256,
+        "implementation_sha256": evidence_protocol.implementation_sha256,
+    }
+    validate_receipt(
+        receipt=receipt,
+        expected=expected,
+        max_peak_rss_bytes=18 * 1024**3,
+        max_artifact_bytes=256 * 1024**2,
+    )
+
+    for field, replacement in (
+        ("arm", V5Arm.ENSEMBLE_NO_GRAPH.value),
+        ("support_sha256", "7" * 64),
+        ("arm_manifest_sha256", "8" * 64),
+        ("run_binding_sha256", "9" * 64),
+    ):
+        changed = receipt.model_dump(mode="json")
+        changed[field] = replacement
+        with pytest.raises(ValueError, match="receipt digest"):
+            staged.V5MetricArmWorkerReceipt.model_validate(changed)
+
+    oversized = receipt.model_dump(mode="json")
+    oversized["resource_telemetry"]["peak_rss_bytes"] = 18 * 1024**3
+    oversized["receipt_sha256"] = staged._sha256(
+        staged._canonical_bytes(
+            {key: value for key, value in oversized.items() if key != "receipt_sha256"}
+        )
+    )
+    over_limit = staged.V5MetricArmWorkerReceipt.model_validate(oversized)
+    with pytest.raises(ValueError, match="worker resource gate"):
+        validate_receipt(
+            receipt=over_limit,
+            expected=expected,
+            max_peak_rss_bytes=18 * 1024**3,
+            max_artifact_bytes=256 * 1024**2,
+        )
+
+
+def test_compact_finalization_never_reloads_the_four_arm_checkpoint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Finalization must consume all eleven predecessors after the split."""
+    """Compact Stage 80 must consume Stage 70 addresses without restoring arms."""
     protocol = load_v5_kaggle_protocol(KAGGLE_CONFIG, root=ROOT)
     predecessor = None
     roots: list[Path] = []
@@ -622,14 +846,101 @@ def test_finalization_accepts_the_exact_split_stage_chain(
         "apar.evaluation.v5_staged_evidence.load_v5_arm_checkpoint",
         arm_loader_reached,
     )
-    with pytest.raises(RuntimeError, match="arm loader reached"):
-        tuple(
-            execute_v5_finalize_stage(
-                root=ROOT,
-                capability=capability,
-                predecessor_checkpoint_roots=tuple(roots),
-            )
+    compact = staged.V5CompactMetricStageEvidence(
+        worker_receipts=(),
+        controls=None,  # type: ignore[arg-type]
+        readiness=None,  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr(staged, "load_v5_metric_checkpoint", lambda **_kwargs: compact)
+    compact_payload = json.dumps(
+        {"schema_version": "apar-sentinel-v5-kaggle-compact-final-payload/2"},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    monkeypatch.setattr(
+        staged,
+        "_build_v5_compact_final_documents",
+        lambda **_kwargs: (
+            {
+                "schema_version": "apar-sentinel-v5-kaggle-final-core/2",
+                "final_core_sha256": "6" * 64,
+            },
+            compact_payload,
+        ),
+    )
+    records = tuple(
+        execute_v5_finalize_stage(
+            root=ROOT,
+            capability=capability,
+            predecessor_checkpoint_roots=tuple(roots),
         )
+    )
+    assert tuple(record.kind for record in records) == ("final_core", "final_payload")
+    assert records[1].canonical_bytes == compact_payload
+
+
+def test_metric_coordinator_runs_exactly_four_workers_without_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The candidate coordinator must finish each fresh arm before starting the next."""
+    protocol = load_v5_kaggle_protocol(KAGGLE_CONFIG, root=ROOT)
+    capability = staged.V5StageCapability(
+        stage=V5KaggleStage.METRICS,
+        mode=V5KaggleMode.CAPACITY_VALIDATION,
+        run_binding_sha256=protocol.run_binding_sha256(
+            V5KaggleMode.CAPACITY_VALIDATION
+        ),
+        attempt_receipt_sha256="2" * 64,
+        predecessor_manifest_sha256="3" * 64,
+        seal=object(),
+        execution_manifest_sha256="4" * 64,
+    )
+    calls: list[V5Arm] = []
+    active = 0
+
+    def fake_worker(**kwargs: object) -> V5Arm:
+        nonlocal active
+        assert active == 0
+        active += 1
+        arm = kwargs["target_arm"]
+        assert isinstance(arm, V5Arm)
+        calls.append(arm)
+        active -= 1
+        return arm
+
+    def validate_receipts(receipts: tuple[V5Arm, ...]) -> None:
+        assert receipts == tuple(calls)
+
+    monkeypatch.setattr(staged, "_run_v5_metric_arm_worker_subprocess", fake_worker)
+    monkeypatch.setattr(
+        staged,
+        "_validate_v5_metric_worker_receipt_set",
+        validate_receipts,
+    )
+    monkeypatch.setattr(staged, "assemble_v5_control_suite", lambda _groups: object())
+    monkeypatch.setattr(
+        staged,
+        "build_v5_compact_metric_stage_documents",
+        lambda **_kwargs: ({"core": True}, {"observation": True}),
+    )
+    core, observation = staged._execute_v5_memory_safe_metric_stage(
+        root=ROOT,
+        capability=capability,
+        arm_checkpoint_root=ROOT / "unused",
+        arm_manifest=None,  # type: ignore[arg-type]
+        control_groups=(),
+        evidence_protocol=None,  # type: ignore[arg-type]
+        limits=protocol.resources,
+    )
+    assert calls == [
+        V5Arm.RULES_ONLY,
+        V5Arm.ENSEMBLE_NO_GRAPH,
+        V5Arm.ENSEMBLE_WITH_GRAPH,
+        V5Arm.FULL_SENTINEL,
+    ]
+    assert active == 0
+    assert core == {"core": True}
+    assert observation == {"observation": True}
 
 
 def test_final_payload_retains_complete_staged_semantics_and_chain(

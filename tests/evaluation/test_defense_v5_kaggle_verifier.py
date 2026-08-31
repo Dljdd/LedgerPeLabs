@@ -10,10 +10,12 @@ import os
 import shutil
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from apar import v5_independent_verifier as semantic
 from apar.evaluation.v5_checkpoint_storage import (
     V5CheckpointInput,
     publish_v5_checkpoint,
@@ -32,6 +34,7 @@ from apar.evaluation.v5_locked_evidence import (
 )
 from apar.evaluation.v5_staged_evidence import (
     _arm_core_and_observation,
+    _build_v5_compact_final_documents,
     _control_group_core_and_observation,
     _issue_stage_capability,
     _iter_arm_result_checkpoint_records,
@@ -39,14 +42,20 @@ from apar.evaluation.v5_staged_evidence import (
     _iter_v5_corpus_records,
     _metric_stage_core_and_observation,
     _prepare_partition,
+    _restore_v5_compact_metric_stage_evidence,
+    build_v5_compact_metric_stage_documents,
+    build_v5_metric_arm_worker_receipt,
     build_v5_metric_stage_evidence,
     execute_v5_authorization_stage,
+    summarize_v5_complete_arm_metrics,
 )
 from apar.features.sentinel import SentinelFeatureCatalog
 from apar.v5_kaggle_independent_verifier import (
     V5KaggleIndependentVerificationError,
     _decode_arm_checkpoint_records,
+    _read_checkpoint,
     _Record,
+    _verify_compact_final_payload,
     _verify_v5_kaggle_test_fixture,
     verify_v5_kaggle_evidence,
     verify_v5_kaggle_prefix,
@@ -369,7 +378,11 @@ def complete_safe_evidence() -> object:
 
 
 def _materialize_complete_chain(
-    tmp_path: Path, evidence: object, *, semantic_mutation: str | None = None
+    tmp_path: Path,
+    evidence: object,
+    *,
+    semantic_mutation: str | None = None,
+    compact_metrics: bool = False,
 ) -> Path:
     _suite, groups, corpus, arm_results = evidence
     protocol = load_v5_kaggle_protocol(
@@ -386,6 +399,8 @@ def _materialize_complete_chain(
         ROOT / "config/defense/defense-v5-evidence.json", root=ROOT
     )
     controls = assemble_v5_control_suite(groups)
+    execution_manifest_sha256 = "7" * 64
+    compact_metric_evidence = None
     metric_evidence = build_v5_metric_stage_evidence(
         arm_results=arm_results,
         control_groups=groups,
@@ -409,6 +424,7 @@ def _materialize_complete_chain(
                 mode=V5KaggleMode.CAPACITY_VALIDATION,
                 attempt_receipt_sha256=attempt,
                 predecessor=None,
+                execution_manifest_sha256=execution_manifest_sha256,
             )
             records = execute_v5_authorization_stage(
                 root=ROOT, capability=capability
@@ -514,23 +530,101 @@ def _materialize_complete_chain(
                 ),
             )
         elif stage is V5KaggleStage.METRICS:
-            records = (
-                V5CheckpointInput(
-                    kind="metric_evidence",
-                    key="complete",
-                    canonical_bytes=json.dumps(
-                        metric_core, sort_keys=True, separators=(",", ":")
-                    ).encode(),
-                ),
-                V5CheckpointInput(
-                    kind="metric_observation",
-                    key="complete",
-                    canonical_bytes=json.dumps(
-                        metric_observation, sort_keys=True, separators=(",", ":")
-                    ).encode(),
-                    layer="observational",
-                ),
-            )
+            if compact_metrics:
+                arm_manifest = next(
+                    item for item in manifests if item.stage is V5KaggleStage.ARMS
+                )
+                support_event_ids = tuple(
+                    row.support.event_id for row in arm_results[0].row_evidence
+                )
+                deterministic_result_sha256 = tuple(
+                    _arm_core_and_observation(result)[0][
+                        "deterministic_result_sha256"
+                    ]
+                    for result in arm_results
+                )
+                receipts = tuple(
+                    build_v5_metric_arm_worker_receipt(
+                        mode=V5KaggleMode.CAPACITY_VALIDATION,
+                        run_binding_sha256=run_binding,
+                        attempt_receipt_sha256=attempt,
+                        execution_manifest_sha256=execution_manifest_sha256,
+                        arm_manifest_sha256=arm_manifest.manifest_sha256,
+                        arm_manifest_deterministic_sha256=(
+                            arm_manifest.deterministic_sha256
+                        ),
+                        arm_index=index,
+                        arm_order=tuple(result.arm for result in arm_results),
+                        support_count=result.support_total,
+                        support_event_ids_sha256=_digest(support_event_ids),
+                        summary=summarize_v5_complete_arm_metrics(
+                            metric=metric,
+                            deterministic_result_sha256=result_sha256,
+                        ),
+                        evidence_protocol_sha256=(
+                            evidence_protocol.evidence_protocol_sha256
+                        ),
+                        implementation_sha256=evidence_protocol.implementation_sha256,
+                        wall_seconds=float(index + 1),
+                        peak_rss_bytes=1_000_000_000 + index,
+                        artifact_bytes=10_000 + index,
+                    )
+                    for index, (result, metric, result_sha256) in enumerate(
+                        zip(
+                            arm_results,
+                            metric_evidence.complete_metrics,
+                            deterministic_result_sha256,
+                            strict=True,
+                        )
+                    )
+                )
+                compact_core, compact_observation = (
+                    build_v5_compact_metric_stage_documents(
+                        receipts=receipts,
+                        controls=controls,
+                    )
+                )
+                compact_metric_evidence = _restore_v5_compact_metric_stage_evidence(
+                    core=compact_core,
+                    observation=compact_observation,
+                )
+                records = (
+                    V5CheckpointInput(
+                        kind="metric_evidence",
+                        key="complete",
+                        canonical_bytes=json.dumps(
+                            compact_core, sort_keys=True, separators=(",", ":")
+                        ).encode(),
+                    ),
+                    V5CheckpointInput(
+                        kind="metric_observation",
+                        key="complete",
+                        canonical_bytes=json.dumps(
+                            compact_observation,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode(),
+                        layer="observational",
+                    ),
+                )
+            else:
+                records = (
+                    V5CheckpointInput(
+                        kind="metric_evidence",
+                        key="complete",
+                        canonical_bytes=json.dumps(
+                            metric_core, sort_keys=True, separators=(",", ":")
+                        ).encode(),
+                    ),
+                    V5CheckpointInput(
+                        kind="metric_observation",
+                        key="complete",
+                        canonical_bytes=json.dumps(
+                            metric_observation, sort_keys=True, separators=(",", ":")
+                        ).encode(),
+                        layer="observational",
+                    ),
+                )
         else:
             raise AssertionError(f"unexpected fixture stage: {stage}")
         records = tuple(records)
@@ -602,25 +696,51 @@ def _materialize_complete_chain(
     }
     chain_values["predecessor_chain_root_sha256"] = _digest(chain_values)
     chain = V5CheckpointChainBinding.model_validate(chain_values)
-    payload_bytes = build_v5_staged_evidence_payload(
-        mode=V5KaggleMode.CAPACITY_VALIDATION,
-        run_binding_sha256=run_binding,
-        support_plan=support_plan,
-        chain=chain,
-        evidence_protocol=evidence_protocol,
-        catalog_sha256=SentinelFeatureCatalog.default().catalog_sha256,
-        arm_results=arm_results,
-        controls=controls,
-    )
-    payload = V5StagedEvidencePayload.model_validate_json(payload_bytes)
-    core = {
-        "schema_version": "apar-sentinel-v5-kaggle-final-core/1",
-        "mode": V5KaggleMode.CAPACITY_VALIDATION,
-        "run_binding_sha256": run_binding,
-        "support_plan_sha256": payload.support_plan.support_plan_sha256,
-        "deterministic_core_sha256": payload.deterministic_core.core_sha256,
-    }
-    core["final_core_sha256"] = _digest(core)
+    if compact_metrics:
+        assert compact_metric_evidence is not None
+        arm_manifest = next(
+            item for item in manifests if item.stage is V5KaggleStage.ARMS
+        )
+        metric_manifest = next(
+            item for item in manifests if item.stage is V5KaggleStage.METRICS
+        )
+        final_capability = _issue_stage_capability(
+            protocol=protocol,
+            mode=V5KaggleMode.CAPACITY_VALIDATION,
+            attempt_receipt_sha256=attempt,
+            predecessor=predecessor,
+            execution_manifest_sha256=execution_manifest_sha256,
+        )
+        core, payload_bytes = _build_v5_compact_final_documents(
+            capability=final_capability,
+            chain=chain,
+            arm_manifest=arm_manifest,
+            metric_manifest=metric_manifest,
+            metric_evidence=compact_metric_evidence,
+            support_plan=support_plan,
+            evidence_protocol=evidence_protocol,
+            catalog_sha256=SentinelFeatureCatalog.default().catalog_sha256,
+        )
+    else:
+        payload_bytes = build_v5_staged_evidence_payload(
+            mode=V5KaggleMode.CAPACITY_VALIDATION,
+            run_binding_sha256=run_binding,
+            support_plan=support_plan,
+            chain=chain,
+            evidence_protocol=evidence_protocol,
+            catalog_sha256=SentinelFeatureCatalog.default().catalog_sha256,
+            arm_results=arm_results,
+            controls=controls,
+        )
+        payload = V5StagedEvidencePayload.model_validate_json(payload_bytes)
+        core = {
+            "schema_version": "apar-sentinel-v5-kaggle-final-core/1",
+            "mode": V5KaggleMode.CAPACITY_VALIDATION,
+            "run_binding_sha256": run_binding,
+            "support_plan_sha256": payload.support_plan.support_plan_sha256,
+            "deterministic_core_sha256": payload.deterministic_core.core_sha256,
+        }
+        core["final_core_sha256"] = _digest(core)
     publish_v5_checkpoint(
         output_root=chain_root / V5KaggleStage.FINALIZE.value,
         stage=V5KaggleStage.FINALIZE,
@@ -686,6 +806,115 @@ def test_independent_verifier_replays_complete_safe_chain_and_rejects_tamper(
             final_root=pristine_roots[-1],
             expected_mode="kaggle_capacity_validation",
         )
+
+
+def test_independent_verifier_replays_compact_metric_chain_and_rejects_receipt_tamper(
+    tmp_path: Path, complete_safe_evidence: object
+) -> None:
+    chain_root = _materialize_complete_chain(
+        tmp_path / "valid",
+        complete_safe_evidence,
+        compact_metrics=True,
+    )
+    roots = tuple(chain_root / stage.value for stage in V5KaggleStage)
+    report = _verify_v5_kaggle_test_fixture(
+        root=ROOT,
+        checkpoint_roots=roots[:-1],
+        final_root=roots[-1],
+    )
+    assert report.valid is True
+    assert report.verified_stage_ids == tuple(stage.value for stage in V5KaggleStage)
+
+    checkpoints = tuple(_read_checkpoint(root) for root in roots)
+    payload = json.loads(checkpoints[-1].observational_records[0].payload)
+    mode = str(payload["mode"])
+    run_binding = str(payload["run_binding_sha256"])
+    attempt = str(payload["attempt_receipt_sha256"])
+    production_support = semantic._independent_locked_support_plan(  # noqa: SLF001
+        json.loads((ROOT / "config/defense/defense-v5-development.json").read_bytes())
+    )
+    production_support["mode"] = mode
+    production_support["support_plan_sha256"] = _digest(
+        {
+            key: value
+            for key, value in production_support.items()
+            if key != "support_plan_sha256"
+        }
+    )
+    official_candidate = dict(payload)
+    official_candidate["support_plan"] = production_support
+    official_candidate["payload_sha256"] = _digest(
+        {
+            key: value
+            for key, value in official_candidate.items()
+            if key != "payload_sha256"
+        }
+    )
+    with pytest.raises(
+        V5KaggleIndependentVerificationError,
+        match="independent semantic replay",
+    ):
+        _verify_compact_final_payload(
+            payload=official_candidate,
+            root=ROOT,
+            mode=mode,
+            run_binding=run_binding,
+            attempt=attempt,
+            checkpoints=checkpoints,
+            enforce_production_support=True,
+        )
+
+    pristine_observation = json.loads(checkpoints[10].observational_records[0].payload)
+    for mutation in ("resource", "support"):
+        metric_observation = json.loads(json.dumps(pristine_observation))
+        receipt = metric_observation["worker_receipts"][0]
+        if mutation == "resource":
+            receipt["resource_telemetry"]["peak_rss_bytes"] = 19_327_352_832
+        else:
+            receipt["support_count"] += 1
+        receipt["receipt_sha256"] = _digest(
+            {
+                key: value
+                for key, value in receipt.items()
+                if key != "receipt_sha256"
+            }
+        )
+        metric_observation["observational_metric_stage_sha256"] = _digest(
+            {
+                key: value
+                for key, value in metric_observation.items()
+                if key != "observational_metric_stage_sha256"
+            }
+        )
+        tampered = list(checkpoints)
+        tampered[10] = replace(
+            checkpoints[10],
+            observational_records=(
+                _Record(
+                    layer="observational",
+                    kind="metric_observation",
+                    key="complete",
+                    payload=json.dumps(
+                        metric_observation,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode(),
+                ),
+            ),
+        )
+        with pytest.raises(
+            V5KaggleIndependentVerificationError,
+            match="resource|receipt",
+        ):
+            _verify_compact_final_payload(
+                payload=payload,
+                root=ROOT,
+                mode=mode,
+                run_binding=run_binding,
+                attempt=attempt,
+                checkpoints=tampered,
+                enforce_production_support=False,
+            )
 
 
 @pytest.mark.parametrize("layer", ("corpus", "feature", "arm"))

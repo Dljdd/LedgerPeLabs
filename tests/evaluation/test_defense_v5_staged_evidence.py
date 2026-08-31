@@ -24,6 +24,8 @@ from apar.evaluation.v5_evaluation import (
     V5EvaluationResult,
     load_v5_arm_configuration,
 )
+from apar.evaluation.v5_evidence_layers import _stable_complete_metrics
+from apar.evaluation.v5_evidence_protocol import load_v5_evidence_protocol
 from apar.evaluation.v5_kaggle_protocol import (
     V5KaggleEnvironmentBinding,
     V5KaggleMode,
@@ -31,6 +33,7 @@ from apar.evaluation.v5_kaggle_protocol import (
     build_v5_kaggle_support_plan,
     load_v5_kaggle_protocol,
 )
+from apar.evaluation.v5_metrics import evaluate_v5_complete_result
 from apar.evaluation.v5_population import V5Corpus, build_v5_corpus
 from apar.evaluation.v5_protocol import V5Profile, load_v5_development_protocol
 from apar.features.sentinel import SentinelFeatureCatalog, build_sentinel_features
@@ -714,7 +717,7 @@ def test_non_authoritative_rescue_stream_releases_each_exact_arm(
         predecessor=feature_manifest,
     )
     arm_root = tmp_path / "arms"
-    _publish_stage(
+    arm_manifest = _publish_stage(
         output_root=arm_root,
         stage=V5KaggleStage.ARMS,
         records=staged.execute_v5_arm_stage(
@@ -728,6 +731,47 @@ def test_non_authoritative_rescue_stream_releases_each_exact_arm(
     expected = staged.load_v5_arm_checkpoint(
         checkpoint_root=arm_root,
         limits=protocol.resources,
+    )
+    candidate_loader = getattr(staged, "load_v5_metric_worker_arm_result", None)
+    assert candidate_loader is not None, "candidate one-arm Stage 70 loader is missing"
+    for expected_index, expected_result in enumerate(expected):
+        isolated = candidate_loader(
+            checkpoint_root=arm_root,
+            limits=protocol.resources,
+            target_arm=expected_result.arm,
+        )
+        assert isolated.arm_index == expected_index
+        assert isolated.arm == expected_result.arm
+        assert isolated.result.model_dump(mode="json") == expected_result.model_dump(
+            mode="json"
+        )
+        assert isolated.deterministic_result_sha256 == (
+            staged._arm_core_and_observation(expected_result)[0][
+                "deterministic_result_sha256"
+            ]
+        )
+    evidence_protocol = load_v5_evidence_protocol(
+        ROOT / "config/defense/defense-v5-evidence.json",
+        root=ROOT,
+    )
+    worker_receipt = staged._run_v5_metric_arm_worker_subprocess(
+        root=ROOT,
+        capability=arm_capability,
+        arm_checkpoint_root=arm_root,
+        arm_manifest=arm_manifest,
+        target_arm=V5Arm.RULES_ONLY,
+        evidence_protocol=evidence_protocol,
+        limits=protocol.resources,
+        timeout_seconds=180.0,
+    )
+    assert worker_receipt.arm is V5Arm.RULES_ONLY
+    assert worker_receipt.resource_telemetry.fresh_interpreter is True
+    assert worker_receipt.metric_summary.stable_document() == _stable_complete_metrics(
+        evaluate_v5_complete_result(
+            result=expected[0],
+            protocol=evidence_protocol,
+        ).model_dump(mode="json"),
+        deterministic_result_sha256=worker_receipt.deterministic_result_sha256,
     )
 
     streamed = rescue.iter_non_authoritative_rescue_arm_results(

@@ -756,6 +756,19 @@ def _verify_final_payload(
         raise V5KaggleIndependentVerificationError("staged final payload is not JSON") from error
     if payload_bytes != _canonical_bytes(payload):
         _fail("staged final payload is not canonical JSON")
+    if (
+        payload.get("schema_version")
+        == "apar-sentinel-v5-kaggle-compact-final-payload/2"
+    ):
+        return _verify_compact_final_payload(
+            payload=payload,
+            root=root,
+            mode=mode,
+            run_binding=run_binding,
+            attempt=attempt,
+            checkpoints=checkpoints,
+            enforce_production_support=enforce_production_support,
+        )
     expected_fields = {
         "schema_version",
         "mode",
@@ -809,6 +822,456 @@ def _verify_final_payload(
         enforce_production_support=enforce_production_support,
     )
     return payload, status, core_sha, observational_sha
+
+
+def _verify_compact_final_payload(
+    *,
+    payload: dict[str, Any],
+    root: Path,
+    mode: str,
+    run_binding: str,
+    attempt: str,
+    checkpoints: Sequence[_VerifiedCheckpoint],
+    enforce_production_support: bool,
+) -> tuple[dict[str, Any], str, str, str]:
+    """Structurally verify the bounded Stage 70/80 candidate index."""
+    expected_fields = {
+        "schema_version",
+        "mode",
+        "profile",
+        "development_test_seed",
+        "run_binding_sha256",
+        "support_plan",
+        "attempt_receipt_sha256",
+        "checkpoint_chain",
+        "evidence_protocol_sha256",
+        "implementation_sha256",
+        "catalog_sha256",
+        "arm_manifest_sha256",
+        "arm_manifest_deterministic_sha256",
+        "metric_manifest_sha256",
+        "metric_manifest_deterministic_sha256",
+        "deterministic_metric_stage_sha256",
+        "metric_worker_receipt_sha256",
+        "worker_resources",
+        "controls_suite_sha256",
+        "readiness",
+        "final_core_sha256",
+        "payload_sha256",
+    }
+    _exact(payload, expected_fields, "compact staged final payload")
+    expected_seed = 404 if mode == "kaggle_capacity_validation" else 2404
+    if (
+        payload.get("mode") != mode
+        or payload.get("profile") != "production"
+        or payload.get("development_test_seed") != expected_seed
+        or payload.get("run_binding_sha256") != run_binding
+        or payload.get("attempt_receipt_sha256") != attempt
+        or payload.get("payload_sha256")
+        != _digest({key: value for key, value in payload.items() if key != "payload_sha256"})
+    ):
+        _fail("compact staged final payload binding differs")
+    support_plan = _mapping(payload["support_plan"], "compact support plan")
+    claimed_support = support_plan.get("support_plan_sha256")
+    if (
+        support_plan.get("mode") != mode
+        or support_plan.get("profile") != "production"
+        or claimed_support
+        != _digest(
+            {
+                key: value
+                for key, value in support_plan.items()
+                if key != "support_plan_sha256"
+            }
+        )
+    ):
+        _fail("compact final support plan differs")
+    if enforce_production_support:
+        recovery = _mapping(
+            json.loads(
+                (root / "config/defense/defense-v5-kaggle-recovery.json").read_bytes()
+            ),
+            "Kaggle recovery protocol",
+        )
+        source_bindings = _mapping(
+            recovery.get("source_bindings"),
+            "Kaggle recovery source bindings",
+        )
+        base_path = root / str(source_bindings.get("base_protocol_path"))
+        base = _mapping(
+            json.loads(base_path.read_bytes()),
+            "production base protocol",
+        )
+        expected_support = semantic._independent_locked_support_plan(base)  # noqa: SLF001
+        expected_support["mode"] = payload["mode"]
+        expected_support["support_plan_sha256"] = _digest(
+            {
+                key: value
+                for key, value in expected_support.items()
+                if key != "support_plan_sha256"
+            }
+        )
+        if payload["support_plan"] != expected_support:
+            _fail("compact staged production support plan differs")
+        _fail(
+            "compact staged evidence is not eligible for official acceptance "
+            "until independent semantic replay is implemented"
+        )
+    chain = _mapping(payload["checkpoint_chain"], "compact checkpoint chain")
+    chain_values = {
+        "schema_version": "apar-sentinel-v5-checkpoint-chain/1",
+        "attempt_receipt_sha256": attempt,
+        "predecessor_stage_manifest_sha256": [
+            [item.manifest["stage"], item.manifest["manifest_sha256"]]
+            for item in checkpoints[:-1]
+        ],
+    }
+    chain_values["predecessor_chain_root_sha256"] = _digest(chain_values)
+    if chain != chain_values:
+        _fail("compact final checkpoint chain differs")
+
+    arm_manifest = checkpoints[3].manifest
+    arm_header = _json_record(
+        checkpoints[3].deterministic_records[0],
+        "compact Stage 30 arm header",
+    )
+    _exact(
+        arm_header,
+        {
+            "schema_version",
+            "arm_order",
+            "support_event_ids",
+            "support_sha256",
+            "deterministic_result_sha256",
+        },
+        "compact Stage 30 arm header",
+    )
+    support_event_ids = _sequence(
+        arm_header.get("support_event_ids"),
+        "compact Stage 30 support event IDs",
+    )
+    arm_result_digests = _sequence(
+        arm_header.get("deterministic_result_sha256"),
+        "compact Stage 30 arm result digests",
+    )
+    if (
+        arm_header.get("schema_version")
+        != "apar-sentinel-v5-kaggle-arms/2"
+        or arm_header.get("arm_order") != list(_ARMS)
+        or not support_event_ids
+        or any(type(item) is not str for item in support_event_ids)
+        or len(set(support_event_ids)) != len(support_event_ids)
+        or len(arm_result_digests) != len(_ARMS)
+        or any(not _is_sha256(item) for item in arm_result_digests)
+        or not _is_sha256(arm_header.get("support_sha256"))
+    ):
+        _fail("compact Stage 30 arm header differs")
+    support_event_ids_sha256 = _digest(support_event_ids)
+    metric_checkpoint = checkpoints[10]
+    metric_manifest = metric_checkpoint.manifest
+    if (
+        payload.get("arm_manifest_sha256") != arm_manifest["manifest_sha256"]
+        or payload.get("arm_manifest_deterministic_sha256")
+        != arm_manifest["deterministic_sha256"]
+        or payload.get("metric_manifest_sha256")
+        != metric_manifest["manifest_sha256"]
+        or payload.get("metric_manifest_deterministic_sha256")
+        != metric_manifest["deterministic_sha256"]
+        or len(metric_checkpoint.deterministic_records) != 1
+        or len(metric_checkpoint.observational_records) != 1
+    ):
+        _fail("compact final Stage 30/70 manifest binding differs")
+    metric_core = _json_record(
+        metric_checkpoint.deterministic_records[0],
+        "compact metric core",
+    )
+    claimed_metric_core = metric_core.pop("deterministic_metric_stage_sha256", None)
+    if (
+        claimed_metric_core != _digest(metric_core)
+        or payload.get("deterministic_metric_stage_sha256")
+        != claimed_metric_core
+    ):
+        _fail("compact metric deterministic core differs")
+    metric_observation = _json_record(
+        metric_checkpoint.observational_records[0],
+        "compact metric observation",
+    )
+    claimed_metric_observation = metric_observation.pop(
+        "observational_metric_stage_sha256",
+        None,
+    )
+    receipts = _sequence(
+        metric_observation.get("worker_receipts"),
+        "compact metric worker receipts",
+    )
+    if (
+        metric_observation.get("schema_version")
+        != "apar-sentinel-v5-kaggle-metric-observation/2"
+        or metric_observation.get("deterministic_metric_stage_sha256")
+        != claimed_metric_core
+        or claimed_metric_observation != _digest(metric_observation)
+        or len(receipts) != len(_ARMS)
+    ):
+        _fail("compact metric observation differs")
+    authorization = _json_record(
+        checkpoints[0].deterministic_records[0],
+        "compact authorization",
+    )
+    evidence_protocol = _mapping(
+        json.loads(
+            (
+                root
+                / "config/defense/defense-v5-evidence.json"
+            ).read_bytes()
+        ),
+        "compact evidence protocol",
+    )
+    implementation_paths = _sequence(
+        evidence_protocol.get("implementation_paths"),
+        "compact evidence implementation paths",
+    )
+    if (
+        any(type(item) is not str for item in implementation_paths)
+        or implementation_paths != sorted(set(implementation_paths))
+    ):
+        _fail("compact evidence implementation paths differ")
+    implementation_binding: list[list[str]] = []
+    for relative in implementation_paths:
+        source = root / relative
+        if not source.is_file():
+            _fail("compact evidence implementation source is missing")
+        implementation_binding.append(
+            [relative, hashlib.sha256(source.read_bytes()).hexdigest()]
+        )
+    expected_evidence_protocol_sha256 = _digest(evidence_protocol)
+    expected_implementation_sha256 = _digest(implementation_binding)
+    if (
+        payload.get("evidence_protocol_sha256")
+        != expected_evidence_protocol_sha256
+        or payload.get("implementation_sha256")
+        != expected_implementation_sha256
+    ):
+        _fail("compact evidence source binding differs")
+    receipt_digests: list[str] = []
+    resource_documents: list[dict[str, Any]] = []
+    observational_latency_documents: list[dict[str, Any]] = []
+    stable_metrics: list[dict[str, Any]] = []
+    common_support: tuple[object, object, object] | None = None
+    resources = _mapping(
+        json.loads(
+            (
+                root
+                / "config/defense/defense-v5-kaggle-recovery.json"
+            ).read_bytes()
+        )["resources"],
+        "compact resource gates",
+    )
+    receipt_fields = {
+        "schema_version",
+        "stage",
+        "mode",
+        "run_binding_sha256",
+        "attempt_receipt_sha256",
+        "execution_manifest_sha256",
+        "arm_manifest_sha256",
+        "arm_manifest_deterministic_sha256",
+        "arm",
+        "arm_index",
+        "arm_order",
+        "support_sha256",
+        "support_count",
+        "support_event_ids_sha256",
+        "deterministic_result_sha256",
+        "evidence_protocol_sha256",
+        "implementation_sha256",
+        "metric_summary",
+        "resource_telemetry",
+        "receipt_sha256",
+    }
+    summary_fields = {
+        "schema_version",
+        "deterministic_result_sha256",
+        "arm",
+        "arm_result_sha256",
+        "support_sha256",
+        "aggregate",
+        "calibration",
+        "economics",
+        "by_family",
+        "bootstrap",
+        "complete_metrics_sha256",
+        "summary_sha256",
+    }
+    bootstrap_fields = {
+        "schema_version",
+        "seed",
+        "replicates",
+        "confidence_level",
+        "interval_method",
+        "resampling_unit",
+        "stratification",
+        "strata",
+        "sample_count",
+        "sample_stream_sha256",
+        "intervals",
+        "bootstrap_sha256",
+        "summary_sha256",
+    }
+    telemetry_fields = {
+        "fresh_interpreter",
+        "wall_seconds",
+        "peak_rss_bytes",
+        "artifact_bytes",
+    }
+    for index, raw_receipt in enumerate(receipts):
+        receipt = _mapping(raw_receipt, "compact metric worker receipt")
+        _exact(receipt, receipt_fields, "compact metric worker receipt")
+        claimed_receipt = receipt.get("receipt_sha256")
+        summary = _mapping(receipt.get("metric_summary"), "compact metric summary")
+        _exact(summary, summary_fields, "compact metric summary")
+        claimed_summary = summary.get("summary_sha256")
+        bootstrap = _mapping(summary.get("bootstrap"), "compact bootstrap summary")
+        _exact(bootstrap, bootstrap_fields, "compact bootstrap summary")
+        claimed_bootstrap = bootstrap.get("summary_sha256")
+        telemetry = _mapping(
+            receipt.get("resource_telemetry"),
+            "compact metric worker resources",
+        )
+        _exact(telemetry, telemetry_fields, "compact metric worker resources")
+        if (
+            receipt.get("schema_version")
+            != "apar-sentinel-v5-source-bound-metric-arm-worker/1"
+            or receipt.get("stage") != "70_metrics"
+            or receipt.get("mode") != mode
+            or receipt.get("run_binding_sha256") != run_binding
+            or receipt.get("attempt_receipt_sha256") != attempt
+            or receipt.get("execution_manifest_sha256")
+            != authorization.get("execution_manifest_sha256")
+            or receipt.get("arm_manifest_sha256")
+            != arm_manifest["manifest_sha256"]
+            or receipt.get("arm_manifest_deterministic_sha256")
+            != arm_manifest["deterministic_sha256"]
+            or receipt.get("arm") != _ARMS[index]
+            or receipt.get("arm_index") != index
+            or receipt.get("arm_order") != list(_ARMS)
+            or receipt.get("support_sha256") != arm_header.get("support_sha256")
+            or receipt.get("support_count") != len(support_event_ids)
+            or receipt.get("support_event_ids_sha256")
+            != support_event_ids_sha256
+            or receipt.get("deterministic_result_sha256")
+            != arm_result_digests[index]
+            or summary.get("arm") != _ARMS[index]
+            or summary.get("deterministic_result_sha256")
+            != receipt.get("deterministic_result_sha256")
+            or summary.get("support_sha256") != receipt.get("support_sha256")
+            or claimed_receipt
+            != _digest(
+                {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+            )
+            or claimed_summary
+            != _digest(
+                {key: value for key, value in summary.items() if key != "summary_sha256"}
+            )
+            or claimed_bootstrap
+            != _digest(
+                {
+                    key: value
+                    for key, value in bootstrap.items()
+                    if key != "summary_sha256"
+                }
+            )
+            or bootstrap.get("sample_count") != bootstrap.get("replicates")
+            or telemetry.get("fresh_interpreter") is not True
+            or not isinstance(telemetry.get("peak_rss_bytes"), int)
+            or telemetry["peak_rss_bytes"] <= 0
+            or telemetry["peak_rss_bytes"] >= resources["max_peak_rss_bytes"]
+            or not isinstance(telemetry.get("wall_seconds"), (int, float))
+            or telemetry["wall_seconds"] <= 0.0
+            or telemetry["wall_seconds"] > resources["max_stage_seconds"]
+            or not isinstance(telemetry.get("artifact_bytes"), int)
+            or telemetry["artifact_bytes"] <= 0
+            or telemetry["artifact_bytes"]
+            >= min(resources["max_stage_output_bytes"], 256 * 1024**2)
+            or receipt.get("evidence_protocol_sha256")
+            != expected_evidence_protocol_sha256
+            or receipt.get("implementation_sha256")
+            != expected_implementation_sha256
+        ):
+            _fail("compact metric worker receipt differs")
+        support = (
+            receipt.get("support_sha256"),
+            receipt.get("support_count"),
+            receipt.get("support_event_ids_sha256"),
+        )
+        if common_support is None:
+            common_support = support
+        elif support != common_support:
+            _fail("compact metric worker support differs across arms")
+        aggregate = _mapping(summary.get("aggregate"), "compact metric aggregate")
+        observational_latency_documents.append(
+            {
+                name: aggregate[name]
+                for name in ("p50_latency_ms", "p95_latency_ms", "p99_latency_ms")
+                if name in aggregate
+            }
+        )
+        stable = {
+            "arm": summary["arm"],
+            "deterministic_result_sha256": summary[
+                "deterministic_result_sha256"
+            ],
+            "support_sha256": summary["support_sha256"],
+            "aggregate": {
+                name: value
+                for name, value in aggregate.items()
+                if name
+                not in {"p50_latency_ms", "p95_latency_ms", "p99_latency_ms"}
+            },
+            "calibration_sha256": _mapping(
+                summary["calibration"], "compact calibration"
+            )["calibration_sha256"],
+            "economics_sha256": _mapping(
+                summary["economics"], "compact economics"
+            )["economics_sha256"],
+            "family_sha256": [
+                _mapping(item, "compact family metric")["family_sha256"]
+                for item in _sequence(summary["by_family"], "compact family metrics")
+            ],
+            "bootstrap_sha256": bootstrap["bootstrap_sha256"],
+        }
+        stable["deterministic_complete_metrics_sha256"] = _digest(stable)
+        stable_metrics.append(stable)
+        receipt_digests.append(str(claimed_receipt))
+        resource_documents.append(telemetry)
+    if metric_core.get("complete_metrics") != stable_metrics:
+        _fail("compact metric summaries change frozen deterministic semantics")
+    controls = _mapping(metric_observation.get("controls"), "compact controls")
+    readiness = _mapping(metric_observation.get("readiness"), "compact readiness")
+    if (
+        controls.get("suite_sha256")
+        != _digest({key: value for key, value in controls.items() if key != "suite_sha256"})
+        or readiness.get("readiness_sha256")
+        != _digest(
+            {key: value for key, value in readiness.items() if key != "readiness_sha256"}
+        )
+        or payload.get("metric_worker_receipt_sha256") != receipt_digests
+        or payload.get("worker_resources") != resource_documents
+        or payload.get("controls_suite_sha256") != controls.get("suite_sha256")
+        or payload.get("readiness") != readiness
+    ):
+        _fail("compact final control/readiness binding differs")
+    return (
+        payload,
+        str(readiness.get("status")),
+        str(payload["final_core_sha256"]),
+        _digest(
+            {
+                "schema_version": "apar-sentinel-v5-compact-latency-observation/1",
+                "arm_latency_metrics": observational_latency_documents,
+                "worker_resources": resource_documents,
+            }
+        ),
+    )
 
 
 def _json_record(record: _Record, label: str) -> dict[str, Any]:
@@ -1908,16 +2371,49 @@ def _verify_v5_kaggle_evidence(
                     != hashlib.sha256(notebook.read_bytes()).hexdigest()
                 ):
                     _fail("checkpoint notebook source binding differs")
-        _verify_stage_record_bindings(
-            checkpoints=checkpoints,
-            payload=payload,
+        compact_final = (
+            payload.get("schema_version")
+            == "apar-sentinel-v5-kaggle-compact-final-payload/2"
         )
+        if not compact_final:
+            _verify_stage_record_bindings(
+                checkpoints=checkpoints,
+                payload=payload,
+            )
         final_core = _mapping(json.loads(final.deterministic_records[0].payload), "final core")
         claimed_final_core = final_core.pop("final_core_sha256", None)
-        if (
-            claimed_final_core != _digest(final_core)
-            or final_core.get("deterministic_core_sha256") != core_sha
-        ):
+        if claimed_final_core != _digest(final_core):
+            _fail("final deterministic core digest differs")
+        if compact_final:
+            if (
+                final_core.get("schema_version")
+                != "apar-sentinel-v5-kaggle-final-core/2"
+                or claimed_final_core != core_sha
+                or final_core.get("mode") != expected_mode
+                or final_core.get("run_binding_sha256") != run_binding
+                or final_core.get("support_plan_sha256")
+                != _mapping(payload["support_plan"], "compact support plan").get(
+                    "support_plan_sha256"
+                )
+                or final_core.get("checkpoint_chain_root_sha256")
+                != _mapping(payload["checkpoint_chain"], "compact chain").get(
+                    "predecessor_chain_root_sha256"
+                )
+                or final_core.get("arm_manifest_deterministic_sha256")
+                != payload.get("arm_manifest_deterministic_sha256")
+                or final_core.get("metric_manifest_deterministic_sha256")
+                != payload.get("metric_manifest_deterministic_sha256")
+                or final_core.get("deterministic_metric_stage_sha256")
+                != payload.get("deterministic_metric_stage_sha256")
+                or final_core.get("evidence_protocol_sha256")
+                != payload.get("evidence_protocol_sha256")
+                or final_core.get("implementation_sha256")
+                != payload.get("implementation_sha256")
+                or final_core.get("catalog_sha256")
+                != payload.get("catalog_sha256")
+            ):
+                _fail("compact final deterministic core binding differs")
+        elif final_core.get("deterministic_core_sha256") != core_sha:
             _fail("final deterministic core binding differs")
         verifier_sha = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
         values = {

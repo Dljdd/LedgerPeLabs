@@ -24,6 +24,12 @@ That runner unconditionally calls `load_v5_arm_checkpoint`, materializing the co
 
 Consequently, an official Stage 70 requires a future source-bound rerun beginning at the protocol-defined blast radius; it cannot be retroactively manufactured from this recovery. No such rerun was started.
 
+## Future source remediation status
+
+A memory-bounded Stage 70/80 candidate is now implemented locally. It restores one Stage 30 arm in each fresh Python interpreter, writes only compact self-hashed metric summaries, enforces per-worker RSS/time/artifact gates, and lets Stage 80 index Stage 70 without restoring the four-arm checkpoint again. Focused tests prove that this candidate preserves the prior deterministic metric core and rejects receipt, support, and resource substitutions.
+
+This is unexecuted source remediation, not an accepted checkpoint and not an extension of the accepted prefix. Its source and implementation bindings differ from commit `40fb4a131da36556d2b8a04564cb62d73152c7c1`, so any official use would require a newly approved chain beginning at Stage 00. The public verifier deliberately rejects compact Stage 70/80 evidence for official acceptance until an independent memory-bounded semantic replay of the Stage 30 rows, model artifacts, controls, and metric construction is implemented. Structural compact replay remains available only to the test fixture. No Kaggle run or Stage 00 restart was performed for this remediation.
+
 ## Verified predecessor lineage
 
 | Stage | Manifest SHA-256 |

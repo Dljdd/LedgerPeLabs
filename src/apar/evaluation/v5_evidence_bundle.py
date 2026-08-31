@@ -7,7 +7,7 @@ import hashlib
 import json
 import zlib
 from collections.abc import Mapping, Sequence
-from typing import Any, Literal, Self, cast
+from typing import Any, Literal, Protocol, Self, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -467,8 +467,32 @@ class V5EvidenceEnvelope(BaseModel):
         return self
 
 
+class _V5ReadinessBootstrapSource(Protocol):
+    @property
+    def intervals(self) -> Sequence[V5BootstrapInterval]: ...
+
+
+class _V5ReadinessFamilySource(Protocol):
+    @property
+    def family(self) -> str: ...
+
+
+class _V5ReadinessMetricSource(Protocol):
+    @property
+    def arm(self) -> V5Arm: ...
+
+    @property
+    def by_family(self) -> Sequence[_V5ReadinessFamilySource]: ...
+
+    @property
+    def bootstrap(self) -> _V5ReadinessBootstrapSource: ...
+
+    @property
+    def aggregate(self) -> Mapping[str, V5MetricEstimate]: ...
+
+
 def _interval(
-    metrics: V5CompleteArmMetrics, metric: str, family: str | None = None
+    metrics: _V5ReadinessMetricSource, metric: str, family: str | None = None
 ) -> V5BootstrapInterval:
     matches = tuple(
         item
@@ -534,10 +558,10 @@ def _gate_from_point(*, metric: V5MetricEstimate, target: float) -> V5ReadinessG
     return V5ReadinessGateEvidence.model_validate(values)
 
 
-def build_v5_readiness_evidence(
-    *, metrics: V5CompleteArmMetrics, controls: V5ExecutedControlSuite
+def _build_v5_readiness_evidence_from_source(
+    *, metrics: _V5ReadinessMetricSource, controls: V5ExecutedControlSuite
 ) -> V5ReadinessEvidence:
-    """Evaluate the exact frozen full-Sentinel point and interval gates."""
+    """Evaluate the frozen gates from a complete or draw-addressed metric source."""
     if metrics.arm is not V5Arm.FULL_SENTINEL:
         raise ValueError("readiness is evaluated only for full_sentinel")
     gates: list[V5ReadinessGateEvidence] = []
@@ -610,6 +634,13 @@ def build_v5_readiness_evidence(
         }
     )
     return V5ReadinessEvidence.model_validate(values)
+
+
+def build_v5_readiness_evidence(
+    *, metrics: V5CompleteArmMetrics, controls: V5ExecutedControlSuite
+) -> V5ReadinessEvidence:
+    """Evaluate the exact frozen full-Sentinel point and interval gates."""
+    return _build_v5_readiness_evidence_from_source(metrics=metrics, controls=controls)
 
 
 def build_v5_evidence_envelope(

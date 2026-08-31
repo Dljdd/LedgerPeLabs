@@ -4,14 +4,29 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterator, Sequence
+import os
+import resource
+import subprocess
+import sys
+import tempfile
+import time
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
-from typing import Literal, cast
+from types import MappingProxyType
+from typing import Literal, Self, cast
 
 import numpy as np
 from numpy.typing import NDArray
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from apar.evaluation.v5_arms import score_v5_arm_set, train_v5_arm_set
 from apar.evaluation.v5_checkpoint_storage import (
@@ -42,6 +57,7 @@ from apar.evaluation.v5_evaluation import (
 )
 from apar.evaluation.v5_evidence_bundle import (
     V5ReadinessEvidence,
+    _build_v5_readiness_evidence_from_source,
     build_v5_readiness_evidence,
 )
 from apar.evaluation.v5_evidence_layers import (
@@ -68,7 +84,15 @@ from apar.evaluation.v5_locked_evidence import (
     V5StagedEvidencePayload,
     build_v5_staged_evidence_payload,
 )
-from apar.evaluation.v5_metrics import V5CompleteArmMetrics, evaluate_v5_complete_result
+from apar.evaluation.v5_metrics import (
+    V5BootstrapInterval,
+    V5CalibrationEvidence,
+    V5CompleteArmMetrics,
+    V5EconomicEvidence,
+    V5FamilyMetrics,
+    V5MetricEstimate,
+    evaluate_v5_complete_result,
+)
 from apar.evaluation.v5_population import (
     V5Corpus,
     V5DecisionRow,
@@ -132,6 +156,17 @@ class V5StageCapability:
 
 
 @dataclass(frozen=True, slots=True)
+class V5MetricWorkerArmResult:
+    """One fully authenticated Stage 30 arm restored for a fresh metric worker."""
+
+    arm: str
+    arm_index: int
+    deterministic_result_sha256: str
+    support_event_ids_sha256: str
+    result: V5EvaluationResult
+
+
+@dataclass(frozen=True, slots=True)
 class V5PreparedPartition:
     partition: str
     matrix: NDArray[np.float64]
@@ -149,6 +184,212 @@ class V5MetricStageEvidence:
     complete_metrics: tuple[V5CompleteArmMetrics, ...]
     controls: V5ExecutedControlSuite
     readiness: V5ReadinessEvidence
+
+
+@dataclass(frozen=True, slots=True)
+class V5CompactMetricStageEvidence:
+    """Authenticated Stage 70 evidence without retained bootstrap draw arrays."""
+
+    worker_receipts: tuple[V5MetricArmWorkerReceipt, ...]
+    controls: V5ExecutedControlSuite
+    readiness: V5ReadinessEvidence
+
+
+class V5MetricBootstrapSummary(BaseModel):
+    """Complete bootstrap design and intervals with the bulky draw stream addressed."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["apar-sentinel-v5-bootstrap-summary/1"]
+    seed: int
+    replicates: int = Field(gt=0, le=10_000)
+    confidence_level: float
+    interval_method: str
+    resampling_unit: str
+    stratification: str
+    strata: tuple[tuple[str, tuple[str, ...]], ...]
+    sample_count: int = Field(gt=0, le=10_000)
+    sample_stream_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    intervals: tuple[V5BootstrapInterval, ...]
+    bootstrap_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    summary_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def summary_is_bound(self) -> Self:
+        if self.sample_count != self.replicates:
+            raise ValueError("bootstrap summary sample count differs")
+        expected = _sha256(
+            _canonical_bytes(self.model_dump(mode="json", exclude={"summary_sha256"}))
+        )
+        if self.summary_sha256 != expected:
+            raise ValueError("bootstrap summary digest differs")
+        return self
+
+
+class V5CompleteArmMetricSummary(BaseModel):
+    """Exact arm metrics with deterministic bootstrap draws retained by address."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["apar-sentinel-v5-complete-metric-summary/1"]
+    deterministic_result_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    arm: V5Arm
+    arm_result_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    support_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    aggregate: Mapping[str, V5MetricEstimate]
+    calibration: V5CalibrationEvidence
+    economics: V5EconomicEvidence
+    by_family: tuple[V5FamilyMetrics, ...]
+    bootstrap: V5MetricBootstrapSummary
+    complete_metrics_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    summary_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("aggregate", mode="after")
+    @classmethod
+    def aggregate_is_immutable(
+        cls, value: Mapping[str, V5MetricEstimate]
+    ) -> Mapping[str, V5MetricEstimate]:
+        return MappingProxyType(dict(sorted(value.items())))
+
+    @field_serializer("aggregate")
+    def serialize_aggregate(self, value: Mapping[str, V5MetricEstimate]) -> dict[str, object]:
+        return {name: metric.model_dump(mode="json") for name, metric in value.items()}
+
+    @model_validator(mode="after")
+    def summary_is_bound(self) -> Self:
+        expected = _sha256(
+            _canonical_bytes(self.model_dump(mode="json", exclude={"summary_sha256"}))
+        )
+        if self.summary_sha256 != expected:
+            raise ValueError("complete metric summary digest differs")
+        return self
+
+    def stable_document(self) -> dict[str, object]:
+        """Return the existing frozen deterministic metric projection."""
+        document = self.model_dump(
+            mode="json",
+            exclude={
+                "schema_version",
+                "deterministic_result_sha256",
+                "summary_sha256",
+            },
+        )
+        return _stable_complete_metrics(
+            document,
+            deterministic_result_sha256=self.deterministic_result_sha256,
+        )
+
+
+class V5MetricWorkerResourceTelemetry(BaseModel):
+    """Resource measurements reported by one fresh Stage 70 interpreter."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    fresh_interpreter: Literal[True]
+    wall_seconds: float = Field(gt=0.0, le=21_600.0)
+    peak_rss_bytes: int = Field(gt=0)
+    artifact_bytes: int = Field(gt=0)
+
+
+class V5MetricArmWorkerReceipt(BaseModel):
+    """Authenticated compact output from one source-bound Stage 70 candidate worker."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["apar-sentinel-v5-source-bound-metric-arm-worker/1"]
+    stage: Literal["70_metrics"]
+    mode: V5KaggleMode
+    run_binding_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    attempt_receipt_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    execution_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    arm_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    arm_manifest_deterministic_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    arm: V5Arm
+    arm_index: int = Field(ge=0, lt=len(_STAGED_ARMS))
+    arm_order: tuple[V5Arm, ...]
+    support_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    support_count: int = Field(gt=0)
+    support_event_ids_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    deterministic_result_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    evidence_protocol_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    implementation_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    metric_summary: V5CompleteArmMetricSummary
+    resource_telemetry: V5MetricWorkerResourceTelemetry
+    receipt_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def receipt_is_bound(self) -> Self:
+        expected = _sha256(
+            _canonical_bytes(self.model_dump(mode="json", exclude={"receipt_sha256"}))
+        )
+        if self.receipt_sha256 != expected:
+            raise ValueError("metric worker receipt digest differs")
+        if self.arm_order != _STAGED_ARMS:
+            raise ValueError("metric worker arm order differs")
+        if self.arm is not self.arm_order[self.arm_index]:
+            raise ValueError("metric worker arm index differs")
+        if self.metric_summary.arm is not self.arm:
+            raise ValueError("metric worker summary arm differs")
+        if self.metric_summary.support_sha256 != self.support_sha256:
+            raise ValueError("metric worker summary support differs")
+        if (
+            self.metric_summary.deterministic_result_sha256
+            != self.deterministic_result_sha256
+        ):
+            raise ValueError("metric worker deterministic result differs")
+        return self
+
+
+class V5CompactFinalPayload(BaseModel):
+    """Official Stage 80 index over the authenticated compact Stage 70 chain."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["apar-sentinel-v5-kaggle-compact-final-payload/2"]
+    mode: V5KaggleMode
+    profile: Literal["production"]
+    development_test_seed: int
+    run_binding_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    support_plan: V5KaggleSupportPlan
+    attempt_receipt_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    checkpoint_chain: V5CheckpointChainBinding
+    evidence_protocol_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    implementation_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    catalog_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    arm_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    arm_manifest_deterministic_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    metric_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    metric_manifest_deterministic_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    deterministic_metric_stage_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    metric_worker_receipt_sha256: tuple[str, ...]
+    worker_resources: tuple[V5MetricWorkerResourceTelemetry, ...]
+    controls_suite_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    readiness: V5ReadinessEvidence
+    final_core_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    payload_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def compact_final_is_bound(self) -> Self:
+        expected_seed = {
+            V5KaggleMode.CAPACITY_VALIDATION: 404,
+            V5KaggleMode.LOCKED_SUCCESSOR: 2404,
+        }[self.mode]
+        if (
+            self.development_test_seed != expected_seed
+            or self.support_plan.mode is not self.mode
+            or self.checkpoint_chain.attempt_receipt_sha256
+            != self.attempt_receipt_sha256
+            or len(self.metric_worker_receipt_sha256) != len(_STAGED_ARMS)
+            or len(set(self.metric_worker_receipt_sha256)) != len(_STAGED_ARMS)
+            or len(self.worker_resources) != len(_STAGED_ARMS)
+        ):
+            raise ValueError("compact final chain shape differs")
+        expected = _sha256(
+            _canonical_bytes(self.model_dump(mode="json", exclude={"payload_sha256"}))
+        )
+        if self.payload_sha256 != expected:
+            raise ValueError("compact final payload digest differs")
+        return self
 
 
 def _require_sha256(value: str, *, label: str) -> None:
@@ -304,6 +545,257 @@ def _canonical_sequence_sha256(items: Sequence[dict[str, object]]) -> str:
 
 def _sha256(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
+
+
+def _bootstrap_sample_stream_sha256(metrics: V5CompleteArmMetrics) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"[")
+    for index, sample in enumerate(metrics.bootstrap.samples):
+        if index:
+            digest.update(b",")
+        digest.update(_canonical_bytes(sample.model_dump(mode="json")))
+    digest.update(b"]")
+    return digest.hexdigest()
+
+
+def summarize_v5_complete_arm_metrics(
+    *,
+    metric: V5CompleteArmMetrics,
+    deterministic_result_sha256: str,
+) -> V5CompleteArmMetricSummary:
+    """Address complete deterministic draws while retaining all reported semantics."""
+    _require_sha256(
+        deterministic_result_sha256,
+        label="metric summary deterministic result digest",
+    )
+    bootstrap_values: dict[str, object] = {
+        "schema_version": "apar-sentinel-v5-bootstrap-summary/1",
+        "seed": metric.bootstrap.seed,
+        "replicates": metric.bootstrap.replicates,
+        "confidence_level": metric.bootstrap.confidence_level,
+        "interval_method": metric.bootstrap.interval_method,
+        "resampling_unit": metric.bootstrap.resampling_unit,
+        "stratification": metric.bootstrap.stratification,
+        "strata": metric.bootstrap.strata,
+        "sample_count": len(metric.bootstrap.samples),
+        "sample_stream_sha256": _bootstrap_sample_stream_sha256(metric),
+        "intervals": tuple(
+            item.model_dump(mode="json") for item in metric.bootstrap.intervals
+        ),
+        "bootstrap_sha256": metric.bootstrap.bootstrap_sha256,
+    }
+    bootstrap_values["summary_sha256"] = _sha256(_canonical_bytes(bootstrap_values))
+    bootstrap = V5MetricBootstrapSummary.model_validate(bootstrap_values)
+    summary_values: dict[str, object] = {
+        "schema_version": "apar-sentinel-v5-complete-metric-summary/1",
+        "deterministic_result_sha256": deterministic_result_sha256,
+        "arm": metric.arm,
+        "arm_result_sha256": metric.arm_result_sha256,
+        "support_sha256": metric.support_sha256,
+        "aggregate": {
+            name: item.model_dump(mode="json")
+            for name, item in metric.aggregate.items()
+        },
+        "calibration": metric.calibration.model_dump(mode="json"),
+        "economics": metric.economics.model_dump(mode="json"),
+        "by_family": tuple(
+            item.model_dump(mode="json") for item in metric.by_family
+        ),
+        "bootstrap": bootstrap.model_dump(mode="json"),
+        "complete_metrics_sha256": metric.complete_metrics_sha256,
+    }
+    summary_values["summary_sha256"] = _sha256(_canonical_bytes(summary_values))
+    return V5CompleteArmMetricSummary.model_validate(summary_values)
+
+
+def build_v5_metric_arm_worker_receipt(
+    *,
+    mode: V5KaggleMode,
+    run_binding_sha256: str,
+    attempt_receipt_sha256: str,
+    execution_manifest_sha256: str,
+    arm_manifest_sha256: str,
+    arm_manifest_deterministic_sha256: str,
+    arm_index: int,
+    arm_order: tuple[str, ...],
+    support_count: int,
+    support_event_ids_sha256: str,
+    summary: V5CompleteArmMetricSummary,
+    evidence_protocol_sha256: str,
+    implementation_sha256: str,
+    wall_seconds: float,
+    peak_rss_bytes: int,
+    artifact_bytes: int,
+) -> V5MetricArmWorkerReceipt:
+    """Bind one compact metric summary to its exact run, arm, and resources."""
+    values: dict[str, object] = {
+        "schema_version": "apar-sentinel-v5-source-bound-metric-arm-worker/1",
+        "stage": V5KaggleStage.METRICS.value,
+        "mode": mode.value,
+        "run_binding_sha256": run_binding_sha256,
+        "attempt_receipt_sha256": attempt_receipt_sha256,
+        "execution_manifest_sha256": execution_manifest_sha256,
+        "arm_manifest_sha256": arm_manifest_sha256,
+        "arm_manifest_deterministic_sha256": arm_manifest_deterministic_sha256,
+        "arm": summary.arm.value,
+        "arm_index": arm_index,
+        "arm_order": arm_order,
+        "support_sha256": summary.support_sha256,
+        "support_count": support_count,
+        "support_event_ids_sha256": support_event_ids_sha256,
+        "deterministic_result_sha256": summary.deterministic_result_sha256,
+        "evidence_protocol_sha256": evidence_protocol_sha256,
+        "implementation_sha256": implementation_sha256,
+        "metric_summary": summary.model_dump(mode="json"),
+        "resource_telemetry": {
+            "fresh_interpreter": True,
+            "wall_seconds": wall_seconds,
+            "peak_rss_bytes": peak_rss_bytes,
+            "artifact_bytes": artifact_bytes,
+        },
+    }
+    values["receipt_sha256"] = _sha256(_canonical_bytes(values))
+    return V5MetricArmWorkerReceipt.model_validate(values)
+
+
+def validate_v5_metric_arm_worker_receipt(
+    *,
+    receipt: V5MetricArmWorkerReceipt,
+    expected: Mapping[str, object],
+    max_peak_rss_bytes: int,
+    max_artifact_bytes: int,
+) -> V5MetricArmWorkerReceipt:
+    """Fail closed unless a worker receipt matches every coordinator binding."""
+    actual = receipt.model_dump(mode="json")
+    for name, expected_value in expected.items():
+        normalized_expected = (
+            expected_value.value
+            if isinstance(expected_value, (V5Arm, V5KaggleMode, V5KaggleStage))
+            else expected_value
+        )
+        if isinstance(normalized_expected, tuple):
+            normalized_expected = list(normalized_expected)
+        if actual.get(name) != normalized_expected:
+            raise ValueError(f"metric worker {name} differs")
+    telemetry = receipt.resource_telemetry
+    if (
+        telemetry.peak_rss_bytes >= max_peak_rss_bytes
+        or telemetry.artifact_bytes >= max_artifact_bytes
+    ):
+        raise ValueError("metric worker resource gate failed")
+    return receipt
+
+
+def execute_v5_metric_arm_worker(
+    *,
+    root: Path,
+    mode: V5KaggleMode,
+    run_binding_sha256: str,
+    attempt_receipt_sha256: str,
+    execution_manifest_sha256: str,
+    arm_checkpoint_root: Path,
+    arm_manifest_sha256: str,
+    arm_manifest_deterministic_sha256: str,
+    target_arm: str,
+) -> V5MetricArmWorkerReceipt:
+    """Compute one exact arm metric inside the caller's fresh interpreter."""
+    started = time.perf_counter()
+    protocol = load_v5_kaggle_protocol(root / _PROTOCOL_PATH, root=root)
+    if protocol.run_binding_sha256(mode) != run_binding_sha256:
+        raise PermissionError("metric worker run binding differs")
+    arm_manifest = read_v5_checkpoint_manifest(
+        output_root=arm_checkpoint_root,
+        limits=protocol.resources,
+    )
+    if (
+        arm_manifest.stage is not V5KaggleStage.ARMS
+        or arm_manifest.run_binding_sha256 != run_binding_sha256
+        or arm_manifest.attempt_receipt_sha256 != attempt_receipt_sha256
+        or arm_manifest.manifest_sha256 != arm_manifest_sha256
+        or arm_manifest.deterministic_sha256
+        != arm_manifest_deterministic_sha256
+    ):
+        raise PermissionError("metric worker Stage 30 manifest differs")
+    evidence_protocol = load_v5_evidence_protocol(
+        root / protocol.source_bindings.evidence_protocol_path,
+        root=root,
+    )
+    isolated = load_v5_metric_worker_arm_result(
+        checkpoint_root=arm_checkpoint_root,
+        limits=protocol.resources,
+        target_arm=target_arm,
+    )
+    metric = evaluate_v5_complete_result(
+        result=isolated.result,
+        protocol=evidence_protocol,
+    )
+    summary = summarize_v5_complete_arm_metrics(
+        metric=metric,
+        deterministic_result_sha256=isolated.deterministic_result_sha256,
+    )
+    maximum_rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    if sys.platform != "darwin":
+        maximum_rss *= 1024
+    receipt = build_v5_metric_arm_worker_receipt(
+        mode=mode,
+        run_binding_sha256=run_binding_sha256,
+        attempt_receipt_sha256=attempt_receipt_sha256,
+        execution_manifest_sha256=execution_manifest_sha256,
+        arm_manifest_sha256=arm_manifest_sha256,
+        arm_manifest_deterministic_sha256=arm_manifest_deterministic_sha256,
+        arm_index=isolated.arm_index,
+        arm_order=tuple(arm.value for arm in _STAGED_ARMS),
+        support_count=isolated.result.support_total,
+        support_event_ids_sha256=isolated.support_event_ids_sha256,
+        summary=summary,
+        evidence_protocol_sha256=evidence_protocol.evidence_protocol_sha256,
+        implementation_sha256=evidence_protocol.implementation_sha256,
+        wall_seconds=max(time.perf_counter() - started, 1e-9),
+        peak_rss_bytes=max(maximum_rss, 1),
+        artifact_bytes=len(_canonical_bytes(summary.model_dump(mode="json"))),
+    )
+    validate_v5_metric_arm_worker_receipt(
+        receipt=receipt,
+        expected={
+            "mode": mode,
+            "run_binding_sha256": run_binding_sha256,
+            "attempt_receipt_sha256": attempt_receipt_sha256,
+            "execution_manifest_sha256": execution_manifest_sha256,
+            "arm_manifest_sha256": arm_manifest_sha256,
+            "arm_manifest_deterministic_sha256": (
+                arm_manifest_deterministic_sha256
+            ),
+            "arm": target_arm,
+            "arm_index": isolated.arm_index,
+            "arm_order": tuple(arm.value for arm in _STAGED_ARMS),
+            "support_sha256": isolated.result.support_sha256,
+            "support_count": isolated.result.support_total,
+            "support_event_ids_sha256": isolated.support_event_ids_sha256,
+            "deterministic_result_sha256": isolated.deterministic_result_sha256,
+            "evidence_protocol_sha256": (
+                evidence_protocol.evidence_protocol_sha256
+            ),
+            "implementation_sha256": evidence_protocol.implementation_sha256,
+        },
+        max_peak_rss_bytes=protocol.resources.max_peak_rss_bytes,
+        max_artifact_bytes=min(
+            protocol.resources.max_stage_output_bytes,
+            256 * 1024**2,
+        ),
+    )
+    return receipt
+
+
+def build_v5_readiness_from_metric_summary(
+    *,
+    metrics: V5CompleteArmMetricSummary,
+    controls: V5ExecutedControlSuite,
+) -> V5ReadinessEvidence:
+    """Evaluate unchanged readiness gates from an authenticated metric summary."""
+    return _build_v5_readiness_evidence_from_source(
+        metrics=metrics,
+        controls=controls,
+    )
 
 
 def _development_protocol_for_stage(
@@ -1418,6 +1910,194 @@ def execute_v5_arm_stage(
         )
 
 
+def _skip_v5_metric_worker_arm_section(
+    records: Iterator[V5CheckpointInput],
+    *,
+    kind: str,
+    arm: str,
+    record_count: int,
+    layer: str,
+) -> None:
+    """Consume one non-target section without retaining its record payloads."""
+    for record_index in range(record_count):
+        try:
+            record = next(records)
+        except StopIteration as error:
+            raise ValueError(f"{arm} skipped section record is missing") from error
+        if (
+            record.kind != kind
+            or record.key != f"{arm}:{record_index:04d}"
+            or record.layer != layer
+            or len(record.canonical_bytes) > _MAX_ARM_SECTION_RECORD_BYTES
+        ):
+            raise ValueError(f"{arm} skipped section record order differs")
+
+
+def load_v5_metric_worker_arm_result(
+    *,
+    checkpoint_root: Path,
+    limits: V5KaggleResourceGates,
+    target_arm: str,
+) -> V5MetricWorkerArmResult:
+    """Restore exactly one Stage 30 arm while authenticating both complete streams."""
+    deterministic = iter(
+        iter_v5_checkpoint_records(output_root=checkpoint_root, limits=limits)
+    )
+    observational = iter(
+        iter_v5_checkpoint_observational_records(
+            output_root=checkpoint_root,
+            limits=limits,
+        )
+    )
+    try:
+        header_record = next(deterministic)
+    except StopIteration as error:
+        raise ValueError("arm checkpoint is empty") from error
+    header = _read_json_record(header_record, label="arm header")
+    expected_order = tuple(arm.value for arm in _STAGED_ARMS)
+    if (
+        set(header)
+        != {
+            "schema_version",
+            "arm_order",
+            "support_event_ids",
+            "support_sha256",
+            "deterministic_result_sha256",
+        }
+        or header_record.kind != "arm_header"
+        or header_record.key != "arms"
+        or header.get("schema_version") != _ARM_HEADER_SCHEMA
+        or header.get("arm_order") != list(expected_order)
+    ):
+        raise ValueError("arm checkpoint header differs")
+    if target_arm not in expected_order:
+        raise ValueError("metric worker target arm is not in the frozen arm order")
+    expected_core_digests = header.get("deterministic_result_sha256")
+    support_event_ids = header.get("support_event_ids")
+    support_sha256 = header.get("support_sha256")
+    if (
+        not isinstance(expected_core_digests, list)
+        or len(expected_core_digests) != len(expected_order)
+        or not isinstance(support_event_ids, list)
+        or not support_event_ids
+        or any(type(event_id) is not str for event_id in support_event_ids)
+        or type(support_sha256) is not str
+    ):
+        raise ValueError("arm checkpoint header support differs")
+    _require_sha256(support_sha256, label="arm checkpoint support digest")
+
+    restored: V5MetricWorkerArmResult | None = None
+    for index, arm in enumerate(expected_order):
+        try:
+            core_meta_record = next(deterministic)
+            latency_meta_record = next(observational)
+        except StopIteration as error:
+            raise ValueError("arm result or latency evidence is missing") from error
+        core, core_sections = _read_arm_meta_record(
+            core_meta_record,
+            kind="arm_result_meta",
+            arm=arm,
+            schema=_ARM_RESULT_META_SCHEMA,
+            section_names=("execution_artifacts", "row_evidence"),
+            layer="deterministic",
+        )
+        observation, observation_sections = _read_arm_meta_record(
+            latency_meta_record,
+            kind="arm_latency_meta",
+            arm=arm,
+            schema=_ARM_LATENCY_META_SCHEMA,
+            section_names=("samples",),
+            layer="observational",
+        )
+        expected_digest = expected_core_digests[index]
+        if (
+            type(expected_digest) is not str
+            or core.get("deterministic_result_sha256") != expected_digest
+        ):
+            raise ValueError("arm deterministic result index binding differs")
+        _require_sha256(expected_digest, label=f"{arm} deterministic result digest")
+
+        if arm == target_arm:
+            core["execution_artifacts"] = _read_arm_section_records(
+                deterministic,
+                kind="arm_execution_artifacts",
+                arm=arm,
+                section="execution_artifacts",
+                index=core_sections["execution_artifacts"],
+                layer="deterministic",
+            )
+            core["row_evidence"] = _read_arm_section_records(
+                deterministic,
+                kind="arm_result_rows",
+                arm=arm,
+                section="row_evidence",
+                index=core_sections["row_evidence"],
+                layer="deterministic",
+            )
+            observation["samples"] = _read_arm_section_records(
+                observational,
+                kind="arm_latency_samples",
+                arm=arm,
+                section="samples",
+                index=observation_sections["samples"],
+                layer="observational",
+            )
+            result = _restore_arm_result(core=core, observation=observation)
+            result_event_ids = [row.support.event_id for row in result.row_evidence]
+            if (
+                result.arm != arm
+                or result.support_sha256 != support_sha256
+                or result_event_ids != support_event_ids
+            ):
+                raise ValueError("metric worker arm support binding differs")
+            restored = V5MetricWorkerArmResult(
+                arm=arm,
+                arm_index=index,
+                deterministic_result_sha256=expected_digest,
+                support_event_ids_sha256=_sha256(
+                    _canonical_bytes(support_event_ids)
+                ),
+                result=result,
+            )
+            continue
+
+        _skip_v5_metric_worker_arm_section(
+            deterministic,
+            kind="arm_execution_artifacts",
+            arm=arm,
+            record_count=core_sections["execution_artifacts"][1],
+            layer="deterministic",
+        )
+        _skip_v5_metric_worker_arm_section(
+            deterministic,
+            kind="arm_result_rows",
+            arm=arm,
+            record_count=core_sections["row_evidence"][1],
+            layer="deterministic",
+        )
+        _skip_v5_metric_worker_arm_section(
+            observational,
+            kind="arm_latency_samples",
+            arm=arm,
+            record_count=observation_sections["samples"][1],
+            layer="observational",
+        )
+
+    for stream, label in (
+        (deterministic, "deterministic"),
+        (observational, "observational"),
+    ):
+        try:
+            next(stream)
+        except StopIteration:
+            pass
+        else:
+            raise ValueError(f"arm checkpoint has extra {label} records")
+    if restored is None:
+        raise ValueError("metric worker target arm was not restored")
+    return restored
+
+
 def load_v5_arm_checkpoint(
     *,
     checkpoint_root: Path,
@@ -1826,6 +2506,145 @@ def _metric_stage_core_and_observation(
     )
 
 
+def _validate_v5_metric_worker_receipt_set(
+    receipts: tuple[V5MetricArmWorkerReceipt, ...],
+) -> None:
+    expected_order = tuple(arm.value for arm in _STAGED_ARMS)
+    if (
+        len(receipts) != len(expected_order)
+        or tuple(receipt.arm.value for receipt in receipts) != expected_order
+        or tuple(receipt.arm_index for receipt in receipts)
+        != tuple(range(len(expected_order)))
+        or any(
+            tuple(arm.value for arm in receipt.arm_order) != expected_order
+            for receipt in receipts
+        )
+    ):
+        raise ValueError("metric worker receipt order differs")
+    common_fields = (
+        "mode",
+        "run_binding_sha256",
+        "attempt_receipt_sha256",
+        "execution_manifest_sha256",
+        "arm_manifest_sha256",
+        "arm_manifest_deterministic_sha256",
+        "support_sha256",
+        "support_count",
+        "support_event_ids_sha256",
+        "evidence_protocol_sha256",
+        "implementation_sha256",
+    )
+    for field in common_fields:
+        if len({getattr(receipt, field) for receipt in receipts}) != 1:
+            raise ValueError(f"metric worker receipt {field} differs across arms")
+    if tuple(
+        receipt.metric_summary.deterministic_result_sha256 for receipt in receipts
+    ) != tuple(receipt.deterministic_result_sha256 for receipt in receipts):
+        raise ValueError("metric worker deterministic result order differs")
+
+
+def build_v5_compact_metric_stage_documents(
+    *,
+    receipts: tuple[V5MetricArmWorkerReceipt, ...],
+    controls: V5ExecutedControlSuite,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Build the unchanged Stage 70 core from compact authenticated arm summaries."""
+    _validate_v5_metric_worker_receipt_set(receipts)
+    readiness = build_v5_readiness_from_metric_summary(
+        metrics=receipts[_STAGED_ARMS.index(V5Arm.FULL_SENTINEL)].metric_summary,
+        controls=controls,
+    )
+    controls_document = controls.model_dump(mode="json")
+    readiness_document = readiness.model_dump(mode="json")
+    stable_controls, control_digests = _stable_controls(controls_document)
+    core: dict[str, object] = {
+        "schema_version": "apar-sentinel-v5-kaggle-metric-core/1",
+        "arm_order": tuple(arm.value for arm in _STAGED_ARMS),
+        "deterministic_result_sha256": tuple(
+            receipt.deterministic_result_sha256 for receipt in receipts
+        ),
+        "complete_metrics": tuple(
+            receipt.metric_summary.stable_document() for receipt in receipts
+        ),
+        "controls": stable_controls,
+        "readiness": _stable_readiness(
+            readiness_document,
+            deterministic_control_digests=control_digests,
+        ),
+    }
+    core["deterministic_metric_stage_sha256"] = _sha256(_canonical_bytes(core))
+    observation: dict[str, object] = {
+        "schema_version": "apar-sentinel-v5-kaggle-metric-observation/2",
+        "deterministic_metric_stage_sha256": core[
+            "deterministic_metric_stage_sha256"
+        ],
+        "worker_receipts": tuple(
+            receipt.model_dump(mode="json") for receipt in receipts
+        ),
+        "controls": controls_document,
+        "readiness": readiness_document,
+    }
+    observation["observational_metric_stage_sha256"] = _sha256(
+        _canonical_bytes(observation)
+    )
+    return cast(dict[str, object], json.loads(_canonical_bytes(core))), cast(
+        dict[str, object],
+        json.loads(_canonical_bytes(observation)),
+    )
+
+
+def _restore_v5_compact_metric_stage_evidence(
+    *,
+    core: dict[str, object],
+    observation: dict[str, object],
+) -> V5CompactMetricStageEvidence:
+    """Rebind a compact Stage 70 observation to its unchanged deterministic core."""
+    claimed_core = core.get("deterministic_metric_stage_sha256")
+    core_document = dict(core)
+    core_document.pop("deterministic_metric_stage_sha256", None)
+    if (
+        type(claimed_core) is not str
+        or _sha256(_canonical_bytes(core_document)) != claimed_core
+    ):
+        raise ValueError("deterministic compact metric stage digest differs")
+    claimed_observation = observation.get("observational_metric_stage_sha256")
+    observation_document = dict(observation)
+    observation_document.pop("observational_metric_stage_sha256", None)
+    if (
+        type(claimed_observation) is not str
+        or _sha256(_canonical_bytes(observation_document)) != claimed_observation
+    ):
+        raise ValueError("observational compact metric stage digest differs")
+    raw_receipts = observation.get("worker_receipts")
+    raw_controls = observation.get("controls")
+    raw_readiness = observation.get("readiness")
+    if (
+        observation.get("schema_version")
+        != "apar-sentinel-v5-kaggle-metric-observation/2"
+        or observation.get("deterministic_metric_stage_sha256") != claimed_core
+        or not isinstance(raw_receipts, list)
+        or not isinstance(raw_controls, dict)
+        or not isinstance(raw_readiness, dict)
+    ):
+        raise ValueError("compact metric stage observation is malformed")
+    receipts = tuple(
+        V5MetricArmWorkerReceipt.model_validate(item) for item in raw_receipts
+    )
+    controls = V5ExecutedControlSuite.model_validate(raw_controls)
+    readiness = V5ReadinessEvidence.model_validate(raw_readiness)
+    rebuilt_core, rebuilt_observation = build_v5_compact_metric_stage_documents(
+        receipts=receipts,
+        controls=controls,
+    )
+    if rebuilt_core != core or rebuilt_observation != observation:
+        raise ValueError("compact metric stage differs from authenticated receipts")
+    return V5CompactMetricStageEvidence(
+        worker_receipts=receipts,
+        controls=controls,
+        readiness=readiness,
+    )
+
+
 def _restore_metric_stage_evidence(
     *, core: dict[str, object], observation: dict[str, object]
 ) -> V5MetricStageEvidence:
@@ -1943,9 +2762,6 @@ def execute_v5_metric_stage(
         )
     ):
         raise PermissionError("metric checkpoint lineage differs")
-    arm_results = load_v5_arm_checkpoint(
-        checkpoint_root=arm_checkpoint_root, limits=protocol.resources
-    )
     control_groups = tuple(
         load_v5_control_group_checkpoint(checkpoint_root=path, limits=protocol.resources)
         for path in control_roots
@@ -1953,13 +2769,14 @@ def execute_v5_metric_stage(
     evidence_protocol = load_v5_evidence_protocol(
         root / protocol.source_bindings.evidence_protocol_path, root=root
     )
-    evidence = build_v5_metric_stage_evidence(
-        arm_results=arm_results,
+    core, observation = _execute_v5_memory_safe_metric_stage(
+        root=root,
+        capability=capability,
+        arm_checkpoint_root=arm_checkpoint_root,
+        arm_manifest=arm_manifest,
         control_groups=control_groups,
         evidence_protocol=evidence_protocol,
-    )
-    core, observation = _metric_stage_core_and_observation(
-        evidence=evidence, arm_results=arm_results
+        limits=protocol.resources,
     )
     yield V5CheckpointInput(
         kind="metric_evidence",
@@ -1974,9 +2791,160 @@ def execute_v5_metric_stage(
     )
 
 
+def _run_v5_metric_arm_worker_subprocess(
+    *,
+    root: Path,
+    capability: V5StageCapability,
+    arm_checkpoint_root: Path,
+    arm_manifest: V5CheckpointManifest,
+    target_arm: V5Arm,
+    evidence_protocol: V5EvidenceProtocol,
+    limits: V5KaggleResourceGates,
+    timeout_seconds: float,
+) -> V5MetricArmWorkerReceipt:
+    """Run one candidate metric arm through an exclusive file-only child channel."""
+    if timeout_seconds <= 0.0:
+        raise TimeoutError("metric worker stage deadline expired")
+    with tempfile.TemporaryDirectory(prefix="apar-v5-stage70-") as temporary:
+        receipt_path = Path(temporary) / "metric-arm-receipt.json"
+        command = [
+            sys.executable,
+            str(root / "scripts/run_defense_v5_kaggle_stage.py"),
+            "--internal-metric-worker",
+            "--root",
+            str(root),
+            "--mode",
+            capability.mode.value,
+            "--run-binding-sha256",
+            capability.run_binding_sha256,
+            "--attempt-receipt-sha256",
+            capability.attempt_receipt_sha256,
+            "--execution-manifest-sha256",
+            capability.execution_manifest_sha256,
+            "--arm-checkpoint-root",
+            str(arm_checkpoint_root),
+            "--arm-manifest-sha256",
+            arm_manifest.manifest_sha256,
+            "--arm-manifest-deterministic-sha256",
+            arm_manifest.deterministic_sha256,
+            "--target-arm",
+            target_arm.value,
+            "--receipt-path",
+            str(receipt_path),
+            "--max-address-space-bytes",
+            str(limits.max_peak_rss_bytes),
+        ]
+        environment = dict(os.environ)
+        environment["PYTHONHASHSEED"] = "0"
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=root,
+                env=environment,
+                check=False,
+                capture_output=True,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise TimeoutError("metric worker stage deadline expired") from error
+        if completed.returncode != 0 or completed.stdout or completed.stderr:
+            raise RuntimeError(
+                "metric worker failed closed: "
+                f"exit={completed.returncode} "
+                f"stdout_bytes={len(completed.stdout)} "
+                f"stdout_sha256={_sha256(completed.stdout)} "
+                f"stderr_bytes={len(completed.stderr)} "
+                f"stderr_sha256={_sha256(completed.stderr)}"
+            )
+        if receipt_path.is_symlink() or not receipt_path.is_file():
+            raise ValueError("metric worker receipt file is missing or linked")
+        metadata = receipt_path.stat()
+        max_artifact_bytes = min(limits.max_stage_output_bytes, 256 * 1024**2)
+        if (
+            metadata.st_nlink != 1
+            or metadata.st_size <= 0
+            or metadata.st_size >= max_artifact_bytes
+        ):
+            raise ValueError("metric worker receipt file exceeds resource gate")
+        raw_receipt = receipt_path.read_bytes()
+        try:
+            raw_document = json.loads(raw_receipt)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("metric worker receipt is not JSON") from error
+        if raw_receipt != _canonical_bytes(raw_document):
+            raise ValueError("metric worker receipt is not canonical")
+        receipt = V5MetricArmWorkerReceipt.model_validate(raw_document)
+        validate_v5_metric_arm_worker_receipt(
+            receipt=receipt,
+            expected={
+                "mode": capability.mode,
+                "run_binding_sha256": capability.run_binding_sha256,
+                "attempt_receipt_sha256": capability.attempt_receipt_sha256,
+                "execution_manifest_sha256": capability.execution_manifest_sha256,
+                "arm_manifest_sha256": arm_manifest.manifest_sha256,
+                "arm_manifest_deterministic_sha256": (
+                    arm_manifest.deterministic_sha256
+                ),
+                "arm": target_arm,
+                "arm_index": _STAGED_ARMS.index(target_arm),
+                "arm_order": tuple(arm.value for arm in _STAGED_ARMS),
+                "support_sha256": receipt.support_sha256,
+                "support_count": receipt.support_count,
+                "support_event_ids_sha256": receipt.support_event_ids_sha256,
+                "deterministic_result_sha256": (
+                    receipt.deterministic_result_sha256
+                ),
+                "evidence_protocol_sha256": (
+                    evidence_protocol.evidence_protocol_sha256
+                ),
+                "implementation_sha256": (
+                    evidence_protocol.implementation_sha256
+                ),
+            },
+            max_peak_rss_bytes=limits.max_peak_rss_bytes,
+            max_artifact_bytes=max_artifact_bytes,
+        )
+        return receipt
+
+
+def _execute_v5_memory_safe_metric_stage(
+    *,
+    root: Path,
+    capability: V5StageCapability,
+    arm_checkpoint_root: Path,
+    arm_manifest: V5CheckpointManifest,
+    control_groups: tuple[V5ExecutedControlGroup, ...],
+    evidence_protocol: V5EvidenceProtocol,
+    limits: V5KaggleResourceGates,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Execute the source-bound Stage 70 worker protocol without retaining all arms."""
+    deadline = time.monotonic() + limits.max_stage_seconds
+    receipts: list[V5MetricArmWorkerReceipt] = []
+    for arm in _STAGED_ARMS:
+        receipts.append(
+            _run_v5_metric_arm_worker_subprocess(
+                root=root,
+                capability=capability,
+                arm_checkpoint_root=arm_checkpoint_root,
+                arm_manifest=arm_manifest,
+                target_arm=arm,
+                evidence_protocol=evidence_protocol,
+                limits=limits,
+                timeout_seconds=max(deadline - time.monotonic(), 1e-9),
+            )
+        )
+    frozen_receipts = tuple(receipts)
+    _validate_v5_metric_worker_receipt_set(frozen_receipts)
+    controls = assemble_v5_control_suite(control_groups)
+    return build_v5_compact_metric_stage_documents(
+        receipts=frozen_receipts,
+        controls=controls,
+    )
+
+
 def load_v5_metric_checkpoint(
     *, checkpoint_root: Path, limits: V5KaggleResourceGates
-) -> V5MetricStageEvidence:
+) -> V5MetricStageEvidence | V5CompactMetricStageEvidence:
     """Load and rebind complete metrics with exact observational evidence."""
     deterministic = tuple(iter_v5_checkpoint_records(output_root=checkpoint_root, limits=limits))
     observational = tuple(
@@ -1991,10 +2959,57 @@ def load_v5_metric_checkpoint(
         or observational[0].key != "complete"
     ):
         raise ValueError("metric checkpoint record identity differs")
-    return _restore_metric_stage_evidence(
-        core=_read_json_record(deterministic[0], label="deterministic metric stage"),
-        observation=_read_json_record(observational[0], label="observational metric stage"),
+    core = _read_json_record(deterministic[0], label="deterministic metric stage")
+    observation = _read_json_record(
+        observational[0],
+        label="observational metric stage",
     )
+    if (
+        observation.get("schema_version")
+        == "apar-sentinel-v5-kaggle-metric-observation/2"
+    ):
+        compact = _restore_v5_compact_metric_stage_evidence(
+            core=core,
+            observation=observation,
+        )
+        for receipt in compact.worker_receipts:
+            validate_v5_metric_arm_worker_receipt(
+                receipt=receipt,
+                expected={
+                    "mode": receipt.mode,
+                    "run_binding_sha256": receipt.run_binding_sha256,
+                    "attempt_receipt_sha256": receipt.attempt_receipt_sha256,
+                    "execution_manifest_sha256": (
+                        receipt.execution_manifest_sha256
+                    ),
+                    "arm_manifest_sha256": receipt.arm_manifest_sha256,
+                    "arm_manifest_deterministic_sha256": (
+                        receipt.arm_manifest_deterministic_sha256
+                    ),
+                    "arm": receipt.arm,
+                    "arm_index": receipt.arm_index,
+                    "arm_order": tuple(arm.value for arm in receipt.arm_order),
+                    "support_sha256": receipt.support_sha256,
+                    "support_count": receipt.support_count,
+                    "support_event_ids_sha256": (
+                        receipt.support_event_ids_sha256
+                    ),
+                    "deterministic_result_sha256": (
+                        receipt.deterministic_result_sha256
+                    ),
+                    "evidence_protocol_sha256": (
+                        receipt.evidence_protocol_sha256
+                    ),
+                    "implementation_sha256": receipt.implementation_sha256,
+                },
+                max_peak_rss_bytes=limits.max_peak_rss_bytes,
+                max_artifact_bytes=min(
+                    limits.max_stage_output_bytes,
+                    256 * 1024**2,
+                ),
+            )
+        return compact
+    return _restore_metric_stage_evidence(core=core, observation=observation)
 
 
 def _build_checkpoint_chain_binding(
@@ -2024,6 +3039,96 @@ def _build_checkpoint_chain_binding(
     return V5CheckpointChainBinding.model_validate(values)
 
 
+def _build_v5_compact_final_documents(
+    *,
+    capability: V5StageCapability,
+    chain: V5CheckpointChainBinding,
+    arm_manifest: V5CheckpointManifest,
+    metric_manifest: V5CheckpointManifest,
+    metric_evidence: V5CompactMetricStageEvidence,
+    support_plan: V5KaggleSupportPlan,
+    evidence_protocol: V5EvidenceProtocol,
+    catalog_sha256: str,
+) -> tuple[dict[str, object], bytes]:
+    """Build a bounded Stage 80 index without restoring any Stage 30 arm."""
+    receipts = metric_evidence.worker_receipts
+    _validate_v5_metric_worker_receipt_set(receipts)
+    for receipt in receipts:
+        if (
+            receipt.mode is not capability.mode
+            or receipt.run_binding_sha256 != capability.run_binding_sha256
+            or receipt.attempt_receipt_sha256 != capability.attempt_receipt_sha256
+            or receipt.execution_manifest_sha256
+            != capability.execution_manifest_sha256
+            or receipt.arm_manifest_sha256 != arm_manifest.manifest_sha256
+            or receipt.arm_manifest_deterministic_sha256
+            != arm_manifest.deterministic_sha256
+            or receipt.evidence_protocol_sha256
+            != evidence_protocol.evidence_protocol_sha256
+            or receipt.implementation_sha256
+            != evidence_protocol.implementation_sha256
+        ):
+            raise ValueError("compact final worker lineage differs")
+    metric_core, _metric_observation = build_v5_compact_metric_stage_documents(
+        receipts=receipts,
+        controls=metric_evidence.controls,
+    )
+    deterministic_metric_stage_sha256 = metric_core.get(
+        "deterministic_metric_stage_sha256"
+    )
+    if type(deterministic_metric_stage_sha256) is not str:
+        raise ValueError("compact final metric digest is missing")
+    core: dict[str, object] = {
+        "schema_version": "apar-sentinel-v5-kaggle-final-core/2",
+        "mode": capability.mode.value,
+        "run_binding_sha256": capability.run_binding_sha256,
+        "support_plan_sha256": support_plan.support_plan_sha256,
+        "checkpoint_chain_root_sha256": chain.predecessor_chain_root_sha256,
+        "arm_manifest_deterministic_sha256": arm_manifest.deterministic_sha256,
+        "metric_manifest_deterministic_sha256": metric_manifest.deterministic_sha256,
+        "deterministic_metric_stage_sha256": deterministic_metric_stage_sha256,
+        "evidence_protocol_sha256": evidence_protocol.evidence_protocol_sha256,
+        "implementation_sha256": evidence_protocol.implementation_sha256,
+        "catalog_sha256": catalog_sha256,
+    }
+    core["final_core_sha256"] = _sha256(_canonical_bytes(core))
+    values: dict[str, object] = {
+        "schema_version": "apar-sentinel-v5-kaggle-compact-final-payload/2",
+        "mode": capability.mode.value,
+        "profile": "production",
+        "development_test_seed": 404
+        if capability.mode is V5KaggleMode.CAPACITY_VALIDATION
+        else 2404,
+        "run_binding_sha256": capability.run_binding_sha256,
+        "support_plan": support_plan.model_dump(mode="json"),
+        "attempt_receipt_sha256": capability.attempt_receipt_sha256,
+        "checkpoint_chain": chain.model_dump(mode="json"),
+        "evidence_protocol_sha256": evidence_protocol.evidence_protocol_sha256,
+        "implementation_sha256": evidence_protocol.implementation_sha256,
+        "catalog_sha256": catalog_sha256,
+        "arm_manifest_sha256": arm_manifest.manifest_sha256,
+        "arm_manifest_deterministic_sha256": arm_manifest.deterministic_sha256,
+        "metric_manifest_sha256": metric_manifest.manifest_sha256,
+        "metric_manifest_deterministic_sha256": metric_manifest.deterministic_sha256,
+        "deterministic_metric_stage_sha256": deterministic_metric_stage_sha256,
+        "metric_worker_receipt_sha256": tuple(
+            receipt.receipt_sha256 for receipt in receipts
+        ),
+        "worker_resources": tuple(
+            receipt.resource_telemetry.model_dump(mode="json")
+            for receipt in receipts
+        ),
+        "controls_suite_sha256": metric_evidence.controls.suite_sha256,
+        "readiness": metric_evidence.readiness.model_dump(mode="json"),
+        "final_core_sha256": core["final_core_sha256"],
+    }
+    values["payload_sha256"] = _sha256(_canonical_bytes(values))
+    payload = V5CompactFinalPayload.model_validate(values)
+    return cast(dict[str, object], json.loads(_canonical_bytes(core))), _canonical_bytes(
+        payload.model_dump(mode="json")
+    )
+
+
 def execute_v5_finalize_stage(
     *,
     root: Path,
@@ -2048,6 +3153,46 @@ def execute_v5_finalize_stage(
     ):
         raise PermissionError("finalization capability or chain differs")
     roots_by_stage = dict(zip(predecessor_stages, roots, strict=True))
+    manifests_by_stage = dict(zip(predecessor_stages, manifests, strict=True))
+    retained_metrics = load_v5_metric_checkpoint(
+        checkpoint_root=roots_by_stage[V5KaggleStage.METRICS],
+        limits=protocol.resources,
+    )
+    evidence_protocol = load_v5_evidence_protocol(
+        root / protocol.source_bindings.evidence_protocol_path,
+        root=root,
+    )
+    support_plan = build_v5_kaggle_support_plan(
+        root=root,
+        protocol=protocol,
+        mode=capability.mode,
+    )
+    catalog = SentinelFeatureCatalog.from_config(
+        root / protocol.source_bindings.feature_catalog_path
+    )
+    if isinstance(retained_metrics, V5CompactMetricStageEvidence):
+        compact_core, compact_payload = _build_v5_compact_final_documents(
+            capability=capability,
+            chain=chain,
+            arm_manifest=manifests_by_stage[V5KaggleStage.ARMS],
+            metric_manifest=manifests_by_stage[V5KaggleStage.METRICS],
+            metric_evidence=retained_metrics,
+            support_plan=support_plan,
+            evidence_protocol=evidence_protocol,
+            catalog_sha256=catalog.catalog_sha256,
+        )
+        yield V5CheckpointInput(
+            kind="final_core",
+            key="complete",
+            canonical_bytes=_canonical_bytes(compact_core),
+        )
+        yield V5CheckpointInput(
+            kind="final_payload",
+            key="complete",
+            canonical_bytes=compact_payload,
+            layer="observational",
+        )
+        return
     arm_results = load_v5_arm_checkpoint(
         checkpoint_root=roots_by_stage[V5KaggleStage.ARMS], limits=protocol.resources
     )
@@ -2064,12 +3209,6 @@ def execute_v5_finalize_stage(
             V5KaggleStage.SINGLE_CLASS_CONTROLS,
         )
     )
-    retained_metrics = load_v5_metric_checkpoint(
-        checkpoint_root=roots_by_stage[V5KaggleStage.METRICS], limits=protocol.resources
-    )
-    evidence_protocol = load_v5_evidence_protocol(
-        root / protocol.source_bindings.evidence_protocol_path, root=root
-    )
     recomputed = build_v5_metric_stage_evidence(
         arm_results=arm_results,
         control_groups=control_groups,
@@ -2077,10 +3216,6 @@ def execute_v5_finalize_stage(
     )
     if recomputed != retained_metrics:
         raise ValueError("finalization recomputation differs from Stage 70 evidence")
-    support_plan = build_v5_kaggle_support_plan(root=root, protocol=protocol, mode=capability.mode)
-    catalog = SentinelFeatureCatalog.from_config(
-        root / protocol.source_bindings.feature_catalog_path
-    )
     payload_bytes = build_v5_staged_evidence_payload(
         mode=capability.mode,
         run_binding_sha256=capability.run_binding_sha256,
@@ -2115,7 +3250,7 @@ def execute_v5_finalize_stage(
 
 def load_v5_final_checkpoint(
     *, checkpoint_root: Path, limits: V5KaggleResourceGates
-) -> V5StagedEvidencePayload:
+) -> V5StagedEvidencePayload | V5CompactFinalPayload:
     """Load the final payload and bind it back to its deterministic core record."""
     deterministic = tuple(iter_v5_checkpoint_records(output_root=checkpoint_root, limits=limits))
     observational = tuple(
@@ -2131,18 +3266,50 @@ def load_v5_final_checkpoint(
     ):
         raise ValueError("final checkpoint record identity differs")
     core = _read_json_record(deterministic[0], label="final deterministic core")
-    claimed = core.pop("final_core_sha256", None)
-    if type(claimed) is not str or _sha256(_canonical_bytes(core)) != claimed:
+    claimed = core.get("final_core_sha256")
+    core_document = dict(core)
+    core_document.pop("final_core_sha256", None)
+    if type(claimed) is not str or _sha256(_canonical_bytes(core_document)) != claimed:
         raise ValueError("final deterministic core digest differs")
-    payload = V5StagedEvidencePayload.model_validate_json(observational[0].canonical_bytes)
+    if core.get("schema_version") == "apar-sentinel-v5-kaggle-final-core/2":
+        compact_payload = V5CompactFinalPayload.model_validate_json(
+            observational[0].canonical_bytes
+        )
+        if (
+            core.get("mode") != compact_payload.mode.value
+            or core.get("run_binding_sha256") != compact_payload.run_binding_sha256
+            or core.get("support_plan_sha256")
+            != compact_payload.support_plan.support_plan_sha256
+            or core.get("checkpoint_chain_root_sha256")
+            != compact_payload.checkpoint_chain.predecessor_chain_root_sha256
+            or core.get("arm_manifest_deterministic_sha256")
+            != compact_payload.arm_manifest_deterministic_sha256
+            or core.get("metric_manifest_deterministic_sha256")
+            != compact_payload.metric_manifest_deterministic_sha256
+            or core.get("deterministic_metric_stage_sha256")
+            != compact_payload.deterministic_metric_stage_sha256
+            or core.get("evidence_protocol_sha256")
+            != compact_payload.evidence_protocol_sha256
+            or core.get("implementation_sha256")
+            != compact_payload.implementation_sha256
+            or core.get("catalog_sha256") != compact_payload.catalog_sha256
+            or claimed != compact_payload.final_core_sha256
+        ):
+            raise ValueError("compact final deterministic/payload binding differs")
+        return compact_payload
+    legacy_payload = V5StagedEvidencePayload.model_validate_json(
+        observational[0].canonical_bytes
+    )
     if (
-        core.get("mode") != payload.mode.value
-        or core.get("run_binding_sha256") != payload.run_binding_sha256
-        or core.get("support_plan_sha256") != payload.support_plan.support_plan_sha256
-        or core.get("deterministic_core_sha256") != payload.deterministic_core.core_sha256
+        core.get("mode") != legacy_payload.mode.value
+        or core.get("run_binding_sha256") != legacy_payload.run_binding_sha256
+        or core.get("support_plan_sha256")
+        != legacy_payload.support_plan.support_plan_sha256
+        or core.get("deterministic_core_sha256")
+        != legacy_payload.deterministic_core.core_sha256
     ):
         raise ValueError("final deterministic/payload binding differs")
-    return payload
+    return legacy_payload
 
 
 def execute_v5_authorization_stage(

@@ -44,6 +44,7 @@ from apar.evaluation.v5_staged_evidence import (  # noqa: E402
     execute_v5_corpus_stage,
     execute_v5_feature_stage,
     execute_v5_finalize_stage,
+    execute_v5_metric_arm_worker,
     execute_v5_metric_stage,
 )
 from apar.v5_independent_verifier import (  # noqa: E402
@@ -538,8 +539,77 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _internal_metric_worker_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--mode", type=V5KaggleMode, required=True)
+    parser.add_argument("--run-binding-sha256", required=True)
+    parser.add_argument("--attempt-receipt-sha256", required=True)
+    parser.add_argument("--execution-manifest-sha256", required=True)
+    parser.add_argument("--arm-checkpoint-root", type=Path, required=True)
+    parser.add_argument("--arm-manifest-sha256", required=True)
+    parser.add_argument("--arm-manifest-deterministic-sha256", required=True)
+    parser.add_argument("--target-arm", required=True)
+    parser.add_argument("--receipt-path", type=Path, required=True)
+    parser.add_argument("--max-address-space-bytes", type=int, required=True)
+    return parser
+
+
+def _write_exclusive_canonical(path: Path, document: object) -> None:
+    if path.parent.is_symlink() or not path.parent.is_dir() or os.path.lexists(path):
+        raise FileExistsError("metric worker receipt path is unsafe")
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        content = _canonical_bytes(document)
+        view = memoryview(content)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("metric worker receipt write did not advance")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _run_internal_metric_worker(argv: Sequence[str]) -> int:
+    arguments = _internal_metric_worker_parser().parse_args(argv)
+    if arguments.max_address_space_bytes <= 0:
+        return 2
+    if sys.platform.startswith("linux") and hasattr(resource, "RLIMIT_AS"):
+        _soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+        requested = arguments.max_address_space_bytes
+        if hard != resource.RLIM_INFINITY:
+            requested = min(requested, hard)
+        resource.setrlimit(resource.RLIMIT_AS, (requested, hard))
+    receipt = execute_v5_metric_arm_worker(
+        root=arguments.root.resolve(),
+        mode=arguments.mode,
+        run_binding_sha256=arguments.run_binding_sha256,
+        attempt_receipt_sha256=arguments.attempt_receipt_sha256,
+        execution_manifest_sha256=arguments.execution_manifest_sha256,
+        arm_checkpoint_root=arguments.arm_checkpoint_root.resolve(),
+        arm_manifest_sha256=arguments.arm_manifest_sha256,
+        arm_manifest_deterministic_sha256=(
+            arguments.arm_manifest_deterministic_sha256
+        ),
+        target_arm=arguments.target_arm,
+    )
+    _write_exclusive_canonical(
+        arguments.receipt_path,
+        receipt.model_dump(mode="json"),
+    )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    arguments = _parser().parse_args(argv)
+    raw_arguments = tuple(sys.argv[1:] if argv is None else argv)
+    if raw_arguments and raw_arguments[0] == "--internal-metric-worker":
+        try:
+            return _run_internal_metric_worker(raw_arguments[1:])
+        except Exception:  # noqa: BLE001 - child failures cross only as a status code
+            return 2
+    arguments = _parser().parse_args(raw_arguments)
     manifest = execute_next_v5_kaggle_stage(
         root=arguments.root,
         input_root=arguments.input_root,
