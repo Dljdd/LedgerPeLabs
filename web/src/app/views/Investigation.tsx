@@ -73,6 +73,7 @@ export function Investigation({ evidence, trace }: { evidence: ConsoleEvidence; 
   const firstAppAlert = trace.traces.find((record) => record.presentation_ground_truth.family === "app_scam_mule" && record.final_action !== "approve");
   const firstAppAlertIndex = firstAppAlert ? trace.traces.indexOf(firstAppAlert) : -1;
   const linkedEdges = useMemo(() => selected ? edges.filter((edge) => edge.source === selected.id || edge.target === selected.id) : [], [edges, selected]);
+  const maxLinkedAmount = Math.max(0, ...linkedEdges.map((edge) => Number(edge.amount)));
   const illicitCount = evidence.scenario_context.graph.nodes.filter((node) => node.illicit).length;
 
   return (
@@ -98,7 +99,7 @@ export function Investigation({ evidence, trace }: { evidence: ConsoleEvidence; 
                 <div><dt>Linked payments</dt><dd>{linkedEdges.length}</dd></div>
                 <div><dt>Account</dt><dd><code>{shortHash(selected.account_id, 12)}</code></dd></div>
               </dl>
-              <div className="linked-events"><span className="eyebrow">Connected value</span>{linkedEdges.map((edge) => <div key={edge.payment_id}><span><b>{titleCase(edge.stage)}</b><small>{edge.event_time.slice(11, 19)} UTC</small></span><strong>{formatMoney(edge.amount, edge.currency)}</strong></div>)}</div>
+              <div className="linked-events"><span className="eyebrow">Connected value</span>{linkedEdges.map((edge) => <div key={edge.payment_id}><span><b>{titleCase(edge.stage)}</b><small>{edge.event_time.slice(11, 19)} UTC</small></span><strong>{formatMoney(edge.amount, edge.currency)}</strong><i aria-hidden="true" className="linked-value-bar" style={{ "--linked-value": maxLinkedAmount > 0 ? Number(edge.amount) / maxLinkedAmount : 0 } as CSSProperties} /></div>)}</div>
             </div> : null}
         </aside>
       </section>

@@ -56,8 +56,8 @@ test("five-minute golden path moves from threat to assurance", async ({ page }) 
   await expect(page.getByText(/no Kaggle locked-successor\/seed-2404 chain was run/i)).toBeVisible();
 });
 
-test("overview and replay pass automated accessibility checks", async ({ page }) => {
-  for (const route of ["overview", "replay"]) {
+test("overview, replay, and assurance pass automated accessibility checks", async ({ page }) => {
+  for (const route of ["overview", "replay", "assurance"]) {
     await page.goto(`/${route}`);
     await expect(page.getByRole("heading", { level: 1 })).toBeVisible();
     const results = await new AxeBuilder({ page }).analyze();
@@ -73,6 +73,12 @@ test("primary journey is keyboard reachable", async ({ page }) => {
   await page.keyboard.press("Enter");
   await expect(page.locator("#main-content")).toBeFocused();
 
+  const overviewEvent = page.getByRole("button", { name: /event 4, 70.5%, review hold/i });
+  await overviewEvent.focus();
+  await page.keyboard.press("Enter");
+  await expect(overviewEvent).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByRole("status", { name: /focused trace event/i })).toContainText("Event 04");
+
   const replayLink = page.getByRole("navigation", { name: "Primary" }).getByRole("link", { name: /replay/i });
   await replayLink.focus();
   await page.keyboard.press("Enter");
@@ -80,4 +86,28 @@ test("primary journey is keyboard reachable", async ({ page }) => {
   await page.getByRole("button", { name: "Step forward" }).focus();
   await page.keyboard.press("Enter");
   await expect(page.getByText(/Event 02 \/ 12/)).toBeVisible();
+
+  const assuranceLink = page.getByRole("navigation", { name: "Primary" }).getByRole("link", { name: /assurance/i });
+  await assuranceLink.focus();
+  await page.keyboard.press("Enter");
+  const checkpoint = page.getByRole("button", { name: "Inspect Stage 30 source checkpoint lineage" });
+  await checkpoint.focus();
+  await page.keyboard.press("Enter");
+  await expect(checkpoint).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByRole("status", { name: "Selected lineage artifact" })).toContainText("Stage 30 source checkpoint");
+});
+
+test("reduced motion campaign advances only on explicit steps", async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.goto("/replay");
+
+  const stepCampaign = page.getByRole("button", { name: "Step campaign" });
+  await expect(stepCampaign).toBeVisible();
+  await stepCampaign.click();
+  await expect(page.getByText("SCENARIO PAYMENT 02")).toBeVisible();
+  await page.waitForTimeout(1100);
+  await expect(page.getByText("SCENARIO PAYMENT 02")).toBeVisible();
+
+  const animationName = await page.locator(".replay-value-packet").evaluate((element) => getComputedStyle(element).animationName);
+  expect(animationName).toBe("none");
 });

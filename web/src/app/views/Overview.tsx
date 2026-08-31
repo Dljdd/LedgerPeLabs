@@ -1,6 +1,9 @@
+import { useState } from "react";
+import type { CSSProperties } from "react";
+
 import { Icon } from "../Icon";
 import { RouteLink } from "../Shell";
-import { formatMoney, formatPercent } from "../format";
+import { formatMoney, formatPercent, titleCase } from "../format";
 import type { ConsoleEvidence, RoutePath, VerifiedTrace } from "../types";
 
 interface OverviewProps {
@@ -16,6 +19,7 @@ function traceTone(action: string): string {
 }
 
 function TraceFootprint({ evidence, trace }: { evidence: ConsoleEvidence; trace: VerifiedTrace }) {
+  const [selectedEvent, setSelectedEvent] = useState(0);
   const challenge = evidence.portable.thresholds.model_challenge;
   const review = evidence.portable.thresholds.model_review;
   const decline = evidence.portable.thresholds.model_decline;
@@ -38,23 +42,37 @@ function TraceFootprint({ evidence, trace }: { evidence: ConsoleEvidence; trace:
     return summary;
   }, {});
   const summary = `${trace.traces.length} ordered calibrated decisions: ${counts.decline_hold ?? 0} decline hold, ${counts.review_hold ?? 0} review hold, ${counts.challenge ?? 0} challenge, and ${counts.approve ?? 0} approve.`;
+  const activeRecord = trace.traces[selectedEvent] ?? trace.traces[0]!;
 
   return (
-    <div className="trace-footprint" aria-label={summary} role="img">
-      <div className="trace-footprint-head"><span>Curated decision footprint</span><span>{trace.traces.length} events</span></div>
-      <svg aria-hidden="true" viewBox={`0 0 ${width} 68`}>
-        <line className="trace-threshold-line is-decline" vectorEffect="non-scaling-stroke" x1={plotLeft} x2={plotRight} y1={yFor(decline)} y2={yFor(decline)} />
-        <line className="trace-threshold-line is-review" vectorEffect="non-scaling-stroke" x1={plotLeft} x2={plotRight} y1={yFor(review)} y2={yFor(review)} />
-        <line className="trace-threshold-line is-challenge" vectorEffect="non-scaling-stroke" x1={plotLeft} x2={plotRight} y1={yFor(challenge)} y2={yFor(challenge)} />
-        <polyline className="trace-risk-line" points={points} vectorEffect="non-scaling-stroke" />
+    <div className="trace-footprint">
+      <div className="trace-footprint-plot" aria-label={summary} role="img">
+        <div className="trace-footprint-head"><span>Curated decision footprint</span><span>{trace.traces.length} events</span></div>
+        <svg aria-hidden="true" viewBox={`0 0 ${width} 68`}>
+          <line className="trace-threshold-line is-decline" vectorEffect="non-scaling-stroke" x1={plotLeft} x2={plotRight} y1={yFor(decline)} y2={yFor(decline)} />
+          <line className="trace-threshold-line is-review" vectorEffect="non-scaling-stroke" x1={plotLeft} x2={plotRight} y1={yFor(review)} y2={yFor(review)} />
+          <line className="trace-threshold-line is-challenge" vectorEffect="non-scaling-stroke" x1={plotLeft} x2={plotRight} y1={yFor(challenge)} y2={yFor(challenge)} />
+          <polyline className="trace-risk-line" points={points} vectorEffect="non-scaling-stroke" />
+          <line className="trace-focus-cursor" style={{ "--trace-cursor-x": `${xFor(selectedEvent)}px` } as CSSProperties} vectorEffect="non-scaling-stroke" x1="0" x2="0" y1={plotTop} y2={plotBottom} />
+          {trace.traces.map((record, index) => (
+            <circle className={`trace-risk-point is-${traceTone(record.final_action)} ${selectedEvent === index ? "is-selected" : ""}`} cx={xFor(index)} cy={yFor(record.calibrated_probability)} key={record.event_id} r="3.5" />
+          ))}
+        </svg>
+        <div className="trace-threshold-labels">
+          <span>Challenge {formatPercent(challenge, 1)}</span>
+          <span>Review {formatPercent(review, 1)}</span>
+          <span>Decline {formatPercent(decline, 1)}</span>
+        </div>
+      </div>
+      <div className="trace-event-selector" aria-label="Select curated trace event" role="group">
         {trace.traces.map((record, index) => (
-          <circle className={`trace-risk-point is-${traceTone(record.final_action)}`} cx={xFor(index)} cy={yFor(record.calibrated_probability)} key={record.event_id} r="3.5" />
+          <button aria-label={`Event ${index + 1}, ${formatPercent(record.calibrated_probability, 1)}, ${titleCase(record.final_action)}`} aria-pressed={selectedEvent === index} key={record.event_id} onClick={() => setSelectedEvent(index)} type="button">{String(index + 1).padStart(2, "0")}</button>
         ))}
-      </svg>
-      <div className="trace-threshold-labels">
-        <span>Challenge {formatPercent(challenge, 1)}</span>
-        <span>Review {formatPercent(review, 1)}</span>
-        <span>Decline {formatPercent(decline, 1)}</span>
+      </div>
+      <div className="trace-event-focus" aria-label="Focused trace event" aria-live="polite" key={activeRecord.event_id} role="status">
+        <span>Event {String(selectedEvent + 1).padStart(2, "0")}</span>
+        <strong>{formatPercent(activeRecord.calibrated_probability, 1)}</strong>
+        <b>{titleCase(activeRecord.final_action)}</b>
       </div>
     </div>
   );

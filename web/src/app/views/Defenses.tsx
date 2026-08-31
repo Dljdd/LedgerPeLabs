@@ -1,3 +1,5 @@
+import { useState } from "react";
+
 import { Icon } from "../Icon";
 import { formatMetric, shortHash, titleCase } from "../format";
 import type { ConsoleEvidence } from "../types";
@@ -9,8 +11,21 @@ const armDescriptions: Record<string, string> = {
   full_sentinel: "Graph ensemble plus deterministic routing architecture.",
 };
 
+function armStatus(arm: string): string {
+  if (arm === "ensemble_with_graph") return "Live portable";
+  if (arm === "full_sentinel") return "Not ready";
+  return "Diagnostic arm";
+}
+
 export function Defenses({ evidence }: { evidence: ConsoleEvidence }) {
+  const [focusedArmName, setFocusedArmName] = useState("ensemble_with_graph");
   const metrics = ["f1", "recall", "precision", "false_decline_rate", "challenge_rate", "p95_latency_ms"];
+  const focusedArm = evidence.recovered.arms.find((arm) => arm.arm === focusedArmName) ?? evidence.recovered.arms[0];
+  const focusFromFinePointer = (arm: string) => {
+    if (typeof window.matchMedia === "function" && window.matchMedia("(hover: hover) and (pointer: fine)").matches) {
+      setFocusedArmName(arm);
+    }
+  };
   return (
     <div className="page">
       <header className="page-header split-header">
@@ -23,15 +38,17 @@ export function Defenses({ evidence }: { evidence: ConsoleEvidence }) {
           const isChampion = arm.arm === "ensemble_with_graph";
           const isFull = arm.arm === "full_sentinel";
           return (
-            <article className={`${isChampion ? "is-champion" : ""} ${isFull ? "is-not-ready" : ""}`} key={arm.arm}>
+            <article className={`${isChampion ? "is-champion" : ""} ${isFull ? "is-not-ready" : ""} ${focusedArmName === arm.arm ? "is-focused" : ""}`} key={arm.arm} onFocus={() => setFocusedArmName(arm.arm)} onMouseEnter={() => focusFromFinePointer(arm.arm)}>
               <div className="arm-top"><span>{String(index + 1).padStart(2, "0")}</span>{isChampion ? <span className="pill pill-accent">Live portable</span> : isFull ? <span className="pill pill-critical">Not ready</span> : <span className="pill">Diagnostic arm</span>}</div>
               <h2>{arm.arm}</h2><p>{armDescriptions[arm.arm]}</p>
               <div className="arm-flow" aria-hidden="true"><i /><b>→</b><i /><b>→</b><i className={index > 1 ? "active" : ""} />{isFull ? <><b>→</b><i className="failed" /></> : null}</div>
               <code title={arm.deterministic_result_sha256}>{shortHash(arm.deterministic_result_sha256, 8)}</code>
+              <button aria-label={`Focus ${arm.arm} architecture`} aria-pressed={focusedArmName === arm.arm} className="arm-focus-button" onClick={() => setFocusedArmName(arm.arm)} type="button">Inspect arm</button>
             </article>
           );
         })}
       </section>
+      {focusedArm ? <div className="architecture-focus" aria-label="Focused architecture" aria-live="polite" key={focusedArm.arm} role="status"><div><span>Focused arm</span><strong>{focusedArm.arm}</strong></div><p>{armDescriptions[focusedArm.arm]}</p><span className="pill">{armStatus(focusedArm.arm)}</span><code>{focusedArm.deterministic_result_sha256}</code></div> : null}
 
       <section className="metrics-panel">
         <div className="panel-head metrics-head">

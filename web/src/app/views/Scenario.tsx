@@ -1,15 +1,19 @@
+import { useState } from "react";
+
 import { Icon } from "../Icon";
 import { RouteLink } from "../Shell";
 import { formatMoney, shortHash, titleCase } from "../format";
 import type { ConsoleEvidence, RoutePath, VerifiedTrace } from "../types";
 
 export function Scenario({ evidence, navigate, trace }: { evidence: ConsoleEvidence; navigate: (path: RoutePath) => void; trace: VerifiedTrace }) {
+  const [selectedStage, setSelectedStage] = useState(0);
   const counts = trace.traces.reduce<Record<string, number>>((total, record) => {
     const rail = record.presentation_ground_truth.rail;
     total[rail] = (total[rail] ?? 0) + 1;
     return total;
   }, {});
   const config = evidence.threat.default_config;
+  const activeStage = config.campaign_stages[selectedStage] ?? config.campaign_stages[0];
 
   return (
     <div className="page">
@@ -25,11 +29,18 @@ export function Scenario({ evidence, navigate, trace }: { evidence: ConsoleEvide
           <p>A controlled network-view simulation of personalized persuasion, authorized transfer, mule ingress, layering, and cash-out.</p>
           <RouteLink className="button button-primary" navigate={navigate} path="/replay">Start verified replay <Icon name="play" /></RouteLink>
         </div>
-        <div className="motif-card">
+        <div className="motif-card" data-stage={selectedStage}>
           <span className="eyebrow">Campaign motif</span>
           <div className="motif-code">{evidence.scenario_context.motif_signature}</div>
+          <div className="motif-stage-readout" aria-live="polite">Configured stage {String(selectedStage + 1).padStart(2, "0")} · {activeStage?.stage_id}</div>
           <div className="motif-visual" aria-label="fan in to mule, layer, fan out, cash out">
-            <span className="node-stack"><i /><i /><i /></span><b>→</b><span className="node-risk" /><b>→</b><span className="node-risk small" /><b>→</b><span className="node-stack reverse"><i /><i /></span>
+            <span className="motif-part motif-persuasion node-stack"><i /><i /><i /></span>
+            <b className="motif-part motif-transfer" aria-hidden="true">→</b>
+            <span className="motif-part motif-transfer node-risk" />
+            <b className="motif-part motif-dispersion" aria-hidden="true">→</b>
+            <span className="motif-part motif-dispersion node-risk small" />
+            <b className="motif-part motif-dispersion" aria-hidden="true">→</b>
+            <span className="motif-part motif-dispersion node-stack reverse"><i /><i /></span>
           </div>
           <dl className="mini-stats">
             <div><dt>Value</dt><dd>{formatMoney(evidence.scenario_context.value_total)}</dd></div>
@@ -65,8 +76,10 @@ export function Scenario({ evidence, navigate, trace }: { evidence: ConsoleEvide
 
       <section className="stage-row" aria-label="Campaign stages">
         {config.campaign_stages.map((stage, index) => (
-          <article key={stage.stage_id}>
-            <span>{String(index + 1).padStart(2, "0")}</span><div><h3>{titleCase(stage.stage_id)}</h3><p>{stage.description}</p></div>
+          <article className={selectedStage === index ? "is-active" : ""} key={stage.stage_id}>
+            <button aria-label={`Focus campaign stage ${index + 1} ${stage.stage_id}`} aria-pressed={selectedStage === index} onClick={() => setSelectedStage(index)} type="button">
+              <span>{String(index + 1).padStart(2, "0")}</span><div><h3>{titleCase(stage.stage_id)}</h3><p>{stage.description}</p></div>
+            </button>
           </article>
         ))}
       </section>

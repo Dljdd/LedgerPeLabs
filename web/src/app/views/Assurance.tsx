@@ -1,8 +1,11 @@
+import { useState } from "react";
+
 import { Icon } from "../Icon";
 import { shortHash, titleCase } from "../format";
 import type { ConsoleEvidence, TraceMode, VerifiedTrace } from "../types";
 
 export function Assurance({ evidence, trace, traceMode }: { evidence: ConsoleEvidence; trace: VerifiedTrace; traceMode: TraceMode }) {
+  const [selectedLineage, setSelectedLineage] = useState(0);
   const lineage: [string, string, string][] = [
     ["Portable bundle manifest", evidence.portable.bundle_manifest_sha256, "Verified input"],
     ["Stage 30 source checkpoint", evidence.portable.source_checkpoint_manifest_sha256, "Accepted source"],
@@ -11,6 +14,7 @@ export function Assurance({ evidence, trace, traceMode }: { evidence: ConsoleEvi
     ["Console evidence document", evidence.document_sha256, "Local projection"],
     ["Recovered diagnostic verification", evidence.recovered.verification_sha256, "Non-authoritative"],
   ];
+  const selectedArtifact = lineage[selectedLineage] ?? lineage[0];
   return (
     <div className="page">
       <header className="page-header split-header">
@@ -21,9 +25,10 @@ export function Assurance({ evidence, trace, traceMode }: { evidence: ConsoleEvi
       <section className="assurance-grid">
         <article className="lineage-panel">
           <div className="panel-head"><div><p className="eyebrow">Evidence lineage</p><h2>Bound artifacts</h2></div><span className="pill pill-good">Inputs verified</span></div>
-          <ol className="lineage-list">
-            {lineage.map(([label, hash, status], index) => <li key={label}><span>{String(index + 1).padStart(2, "0")}</span><div><strong>{label}</strong><code title={hash}>{shortHash(hash, 12)}</code></div><small>{status}</small></li>)}
+          <ol className="lineage-list" aria-label="Evidence lineage artifacts">
+            {lineage.map(([label, hash, status], index) => <li className={selectedLineage === index ? "is-selected" : ""} key={label}><button aria-label={`Inspect ${label} lineage`} aria-pressed={selectedLineage === index} onClick={() => setSelectedLineage(index)} type="button"><span>{String(index + 1).padStart(2, "0")}</span><div><strong>{label}</strong><code title={hash}>{shortHash(hash, 12)}</code></div><small>{status}</small></button></li>)}
           </ol>
+          {selectedArtifact ? <div className="lineage-focus" aria-label="Selected lineage artifact" aria-live="polite" key={selectedArtifact[0]} role="status"><span>{selectedArtifact[0]}</span><code>{selectedArtifact[1]}</code><small>{selectedArtifact[2]}</small></div> : null}
         </article>
         <aside className="promotion-panel">
           <p className="eyebrow">Human promotion gate</p><div className="promotion-state"><Icon name="warning" size={25} /><span><strong>Promotion blocked</strong><small>{evidence.recovered.readiness.status.replace("_", " ")}</small></span></div>
@@ -40,7 +45,7 @@ export function Assurance({ evidence, trace, traceMode }: { evidence: ConsoleEvi
           <div className="source-chip"><span>TEST SOURCE</span><code title={evidence.trust_proof.test_evidence_sha256}>{evidence.trust_proof.test_evidence}</code></div>
         </div>
         <div className="trust-checks">
-          {evidence.trust_proof.checks.map((check, index) => <article key={check.check}><span>{String(index + 1).padStart(2, "0")}</span><div><h3>{titleCase(check.check)}</h3><code>{check.evidence}</code></div><span className="pill pill-good"><Icon name="check" size={13} /> Tested</span></article>)}
+          {evidence.trust_proof.checks.map((check, index) => <article key={check.check}><span className="trust-step">{String(index + 1).padStart(2, "0")}</span><div><h3>{titleCase(check.check)}</h3><code>{check.evidence}</code></div><span className="pill pill-good"><Icon name="check" size={13} /> Tested</span></article>)}
         </div>
       </section>
 
