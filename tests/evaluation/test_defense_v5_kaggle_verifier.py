@@ -33,6 +33,7 @@ from apar.evaluation.v5_locked_evidence import (
     build_v5_staged_evidence_payload,
 )
 from apar.evaluation.v5_staged_evidence import (
+    V5CompleteArmMetricSummary,
     _arm_core_and_observation,
     _build_v5_compact_final_documents,
     _control_group_core_and_observation,
@@ -383,6 +384,7 @@ def _materialize_complete_chain(
     *,
     semantic_mutation: str | None = None,
     compact_metrics: bool = False,
+    compact_semantic_mutation: str | None = None,
 ) -> Path:
     _suite, groups, corpus, arm_results = evidence
     protocol = load_v5_kaggle_protocol(
@@ -543,41 +545,69 @@ def _materialize_complete_chain(
                     ]
                     for result in arm_results
                 )
-                receipts = tuple(
-                    build_v5_metric_arm_worker_receipt(
-                        mode=V5KaggleMode.CAPACITY_VALIDATION,
-                        run_binding_sha256=run_binding,
-                        attempt_receipt_sha256=attempt,
-                        execution_manifest_sha256=execution_manifest_sha256,
-                        arm_manifest_sha256=arm_manifest.manifest_sha256,
-                        arm_manifest_deterministic_sha256=(
-                            arm_manifest.deterministic_sha256
-                        ),
-                        arm_index=index,
-                        arm_order=tuple(result.arm for result in arm_results),
-                        support_count=result.support_total,
-                        support_event_ids_sha256=_digest(support_event_ids),
-                        summary=summarize_v5_complete_arm_metrics(
-                            metric=metric,
-                            deterministic_result_sha256=result_sha256,
-                        ),
-                        evidence_protocol_sha256=(
-                            evidence_protocol.evidence_protocol_sha256
-                        ),
-                        implementation_sha256=evidence_protocol.implementation_sha256,
-                        wall_seconds=float(index + 1),
-                        peak_rss_bytes=1_000_000_000 + index,
-                        artifact_bytes=10_000 + index,
+                receipt_items = []
+                for index, (result, metric, result_sha256) in enumerate(
+                    zip(
+                        arm_results,
+                        metric_evidence.complete_metrics,
+                        deterministic_result_sha256,
+                        strict=True,
                     )
-                    for index, (result, metric, result_sha256) in enumerate(
-                        zip(
-                            arm_results,
-                            metric_evidence.complete_metrics,
-                            deterministic_result_sha256,
-                            strict=True,
+                ):
+                    summary = summarize_v5_complete_arm_metrics(
+                        metric=metric,
+                        deterministic_result_sha256=result_sha256,
+                    )
+                    if compact_semantic_mutation == "aggregate_recall" and index == 0:
+                        summary_values = summary.model_dump(mode="json")
+                        recall = summary_values["aggregate"]["recall"]
+                        recall["value"] = 0.125
+                        recall["numerator"] = 1.0
+                        recall["denominator"] = 8.0
+                        recall["metric_sha256"] = _digest(
+                            {
+                                key: value
+                                for key, value in recall.items()
+                                if key != "metric_sha256"
+                            }
+                        )
+                        summary_values["summary_sha256"] = _digest(
+                            {
+                                key: value
+                                for key, value in summary_values.items()
+                                if key != "summary_sha256"
+                            }
+                        )
+                        summary = V5CompleteArmMetricSummary.model_validate(
+                            summary_values
+                        )
+                    receipt_items.append(
+                        build_v5_metric_arm_worker_receipt(
+                            mode=V5KaggleMode.CAPACITY_VALIDATION,
+                            run_binding_sha256=run_binding,
+                            attempt_receipt_sha256=attempt,
+                            execution_manifest_sha256=execution_manifest_sha256,
+                            arm_manifest_sha256=arm_manifest.manifest_sha256,
+                            arm_manifest_deterministic_sha256=(
+                                arm_manifest.deterministic_sha256
+                            ),
+                            arm_index=index,
+                            arm_order=tuple(result.arm for result in arm_results),
+                            support_count=result.support_total,
+                            support_event_ids_sha256=_digest(support_event_ids),
+                            summary=summary,
+                            evidence_protocol_sha256=(
+                                evidence_protocol.evidence_protocol_sha256
+                            ),
+                            implementation_sha256=(
+                                evidence_protocol.implementation_sha256
+                            ),
+                            wall_seconds=float(index + 1),
+                            peak_rss_bytes=1_000_000_000 + index,
+                            artifact_bytes=10_000 + index,
                         )
                     )
-                )
+                receipts = tuple(receipt_items)
                 compact_core, compact_observation = (
                     build_v5_compact_metric_stage_documents(
                         receipts=receipts,
@@ -915,6 +945,46 @@ def test_independent_verifier_replays_compact_metric_chain_and_rejects_receipt_t
                 checkpoints=tampered,
                 enforce_production_support=False,
             )
+
+
+def test_compact_semantic_replay_rejects_rebound_aggregate_metric_mutation(
+    tmp_path: Path,
+    complete_safe_evidence: object,
+) -> None:
+    """A fully rebound metric claim must still be derived from the Stage 30 rows."""
+    chain_root = _materialize_complete_chain(
+        tmp_path,
+        complete_safe_evidence,
+        compact_metrics=True,
+        compact_semantic_mutation="aggregate_recall",
+    )
+    roots = tuple(chain_root / stage.value for stage in V5KaggleStage)
+    with pytest.raises(
+        V5KaggleIndependentVerificationError,
+        match="semantic|metric|recall",
+    ):
+        _verify_v5_kaggle_test_fixture(
+            root=ROOT,
+            checkpoint_roots=roots[:-1],
+            final_root=roots[-1],
+        )
+
+
+def test_compact_parent_reader_retains_only_stage30_header(
+    tmp_path: Path,
+    complete_safe_evidence: object,
+) -> None:
+    """The compact coordinator must not retain multiple Stage 30 arms in its process."""
+    chain_root = _materialize_complete_chain(
+        tmp_path,
+        complete_safe_evidence,
+        compact_metrics=True,
+    )
+    checkpoint = _read_checkpoint(chain_root / V5KaggleStage.ARMS.value)
+    assert [record.kind for record in checkpoint.deterministic_records] == [
+        "arm_header"
+    ]
+    assert checkpoint.observational_records == ()
 
 
 @pytest.mark.parametrize("layer", ("corpus", "feature", "arm"))

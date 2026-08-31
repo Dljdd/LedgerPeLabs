@@ -16,6 +16,7 @@ import struct
 import zlib
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal, NoReturn, Self, cast
 
@@ -377,7 +378,12 @@ class _VerifiedCheckpoint:
     observational_records: tuple[_Record, ...]
 
 
-def _read_checkpoint(root: Path) -> _VerifiedCheckpoint:
+def _read_checkpoint(
+    root: Path,
+    *,
+    retain_arm_records: bool = False,
+    target_arm: str | None = None,
+) -> _VerifiedCheckpoint:
     try:
         metadata = root.lstat()
     except OSError as error:
@@ -446,6 +452,12 @@ def _read_checkpoint(root: Path) -> _VerifiedCheckpoint:
     }.get(str(manifest["stage"]))
     if retained_kinds is None:
         _fail("checkpoint stage is unknown")
+    if target_arm is not None and (
+        manifest["stage"] != "30_arms" or target_arm not in _ARMS
+    ):
+        _fail("target arm checkpoint selection differs")
+    if manifest["stage"] == "30_arms" and not retain_arm_records:
+        retained_kinds = {"arm_header"} if target_arm is None else retained_kinds
     streams = (
         _RecordStream(
             root=root,
@@ -466,7 +478,17 @@ def _read_checkpoint(root: Path) -> _VerifiedCheckpoint:
         streams, (retained_deterministic, retained_observational), strict=True
     ):
         for record in stream:
-            if record.kind in retained_kinds:
+            retain_target_arm = (
+                target_arm is not None
+                and (
+                    record.kind == "arm_header"
+                    or record.key == target_arm
+                    or record.key.startswith(f"{target_arm}:")
+                )
+            )
+            if record.kind in retained_kinds and (
+                target_arm is None or retain_target_arm
+            ):
                 retained.append(record)
         prefix = "" if stream.layer == "deterministic" else "observational_"
         if (
@@ -1488,6 +1510,318 @@ def _decode_arm_checkpoint_records(
     return header, cores, observations
 
 
+def _decode_single_arm_checkpoint_records(
+    *,
+    deterministic: Sequence[_Record],
+    observational: Sequence[_Record],
+    target_arm: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Restore one selected arm from an otherwise fully authenticated stream."""
+    if target_arm not in _ARMS or not deterministic or deterministic[0].kind != "arm_header":
+        _fail("single-arm checkpoint selection differs")
+    header = _json_record(deterministic[0], "single-arm header")
+    if (
+        header.get("schema_version") != "apar-sentinel-v5-kaggle-arms/2"
+        or header.get("arm_order") != list(_ARMS)
+    ):
+        _fail("single-arm checkpoint header differs")
+    cursor = 1
+    if cursor >= len(deterministic):
+        _fail("single-arm result metadata is missing")
+    meta_record = deterministic[cursor]
+    cursor += 1
+    if meta_record.kind != "arm_result_meta" or meta_record.key != target_arm:
+        _fail("single-arm result metadata differs")
+    core_meta = _json_record(meta_record, "single-arm result metadata")
+    _exact(
+        core_meta,
+        {"schema_version", "arm", "fields", "sections"},
+        "single-arm result metadata",
+    )
+    sections = _mapping(core_meta["sections"], "single-arm result sections")
+    _exact(
+        sections,
+        {"execution_artifacts", "row_evidence"},
+        "single-arm result sections",
+    )
+    if (
+        core_meta["schema_version"]
+        != "apar-sentinel-v5-kaggle-arm-result-meta/1"
+        or core_meta["arm"] != target_arm
+    ):
+        _fail("single-arm result metadata binding differs")
+    artifacts, cursor = _consume_arm_section(
+        records=deterministic,
+        cursor=cursor,
+        arm=target_arm,
+        kind="arm_execution_artifacts",
+        section="execution_artifacts",
+        index=_arm_section_index(
+            sections["execution_artifacts"],
+            f"{target_arm} execution artifacts",
+        ),
+        layer="deterministic",
+    )
+    rows, cursor = _consume_arm_section(
+        records=deterministic,
+        cursor=cursor,
+        arm=target_arm,
+        kind="arm_result_rows",
+        section="row_evidence",
+        index=_arm_section_index(
+            sections["row_evidence"],
+            f"{target_arm} row evidence",
+        ),
+        layer="deterministic",
+    )
+    if cursor != len(deterministic) or not observational:
+        _fail("single-arm deterministic record set differs")
+    latency_meta = _json_record(observational[0], "single-arm latency metadata")
+    _exact(
+        latency_meta,
+        {"schema_version", "arm", "fields", "sections"},
+        "single-arm latency metadata",
+    )
+    latency_sections = _mapping(
+        latency_meta["sections"],
+        "single-arm latency sections",
+    )
+    _exact(latency_sections, {"samples"}, "single-arm latency sections")
+    if (
+        observational[0].kind != "arm_latency_meta"
+        or observational[0].key != target_arm
+        or latency_meta["schema_version"]
+        != "apar-sentinel-v5-kaggle-arm-latency-meta/1"
+        or latency_meta["arm"] != target_arm
+    ):
+        _fail("single-arm latency metadata binding differs")
+    samples, observation_cursor = _consume_arm_section(
+        records=observational,
+        cursor=1,
+        arm=target_arm,
+        kind="arm_latency_samples",
+        section="samples",
+        index=_arm_section_index(
+            latency_sections["samples"],
+            f"{target_arm} latency samples",
+        ),
+        layer="observational",
+    )
+    if observation_cursor != len(observational):
+        _fail("single-arm observational record set differs")
+    core = dict(_mapping(core_meta["fields"], "single-arm result fields"))
+    core["execution_artifacts"] = artifacts
+    core["row_evidence"] = rows
+    observation = dict(
+        _mapping(latency_meta["fields"], "single-arm latency fields")
+    )
+    observation["samples"] = samples
+    return header, core, observation
+
+
+def _restore_single_arm_result_document(
+    *,
+    core: dict[str, Any],
+    observation: dict[str, Any],
+) -> tuple[dict[str, Any], str]:
+    claimed_core = core.pop("deterministic_result_sha256", None)
+    if not _is_sha256(claimed_core) or claimed_core != _digest(core):
+        _fail("single-arm deterministic result digest differs")
+    claimed_observation = observation.pop("observational_sha256", None)
+    if not _is_sha256(claimed_observation) or claimed_observation != _digest(observation):
+        _fail("single-arm observational result digest differs")
+    if (
+        observation.get("schema_version")
+        != "apar-sentinel-v5-kaggle-arm-latency/1"
+        or observation.get("arm") != core.get("arm")
+        or observation.get("deterministic_result_sha256") != claimed_core
+    ):
+        _fail("single-arm deterministic/observational binding differs")
+    rows = _sequence(core.get("row_evidence"), "single-arm rows")
+    samples = _sequence(observation.get("samples"), "single-arm latency samples")
+    if len(rows) != len(samples):
+        _fail("single-arm latency sample support differs")
+    restored_rows: list[dict[str, Any]] = []
+    for raw_row, raw_sample in zip(rows, samples, strict=True):
+        row = dict(_mapping(raw_row, "single-arm row"))
+        sample = _mapping(raw_sample, "single-arm latency sample")
+        claimed_row = row.pop("deterministic_row_sha256", None)
+        support = _mapping(row.get("support"), "single-arm row support")
+        if (
+            not _is_sha256(claimed_row)
+            or claimed_row != _digest(row)
+            or sample.get("event_id") != support.get("event_id")
+            or not isinstance(sample.get("latency_ms"), (int, float))
+            or not _is_sha256(sample.get("row_output_sha256"))
+        ):
+            _fail("single-arm row/latency binding differs")
+        row["latency_ms"] = sample["latency_ms"]
+        row["row_output_sha256"] = sample["row_output_sha256"]
+        restored_rows.append(row)
+    restored = dict(core)
+    restored["row_evidence"] = restored_rows
+    for field in (
+        "p50_latency_ms",
+        "p95_latency_ms",
+        "p99_latency_ms",
+        "score_sha256",
+        "result_sha256",
+    ):
+        restored[field] = observation.get(field)
+    return restored, cast(str, claimed_core)
+
+
+def _verify_compact_arm_metric_semantics(
+    *,
+    checkpoint_root: Path,
+    target_arm: str,
+    summary: Mapping[str, Any],
+    catalog_sha256: str,
+    evidence_protocol: Mapping[str, Any],
+) -> str:
+    """Independently recompute one compact arm's retained metric semantics."""
+    checkpoint = _read_checkpoint(checkpoint_root, target_arm=target_arm)
+    header, core, observation = _decode_single_arm_checkpoint_records(
+        deterministic=checkpoint.deterministic_records,
+        observational=checkpoint.observational_records,
+        target_arm=target_arm,
+    )
+    result, deterministic_result_sha256 = _restore_single_arm_result_document(
+        core=core,
+        observation=observation,
+    )
+    index = _ARMS.index(target_arm)
+    result_digests = _sequence(
+        header.get("deterministic_result_sha256"),
+        "single-arm result digest index",
+    )
+    if (
+        len(result_digests) != len(_ARMS)
+        or result_digests[index] != deterministic_result_sha256
+        or summary.get("deterministic_result_sha256")
+        != deterministic_result_sha256
+        or summary.get("arm") != target_arm
+        or summary.get("arm_result_sha256") != result.get("result_sha256")
+        or summary.get("support_sha256") != result.get("support_sha256")
+    ):
+        _fail("compact arm/result metric binding differs")
+    rows, _artifacts, manifests = semantic._verify_arm_result(  # noqa: SLF001
+        result,
+        catalog_sha256,
+        evidence_protocol,
+    )
+    support_ids = [str(row["support"]["event_id"]) for row in rows]
+    labels = [int(row["support"]["label"]) for row in rows]
+    actions = [str(row["action"]) for row in rows]
+    probabilities = (
+        None
+        if target_arm == "rules_only"
+        else [float(row["probability"]) for row in rows]
+    )
+    aggregate = _mapping(summary.get("aggregate"), "compact semantic aggregate")
+    expectations = semantic._metric_expectations(  # noqa: SLF001
+        labels=labels,
+        actions=actions,
+        probabilities=probabilities,
+    )
+    for name, expected in expectations.items():
+        semantic._verify_metric(  # noqa: SLF001
+            _mapping(aggregate.get(name), f"compact aggregate {name}"),
+            value=expected[0],
+            numerator=expected[1],
+            denominator=expected[2],
+            applicability=expected[3],
+            support_ids=support_ids,
+        )
+    latencies = [float(row["latency_ms"]) for row in rows]
+    for percentile in (50, 95, 99):
+        value = semantic._percentile(latencies, percentile)  # noqa: SLF001
+        semantic._verify_metric(  # noqa: SLF001
+            _mapping(
+                aggregate.get(f"p{percentile}_latency_ms"),
+                "compact latency metric",
+            ),
+            value=value,
+            numerator=value,
+            denominator=1.0,
+            applicability="defined",
+            support_ids=support_ids,
+        )
+    semantic._verify_calibration(  # noqa: SLF001
+        _mapping(summary.get("calibration"), "compact calibration"),
+        labels=labels,
+        probabilities=probabilities,
+        support_ids=support_ids,
+    )
+    economics = _mapping(summary.get("economics"), "compact economics")
+    semantic._verify_economics(  # noqa: SLF001
+        economics,
+        rows=rows,
+        manifests=manifests,
+    )
+    malicious = [
+        item
+        for item in _sequence(economics.get("by_currency"), "compact currency economics")
+        if Decimal(str(_mapping(item, "compact currency stratum")["malicious_amount"]))
+        > 0
+    ]
+    for name, amount_field in (
+        ("captured_value_fraction", "captured_amount"),
+        ("escaped_value_fraction", "escaped_amount"),
+    ):
+        fractions = [
+            float(
+                Decimal(str(_mapping(item, "compact currency stratum")[amount_field]))
+                / Decimal(
+                    str(_mapping(item, "compact currency stratum")["malicious_amount"])
+                )
+            )
+            for item in malicious
+        ]
+        semantic._verify_metric(  # noqa: SLF001
+            _mapping(aggregate.get(name), name),
+            value=sum(fractions) / len(fractions) if fractions else None,
+            numerator=sum(fractions) if fractions else 0.0,
+            denominator=float(len(fractions)),
+            applicability="defined" if fractions else "undefined",
+            support_ids=support_ids,
+        )
+    fraud_campaigns = {
+        row["support"]["campaign_id"]
+        for row in rows
+        if row["support"]["label"] == 1
+    }
+    detected_campaigns = {
+        row["support"]["campaign_id"]
+        for row in rows
+        if row["support"]["label"] == 1
+        and row["action"] in semantic._DETECTION  # noqa: SLF001
+    }
+    semantic._verify_metric(  # noqa: SLF001
+        _mapping(aggregate.get("campaign_detection_rate"), "campaign detection"),
+        value=(
+            float(len(detected_campaigns)) / float(len(fraud_campaigns))
+            if fraud_campaigns
+            else None
+        ),
+        numerator=float(len(detected_campaigns)),
+        denominator=float(len(fraud_campaigns)),
+        applicability="defined" if fraud_campaigns else "undefined",
+        support_ids=support_ids,
+    )
+    family_metrics = _sequence(summary.get("by_family"), "compact family metrics")
+    semantic._verify_family_metrics(  # noqa: SLF001
+        family_metrics,
+        rows=rows,
+        economics=economics,
+        manifests=manifests,
+    )
+    summary_sha256 = summary.get("summary_sha256")
+    if not _is_sha256(summary_sha256):
+        _fail("compact semantic summary digest differs")
+    return cast(str, summary_sha256)
+
+
 def _verify_corpus_records(
     *, records: Sequence[_Record], payload: Mapping[str, Any] | None
 ) -> dict[str, dict[str, list[dict[str, Any]]]]:
@@ -2275,7 +2609,30 @@ def _verify_v5_kaggle_evidence(
         _protocol, _run, run_binding = _protocol_and_run_binding(
             root=root.resolve(), expected_mode=expected_mode
         )
-        checkpoints = tuple(_read_checkpoint(path) for path in (*roots, final_root))
+        final_checkpoint = _read_checkpoint(final_root)
+        final_records = final_checkpoint.observational_records
+        if len(final_records) != 1 or final_records[0].kind != "final_payload":
+            _fail("final checkpoint records differ")
+        try:
+            final_index = _mapping(
+                json.loads(final_records[0].payload),
+                "staged final payload",
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise V5KaggleIndependentVerificationError(
+                "staged final payload is not JSON"
+            ) from error
+        compact_final = (
+            final_index.get("schema_version")
+            == "apar-sentinel-v5-kaggle-compact-final-payload/2"
+        )
+        checkpoints = (
+            *(
+                _read_checkpoint(path, retain_arm_records=not compact_final)
+                for path in roots
+            ),
+            final_checkpoint,
+        )
         if tuple(item.manifest["stage"] for item in checkpoints) != _STAGES:
             _fail("checkpoint stage order differs")
         for index, checkpoint in enumerate(checkpoints):
