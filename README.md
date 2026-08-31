@@ -88,7 +88,7 @@ Mastercard/cardholder data.
 ## Explore the public prototype
 
 The [Vercel deployment](https://web-six-tau-bxhm7rwrzu.vercel.app/overview)
-contains six judge-facing routes:
+contains six interactive routes:
 
 | Route | What to inspect |
 |---|---|
