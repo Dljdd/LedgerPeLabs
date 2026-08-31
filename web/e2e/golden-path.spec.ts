@@ -37,11 +37,11 @@ test("five-minute golden path moves from threat to assurance", async ({ page }) 
   await expect(page.getByRole("img", { name: /14 genuine scenario entities and 10 ordered payment edges/i })).toBeVisible();
   await expect(page.getByText(/no payment-to-trace record mapping asserted/i)).toBeVisible();
   await expect(page.getByRole("img", { name: /calibrated risk 100.0%.*bound action thresholds/i })).toBeVisible();
-  await page.getByRole("button", { name: /play campaign/i }).click();
-  await expect(page.getByRole("button", { name: /pause campaign/i })).toBeVisible();
-  await page.getByRole("button", { name: /pause campaign/i }).click();
-  await page.getByRole("button", { name: "Step forward" }).click();
+  await page.getByRole("button", { name: /play both streams/i }).click();
+  await expect(page.getByRole("button", { name: /pause both streams/i })).toBeVisible();
+  await expect(page.getByText("SCENARIO PAYMENT 02")).toBeVisible();
   await expect(page.getByText(/Event 02 \/ 12/)).toBeVisible();
+  await page.getByRole("button", { name: /pause both streams/i }).click();
 
   await page.getByRole("navigation", { name: "Primary" }).getByRole("link", { name: /investigation/i }).click();
   await expect(page.getByRole("img", { name: /14 linked entities and 10 directional payment edges/i })).toBeVisible();
@@ -83,9 +83,11 @@ test("primary journey is keyboard reachable", async ({ page }) => {
   await replayLink.focus();
   await page.keyboard.press("Enter");
   await expect(page.getByRole("heading", { name: "Verified decision replay" })).toBeVisible();
-  await page.getByRole("button", { name: "Step forward" }).focus();
+  await page.getByRole("button", { name: "Play both streams" }).focus();
   await page.keyboard.press("Enter");
   await expect(page.getByText(/Event 02 \/ 12/)).toBeVisible();
+  await page.getByRole("button", { name: "Pause both streams" }).focus();
+  await page.keyboard.press("Enter");
 
   const assuranceLink = page.getByRole("navigation", { name: "Primary" }).getByRole("link", { name: /assurance/i });
   await assuranceLink.focus();
@@ -101,10 +103,11 @@ test("reduced motion campaign advances only on explicit steps", async ({ page })
   await page.emulateMedia({ reducedMotion: "reduce" });
   await page.goto("/replay");
 
-  const stepCampaign = page.getByRole("button", { name: "Step campaign" });
+  const stepCampaign = page.getByRole("button", { name: "Step both streams" });
   await expect(stepCampaign).toBeVisible();
   await stepCampaign.click();
   await expect(page.getByText("SCENARIO PAYMENT 02")).toBeVisible();
+  await expect(page.getByText("Event 02 / 12")).toBeVisible();
   await page.waitForTimeout(1100);
   await expect(page.getByText("SCENARIO PAYMENT 02")).toBeVisible();
 

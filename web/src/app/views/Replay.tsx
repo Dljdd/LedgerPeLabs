@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import type { CSSProperties } from "react";
 
-import { Icon } from "../Icon";
 import { formatMoney, formatPercent, shortHash, titleCase } from "../format";
 import type { ConsoleEvidence, GraphEdge, TraceMode, VerifiedTrace } from "../types";
 import { useReducedMotion } from "../useReducedMotion";
@@ -144,6 +143,13 @@ function scenarioParties(evidence: ConsoleEvidence, edge: GraphEdge) {
   };
 }
 
+function synchronizedTraceIndex(campaignIndex: number, campaignLength: number, traceLength: number) {
+  if (campaignLength <= 1 || traceLength <= 1) return 0;
+  // Presentation progress only; the repository does not bind scenario edges to trace rows.
+  const progress = campaignIndex / (campaignLength - 1);
+  return Math.round(progress * (traceLength - 1));
+}
+
 export function Replay({ evidence, trace, traceMode }: { evidence: ConsoleEvidence; trace: VerifiedTrace; traceMode: TraceMode }) {
   const [current, setCurrent] = useState(0);
   const [campaignStep, setCampaignStep] = useState(0);
@@ -154,6 +160,10 @@ export function Replay({ evidence, trace, traceMode }: { evidence: ConsoleEviden
   const campaignEdge = campaignEdges[campaignStep] ?? campaignEdges[0];
   const total = trace.traces.length;
   const reducedMotion = useReducedMotion();
+
+  useEffect(() => {
+    setCurrent(synchronizedTraceIndex(campaignStep, campaignEdges.length, total));
+  }, [campaignEdges.length, campaignStep, total]);
 
   useEffect(() => {
     if (!campaignPlaying || reducedMotion) return;
@@ -183,33 +193,45 @@ export function Replay({ evidence, trace, traceMode }: { evidence: ConsoleEviden
   }
 
   const parties = scenarioParties(evidence, campaignEdge);
-  const stepForward = () => setCurrent((index) => Math.min(index + 1, total - 1));
-  const reset = () => setCurrent(0);
+  const resetStreams = () => {
+    setCampaignPlaying(false);
+    setCampaignStep(0);
+    setCurrent(0);
+  };
   const toggleCampaign = () => {
     if (reducedMotion) {
       setCampaignPlaying(false);
-      setCampaignStep((index) => index >= campaignEdges.length - 1 ? 0 : index + 1);
+      const nextCampaignStep = campaignStep >= campaignEdges.length - 1 ? 0 : campaignStep + 1;
+      setCampaignStep(nextCampaignStep);
+      setCurrent(synchronizedTraceIndex(nextCampaignStep, campaignEdges.length, total));
       return;
     }
-    if (!campaignPlaying && campaignStep === campaignEdges.length - 1) setCampaignStep(0);
+    if (!campaignPlaying) {
+      const nextCampaignStep = campaignStep === campaignEdges.length - 1 ? 0 : campaignStep;
+      setCampaignStep(nextCampaignStep);
+      setCurrent(synchronizedTraceIndex(nextCampaignStep, campaignEdges.length, total));
+    }
     setCampaignPlaying((value) => !value);
   };
   const campaignControlLabel = reducedMotion
-    ? campaignStep === campaignEdges.length - 1 ? "Reset campaign" : "Step campaign"
-    : campaignPlaying ? "Pause campaign" : campaignStep === campaignEdges.length - 1 ? "Replay campaign" : "Play campaign";
+    ? campaignStep === campaignEdges.length - 1 ? "Restart both streams" : "Step both streams"
+    : campaignPlaying ? "Pause both streams" : campaignStep === campaignEdges.length - 1 ? "Replay both streams" : "Play both streams";
 
   return (
     <div className="page replay-page">
       <header className="page-header split-header replay-header">
-        <div><p className="eyebrow">03 · Detection narrative</p><h1>Verified decision replay</h1><p>Follow the genuine campaign path, then inspect the independent portable graph-ensemble response.</p></div>
+        <div><p className="eyebrow">03 · Detection narrative</p><h1>Verified decision replay</h1><p>Advance both evidence streams through one presentation control, then inspect each independently.</p></div>
         <div className="live-arm"><span className="status-dot" aria-hidden="true" /><span><small>{traceMode === "live_local_scorer" ? "LIVE LOCAL SCORER" : "HASH-BOUND VERIFIED FALLBACK"}</small><strong>ensemble_with_graph</strong></span></div>
       </header>
 
       <section className="replay-narrative" aria-label="Campaign and detection narrative">
         <div className="campaign-playback">
           <header className="campaign-playback-head">
-            <div><span>CAMPAIGN PLAYBACK / {String(campaignStep + 1).padStart(2, "0")} OF {String(campaignEdges.length).padStart(2, "0")}</span><h2>Reveal the payment path in event order</h2></div>
-            <button aria-pressed={reducedMotion ? undefined : campaignPlaying} className="campaign-play-button" onClick={toggleCampaign} type="button"><i aria-hidden="true" />{campaignControlLabel}</button>
+            <div><span>PRESENTATION PLAYBACK / CAMPAIGN {String(campaignStep + 1).padStart(2, "0")}/{String(campaignEdges.length).padStart(2, "0")} · PORTABLE {String(current + 1).padStart(2, "0")}/{String(total).padStart(2, "0")}</span><h2>Advance campaign and model evidence together</h2></div>
+            <div className="campaign-transport">
+              <button aria-pressed={reducedMotion ? undefined : campaignPlaying} className="campaign-play-button" onClick={toggleCampaign} type="button"><i aria-hidden="true" />{campaignControlLabel}</button>
+              <button aria-label="Reset both streams" className="campaign-reset-button" onClick={resetStreams} type="button"><span aria-hidden="true">↺</span>Reset both</button>
+            </div>
           </header>
           <CampaignPlaybackGraph evidence={evidence} selectedEdge={campaignStep} />
           <div className="campaign-progress"><i style={{ transform: `scaleX(${(campaignStep + 1) / campaignEdges.length})` }} /><span>{formatMoney(campaignEdge.cumulative_attempted_value, campaignEdge.currency)} cumulative attempted</span></div>
@@ -217,7 +239,7 @@ export function Replay({ evidence, trace, traceMode }: { evidence: ConsoleEviden
             <ol className="campaign-tape" aria-label="Ordered campaign payments">
               {campaignEdges.map((edge, index) => (
                 <li key={edge.payment_id}>
-                  <button aria-current={campaignStep === index ? "step" : undefined} onClick={() => { setCampaignPlaying(false); setCampaignStep(index); }} type="button">
+                  <button aria-current={campaignStep === index ? "step" : undefined} onClick={() => { setCampaignPlaying(false); setCampaignStep(index); setCurrent(synchronizedTraceIndex(index, campaignEdges.length, total)); }} type="button">
                     <span>{String(index + 1).padStart(2, "0")}</span><i aria-hidden="true" /><b>{formatMoney(edge.amount, edge.currency)}</b><small>{titleCase(edge.stage)}</small>
                   </button>
                 </li>
@@ -254,10 +276,9 @@ export function Replay({ evidence, trace, traceMode }: { evidence: ConsoleEviden
                 <div><dt>Feature vector</dt><dd>{inputRecord.model_input.features.length} bound features</dd></div>
               </dl>
             </div>
-            <div className="portable-controls" aria-label="Portable replay controls">
-              <button className="icon-button" disabled={current === total - 1} onClick={stepForward} title="Step forward" type="button"><Icon name="step" /><span className="sr-only">Step forward</span></button>
-              <button className="icon-button" onClick={reset} title="Reset replay" type="button"><Icon name="reset" /><span className="sr-only">Reset replay</span></button>
+            <div className="portable-status">
               <span aria-live="polite">Event {String(current + 1).padStart(2, "0")} / {String(total).padStart(2, "0")}</span>
+              <small>Manual trace inspection below</small>
             </div>
           </section>
 
@@ -267,7 +288,7 @@ export function Replay({ evidence, trace, traceMode }: { evidence: ConsoleEviden
             ))}
           </div>
 
-          <p className="stream-boundary"><b>Scenario graph</b><span>and</span><b>portable replay</b><small>Both repository-bound. No payment-to-trace record mapping asserted.</small></p>
+          <p className="stream-boundary"><b>Scenario graph</b><span>with</span><b>portable replay</b><small>Shared presentation control · independent evidence streams. No payment-to-trace record mapping asserted.</small></p>
         </aside>
       </section>
 

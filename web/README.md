@@ -8,8 +8,10 @@ complete hybrid.
 
 The finalized interface uses an Editorial Casefile design system: serif
 narrative headings, warm ink surfaces, monospaced evidence, and a graph-led
-Replay route. The scenario graph and portable trace have independent selectors;
-the console does not assert a payment-to-trace record mapping.
+Replay route. One presentation transport advances the scenario graph and
+portable trace together in their own repository order. Their independent
+selectors remain available, and the console does not assert a payment-to-trace
+record mapping.
 
 ## Prerequisites
 
@@ -55,7 +57,8 @@ rows and bundle manifest before rendering model values.
 `health` verifies both embedded document hashes, bundle binding, all 12
 accepted event/action/probability pairs, `authoritative=false`, and
 `accepted_capacity_evidence=false`. `reset` removes only the generated local
-live trace; reload or the Replay reset button returns the interface to event 1.
+live trace; reload or **Reset both** on Replay returns both streams to their
+canonical first record.
 `--fallback-only` is the deterministic worker-failure drill.
 
 ## Focused verification

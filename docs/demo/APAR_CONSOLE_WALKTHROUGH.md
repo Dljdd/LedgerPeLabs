@@ -35,20 +35,20 @@ Say: “The console calls the real local scorer first. The green runtime label
 shows `ensemble_with_graph`. If the worker fails, the same view explicitly
 switches to a hash-bound verified fallback.”
 
-Click **Play campaign** briefly. The left surface reveals the 10 genuine payment
-edges in order; an orange transfer marker moves between the active source and
-target while the scenario payment inspector shows the selected stage, amount,
-route, time, and cumulative attempted value. Say: “This is the campaign story;
-it is not a row-level join to the portable trace.”
+Click **Play both streams** briefly. One presentation transport advances the 10
+genuine payment edges and the 12 portable decisions in their respective
+repository order. The orange transfer marker moves between the active source
+and target while both inspectors update. Say: “The shared control keeps the
+walkthrough synchronized; it is not a row-level join between the two streams.”
 
 On the right, point out the independently selected calibrated probability,
 bound action thresholds, final action, observed local or fixed-trace latency,
 feature count, and repository reason code. Call out the explicit “No
 payment-to-trace record mapping asserted” boundary. Emphasize that post-event
 truth sits in its own amber examination panel and was withheld from the model.
-Click **Step forward** once to reach the A2A APP event, then use the event ledger
-to show the curated cross-rail cases. Do not describe the 12 cases as production
-estimates.
+Use the portable trace dots or event ledger to inspect the A2A APP event without
+moving the campaign selector. **Reset both** returns both streams to their
+canonical first record. Do not describe the 12 cases as production estimates.
 
 Open **Investigation**.
 

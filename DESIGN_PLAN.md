@@ -5,7 +5,7 @@
 - **Scope:** Six-route judge-facing assurance console
 - **Target:** `web/src/app` and `web/src/styles.css`
 - **Winning direction:** Variant F campaign narrative with Variant B Editorial Casefile treatment
-- **Key improvements:** graph-led campaign playback, visible value transfer, persistent detection inspector, independent evidence selectors, route-specific evidence interactions, serif narrative hierarchy, warm ink surfaces, and reduced card/pill repetition
+- **Key improvements:** graph-led campaign playback, shared presentation transport, visible value transfer, persistent detection inspector, independent evidence selectors, route-specific evidence interactions, serif narrative hierarchy, warm ink surfaces, and reduced card/pill repetition
 
 ## Files Changed
 
@@ -24,7 +24,7 @@
 1. Apply an offline-safe editorial serif stack to narrative headings and decisive values.
 2. Retain sans-serif body copy and monospaced labels, hashes, timing, probabilities, and evidence identifiers.
 3. Present the 10 genuine scenario payment edges as an ordered campaign playback.
-4. Keep the 12 verified portable events independently selectable and visibly label the lack of record-level mapping.
+4. Advance the campaign and portable evidence together through one presentation transport while keeping both independently selectable and visibly labeling the lack of record-level mapping.
 5. Show calibrated probability, bound thresholds, final action, latency, feature count, and reason evidence for the selected portable event.
 6. Move post-event truth into a separate examination panel marked as withheld from the model.
 7. Carry warm dossier surfaces, fine rulework, and semantic orange/red/amber/green states through every console route.
@@ -37,18 +37,18 @@
 ### Replay
 
 - **Props:** `evidence: ConsoleEvidence`, `trace: VerifiedTrace`, `traceMode: TraceMode`
-- **State:** selected scenario edge, campaign playback state, and independently selected portable trace event
-- **Events:** campaign play/pause, scenario-edge focus, portable-event focus, step-forward, and reset
+- **State:** selected scenario edge, shared presentation playback state, and independently inspectable portable trace event
+- **Events:** shared play/pause, shared reset, scenario-edge focus, and portable-event focus
 - **Evidence rule:** selected scenario and portable records never imply a payment-to-trace mapping
 
 ## Required UI States
 
 - **Loading:** retained at the application loader boundary
 - **Empty/degraded:** replay stops safely when bound scenario or trace evidence is absent
-- **Disabled:** portable step-forward control disables at the final trace event
+- **Reset:** one transport restores both evidence streams to their canonical first record
 - **Selected:** scenario and portable selectors expose `aria-current` or `aria-pressed`
 - **Playing:** campaign progress, active endpoint focus, and the bound value-transfer marker communicate the selected genuine edge
-- **Reduced motion:** campaign playback becomes explicit Step/Reset; positional travel is removed while brief state feedback remains
+- **Reduced motion:** shared playback becomes explicit Step/Reset; positional travel is removed while brief state feedback remains
 
 ## Accessibility Checklist
 

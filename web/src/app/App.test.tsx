@@ -109,13 +109,53 @@ describe("native route boundary", () => {
     expect(screen.getByRole("img", { name: /14 genuine scenario entities and 10 ordered payment edges/i })).toBeVisible();
     expect(screen.getByText(/no payment-to-trace record mapping asserted/i)).toBeVisible();
 
-    await user.click(screen.getByRole("button", { name: /step forward/i }));
+    const portable = within(screen.getByRole("group", { name: /select independent portable trace event/i })).getAllByRole("button");
+    await user.click(portable[1]!);
     expect(screen.getByText("Event 02 / 12")).toBeVisible();
-    await user.click(screen.getByRole("button", { name: /reset replay/i }));
+    await user.click(screen.getByRole("button", { name: /reset both streams/i }));
     expect(screen.getByText("Event 01 / 12")).toBeVisible();
   });
 
-  it("keeps scenario playback independent from portable event selection", async () => {
+  it("advances both evidence streams from the shared playback control", () => {
+    vi.useFakeTimers();
+    try {
+      history.replaceState({}, "", "/replay");
+      const evidence = parseEvidence(rawEvidence);
+      render(<App evidence={evidence} trace={parseTrace(rawTrace, evidence)} />);
+
+      act(() => {
+        screen.getByRole("button", { name: "Play both streams" }).click();
+      });
+      act(() => {
+        vi.advanceTimersByTime(901);
+      });
+
+      expect(screen.getByText("SCENARIO PAYMENT 02")).toBeVisible();
+      expect(screen.getByText("Event 02 / 12")).toBeVisible();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("uses one transport to reset both evidence streams", async () => {
+    const user = userEvent.setup();
+    history.replaceState({}, "", "/replay");
+    const evidence = parseEvidence(rawEvidence);
+    render(<App evidence={evidence} trace={parseTrace(rawTrace, evidence)} />);
+
+    expect(screen.queryByRole("button", { name: "Step forward" })).not.toBeInTheDocument();
+    const campaign = within(screen.getByRole("list", { name: /ordered campaign payments/i })).getAllByRole("button");
+    await user.click(campaign[4]!);
+    expect(screen.getByText("SCENARIO PAYMENT 05")).toBeVisible();
+    expect(screen.getByText("Event 06 / 12")).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: "Reset both streams" }));
+    expect(screen.getByText("SCENARIO PAYMENT 01")).toBeVisible();
+    expect(screen.getByText("Event 01 / 12")).toBeVisible();
+  });
+
+  it("synchronizes campaign selection while retaining independent portable inspection", async () => {
     const user = userEvent.setup();
     const evidence = parseEvidence(rawEvidence);
     render(<App evidence={evidence} trace={parseTrace(rawTrace, evidence)} />);
@@ -125,7 +165,7 @@ describe("native route boundary", () => {
     await user.click(campaign[4]!);
 
     expect(campaign[4]).toHaveAttribute("aria-current", "step");
-    expect(screen.getByText("Event 01 / 12")).toBeVisible();
+    expect(screen.getByText("Event 06 / 12")).toBeVisible();
 
     const portable = within(screen.getByRole("group", { name: /select independent portable trace event/i })).getAllByRole("button");
     await user.click(portable[1]!);
@@ -133,37 +173,38 @@ describe("native route boundary", () => {
     expect(screen.getByText("Event 02 / 12")).toBeVisible();
   });
 
-  it("exposes normal campaign play, pause, and replay controls", async () => {
+  it("exposes shared play, pause, and replay controls", async () => {
     const user = userEvent.setup();
     const evidence = parseEvidence(rawEvidence);
     render(<App evidence={evidence} trace={parseTrace(rawTrace, evidence)} />);
 
     await user.click(within(screen.getByRole("navigation", { name: "Primary" })).getByRole("link", { name: /replay/i }));
-    await user.click(screen.getByRole("button", { name: "Play campaign" }));
-    expect(screen.getByRole("button", { name: "Pause campaign" })).toHaveAttribute("aria-pressed", "true");
-    await user.click(screen.getByRole("button", { name: "Pause campaign" }));
-    expect(screen.getByRole("button", { name: "Play campaign" })).toHaveAttribute("aria-pressed", "false");
+    await user.click(screen.getByRole("button", { name: "Play both streams" }));
+    expect(screen.getByRole("button", { name: "Pause both streams" })).toHaveAttribute("aria-pressed", "true");
+    await user.click(screen.getByRole("button", { name: "Pause both streams" }));
+    expect(screen.getByRole("button", { name: "Play both streams" })).toHaveAttribute("aria-pressed", "false");
 
     const payments = within(screen.getByRole("list", { name: /ordered campaign payments/i })).getAllByRole("button");
     await user.click(payments.at(-1)!);
-    expect(screen.getByRole("button", { name: "Replay campaign" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Replay both streams" })).toBeVisible();
   });
 
-  it("steps and resets campaign playback when reduced motion is requested", async () => {
+  it("steps and resets both streams when reduced motion is requested", async () => {
     mockReducedMotion(true);
     const user = userEvent.setup();
     const evidence = parseEvidence(rawEvidence);
     render(<App evidence={evidence} trace={parseTrace(rawTrace, evidence)} />);
 
     await user.click(within(screen.getByRole("navigation", { name: "Primary" })).getByRole("link", { name: /replay/i }));
-    const stepCampaign = screen.getByRole("button", { name: "Step campaign" });
+    const stepCampaign = screen.getByRole("button", { name: "Step both streams" });
     expect(stepCampaign).not.toHaveAttribute("aria-pressed");
     await user.click(stepCampaign);
     expect(screen.getByText("SCENARIO PAYMENT 02")).toBeVisible();
+    expect(screen.getByText("Event 02 / 12")).toBeVisible();
 
     const payments = within(screen.getByRole("list", { name: /ordered campaign payments/i })).getAllByRole("button");
     await user.click(payments.at(-1)!);
-    const resetCampaign = screen.getByRole("button", { name: "Reset campaign" });
+    const resetCampaign = screen.getByRole("button", { name: "Reset both streams" });
     expect(resetCampaign).not.toHaveAttribute("aria-pressed");
     await user.click(resetCampaign);
     expect(screen.getByText("SCENARIO PAYMENT 01")).toBeVisible();
@@ -176,14 +217,14 @@ describe("native route boundary", () => {
     render(<App evidence={evidence} trace={parseTrace(rawTrace, evidence)} />);
 
     await user.click(within(screen.getByRole("navigation", { name: "Primary" })).getByRole("link", { name: /replay/i }));
-    await user.click(screen.getByRole("button", { name: "Play campaign" }));
-    expect(screen.getByRole("button", { name: "Pause campaign" })).toHaveAttribute("aria-pressed", "true");
+    await user.click(screen.getByRole("button", { name: "Play both streams" }));
+    expect(screen.getByRole("button", { name: "Pause both streams" })).toHaveAttribute("aria-pressed", "true");
 
     act(() => motionPreference.setMatches(true));
-    expect(screen.getByRole("button", { name: "Step campaign" })).not.toHaveAttribute("aria-pressed");
+    expect(screen.getByRole("button", { name: "Step both streams" })).not.toHaveAttribute("aria-pressed");
 
     act(() => motionPreference.setMatches(false));
-    expect(screen.getByRole("button", { name: "Play campaign" })).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByRole("button", { name: "Play both streams" })).toHaveAttribute("aria-pressed", "false");
   });
 
   it("keeps recovered metrics and integrity proof in their own claim lanes", async () => {

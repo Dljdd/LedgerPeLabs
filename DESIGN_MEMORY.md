@@ -33,10 +33,11 @@
 - Motion is reserved for campaign playback, graph focus, calibrated progress, and meaningful state changes.
 - Every route may expose one user-driven evidence interaction when it helps a judge inspect genuine repository-bound data; do not add ambient motion merely to fill space.
 - Campaign playback may use a transform-only value-transfer marker and active endpoint focus while the underlying event order and inspector values remain authoritative.
+- Use one presentation transport to advance the scenario graph and portable trace in their respective repository order; state explicitly that synchronized presentation does not create a record-level mapping.
 - Selected ordered steps use `aria-current`; independent selectors use `aria-pressed`.
-- Preserve visible reset and step-forward controls for deterministic demonstrations.
+- Preserve one visible shared reset and keep the independent selectors available for deterministic inspection.
 - Do not animate content into existence or hide judge-critical evidence behind hover.
-- In reduced-motion mode, campaign autoplay becomes explicit Step/Reset control; retain short opacity and color feedback while removing travel.
+- In reduced-motion mode, shared autoplay becomes explicit Step/Reset control; retain short opacity and color feedback while removing travel.
 - Keep touch targets at least 44 CSS pixels where practical.
 
 ## Evidence Presentation

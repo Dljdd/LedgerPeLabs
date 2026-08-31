@@ -10,12 +10,13 @@ calls the real Python portable scorer when available, and retains a labeled,
 hash-bound fixed trace for degraded operation.
 
 The finalized Editorial Casefile treatment uses a serif narrative hierarchy,
-warm ink surfaces, and graph-led replay. The 10 scenario payment edges and 12
-portable decisions remain independently selectable, with an explicit statement
-that no payment-to-trace record mapping is asserted. Every route now includes
-a user-driven evidence visual: trace focus, configured-stage motif focus,
-campaign value transfer, linked-value bars, architecture-arm inspection, or
-full lineage inspection.
+warm ink surfaces, and graph-led replay. One presentation transport advances
+the 10 scenario payment edges and 12 portable decisions together in their own
+repository order. Both remain independently inspectable, with an explicit
+statement that this synchronization does not assert a payment-to-trace record
+mapping. Every route now includes a user-driven evidence visual: trace focus,
+configured-stage motif focus, campaign value transfer, linked-value bars,
+architecture-arm inspection, or full lineage inspection.
 
 ## Representative screenshots
 
@@ -29,7 +30,7 @@ full lineage inspection.
 
 - Console evidence builder: 5 tests passed.
 - Console server and live scorer worker: 3 tests passed.
-- Frontend unit and boundary checks: 19 tests passed.
+- Frontend unit and boundary checks: 21 tests passed.
 - TypeScript project check: passed.
 - ESLint with zero warnings: passed.
 - Vite production build: passed.
@@ -37,10 +38,10 @@ full lineage inspection.
 - Playwright route smoke: all six routes, both breakpoints.
 - Axe automated checks: no violations on Overview, Replay, and Assurance,
   desktop/mobile.
-- Keyboard path: skip link, primary navigation, trace selection, replay step,
+- Keyboard path: skip link, primary navigation, trace selection, shared replay control,
   and lineage selection passed.
-- Reduced motion: campaign autoplay is unavailable; explicit Step/Reset and
-  stationary transfer-state verification passed.
+- Reduced motion: autoplay is unavailable; explicit shared Step/Reset and
+  synchronized stationary transfer-state verification passed.
 - Viewport check: no document-level horizontal overflow on any route at tested
   desktop/mobile breakpoints.
 - Fixed trace hash, bundle binding, accepted action/probability replay, and real
