@@ -266,6 +266,29 @@ function styleHeader(slideNumber, titleSize = 39) {
 {
   styleHeader(5, 39);
   setText(textItem(5, "Verified recovered diagnostics — synthetic and non-authoritative"), { typeface: "Menlo", size: 12, bold: true, color: C.orangeHot });
+  const tableColumns = [
+    { left: 42, width: 300 },
+    { left: 342, width: 170 },
+    { left: 512, width: 170 },
+    { left: 682, width: 170 },
+    { left: 852, width: 216 },
+    { left: 1068, width: 170 },
+  ];
+  const tableRows = [
+    { panelTop: 200, panelHeight: 48, textTop: 214, textHeight: 20 },
+    { panelTop: 248, panelHeight: 66, textTop: 269, textHeight: 25 },
+    { panelTop: 314, panelHeight: 66, textTop: 335, textHeight: 25 },
+    { panelTop: 380, panelHeight: 66, textTop: 401, textHeight: 25 },
+    { panelTop: 446, panelHeight: 66, textTop: 467, textHeight: 25 },
+  ];
+  for (const row of tableRows) {
+    const panels = shapesAt(5, (entry) => within((entry.bbox ?? [])[1], row.panelTop) && within((entry.bbox ?? [])[3], row.panelHeight)).sort((a, b) => a.bbox[0] - b.bbox[0]);
+    const labels = textsAt(5, (entry) => within((entry.bbox ?? [])[1], row.textTop) && within((entry.bbox ?? [])[3], row.textHeight)).sort((a, b) => a.bbox[0] - b.bbox[0]);
+    tableColumns.forEach((column, index) => {
+      setPosition(panels[index], { left: column.left, width: column.width });
+      setPosition(labels[index], { left: column.left + 10, width: column.width - 20 });
+    });
+  }
   for (const shape of shapesAt(5, () => true)) {
     const box = shape.bbox ?? [];
     if (within(box[1], 200) && within(box[3], 48)) setPanel(shape, "none", C.lineStrong, 0.6);
@@ -307,10 +330,17 @@ function styleHeader(slideNumber, titleSize = 39) {
 // 07 — Case-centric investigation with a contained evidence card.
 {
   styleHeader(7, 39);
-  const frame = shapesAt(7, (entry) => at(entry, 386, 152, 860, 494))[0];
+  const frame = shapesAt(7, (entry) => {
+    const box = entry.bbox ?? [];
+    return within(box[0], 386) && box[1] >= 150 && box[1] <= 162 && within(box[2], 860) && box[3] >= 484 && box[3] <= 496;
+  })[0];
+  setPosition(frame, { left: 386, top: 160, width: 860, height: 486 });
   setPanel(frame, "none", C.lineStrong, 1);
   const image = items(7, "image")[0];
-  if (image) image.target.borderRadius = "rounded-none";
+  if (image) {
+    setPosition(image, { left: 394, top: 168, width: 844, height: 470 });
+    image.target.borderRadius = "rounded-none";
+  }
   const pill = shapesAt(7, (entry) => at(entry, 42, 174, 150, 32))[0];
   setPosition(pill, { left: 42, top: 168, width: 304, height: 386 });
   setPanel(pill, "none", C.lineStrong, 0.8);
@@ -379,11 +409,26 @@ function styleHeader(slideNumber, titleSize = 39) {
   const cards = shapesAt(9, (entry) => {
     const box = entry.bbox ?? [];
     return box[1] >= 170 && box[1] <= 300 && box[2] >= 200 && box[2] <= 220 && box[3] >= 230;
-  });
+  }).sort((a, b) => a.bbox[0] - b.bbox[0]);
+  const cardLefts = [42, 286.5, 531, 775.5, 1020];
   cards.forEach((card, index) => {
+    setPosition(card, { left: cardLefts[index], width: 218 });
     if (index === 0) setPanel(card, "none", C.orange, 1.2);
     else if (index === 4) setPanel(card, "none", C.green, 1.2);
     else setPanel(card, "none", C.line, 0.8);
+  });
+  const cardCopy = [
+    ["01", "Causal features", "Future append + equal-time isolation"],
+    ["02", "Executed controls", "Shuffle, rename, leakage, single-class"],
+    ["03", "Immutable evidence", "Models, traces, metrics, manifests hashed"],
+    ["04", "Independent replay", "Fresh environment re-scores all 12 cases"],
+    ["05", "Human promotion", "The model cannot approve itself"],
+  ];
+  cardCopy.forEach(([number, titleText, bodyText], index) => {
+    const left = cardLefts[index] + 18;
+    setPosition(textItem(9, number), { left });
+    setPosition(textItem(9, titleText), { left, width: 182 });
+    setPosition(textItem(9, bodyText), { left, width: 182 });
   });
   for (const item of textsAt(9, (entry) => /^0[1-5]$/.test(entry.text))) setText(item, { typeface: "Georgia", size: 18, bold: false, color: C.orangeHot });
   for (const item of textsAt(9, (entry) => ["Causal features", "Executed controls", "Immutable evidence", "Independent replay", "Human promotion"].includes(entry.text))) setText(item, { typeface: "Georgia", size: 20, bold: false, color: C.text });
@@ -433,13 +478,30 @@ function styleHeader(slideNumber, titleSize = 39) {
   setPosition(rule, { top: 148 });
   const cards = shapesAt(11, (entry) => {
     const box = entry.bbox ?? [];
-    return within(box[1], 184) && within(box[2], 212) && within(box[3], 218);
-  });
+    return within(box[1], 184) && box[2] >= 210 && box[2] <= 220 && within(box[3], 218);
+  }).sort((a, b) => a.bbox[0] - b.bbox[0]);
+  const cardLefts = [42, 286.5, 531, 775.5, 1020];
   cards.forEach((card, index) => {
+    setPosition(card, { left: cardLefts[index], width: 218 });
     if (index === 0) setPanel(card, "none", C.orange, 1.2);
     else if (index === 4) setPanel(card, "none", C.green, 1.2);
     else setPanel(card, "none", C.line, 0.8);
   });
+  const cardCopy = [
+    ["1", "OFFLINE REPLAY", "Authorized historical samples"],
+    ["2", "SHADOW MODE", "Live features; no authority"],
+    ["3", "ASSISTED OPS", "Human-controlled friction"],
+    ["4", "CHALLENGER", "Limited traffic + rollback"],
+    ["5", "GOVERNED SCALE", "Continuous adversarial regression"],
+  ];
+  cardCopy.forEach(([number, titleText, bodyText], index) => {
+    const left = cardLefts[index] + 18;
+    setPosition(textItem(11, number), { left });
+    setPosition(textItem(11, titleText), { left, width: 182 });
+    setPosition(textItem(11, bodyText), { left, width: 182 });
+  });
+  const arrowLefts = [260, 504.5, 749, 993.5];
+  textsAt(11, (entry) => entry.text === "→").sort((a, b) => a.bbox[0] - b.bbox[0]).forEach((arrow, index) => setPosition(arrow, { left: arrowLefts[index], width: 26.5 }));
   for (const item of textsAt(11, (entry) => /^[1-5]$/.test(entry.text))) setText(item, { typeface: "Georgia", size: 19, bold: false, color: C.orangeHot });
   for (const item of textsAt(11, (entry) => ["OFFLINE REPLAY", "SHADOW MODE", "ASSISTED OPS", "CHALLENGER", "GOVERNED SCALE"].includes(entry.text))) setText(item, { typeface: "Menlo", size: 13, bold: true, color: C.text });
   for (const item of textsAt(11, (entry) => entry.text.includes("\n") && (entry.bbox ?? [])[1] < 430)) setText(item, { size: 14, color: C.muted });
