@@ -12,6 +12,7 @@ The product is an assurance layer, not a replacement payment-decision engine. It
 - [Diagram catalog](docs/diagrams/README.md)
 - [Empirical validation spike](validation_spike/README.md)
 - [Judge-facing APAR console](web/README.md)
+- [Competition submission pack](docs/submission/README.md)
 
 ## Run the judge-facing console
 
@@ -62,13 +63,15 @@ scenario compiler, API, and immutable artifact store from clean temporary state.
 | Area | Status |
 |---|---|
 | Product and architecture specification | Documented |
-| Empirical falsification spike | Implemented |
-| Threat registry and scenario compiler | G0 foundation implemented |
-| Rail-specific simulator | Specified, not implemented |
-| Adaptive red-team optimizer | Harness validated; adaptive optimizer not implemented |
-| Defender service | Implemented; 200-campaign v1 evidence is signed and hash-pinned, with truthful `no_promotion` after the frozen 1% workload budget proved infeasible |
-| Agentic trust plane | Specified, not implemented |
-| Web prototype and walkthrough | Implemented and locally verified; walkthrough video not recorded |
+| Threat registry and scenario compiler | Implemented and contract-tested |
+| Rail-specific simulator | Implemented for card, A2A, and agentic competition paths with ledger checks |
+| Adaptive red-team research | Bounded generator/search harness implemented; results remain synthetic |
+| Defender service | Portable Stage 30 `ensemble_with_graph` model packaged and replay-verified |
+| Agentic trust plane | Deterministic TrustVerifier implemented and tested separately from model performance |
+| Web prototype | Six-route offline console implemented and verified |
+| Submission archive | Deterministic allowlist package and clean-room replay tooling implemented |
+| Official capacity evidence | Incomplete at Stage 70; recovered four-arm metrics are non-authoritative |
+| Walkthrough video | Script complete; recording and upload remain user-owned |
 
 The `validation_spike` is retained as supporting evidence. It must not be represented as the complete competition solution.
 
@@ -89,6 +92,14 @@ Defend v3 confirmatory attempt consumed on an incomplete scaffold; truthful `no_
 Defend v4: execution path implemented; evaluation not executed.
 
 Defend v4 confirmatory attempt consumed; truthful `no_promotion` recorded. Real frozen CatBoost/calibrator/rules were scored, but CALIBRATION and TIME_TO_ALERT gates always fail because those metrics are not yet computed (fail-closed None). No champion is claimed.
+
+Defend v5: the accepted portable competition model is the Stage 30
+`ensemble_with_graph` bundle. It replays 12 curated synthetic scenarios exactly.
+Recovered four-arm diagnostics favor the graph ensemble over rules-only,
+non-graph, and full-hybrid alternatives, but they are explicitly
+non-authoritative and the official chain remains incomplete at Stage 70. See
+[the model card](docs/submission/MODEL_CARD.md) and
+[evaluation boundary](docs/submission/EVALUATION_AND_LIMITATIONS.md).
 
 ## Working title
 

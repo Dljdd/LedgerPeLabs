@@ -28,6 +28,14 @@ The canonical design is [SOLUTION_SPEC.md](../SOLUTION_SPEC.md). The documents i
 - [Empirical validation spike](../validation_spike/README.md)
 - [APAR console walkthrough](demo/APAR_CONSOLE_WALKTHROUGH.md)
 - [APAR console verification and remaining gaps](demo/APAR_CONSOLE_VERIFICATION.md)
+- [Competition submission pack](submission/README.md)
+- [Research and experiment journey](submission/RESEARCH_AND_EXPERIMENT_JOURNEY.md)
+- [Competition traceability](submission/COMPETITION_TRACEABILITY.md)
+- [Model card](submission/MODEL_CARD.md)
+- [Data and simulation card](submission/DATA_AND_SIMULATION_CARD.md)
+- [Evaluation and limitations](submission/EVALUATION_AND_LIMITATIONS.md)
+- [Commercial and deployment plan](submission/COMMERCIAL_AND_DEPLOYMENT_PLAN.md)
+- [Five-minute walkthrough](submission/FIVE_MINUTE_WALKTHROUGH.md)
 
 ## Status language
 

@@ -4,11 +4,11 @@ This matrix is the control surface for implementation status. Replace `Specified
 
 | Requirement area | Requirement | Status | Planned evidence |
 |---|---|---|---|
-| Identify | At least 20 reviewed threat cards | Specified | Registry export and coverage report |
-| Identify | Evidence, confidence, rail, lifecycle, and GenAI delta | Specified | Threat-card schema tests |
-| Generate | Four deep scenario families | Specified | Scenario bundles and replay fixtures |
-| Generate | Rail-correct lifecycle | Specified | State-transition tests |
-| Generate | Value conservation | Specified | Reconciliation artifacts |
+| Identify | At least 20 reviewed threat cards | Validated | Registry export, contract tests, and Overview evidence |
+| Identify | Evidence, confidence, rail, lifecycle, and GenAI delta | Validated | Threat-card schema tests and sourced cards |
+| Generate | Four deep scenario families | Implemented | Real generator-to-rail execution across four families |
+| Generate | Rail-correct lifecycle | Validated | Card, A2A, and agentic state-transition tests |
+| Generate | Value conservation | Validated | Ledger reconciliation and tamper tests |
 | Generate | Benign novelty and degraded data | Specified | Stress-suite report |
 | Adapt | Candidate uses prior feedback | Specified | Candidate trace and counterfactual test |
 | Adapt | Matched random, adaptive, and agent ablation | Specified | Red-team evaluation report |
@@ -18,7 +18,7 @@ This matrix is the control surface for implementation status. Replace `Specified
 | Defend | Past-only feature state | Validated | Causal source audit, future-append tests, and frozen 48-feature competition matrix |
 | Defend | Campaign case grouping | Validated | Exact callback reconstruction and signed 6/336 minimum workload failure evidence |
 | Defend | v2 sealed evaluation protocol | Protocol sealed, not executed | Signed preregistration and read-only pre-execution verifier; no evaluation receipt or result artifact exists |
-| Agentic | Identity, mandate, scope, binding, replay | Specified | Integrity attack suite |
+| Agentic | Identity, mandate, scope, binding, replay | Validated | TrustVerifier integrity attack suite and Assurance proof |
 | Evaluate | Chronological and cold-entity splits | Specified | Dataset manifest and assertions |
 | Evaluate | Independent hidden generator | Implemented, not released | Separate pinned authority and isolated worker; release was correctly withheld because no defender could freeze |
 | Evaluate | Fixed operational budgets | Validated negative | Signed exhaustive frontier proves 1.7857% minimum review workload exceeds the frozen 1% cap; no relaxation |
@@ -26,15 +26,18 @@ This matrix is the control surface for implementation status. Replace `Specified
 | Governance | Immutable content-addressed runs | Validated | 200 signed run manifests plus signed corpus/result/hash aliases |
 | Governance | Human promotion gate | Specified | Signed report and audit event |
 | Safety | Synthetic-only, no live targeting | Specified | Network and input safety tests |
-| Engineering | Portable one-command start | Specified | Clean-machine test log |
-| Engineering | CI fails on invariant failure | Specified | CI run and mutation tests |
-| Prototype | Five-minute offline golden path | Specified | Usability test and recording |
-| Submission | Repository, walkthrough, web prototype | Specified | Final archive inventory |
+| Engineering | Portable one-command start | Validated | Portable replay and console launcher |
+| Engineering | Verification fails on invariant mutation | Validated | Evidence, projection, release, and replay mutation tests |
+| Prototype | Five-minute offline golden path | Validated except recording | Six-route browser tests and final recording script |
+| Submission | Repository, walkthrough, web prototype | Implemented | Deterministic archive inventory and submission documentation |
 | Validation spike | H1-H5 falsification spike | Validated with limitations | `validation_spike` reports and outputs |
 | Defend v3 | Execution path drafted; evaluation not executed | Drafted | Separately versioned protocol; no v3 population or result exists |
 | Defend v3 result | Confirmatory attempt consumed on incomplete scaffold | Truthful no_promotion | No scoring, metrics, or gates were evaluated; v4 protocol revision required |
 | Defend v4 | Execution path implemented; evaluation not executed | Implemented | Actual scoring, gate evaluation, and signed publication wired into the v3 boundary |
 | Defend v4 result | Confirmatory attempt consumed with real scoring | Truthful no_promotion | Frozen CatBoost/calibrator/rules scored; ECE/time-to-alert not computed so all arms fail conservatively |
+| Defend v5 portable model | Accepted Stage 30 `ensemble_with_graph` | Demo-ready | Three CatBoost members, three calibrators, 46 frozen features, exact 12-scenario replay |
+| Defend v5 recovered comparison | Four arms scored | Verified non-authoritative | Graph arm selected; full hybrid remains `not_ready`; official Stage 70 missing |
+| Release | Allowlist archive and clean-room replay | Implemented | Deterministic archive, secret scan, SBOM, manifest verification, fresh-environment replay |
 
 ## Status update rules
 

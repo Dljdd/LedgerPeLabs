@@ -7,7 +7,7 @@ submission archive therefore makes no new licensing claim for APAR source or
 model artifacts. Judges may inspect and run the archive for the competition use
 case, subject to the competition's own terms.
 
-The archive vendors no third-party package code or wheels. Its exact Python
+The archive vendors no third-party package code, wheels, or `node_modules`. Its exact Python
 runtime resolution is in `release/requirements-judge.txt`; the matching
 CycloneDX record is in `release/dependency-sbom.cdx.json`. The packages are
 downloaded from the judge's configured Python package index during first-time
@@ -42,5 +42,10 @@ setup and retain their upstream licenses.
 | typing-inspection | 0.4.4 | MIT |
 | tzdata | 2026.3 | Apache-2.0 |
 
-No web dependency or built web artifact is shipped in this release. That scope
-must be regenerated when the web prototype's merge-ready commit is integrated.
+The archive ships the React/TypeScript console source and the complete npm
+dependency lock at `web/package-lock.json`. `npm ci` resolves the exact
+transitive frontend graph during first-time setup; no third-party frontend code
+is committed into the archive. Direct dependencies include React and React DOM
+(MIT); development/build dependencies include TypeScript, Vite, Vitest,
+Playwright, Testing Library, Axe, ESLint, Tailwind CSS, and their plugins. The
+npm lock remains the authoritative version inventory for that toolchain.

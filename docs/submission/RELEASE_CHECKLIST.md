@@ -49,9 +49,11 @@ exact locked packages are installed, model loading, scenario replay, payload
 verification, and fallback trace generation are fully offline. No Kaggle,
 cloud, API key, credential, service, database, or network call is used.
 
-The built web artifact is not yet integrated. The manifest deliberately records
-`web.status=pending`, `web.included=false`, and
-`web.cold_start_verified=false`. Use the portable CLI as the fallback:
+The submission can include the complete console source with `--include-web`.
+The clean-room gate installs the exact frontend lock and runs a production
+build from the extracted archive. After dependency installation, model replay,
+console build, and fallback operation are offline. Use the portable CLI as the
+minimal fallback:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 .venv/bin/python scripts/run_sentinel_v5_demo.py \
@@ -59,8 +61,9 @@ PYTHONDONTWRITEBYTECODE=1 .venv/bin/python scripts/run_sentinel_v5_demo.py \
 ```
 
 The judge-side verifier emits the deterministic fallback trace as part of its
-JSON output. Final UI cold-start verification remains pending until the web
-task's merge-ready commit is integrated, explicitly allowlisted, and packaged.
+JSON output. The web source, embedded evidence, and launcher are hash-inventoried
+in the archive; browser end-to-end tests remain maintainer-side because they
+require a preinstalled Chromium binary.
 
 ## Archive contents
 
@@ -73,6 +76,11 @@ task's merge-ready commit is integrated, explicitly allowlisted, and packaged.
 - `scripts/run_sentinel_v5_demo.py`: direct demo CLI.
 - `scripts/submission/`: judge-side payload/replay verifier and deterministic
   fallback projection.
+- `web/`: six-route React/TypeScript console, exact dependency lock, and embedded
+  verified evidence.
+- `scripts/run_apar_console.py` and `scripts/build_apar_console_evidence.py`:
+  offline launcher and evidence preflight.
+- `docs/submission/`: deck companion documents and video walkthrough.
 - `evidence/sentinel-v5-recovered-metrics/`: verified but explicitly
   non-authoritative recovery receipt/report.
 - `docs/experiments/defense-v5-locked-development-abort.json`: retained abort

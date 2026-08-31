@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from scripts.submission.archive import build_archive, verify_archive
+from scripts.submission.claims import verify_submission_claims
 from scripts.submission.clean_room import run_clean_room
 from scripts.submission.inventory import validate_dependency_inventory
 from scripts.submission.model import ReleaseError
@@ -75,6 +76,7 @@ def run_release_gate(root: Path) -> dict[str, Any]:
         notice_path=repo_root / "docs/submission/THIRD_PARTY_NOTICES.md",
         web_status=policy.web_status,
     )
+    verify_submission_claims(repo_root)
     python = sys.executable
     _run(
         repo_root,
@@ -96,8 +98,8 @@ def run_release_gate(root: Path) -> dict[str, Any]:
         temporary_root = Path(temporary)
         first_path = temporary_root / "first.zip"
         second_path = temporary_root / "second.zip"
-        first = build_archive(repo_root, policy_path, first_path)
-        build_archive(repo_root, policy_path, second_path)
+        first = build_archive(repo_root, policy_path, first_path, include_web=True)
+        build_archive(repo_root, policy_path, second_path, include_web=True)
         if first_path.read_bytes() != second_path.read_bytes():
             raise ReleaseError("two release builds produced different archive bytes")
         manifest = verify_archive(first_path)
@@ -116,6 +118,7 @@ def run_release_gate(root: Path) -> dict[str, Any]:
         "prediction_sha256": fallback.get("prediction_sha256"),
         "replay_verified": clean_room.get("replay_verified"),
         "scenario_count": fallback.get("scenario_count"),
+        "web_build_verified": clean_room.get("web_build_verified"),
         "schema_version": "apar-submission-release-gate/1",
         "source_commit": first.source_commit,
         "source_tree": first.source_tree,

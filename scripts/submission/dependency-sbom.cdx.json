@@ -37,7 +37,7 @@
     "properties": [
       {"name": "apar:dependencies-vendored", "value": "false"},
       {"name": "apar:project-license-status", "value": "unspecified"},
-      {"name": "apar:web-dependencies-shipped", "value": "false"}
+      {"name": "apar:web-dependencies-shipped", "value": "true"}
     ]
   },
   "serialNumber": "urn:uuid:5cae4f40-d1fb-4316-ae2d-4fdb235c0043",

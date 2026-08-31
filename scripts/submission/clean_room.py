@@ -48,7 +48,7 @@ def _run(command: list[str], *, cwd: Path | None = None, env: dict[str, str] | N
 
 
 def run_clean_room(archive_path: Path, *, python_executable: str) -> dict[str, Any]:
-    """Install only the locked dependencies in a new venv and replay extracted bytes."""
+    """Install exact locks, replay the model, and build the extracted console."""
     uv = shutil.which("uv")
     if uv is None:
         raise ReleaseError("clean-room release gate requires uv")
@@ -96,4 +96,30 @@ def run_clean_room(archive_path: Path, *, python_executable: str) -> dict[str, A
             raise ReleaseError("clean-room verifier did not emit JSON") from error
         if not isinstance(document, dict) or document.get("replay_verified") is not True:
             raise ReleaseError("clean-room verifier did not confirm replay")
+        manifest = document.get("accepted_model")
+        if not isinstance(manifest, dict):
+            raise ReleaseError("clean-room accepted model identity is absent")
+        npm = shutil.which("npm")
+        if npm is None:
+            raise ReleaseError("clean-room web verification requires npm")
+        web_root = release_root / "web"
+        if not (web_root / "package-lock.json").is_file():
+            raise ReleaseError("clean-room web dependency lock is absent")
+        _run([npm, "ci", "--no-audit", "--no-fund"], cwd=web_root)
+        _run([npm, "run", "build"], cwd=web_root)
+        if not (web_root / "dist" / "index.html").is_file():
+            raise ReleaseError("clean-room web build did not produce index.html")
+        health_output = _run(
+            [str(venv_python), "scripts/run_apar_console.py", "health"],
+            cwd=release_root,
+            env=environment,
+        )
+        try:
+            health = json.loads(health_output)
+        except json.JSONDecodeError as error:
+            raise ReleaseError("clean-room console health did not emit JSON") from error
+        if not isinstance(health, dict) or health.get("status") != "ready":
+            raise ReleaseError("clean-room console health did not confirm readiness")
+        document["web_build_verified"] = True
+        document["web_health"] = health
         return cast(dict[str, Any], document)

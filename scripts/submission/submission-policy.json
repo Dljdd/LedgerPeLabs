@@ -1,5 +1,5 @@
 {
-  "allowed_extensions": [".in", ".json", ".md", ".py", ".txt"],
+  "allowed_extensions": [".css", ".html", ".in", ".json", ".md", ".py", ".ts", ".tsx", ".txt"],
   "archive_root": "APAR",
   "entries": [
     {"archive": "demo/sentinel-v5/calibrators/member-00.json", "required": true, "source": "demo/sentinel-v5/calibrators/member-00.json"},
@@ -11,9 +11,19 @@
     {"archive": "demo/sentinel-v5/models/member-02.json", "required": true, "source": "demo/sentinel-v5/models/member-02.json"},
     {"archive": "demo/sentinel-v5/scenarios.json", "required": true, "source": "demo/sentinel-v5/scenarios.json"},
     {"archive": "demo/sentinel-v5/spec.json", "required": true, "source": "demo/sentinel-v5/spec.json"},
+    {"archive": "docs/demo/APAR_CONSOLE_VERIFICATION.md", "required": true, "source": "docs/demo/APAR_CONSOLE_VERIFICATION.md"},
+    {"archive": "docs/demo/APAR_CONSOLE_WALKTHROUGH.md", "required": true, "source": "docs/demo/APAR_CONSOLE_WALKTHROUGH.md"},
     {"archive": "docs/demo/SENTINEL_V5_DEMO.md", "required": true, "source": "docs/demo/SENTINEL_V5_DEMO.md"},
     {"archive": "docs/experiments/defense-v5-locked-development-abort.json", "required": true, "source": "docs/experiments/defense-v5-locked-development-abort.json"},
+    {"archive": "docs/submission/COMMERCIAL_AND_DEPLOYMENT_PLAN.md", "required": true, "source": "docs/submission/COMMERCIAL_AND_DEPLOYMENT_PLAN.md"},
+    {"archive": "docs/submission/COMPETITION_TRACEABILITY.md", "required": true, "source": "docs/submission/COMPETITION_TRACEABILITY.md"},
+    {"archive": "docs/submission/DATA_AND_SIMULATION_CARD.md", "required": true, "source": "docs/submission/DATA_AND_SIMULATION_CARD.md"},
+    {"archive": "docs/submission/EVALUATION_AND_LIMITATIONS.md", "required": true, "source": "docs/submission/EVALUATION_AND_LIMITATIONS.md"},
+    {"archive": "docs/submission/FIVE_MINUTE_WALKTHROUGH.md", "required": true, "source": "docs/submission/FIVE_MINUTE_WALKTHROUGH.md"},
+    {"archive": "docs/submission/MODEL_CARD.md", "required": true, "source": "docs/submission/MODEL_CARD.md"},
+    {"archive": "docs/submission/README.md", "required": true, "source": "docs/submission/README.md"},
     {"archive": "docs/submission/RELEASE_CHECKLIST.md", "required": true, "source": "docs/submission/RELEASE_CHECKLIST.md"},
+    {"archive": "docs/submission/RESEARCH_AND_EXPERIMENT_JOURNEY.md", "required": true, "source": "docs/submission/RESEARCH_AND_EXPERIMENT_JOURNEY.md"},
     {"archive": "docs/submission/THIRD_PARTY_NOTICES.md", "required": true, "source": "docs/submission/THIRD_PARTY_NOTICES.md"},
     {"archive": "evidence/sentinel-v5-recovered-metrics/source-rescue-receipt.json", "required": true, "source": "evidence/sentinel-v5-recovered-metrics/source-rescue-receipt.json"},
     {"archive": "evidence/sentinel-v5-recovered-metrics/verified-report.json", "required": true, "source": "evidence/sentinel-v5-recovered-metrics/verified-report.json"},
@@ -21,8 +31,10 @@
     {"archive": "release/requirements-judge.in", "required": true, "source": "scripts/submission/requirements-judge.in"},
     {"archive": "release/requirements-judge.txt", "required": true, "source": "scripts/submission/requirements-judge.txt"},
     {"archive": "release/submission-policy.json", "required": true, "source": "scripts/submission/submission-policy.json"},
+    {"archive": "scripts/run_apar_console.py", "required": true, "source": "scripts/run_apar_console.py"},
     {"archive": "scripts/run_sentinel_v5_demo.py", "required": true, "source": "scripts/run_sentinel_v5_demo.py"},
     {"archive": "scripts/submission/__init__.py", "required": true, "source": "scripts/submission/__init__.py"},
+    {"archive": "scripts/submission/claims.py", "required": true, "source": "scripts/submission/claims.py"},
     {"archive": "scripts/submission/model.py", "required": true, "source": "scripts/submission/model.py"},
     {"archive": "scripts/submission/replay.py", "required": true, "source": "scripts/submission/replay.py"},
     {"archive": "scripts/submission/runtime_verify.py", "required": true, "source": "scripts/submission/runtime_verify.py"},
@@ -41,11 +53,11 @@
   ],
   "extensionless_paths": [],
   "max_file_bytes": 524288,
-  "max_total_bytes": 2097152,
+  "max_total_bytes": 6291456,
   "release": {
     "accepted_demo_arm": "ensemble_with_graph",
     "accepted_stage": "30_arms",
-    "build_command": "python3.12 -m scripts.submission.cli build --repo . --policy scripts/submission/submission-policy.json --output APAR-submission.zip",
+    "build_command": "python3.12 -m scripts.submission.cli build --repo . --policy scripts/submission/submission-policy.json --output APAR-submission.zip --include-web",
     "evidence_authority": {
       "accepted_capacity_evidence": false,
       "authoritative": false,
@@ -55,7 +67,7 @@
       "real_cardholder_data": false,
       "recovered_metrics_verified": true
     },
-    "evidence_baseline_commit": "eeeb1f9fef9545083686b4076dfb043cf424a122",
+    "evidence_baseline_commit": "71a0ec37ba4c8b5135baa60a30e065ed9a7d4d21",
     "first_missing_official_stage": "70_metrics",
     "frozen_arm_spec_sha256": "c9fe9ed92109eedabf0ed4b9e1dd11b58c27dd87d3a86ec5e00b41f2c9e73878",
     "license": {
@@ -110,12 +122,42 @@
       {"path": "demo/sentinel-v5/models/member-02.json", "reason": "Accepted CatBoost JSON embeds one upstream library author email in model metadata.", "rule": "email"},
       {"path": "demo/sentinel-v5/models/member-02.json", "reason": "Hash-bound numeric CatBoost model serialization may resemble a payment number.", "rule": "pii_pan"},
       {"path": "demo/sentinel-v5/scenarios.json", "reason": "Hash-bound synthetic feature decimals may coincidentally satisfy the Luhn checksum.", "rule": "pii_pan"},
-      {"path": "evidence/sentinel-v5-recovered-metrics/verified-report.json", "reason": "Hash-bound aggregate metric decimals may coincidentally satisfy the Luhn checksum.", "rule": "pii_pan"}
+      {"path": "evidence/sentinel-v5-recovered-metrics/verified-report.json", "reason": "Hash-bound aggregate metric decimals may coincidentally satisfy the Luhn checksum.", "rule": "pii_pan"},
+      {"path": "web/public/data/console-evidence.json", "reason": "Hash-bound synthetic feature decimals may coincidentally satisfy the Luhn checksum.", "rule": "pii_pan"},
+      {"path": "web/public/data/verified-trace.json", "reason": "Hash-bound synthetic feature decimals may coincidentally satisfy the Luhn checksum.", "rule": "pii_pan"}
     ]
   },
   "schema_version": "apar-submission-policy/1",
   "web": {
-    "entries": [],
-    "status": "pending"
+    "entries": [
+      {"archive":"web/README.md","required":true,"source":"web/README.md"},
+      {"archive":"web/index.html","required":true,"source":"web/index.html"},
+      {"archive":"web/package-lock.json","required":true,"source":"web/package-lock.json"},
+      {"archive":"web/package.json","required":true,"source":"web/package.json"},
+      {"archive":"web/public/data/console-evidence.json","required":true,"source":"web/public/data/console-evidence.json"},
+      {"archive":"web/public/data/verified-trace.json","required":true,"source":"web/public/data/verified-trace.json"},
+      {"archive":"web/src/app/App.tsx","required":true,"source":"web/src/app/App.tsx"},
+      {"archive":"web/src/app/Icon.tsx","required":true,"source":"web/src/app/Icon.tsx"},
+      {"archive":"web/src/app/Shell.tsx","required":true,"source":"web/src/app/Shell.tsx"},
+      {"archive":"web/src/app/evidence.ts","required":true,"source":"web/src/app/evidence.ts"},
+      {"archive":"web/src/app/format.ts","required":true,"source":"web/src/app/format.ts"},
+      {"archive":"web/src/app/loader.ts","required":true,"source":"web/src/app/loader.ts"},
+      {"archive":"web/src/app/routes.ts","required":true,"source":"web/src/app/routes.ts"},
+      {"archive":"web/src/app/types.ts","required":true,"source":"web/src/app/types.ts"},
+      {"archive":"web/src/app/useReducedMotion.ts","required":true,"source":"web/src/app/useReducedMotion.ts"},
+      {"archive":"web/src/app/views/Assurance.tsx","required":true,"source":"web/src/app/views/Assurance.tsx"},
+      {"archive":"web/src/app/views/Defenses.tsx","required":true,"source":"web/src/app/views/Defenses.tsx"},
+      {"archive":"web/src/app/views/Investigation.tsx","required":true,"source":"web/src/app/views/Investigation.tsx"},
+      {"archive":"web/src/app/views/Overview.tsx","required":true,"source":"web/src/app/views/Overview.tsx"},
+      {"archive":"web/src/app/views/Replay.tsx","required":true,"source":"web/src/app/views/Replay.tsx"},
+      {"archive":"web/src/app/views/Scenario.tsx","required":true,"source":"web/src/app/views/Scenario.tsx"},
+      {"archive":"web/src/main.tsx","required":true,"source":"web/src/main.tsx"},
+      {"archive":"web/src/styles.css","required":true,"source":"web/src/styles.css"},
+      {"archive":"web/tsconfig.app.json","required":true,"source":"web/tsconfig.app.json"},
+      {"archive":"web/tsconfig.json","required":true,"source":"web/tsconfig.json"},
+      {"archive":"web/tsconfig.node.json","required":true,"source":"web/tsconfig.node.json"},
+      {"archive":"web/vite.config.ts","required":true,"source":"web/vite.config.ts"}
+    ],
+    "status": "ready"
   }
 }
