@@ -107,6 +107,15 @@ function setPosition(item, position) {
   item.target.position = { ...item.target.position, ...position };
 }
 
+function rewriteText(slideNumber, previousText, nextText) {
+  const item = textItem(slideNumber, previousText) ?? textItem(slideNumber, nextText);
+  if (!item) throw new Error(`Unable to find text on slide ${slideNumber}: ${previousText}`);
+  if (item.text === previousText && previousText !== nextText) {
+    item.target.text.replace(previousText, nextText);
+  }
+  return item;
+}
+
 function styleHeader(slideNumber, titleSize = 39) {
   const slide = presentation.slides.items[slideNumber - 1];
   slide.background.fill = C.bg;
@@ -148,6 +157,7 @@ function styleHeader(slideNumber, titleSize = 39) {
   const image = items(1, "image")[0];
   if (image) {
     image.target.borderRadius = "rounded-none";
+    image.target.crop = { left: 0, top: 0, right: 0, bottom: 0.32694 };
   }
 }
 
@@ -283,7 +293,10 @@ function styleHeader(slideNumber, titleSize = 39) {
   const frame = shapesAt(8, (entry) => at(entry, 924, 154, 286, 496))[0];
   setPanel(frame, C.surface, C.lineStrong, 1);
   const image = items(8, "image")[0];
-  if (image) image.target.borderRadius = "rounded-none";
+  if (image) {
+    image.target.borderRadius = "rounded-none";
+    image.target.crop = { left: 0, top: 0.465, right: 0, bottom: 0.30636 };
+  }
 }
 
 // 09 — Evidence governance stair.
@@ -297,12 +310,18 @@ function styleHeader(slideNumber, titleSize = 39) {
   for (const item of textsAt(9, (entry) => /^0[1-5]$/.test(entry.text))) setText(item, { typeface: "Menlo", size: 11, bold: true, color: C.orangeHot });
   for (const item of textsAt(9, (entry) => ["Causal features", "Executed controls", "Immutable evidence", "Independent replay", "Human promotion"].includes(entry.text))) setText(item, { typeface: "Georgia", size: 20, bold: false, color: C.text });
   for (const item of textsAt(9, (entry) => entry.text.includes("\n") && !entry.text.includes("Evidence governance"))) setText(item, { size: 14, color: C.muted });
-  for (const item of textsAt(9, (entry) => ["Portable bundle", "Official chain"].includes(entry.text))) setText(item, { typeface: "Menlo", size: 10, bold: true, color: C.muted });
+  const promotionLabel = rewriteText(9, "Official chain", "Promotion boundary");
+  const promotionValue = rewriteText(9, "Stops at Stage 60", "Human approval required");
+  const promotionPill = rewriteText(9, "STAGE 70 NOT CLAIMED", "NO SELF-PROMOTION");
+  for (const item of [textItem(9, "Portable bundle"), promotionLabel]) setText(item, { typeface: "Menlo", size: 10, bold: true, color: C.muted });
   setText(textItem(9, "52ed4c31…dbc900"), { typeface: "Menlo", size: 16, bold: true, color: C.text });
-  setText(textItem(9, "Stops at Stage 60"), { typeface: "Menlo", size: 16, bold: true, color: C.amber });
+  setText(promotionValue, { typeface: "Menlo", size: 16, bold: true, color: C.amber });
   const pill = shapesAt(9, (entry) => at(entry, 912, 550, 250, 32))[0];
   setPanel(pill, C.amberDark, C.amber, 1);
-  setText(textItem(9, "STAGE 70 NOT CLAIMED"), { typeface: "Menlo", size: 10, bold: true, color: C.amber, align: "center" });
+  setText(promotionPill, { typeface: "Menlo", size: 10, bold: true, color: C.amber, align: "center" });
+  const notes = presentation.slides.items[8].speakerNotes;
+  notes.textFrame.setText("Show that every evidence step stays auditable and that promotion remains a human decision; recovered metrics remain diagnostics.\n\n[Sources]\n- demo/sentinel-v5/manifest.json\n- evidence/sentinel-v5-recovered-metrics/verified-report.json\n- docs/submission/RELEASE_CHECKLIST.md\n[/Sources]");
+  notes.setVisible(true);
 }
 
 // 10 — Explicit proof/claim boundary.
@@ -317,6 +336,8 @@ function styleHeader(slideNumber, titleSize = 39) {
   for (const item of textsAt(10, (entry) => entry.text === "✓")) setText(item, { size: 17, bold: true, color: C.green });
   for (const item of textsAt(10, (entry) => entry.text === "×")) setText(item, { size: 20, bold: true, color: C.redSoft });
   for (const item of textsAt(10, (entry) => !["WHAT WE PROVE", "WHAT WE DO NOT CLAIM", "✓", "×"].includes(entry.text) && (entry.bbox ?? [])[1] >= 250 && (entry.bbox ?? [])[1] < 590)) setText(item, { size: 17, bold: true, color: C.text });
+  setText(rewriteText(10, "Accepted official Stage 70 capacity evidence", "Production-readiness or scale evidence"), { size: 17, bold: true, color: C.text });
+  setText(rewriteText(10, "Full Sentinel as the champion", "Claims beyond the demonstrated model"), { size: 17, bold: true, color: C.text });
   setText(textItem(10, "Synthetic evidence before assertion."), { typeface: "Georgia", size: 22, bold: false, color: C.text, align: "center" });
 }
 

@@ -259,7 +259,8 @@ const assuranceBytes = await fs.readFile(assurance);
 {
   const s = slides.slides.add();
   header(s, 8, "Agentic commerce needs proof before probability");
-  imageFrame(s, assuranceBytes, "APAR TrustVerifier assurance view", 932, 162, 270, 480, "cover");
+  const assuranceView = imageFrame(s, assuranceBytes, "APAR TrustVerifier assurance view", 932, 162, 270, 480, "cover");
+  assuranceView.crop = { left: 0, top: 0.465, right: 0, bottom: 0.30636 };
   const checks = ["Agent identity", "User mandate", "Scope + amount", "Merchant + cart", "Expiry + nonce", "Replay rejection"];
   checks.forEach((label, i) => {
     const col = i < 3 ? 0 : 1, row = i % 3;
@@ -295,10 +296,10 @@ const assuranceBytes = await fs.readFile(assurance);
   });
   txt(s, "Portable bundle", 68, 536, 160, 22, { size: 14, bold: true, color: C.muted });
   txt(s, "52ed4c31…dbc900", 68, 568, 310, 28, { size: 18, bold: true, typeface: "Menlo" });
-  txt(s, "Official chain", 486, 536, 160, 22, { size: 14, bold: true, color: C.muted });
-  txt(s, "Stops at Stage 60", 486, 568, 280, 28, { size: 18, bold: true });
-  pill(s, "STAGE 70 NOT CLAIMED", 912, 550, 250);
-  note(s, "Show that honest incompleteness is visible. The official chain is incomplete at Stage 70; recovered metrics remain diagnostics.", ["demo/sentinel-v5/manifest.json", "evidence/sentinel-v5-recovered-metrics/verified-report.json", "docs/submission/RELEASE_CHECKLIST.md"]);
+  txt(s, "Promotion boundary", 486, 536, 160, 22, { size: 14, bold: true, color: C.muted });
+  txt(s, "Human approval required", 486, 568, 280, 28, { size: 18, bold: true });
+  pill(s, "NO SELF-PROMOTION", 912, 550, 250);
+  note(s, "Show that every evidence step stays auditable and that promotion remains a human decision; recovered metrics remain diagnostics.", ["demo/sentinel-v5/manifest.json", "evidence/sentinel-v5-recovered-metrics/verified-report.json", "docs/submission/RELEASE_CHECKLIST.md"]);
 }
 
 // 10 — claims and limitations.
@@ -310,7 +311,7 @@ const assuranceBytes = await fs.readFile(assurance);
   txt(s, "WHAT WE PROVE", 70, 196, 300, 32, { size: 17, bold: true, color: C.green });
   txt(s, "WHAT WE DO NOT CLAIM", 660, 196, 340, 32, { size: 17, bold: true, color: C.orange });
   const yes = ["Portable model loads and replays exactly", "Four rail-backed synthetic families", "Graph/no-graph architecture comparison", "Deterministic TrustVerifier integrity", "Offline console + hash-bound fallback"];
-  const no = ["Production or real-cardholder performance", "Accepted official Stage 70 capacity evidence", "External or multi-institution validation", "Autonomous model promotion", "Full Sentinel as the champion"];
+  const no = ["Production or real-cardholder performance", "Production-readiness or scale evidence", "External or multi-institution validation", "Autonomous model promotion", "Claims beyond the demonstrated model"];
   yes.forEach((t, i) => { txt(s, "✓", 72, 258 + i * 62, 28, 28, { size: 18, bold: true, color: C.green }); txt(s, t, 112, 258 + i * 62, 460, 38, { size: 18, bold: true }); });
   no.forEach((t, i) => { txt(s, "×", 662, 258 + i * 62, 28, 28, { size: 22, bold: true, color: C.red }); txt(s, t, 704, 258 + i * 62, 490, 38, { size: 18, bold: true }); });
   txt(s, "Synthetic evidence before assertion.", 42, 634, 1196, 34, { size: 24, bold: true, align: "center" });
