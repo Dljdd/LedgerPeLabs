@@ -36,8 +36,8 @@ produces auditable evidence for a human promotion decision.
 **Project links**
 
 - Working prototype: https://web-six-tau-bxhm7rwrzu.vercel.app/overview
-- Public source: https://github.com/Dljdd/mastercard-innovation-challenge-2026
-- Pitch deck: https://github.com/Dljdd/mastercard-innovation-challenge-2026/blob/codex/apar-final-submission/docs/submission/APAR_COMPETITION_DECK.pdf
+- Public source: https://github.com/Dljdd/LedgerPeLabs
+- Pitch deck: https://github.com/Dljdd/LedgerPeLabs/blob/codex/apar-final-submission/docs/submission/APAR_COMPETITION_DECK.pdf
 
 **Suggested media gallery order**
 
@@ -234,8 +234,13 @@ controlled.
 ## Links
 
 - **Working prototype:** https://web-six-tau-bxhm7rwrzu.vercel.app/overview
-- **Public repository:** https://github.com/Dljdd/mastercard-innovation-challenge-2026
-- **Pitch deck:** https://github.com/Dljdd/mastercard-innovation-challenge-2026/blob/codex/apar-final-submission/docs/submission/APAR_COMPETITION_DECK.pdf
-- **Video:** [ADD FINAL PUBLIC VIDEO URL]
+- **Public repository:** https://github.com/Dljdd/LedgerPeLabs
+- **Pitch deck:** https://github.com/Dljdd/LedgerPeLabs/blob/codex/apar-final-submission/docs/submission/APAR_COMPETITION_DECK.pdf
+- **Video:** https://www.youtube.com/watch?v=A_4Pe_A7iMg
 
-**Team: LedgerPe Labs**
+## Team LedgerPeLabs
+
+- Dylan Moraes
+- Anuj Sharma
+- Dhananjay Joshi
+- Rahul Biradar
